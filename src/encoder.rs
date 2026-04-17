@@ -1,9 +1,9 @@
 //! Vorbis encoder (tier 2 — ffmpeg-interop quality).
 //!
 //! Supports mono and stereo at any sample rate. The setup header carries
-//! both the short (256) and long (2048) block configurations, but the
-//! current driver always emits long blocks — see the "Known limitations"
-//! section below for the short-block switching gap. The setup contains:
+//! both the short (256) and long (2048) block configurations and the
+//! runtime picks per-block via a lookahead-driven transient detector
+//! (Vorbis I §1.3.2 / §4.3.1 asymmetric windows). The setup contains:
 //!
 //! - A Y-value codebook (128 entries, length 7, dim 1) for floor1
 //!   amplitudes.
@@ -17,31 +17,25 @@
 //! - One mapping per block-size, 1 or 2 channels. Stereo mappings declare
 //!   one coupling step `(mag=0, ang=1)` — see `forward_couple` for the
 //!   sign-coded sum/difference transform.
-//! - Two modes: mode 0 = short, mode 1 = long.
+//! - Two modes: mode 0 = short (blockflag 0), mode 1 = long (blockflag 1).
 //!
-//! Pipeline for an audio block: build asymmetric sin-window → forward
-//! MDCT (with `2/N` scale) → per-channel floor1 analysis (peak in the
-//! window between adjacent posts, divided by `FLOOR_SCALE` so residues
-//! have headroom, ATH-clamped at the bottom) → floor curve via
-//! `synth_floor1` → residue = spectrum / floor_curve → forward channel
-//! couple (stereo only) → per-partition exhaustive VQ search → emit
-//! packet. Each block advances by N/2 samples and overlaps by N/2 with
-//! the previous block (sin/sin OLA — see `prev_tail`).
+//! Pipeline for an audio block: decide block size via transient lookahead
+//! (→ set the current block's `next_long` flag) → build asymmetric
+//! sin-window → forward MDCT (with `2/N` scale) → per-channel floor1
+//! analysis (peak in the window between adjacent posts, divided by
+//! `FLOOR_SCALE` so residues have headroom, ATH-clamped at the bottom) →
+//! floor curve via `synth_floor1` → residue = spectrum / floor_curve →
+//! forward channel couple (stereo only) → per-partition exhaustive VQ
+//! search → emit packet. Consecutive blocks overlap by
+//! `left_win_end - left_win_start` samples: `n/2` for long↔long and
+//! short↔short, `bs0/2 = 128` for any transition involving a short
+//! (see `prev_tail` + `window_bounds`).
 //!
 //! Known limitations relative to libvorbis. These are intentional scope
 //! cuts, not open tasks — each represents a significant feature whose
 //! absence affects bitrate/quality but not bitstream conformance:
 //!
-//! 1. **Transient detection + short-block switching**: the setup header
-//!    declares short and long modes but the runtime always picks long.
-//!    Adding short blocks would help percussive content (less pre-echo).
-//!    This requires a 2-block lookahead pipeline so prev/next flags are
-//!    correct at emit time; the cleanest way is to buffer 2 long blocks
-//!    of input and decide block-size after both are available. Until
-//!    that pipeline is built, `mode_idx = 1` (long) is hard-coded in
-//!    `drain_blocks` / `flush`.
-//!
-//! 2. **Point-stereo coupling**: our coupling is sum/difference (lossless,
+//! 1. **Point-stereo coupling**: our coupling is sum/difference (lossless,
 //!    Vorbis I §1.3.3). Real libvorbis uses lossy point-stereo above some
 //!    threshold frequency, which roughly halves the residue cost for the
 //!    angle channel. Plumbing point-stereo means signaling it in the
@@ -49,14 +43,14 @@
 //!    encoder-side phase encoding. The decoder already handles the
 //!    general inverse, so enabling this is an encoder-side refinement.
 //!
-//! 3. **Bigger residue VQ family**: a single 128-entry book serves both
+//! 2. **Bigger residue VQ family**: a single 128-entry book serves both
 //!    short and long blocks. libvorbis ships dozens of books per quality
 //!    setting plus master codebooks that classify partition energy with
 //!    fewer bits. The Vorbis I Annex B reference codebooks would let us
 //!    match libvorbis bitrates, at the cost of a much larger setup
 //!    header and a quality-indexed picker.
 //!
-//! 4. **Floor type 0 (LSP)**: never seen in modern Vorbis files; not
+//! 3. **Floor type 0 (LSP)**: never seen in modern Vorbis files; not
 //!    implemented on the encode side. Our setup header always uses
 //!    floor1.
 
@@ -565,10 +559,15 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         flushed: false,
         codebooks,
         setup,
-        // Track the previous block's blockflag to decide window geometry
-        // when emitting the *next* long block. Start with `false` (short)
-        // so the first long block gets short-sized left overlap.
-        prev_block_long: false,
+        // First emitted block is long-with-prev_long=true. Because the
+        // initial `prev_tail` is empty (we'll treat missing samples as
+        // zero), the decoder ignores the first block's contribution —
+        // using prev_long=true just keeps the encoder's long→long
+        // bookkeeping simple.
+        prev_block_long: true,
+        next_block_long: true,
+        prior_energy: 0.0,
+        force_long_only: false,
     }))
 }
 
@@ -578,13 +577,14 @@ struct VorbisEncoder {
     time_base: TimeBase,
     channels: u16,
     sample_rate: u32,
-    #[allow(dead_code)]
     blocksize_short: usize,
     blocksize_long: usize,
     input_buf: Vec<Vec<f32>>,
-    /// Per-channel "right half of the last block we emitted". Used as the
-    /// left half of the next block so consecutive windows overlap by N/2,
-    /// which is what the decoder's sin/sin OLA assumes.
+    /// Per-channel "overlap-region samples of the last block we emitted" —
+    /// the chunk the decoder will OLA with the left side of the next block.
+    /// Its length equals the overlap between the last block and the next:
+    /// `n/2` for long↔long or short↔short, `bs0/2` for any transition
+    /// involving a short block.
     prev_tail: Vec<Vec<f32>>,
     output_queue: VecDeque<Packet>,
     pts: i64,
@@ -592,7 +592,58 @@ struct VorbisEncoder {
     flushed: bool,
     codebooks: Vec<Codebook>,
     setup: Setup,
+    /// Size flag (long=true / short=false) of the most recently emitted
+    /// block. Feeds into the next block's `prev_long` window flag.
     prev_block_long: bool,
+    /// Size flag of the next block we're about to emit — either "true"
+    /// initially or set by the previous block's `next_long` decision.
+    next_block_long: bool,
+    /// Rolling energy estimate (per-channel-averaged short-window energy)
+    /// used by the transient detector. Updated every time `drain_blocks`
+    /// scans fresh input.
+    prior_energy: f32,
+    /// When true, `decide_next_long` always returns true (long-only). Used
+    /// by tests to establish a baseline without transient-driven short
+    /// blocks. Off by default for production encodes.
+    force_long_only: bool,
+}
+
+/// Short-window size for the transient detector (samples). Chosen as
+/// `bs0 / 2` so each sub-window is ≤ 1 short block wide.
+const TRANSIENT_SUB_WINDOW: usize = 128;
+
+/// Amplitude-ratio threshold for flagging a transient. A sub-window whose
+/// average amplitude (root of energy) exceeds `TRANSIENT_RATIO * sqrt(prior_energy)`
+/// flips the encoder into short-block mode. 10× amplitude ≈ 20 dB spike,
+/// which is the signature of a percussive hit riding on a steady tone.
+const TRANSIENT_RATIO: f32 = 10.0;
+
+/// Smoothing factor for the rolling prior-energy estimate. Closer to 1.0
+/// = slower adaptation (longer history); closer to 0.0 = faster.
+const PRIOR_ENERGY_ALPHA: f32 = 0.7;
+
+/// Compute the window boundaries for a block given its size flag and the
+/// neighbour flags (Vorbis I §1.3.2 / §4.3.1). Returns
+/// `(left_win_start, left_win_end, right_win_start, right_win_end)` in
+/// local block indices. Short blocks are symmetric and ignore the
+/// neighbour flags.
+fn window_bounds(
+    long: bool,
+    prev_long: bool,
+    next_long: bool,
+    n: usize,
+    bs0: usize,
+) -> (usize, usize, usize, usize) {
+    if !long {
+        // Short block is symmetric: overlap = n/2 = bs0/2 on each side.
+        (0, n / 2, n / 2, n)
+    } else {
+        let left_start = if prev_long { 0 } else { (n - bs0) / 4 };
+        let left_end = if prev_long { n / 2 } else { (n + bs0) / 4 };
+        let right_start = if next_long { n / 2 } else { (3 * n - bs0) / 4 };
+        let right_end = if next_long { n } else { (3 * n + bs0) / 4 };
+        (left_start, left_end, right_start, right_end)
+    }
 }
 
 impl VorbisEncoder {
@@ -656,60 +707,179 @@ impl VorbisEncoder {
         Ok(())
     }
 
-    /// Emit long-block packets as long as enough input is buffered. Each
-    /// block is an N-sample window that advances by N/2 (so consecutive
-    /// blocks overlap by N/2 — required for correct sin/sin OLA at the
-    /// decoder, see Vorbis I §1.3.4). The first block of the stream pads
-    /// its left half with zeros (the decoder discards left-half output of
-    /// the first packet anyway, so this is a free choice).
+    /// Decide whether the next block (i.e. the one AFTER the block we're
+    /// about to emit) should be long or short by scanning the lookahead
+    /// region for a transient. Caller passes the lookahead slice starting
+    /// at the samples that will fall inside the next block's useful region.
+    ///
+    /// Two-pronged detector:
+    ///   1. **Local contrast**: max sub-window energy vs. min sub-window
+    ///      energy across the lookahead. Catches isolated clicks sitting
+    ///      in quiet regions (minimum ~ 0, maximum ~ click energy → big
+    ///      ratio → transient). Only applies once `prior_energy` has
+    ///      settled (first N blocks use global-only) so the onset of a
+    ///      normal tone from silence isn't flagged as a transient.
+    ///   2. **Global ratio**: max sub-window energy vs. the encoder's
+    ///      rolling `prior_energy` estimate. Catches transients inside a
+    ///      busy signal where local contrast alone isn't enough.
+    fn decide_next_long(&mut self, lookahead: &[f32]) -> bool {
+        if self.force_long_only {
+            return true;
+        }
+        if lookahead.len() < TRANSIENT_SUB_WINDOW {
+            return true;
+        }
+        // Collect per-sub-window energies.
+        let win = TRANSIENT_SUB_WINDOW;
+        let stride = win / 2;
+        let mut max_e = 0f32;
+        let mut min_e = f32::INFINITY;
+        let mut sum_e = 0f32;
+        let mut n_wins = 0usize;
+        let mut i = 0;
+        while i + win <= lookahead.len() {
+            let mut e = 0f32;
+            for &s in &lookahead[i..i + win] {
+                e += s * s;
+            }
+            e /= win as f32;
+            if e > max_e {
+                max_e = e;
+            }
+            if e < min_e {
+                min_e = e;
+            }
+            sum_e += e;
+            n_wins += 1;
+            i += stride;
+        }
+        let avg_e = if n_wins > 0 {
+            sum_e / n_wins as f32
+        } else {
+            0.0
+        };
+        let ratio_sq = TRANSIENT_RATIO * TRANSIENT_RATIO;
+        // Require a settled prior-energy before applying local contrast.
+        // Without this, the onset of any non-silence signal (tone fade-in,
+        // music start) would flag as a transient every time — draining
+        // bits into short blocks where a long block would have done.
+        let prior_settled = self.prior_energy > 1e-6;
+        let local_contrast = prior_settled && max_e > ratio_sq * min_e.max(1e-12) && max_e > 1e-4;
+        let global_contrast = prior_settled && max_e > ratio_sq * self.prior_energy;
+        let is_transient = local_contrast || global_contrast;
+        // Roll the prior-energy estimate toward the lookahead average.
+        // Using the average (not peak) keeps prior_energy from being
+        // pushed high by the transient itself — we want it to track the
+        // surrounding energy level so subsequent blocks can compare against
+        // the baseline.
+        self.prior_energy =
+            PRIOR_ENERGY_ALPHA * self.prior_energy + (1.0 - PRIOR_ENERGY_ALPHA) * avg_e;
+        !is_transient
+    }
+
+    /// Emit as many complete blocks as the current input buffer supports.
+    /// Each block's size (long / short) is determined by the previous
+    /// emission's `next_long` decision; the current emission makes the
+    /// `next_long` decision for the following block.
     fn drain_blocks(&mut self) {
-        let n = self.blocksize_long;
-        let half = n / 2;
+        let n_channels = self.channels as usize;
+        let bs0 = self.blocksize_short;
         loop {
-            // Need `half` samples of NEW data plus `half` samples already
-            // produced (which sit in `prev_tail`). Equivalently: input_buf
-            // must hold at least `half` samples.
-            if self.input_buf[0].len() < half {
+            let long = self.next_block_long;
+            let prev_long = self.prev_block_long;
+            let n = if long {
+                self.blocksize_long
+            } else {
+                self.blocksize_short
+            };
+
+            // We need to know `next_long` (i.e. the flag of the block AFTER
+            // this one) to know how many fresh samples this block consumes.
+            // Peek at the lookahead BEFORE committing: if there aren't
+            // enough samples to also run transient detection, fall back to
+            // `next_long = true`.
+            //
+            // Worst-case fresh consumption for the CURRENT block: the max
+            // of the two `next_long` options. Use that as the gate: we want
+            // to make sure that whichever `next_long` we pick, we have
+            // enough input.
+            let (l_start_t, l_end_t, _, r_end_t) = window_bounds(long, prev_long, true, n, bs0);
+            let (_, _, _, r_end_f) = window_bounds(long, prev_long, false, n, bs0);
+            let fresh_true = r_end_t.saturating_sub(l_end_t);
+            let (_, l_end_f, _, _) = window_bounds(long, prev_long, false, n, bs0);
+            let fresh_false = r_end_f.saturating_sub(l_end_f);
+            let max_fresh = fresh_true.max(fresh_false);
+            if self.input_buf[0].len() < max_fresh {
+                let _ = l_start_t; // keep unused var silent
                 return;
             }
-            self.emit_one_block(n, /*long=*/ true);
-        }
-    }
 
-    fn emit_one_block(&mut self, n: usize, long: bool) {
-        let half = n / 2;
-        let n_channels = self.channels as usize;
-        let mut block: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
-        for ch in 0..n_channels {
-            let mut v = Vec::with_capacity(n);
-            // Left half: take from `prev_tail` (last N/2 samples of the
-            // previous block's window). Empty for the very first block →
-            // pad with zeros so the window's left transition fades from
-            // silence.
-            let tail = self.prev_tail[ch].as_slice();
-            if tail.len() >= half {
-                v.extend_from_slice(&tail[tail.len() - half..]);
+            // Transient detection: look a little beyond the current block's
+            // fresh region to decide the NEXT block's size. The lookahead
+            // window is two short-blocks wide (small enough that it stays
+            // inside the next block).
+            let lookahead_start = fresh_true.min(self.input_buf[0].len());
+            let lookahead_end =
+                (fresh_true + 2 * self.blocksize_short).min(self.input_buf[0].len());
+            let next_long = if lookahead_end > lookahead_start {
+                // Use channel 0 for transient detection (stereo is usually
+                // correlated; this avoids false positives from mid/side
+                // signals). Clone the slice to decouple the borrow.
+                let slice: Vec<f32> = self.input_buf[0][lookahead_start..lookahead_end].to_vec();
+                self.decide_next_long(&slice)
             } else {
-                v.resize(half - tail.len(), 0.0);
-                v.extend_from_slice(tail);
+                true
+            };
+
+            // Recompute bounds with the chosen next_long.
+            let (l_start, l_end, r_start, r_end) =
+                window_bounds(long, prev_long, next_long, n, bs0);
+            let fresh_needed = r_end - l_end;
+            if self.input_buf[0].len() < fresh_needed {
+                // Should not happen given max_fresh gate above, but bail safely.
+                return;
             }
-            // Right half: pull `half` samples from `input_buf` (or zero-pad
-            // if we're flushing a partial trailing block).
-            let take = self.input_buf[ch].len().min(half);
-            v.extend_from_slice(&self.input_buf[ch][..take]);
-            v.resize(n, 0.0);
-            // Save the right half as next block's left half.
-            self.prev_tail[ch].clear();
-            self.prev_tail[ch].extend_from_slice(&v[half..]);
-            // Advance input_buf by `take` samples.
-            self.input_buf[ch].drain(..take);
-            block.push(v);
+
+            // Build the block per channel.
+            let mut block: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+            for ch in 0..n_channels {
+                let mut v = vec![0f32; n];
+                // Left OLA region: prev_tail samples at [l_start, l_end).
+                let overlap_len = l_end - l_start;
+                let tail = &self.prev_tail[ch];
+                let tlen = tail.len().min(overlap_len);
+                let tail_offset = overlap_len - tlen;
+                v[l_start + tail_offset..l_start + tail_offset + tlen]
+                    .copy_from_slice(&tail[tail.len() - tlen..]);
+                // Fresh samples [l_end, r_end) from input_buf.
+                let fresh_take = self.input_buf[ch].len().min(fresh_needed);
+                v[l_end..l_end + fresh_take].copy_from_slice(&self.input_buf[ch][..fresh_take]);
+                // Save the right overlap region [r_start, r_end) as the
+                // next block's prev_tail.
+                self.prev_tail[ch].clear();
+                self.prev_tail[ch].extend_from_slice(&v[r_start..r_end]);
+                // Consume the fresh samples from the input queue.
+                self.input_buf[ch].drain(..fresh_take);
+                block.push(v);
+            }
+
+            let pkt = self.encode_block_packet(&block, n, long, prev_long, next_long);
+            self.output_queue.push_back(pkt);
+
+            // Update state for the next iteration.
+            self.prev_block_long = long;
+            self.next_block_long = next_long;
         }
-        let pkt = self.encode_block_packet(&block, n, long);
-        self.output_queue.push_back(pkt);
     }
 
-    fn encode_block_packet(&mut self, block: &[Vec<f32>], n: usize, long: bool) -> Packet {
+    fn encode_block_packet(
+        &mut self,
+        block: &[Vec<f32>],
+        n: usize,
+        long: bool,
+        prev_long: bool,
+        next_long: bool,
+    ) -> Packet {
         let mut max_abs = 0f32;
         for ch in block {
             for &s in ch {
@@ -720,14 +890,13 @@ impl VorbisEncoder {
             }
         }
         if max_abs < 1.0e-6 {
-            return self.emit_silent_packet(n, long);
+            return self.emit_silent_packet(n, long, prev_long, next_long);
         }
-        match self.encode_block(block, n, long) {
+        match self.encode_block(block, n, long, prev_long, next_long) {
             Some(data) => {
                 let pts = self.pts;
                 self.pts += n as i64;
                 self.blocks_emitted += 1;
-                self.prev_block_long = long;
                 let mut pkt = Packet::new(0, self.time_base, data);
                 pkt.pts = Some(pts);
                 pkt.dts = Some(pts);
@@ -735,21 +904,25 @@ impl VorbisEncoder {
                 pkt.flags.keyframe = true;
                 pkt
             }
-            None => self.emit_silent_packet(n, long),
+            None => self.emit_silent_packet(n, long, prev_long, next_long),
         }
     }
 
-    fn emit_silent_packet(&mut self, n: usize, long: bool) -> Packet {
+    fn emit_silent_packet(
+        &mut self,
+        n: usize,
+        long: bool,
+        prev_long: bool,
+        next_long: bool,
+    ) -> Packet {
         let mut w = BitWriter::with_capacity(4);
         // packet type bit: 0 (audio).
         w.write_bit(false);
         // mode bits: 1 bit for 2 modes.
         w.write_u32(if long { 1 } else { 0 }, 1);
         if long {
-            // prev_long, next_long flags: pick false/false — matches our
-            // window geometry assumption for the silent case.
-            w.write_bit(self.prev_block_long);
-            w.write_bit(false);
+            w.write_bit(prev_long);
+            w.write_bit(next_long);
         }
         // Per-channel floor unused bit.
         for _ in 0..self.channels as usize {
@@ -759,7 +932,6 @@ impl VorbisEncoder {
         let pts = self.pts;
         self.pts += n as i64;
         self.blocks_emitted += 1;
-        self.prev_block_long = long;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = Some(pts);
         pkt.dts = Some(pts);
@@ -770,22 +942,24 @@ impl VorbisEncoder {
 
     /// Full encode pipeline for a block of size `n`. Returns `None` if
     /// anything went wrong (caller emits a silent packet instead).
-    fn encode_block(&self, block: &[Vec<f32>], n: usize, long: bool) -> Option<Vec<u8>> {
+    ///
+    /// `prev_long` / `next_long` are only meaningful for long blocks — for
+    /// short blocks they are ignored by the decoder and by `build_window`.
+    fn encode_block(
+        &self,
+        block: &[Vec<f32>],
+        n: usize,
+        long: bool,
+        prev_long: bool,
+        next_long: bool,
+    ) -> Option<Vec<u8>> {
         let n_half = n / 2;
         let n_channels = self.channels as usize;
         let mode_idx = if long { 1 } else { 0 };
         let mode = &self.setup.modes[mode_idx];
         let mapping = &self.setup.mappings[mode.mapping as usize];
 
-        // Build the window for this block. Since we currently always emit
-        // long blocks back-to-back, `prev_long` and `next_long` both
-        // default to `true` (full long-long-long sin-window pattern). The
-        // very first block of the stream has no predecessor so prev_long
-        // = false there. Look-ahead-driven short-block switching would
-        // override these flags.
-        let prev_long = if long { self.prev_block_long } else { false };
-        let next_long = long; // assume next block is long; true for steady-state long-only
-        let window = build_window(n, long, prev_long, next_long);
+        let window = build_window(n, long, prev_long, next_long, self.blocksize_short);
 
         // Per-channel: window × forward MDCT → floor analysis → residue.
         let mut floor_codes: Vec<Vec<i32>> = Vec::with_capacity(n_channels);
@@ -1377,20 +1551,65 @@ impl Encoder for VorbisEncoder {
         if self.flushed {
             return Ok(());
         }
-        // Drain whole blocks from the regular pipeline.
+        // Drain whole blocks from the regular pipeline (each emit requires
+        // `max_fresh` samples; below that we fall through to the trailing
+        // zero-padded block below).
         self.drain_blocks();
         // Emit one final block (zero-padded right half) so the decoder's
         // final OLA pass produces samples for the last full half-block of
         // input. This matches the Vorbis convention: the trailing block is
-        // a "phantom" — same-size as the previous block, with no real new
-        // input. Without it the very last `blocksize_long/2` samples of
-        // input stay locked in `prev_tail` and the decoder never sees them.
+        // a "phantom" — same size as the previous block, with no real new
+        // input. Without it the very last overlap-width samples of input
+        // stay locked in `prev_tail` and the decoder never sees them.
         let pending = self.input_buf[0].len();
         if pending > 0 || !self.prev_tail[0].is_empty() {
-            self.emit_one_block(self.blocksize_long, true);
+            self.emit_flush_block();
         }
         self.flushed = true;
         Ok(())
+    }
+}
+
+impl VorbisEncoder {
+    /// Emit a trailing zero-padded block matching the last-committed size.
+    /// Used at flush time so the decoder sees OLA for the final chunk of
+    /// input.
+    fn emit_flush_block(&mut self) {
+        let n_channels = self.channels as usize;
+        let bs0 = self.blocksize_short;
+        let long = self.next_block_long;
+        let prev_long = self.prev_block_long;
+        // Next block after the flush block is nominally long — the stream
+        // ends here but we still write a valid flag.
+        let next_long = true;
+        let n = if long {
+            self.blocksize_long
+        } else {
+            self.blocksize_short
+        };
+        let (l_start, l_end, r_start, r_end) = window_bounds(long, prev_long, next_long, n, bs0);
+        let fresh_needed = r_end - l_end;
+        let mut block: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for ch in 0..n_channels {
+            let mut v = vec![0f32; n];
+            let overlap_len = l_end - l_start;
+            let tail = &self.prev_tail[ch];
+            let tlen = tail.len().min(overlap_len);
+            let tail_offset = overlap_len - tlen;
+            v[l_start + tail_offset..l_start + tail_offset + tlen]
+                .copy_from_slice(&tail[tail.len() - tlen..]);
+            let take = self.input_buf[ch].len().min(fresh_needed);
+            v[l_end..l_end + take].copy_from_slice(&self.input_buf[ch][..take]);
+            // Remaining positions stay zero (zero-pad).
+            self.input_buf[ch].drain(..take);
+            self.prev_tail[ch].clear();
+            self.prev_tail[ch].extend_from_slice(&v[r_start..r_end]);
+            block.push(v);
+        }
+        let pkt = self.encode_block_packet(&block, n, long, prev_long, next_long);
+        self.output_queue.push_back(pkt);
+        self.prev_block_long = long;
+        self.next_block_long = next_long;
     }
 }
 
@@ -1840,6 +2059,288 @@ mod tests {
         assert!(rms_r > 500.0, "R RMS too low: {rms_r}");
         assert!(t_l > off_l);
         assert!(t_r > off_r);
+    }
+
+    /// Encode `pcm_i16_interleaved` through the encoder with the optional
+    /// `force_long_only` override, then decode through our own decoder.
+    fn encode_and_decode_with_flag(
+        channels: u16,
+        samples_per_channel: usize,
+        pcm_i16_interleaved: &[i16],
+        force_long_only: bool,
+    ) -> Vec<i16> {
+        use crate::decoder::make_decoder as make_dec;
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.channels = Some(channels);
+        params.sample_rate = Some(48_000);
+        let mut enc = make_encoder(&params).unwrap();
+        // SAFETY: the encoder implementation is a `VorbisEncoder`; we
+        // downcast via a dedicated flag setter on the trait extension in
+        // this test module. Rather than wire a trait method through, we
+        // rebuild a VorbisEncoder directly for the forced-long path.
+        if force_long_only {
+            let sample_rate = 48_000u32;
+            let id_hdr = build_identification_header(
+                channels as u8,
+                sample_rate,
+                0,
+                DEFAULT_BLOCKSIZE_SHORT_LOG2,
+                DEFAULT_BLOCKSIZE_LONG_LOG2,
+            );
+            let comment_hdr = build_comment_header(&[]);
+            let setup_hdr = build_encoder_setup_header(channels as u8);
+            let extradata = build_extradata(&id_hdr, &comment_hdr, &setup_hdr);
+            let codebooks = extract_codebooks(&setup_hdr).unwrap();
+            let setup = crate::setup::parse_setup(&setup_hdr, channels as u8).unwrap();
+            let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            out_params.media_type = MediaType::Audio;
+            out_params.channels = Some(channels);
+            out_params.sample_rate = Some(sample_rate);
+            out_params.sample_format = Some(SampleFormat::S16);
+            out_params.extradata = extradata;
+            let blocksize_short = 1usize << DEFAULT_BLOCKSIZE_SHORT_LOG2;
+            let blocksize_long = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+            enc = Box::new(VorbisEncoder {
+                codec_id: CodecId::new(crate::CODEC_ID_STR),
+                out_params,
+                time_base: TimeBase::new(1, sample_rate as i64),
+                channels,
+                sample_rate,
+                blocksize_short,
+                blocksize_long,
+                input_buf: vec![Vec::with_capacity(blocksize_long * 4); channels as usize],
+                prev_tail: vec![Vec::with_capacity(blocksize_long); channels as usize],
+                output_queue: VecDeque::new(),
+                pts: 0,
+                blocks_emitted: 0,
+                flushed: false,
+                codebooks,
+                setup,
+                prev_block_long: true,
+                next_block_long: true,
+                prior_energy: 0.0,
+                force_long_only: true,
+            });
+        }
+        let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
+        for s in pcm_i16_interleaved {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels,
+            sample_rate: 48_000,
+            samples: samples_per_channel as u32,
+            pts: Some(0),
+            time_base: TimeBase::new(1, 48_000),
+            data: vec![data],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        let mut dec_params = enc.output_params().clone();
+        dec_params.extradata = enc.output_params().extradata.clone();
+        let mut dec = make_dec(&dec_params).expect("decoder accepts our extradata");
+        let mut out: Vec<i16> = Vec::new();
+        for pkt in &packets {
+            dec.send_packet(pkt).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for chunk in a.data[0].chunks_exact(2) {
+                    out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+            }
+        }
+        out
+    }
+
+    /// Compute the mean-squared error between `reference` and `candidate`
+    /// over a reference-index window `[start, end)`. Positions beyond
+    /// `candidate.len()` contribute the reference sample's squared value
+    /// (candidate treated as silent past its end). Returns 0 if the
+    /// window is empty.
+    ///
+    /// Note: the Vorbis decoder's output is aligned 1:1 with the encoder
+    /// input (pcm[i] = samples[i]) in our harness — the first packet
+    /// emits zero samples but does so "before" the audio window starts,
+    /// so the second packet's emission is already at audio index 0.
+    fn mse_window(reference: &[i16], candidate: &[i16], start: usize, end: usize) -> f64 {
+        let end = end.min(reference.len());
+        if end <= start {
+            return 0.0;
+        }
+        let mut sum = 0f64;
+        for i in start..end {
+            let r = reference[i] as f64;
+            let c = candidate.get(i).copied().unwrap_or(0) as f64;
+            let d = r - c;
+            sum += d * d;
+        }
+        sum / (end - start) as f64
+    }
+
+    #[test]
+    fn encoder_emits_short_blocks_on_transient() {
+        // Sanity check: the transient detector actually flips the encoder
+        // into short-block mode when fed a loud click riding on a steady
+        // mid-amplitude tone.
+        let n_blocks = 10usize;
+        let n_long = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        let total = n_blocks * n_long;
+        let click_pos = 2 * n_long + 1024;
+        let mut samples = vec![0i16; total];
+        // Steady 220 Hz tone at 0.3 amp so `prior_energy` settles.
+        for (i, s) in samples.iter_mut().enumerate().take(click_pos) {
+            let t = i as f64 / 48_000.0;
+            let v = (2.0 * std::f64::consts::PI * 220.0 * t).sin() * 0.3;
+            *s = (v * 32768.0) as i16;
+        }
+        samples[click_pos] = -32000;
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.channels = Some(1);
+        params.sample_rate = Some(48_000);
+        let mut enc = make_encoder(&params).unwrap();
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate: 48_000,
+            samples: total as u32,
+            pts: Some(0),
+            time_base: TimeBase::new(1, 48_000),
+            data: vec![data],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut n_short = 0usize;
+        let mut n_long_pkts = 0usize;
+        while let Ok(p) = enc.receive_packet() {
+            // Decode the mode bit from the packet's first byte: bit 0 is
+            // the audio header bit, bit 1 is the mode bit (short=0, long=1).
+            let first = p.data[0];
+            let mode_bit = (first >> 1) & 1;
+            if mode_bit == 1 {
+                n_long_pkts += 1;
+            } else {
+                n_short += 1;
+            }
+        }
+        eprintln!("n_long_pkts={n_long_pkts} n_short={n_short}");
+        assert!(
+            n_short > 0,
+            "expected at least one short block emitted for a transient signal"
+        );
+    }
+
+    #[test]
+    fn roundtrip_sine_through_forced_transition_matches_baseline() {
+        // Drive the encoder into short-block mode with an artificial loud
+        // pulse, then let it fall back to long. Verify the non-transient
+        // portions of the output still track the input reasonably — if
+        // the asymmetric window OLA is broken, the output around the
+        // transition will diverge wildly from a pure sine.
+        let n_long = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        let total = n_long * 6;
+        let sr = 48_000.0f64;
+        let mut samples = vec![0i16; total];
+        for (i, s) in samples.iter_mut().enumerate() {
+            let t = i as f64 / sr;
+            let v = (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 0.3;
+            *s = (v * 32768.0) as i16;
+        }
+        // Insert a short-duration loud burst to trigger the transient
+        // detector mid-stream.
+        for i in (n_long * 2)..(n_long * 2 + 64) {
+            samples[i] = 32000;
+        }
+        // Decode through the short-capable encoder.
+        let pcm = encode_and_decode_with_flag(1, total, &samples, false);
+        assert!(!pcm.is_empty());
+        // Sanity: the 440 Hz Goertzel component should still dominate over
+        // the 5 kHz off-band one in a "safe" region far from the burst
+        // (samples 12288..16384).
+        let safe: Vec<i16> = pcm[(3 * n_long)..(4 * n_long).min(pcm.len())].to_vec();
+        assert!(!safe.is_empty());
+        let t_safe = goertzel_mag(&safe, 440.0, sr);
+        let o_safe = goertzel_mag(&safe, 5000.0, sr);
+        eprintln!("post-transition: 440={t_safe} 5k={o_safe}");
+        assert!(
+            t_safe > 2.0 * o_safe,
+            "post-transition tone should still dominate: 440={t_safe} 5k={o_safe}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_click_short_beats_long_only_baseline() {
+        // A full-scale click placed inside the 3rd long block (sample 5120,
+        // =2*n_long+1024). The first long block of a Vorbis stream has its
+        // decoded output discarded by the decoder (prev_tail is empty on
+        // the first packet), so the click has to land in a later packet to
+        // be measurable at all — for both the short-capable and long-only
+        // baselines. Preceding the click we mix in a quiet 220 Hz sine so
+        // the transient detector's rolling `prior_energy` has a baseline
+        // to compare against.
+        let n_blocks = 10usize;
+        let n_long = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        let total = n_blocks * n_long;
+        let click_pos = 2 * n_long + 1024;
+        let mut samples = vec![0i16; total];
+        // Preceding the click: a mid-amplitude 220 Hz sine so the
+        // transient detector's `prior_energy` estimator has a non-trivial
+        // baseline and a reasonably-encodable "continuous" signal.
+        // The click is full-scale; the trailing silence is where the
+        // MSE metric picks up pre-/post-echo leakage.
+        let seed_energy = 0.3f64;
+        for (i, s) in samples.iter_mut().enumerate().take(click_pos) {
+            let t = i as f64 / 48_000.0;
+            let v = (2.0 * std::f64::consts::PI * 220.0 * t).sin() * seed_energy;
+            *s = (v * 32768.0) as i16;
+        }
+        samples[click_pos] = -32000;
+        // Post-click: silence (already zero).
+
+        // Baseline: long-only encode.
+        let pcm_long = encode_and_decode_with_flag(1, total, &samples, true);
+        // Short-block capable encode.
+        let pcm_short = encode_and_decode_with_flag(1, total, &samples, false);
+
+        assert!(!pcm_long.is_empty(), "long-only encode produced no output");
+        assert!(
+            !pcm_short.is_empty(),
+            "short-capable encode produced no output"
+        );
+
+        // Measure post-echo in the silence region 192..704 samples after
+        // the click. Reference is zero there, so any decoded energy is
+        // pure encoding error. Long blocks (N=2048) spread full-scale
+        // transient energy across the entire block's ~1024-sample post-
+        // echo tail; short blocks (N=256) confine the spread to ~128
+        // samples, so by 192 samples out the short-capable encoder's
+        // residual should be substantially smaller than the long baseline.
+        let win_start = click_pos + 192;
+        let win_end = (click_pos + 192 + 512)
+            .min(pcm_long.len())
+            .min(pcm_short.len());
+        let mse_long = mse_window(&samples, &pcm_long, win_start, win_end);
+        let mse_short = mse_window(&samples, &pcm_short, win_start, win_end);
+
+        eprintln!(
+            "click post-echo window [{win_start}, {win_end}): mse_long={mse_long:.2} mse_short={mse_short:.2} (pcm_long.len={} pcm_short.len={})",
+            pcm_long.len(),
+            pcm_short.len()
+        );
+        // Short-block encoder should have noticeably less residual energy
+        // post-click. 1.2× is a conservative ratio — libvorbis-style
+        // transient handling routinely buys much more than this.
+        assert!(
+            mse_short * 1.2 < mse_long,
+            "expected short-block MSE < long-only MSE in post-click window, got short={mse_short} long={mse_long}"
+        );
     }
 
     #[test]

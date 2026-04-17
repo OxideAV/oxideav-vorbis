@@ -21,13 +21,24 @@ pub fn sin_window_sample(i: usize, n: usize) -> f32 {
 }
 
 /// Build the asymmetric Vorbis window for a block of length `n` given the
-/// neighbouring window flags. The returned vector has length `n`. The four
-/// transition cases come from §1.3.4 and depend on whether the previous /
-/// next packet is a long block when this packet is also a long block.
+/// neighbouring window flags.
 ///
-/// For short blocks (always symmetric), `prev_long` and `next_long` are
-/// ignored and a full sin window of length `n` is returned.
-pub fn build_window(n: usize, blockflag: bool, prev_long: bool, next_long: bool) -> Vec<f32> {
+/// The returned vector has length `n`. The four transition cases come from
+/// §1.3.4 and depend on whether the previous / next packet is a long block
+/// when this packet is also a long block. Short blocks (blockflag=0) are
+/// always symmetric.
+///
+/// `short_blocksize` is the configured short blocksize (§4.2.2 field
+/// `blocksize_0 = 1 << n`) — used to size the asymmetric ramps for long
+/// blocks that neighbour shorts, per Vorbis I §1.3.2 / §4.3.1. When
+/// `blockflag=false` (short block) this parameter is ignored.
+pub fn build_window(
+    n: usize,
+    blockflag: bool,
+    prev_long: bool,
+    next_long: bool,
+    short_blocksize: usize,
+) -> Vec<f32> {
     let mut w = vec![0f32; n];
     if !blockflag {
         // Short: symmetric sin window of length n.
@@ -36,31 +47,49 @@ pub fn build_window(n: usize, blockflag: bool, prev_long: bool, next_long: bool)
         }
         return w;
     }
-    // Long: split into 4 quarters. Each "side" can be short or long depending
-    // on the neighbour flag.
+    // Long block. Overlap layout (Vorbis I §1.3.2 / §4.3.1):
+    //   - If prev_long:  left ramp has width n, positioned [0, n/2) rising.
+    //   - If !prev_long: left ramp has width short_blocksize, centred at n/4:
+    //       [(n - bs0)/4, (n + bs0)/4) rising (first half of a sin window of
+    //       length bs0).
+    //   - Symmetric treatment on the right with short_blocksize / n_long.
+    //   - Outside the ramp regions: 0 in the tails, 1.0 in the flat centre.
     let n2 = n / 2;
-    let n4 = n / 4;
-    let n8 = n / 8;
-    let prev_n = if prev_long { n2 } else { n8 * 2 };
-    let next_n = if next_long { n2 } else { n8 * 2 };
-    let prev_start = n4 - prev_n / 2;
-    let prev_end = prev_start + prev_n;
-    let next_start = 3 * n4 - next_n / 2;
-    let next_end = next_start + next_n;
-    for i in 0..n {
-        if i < prev_start {
-            w[i] = 0.0;
-        } else if i < prev_end {
-            // Rising edge of a sin window of length prev_n.
-            w[i] = sin_window_sample(i - prev_start, prev_n);
-        } else if i < next_start {
-            w[i] = 1.0;
-        } else if i < next_end {
-            // Falling edge of a sin window of length next_n.
-            w[i] = sin_window_sample(next_n - 1 - (i - next_start), next_n);
-        } else {
-            w[i] = 0.0;
+    let bs0 = short_blocksize;
+    // Left (rising) ramp.
+    if prev_long {
+        for i in 0..n2 {
+            w[i] = sin_window_sample(i, n);
         }
+    } else {
+        let left_start = (n - bs0) / 4;
+        let left_end = (n + bs0) / 4;
+        // Positions before the ramp stay at zero (default init).
+        for i in left_start..left_end {
+            w[i] = sin_window_sample(i - left_start, bs0);
+        }
+        // Flat 1.0 from left_end to n/2.
+        for i in left_end..n2 {
+            w[i] = 1.0;
+        }
+    }
+    // Right (falling) ramp.
+    if next_long {
+        for i in n2..n {
+            w[i] = sin_window_sample(i, n);
+        }
+    } else {
+        let right_start = (3 * n - bs0) / 4;
+        let right_end = (3 * n + bs0) / 4;
+        // Flat 1.0 from n/2 to right_start.
+        for i in n2..right_start {
+            w[i] = 1.0;
+        }
+        for i in right_start..right_end {
+            // Second half of a sin window of length bs0.
+            w[i] = sin_window_sample(bs0 / 2 + (i - right_start), bs0);
+        }
+        // Positions after the ramp stay at zero (default init).
     }
     w
 }
@@ -127,12 +156,45 @@ mod tests {
     #[test]
     fn window_endpoints_short_block() {
         // Symmetric sin window: w[0] is small, w[n/2-1] is near 1 / 1, w[n-1] is small.
-        let w = build_window(64, false, false, false);
+        let w = build_window(64, false, false, false, 64);
         assert!(w[0] < 0.05);
         assert!(w[63] < 0.05);
         // Window squared should sum to ~n/2 (orthogonality with sin overlap).
         let sumsq: f32 = w.iter().map(|x| x * x).sum();
         assert!((sumsq - 32.0).abs() < 0.5, "sumsq = {sumsq}");
+    }
+
+    #[test]
+    fn window_long_symmetric_sums_unity() {
+        // Long block with prev_long=next_long=true: full symmetric sin
+        // window — sum of squares should be n/2 (Vorbis orthogonality).
+        let n = 2048;
+        let w = build_window(n, true, true, true, 256);
+        let sumsq: f32 = w.iter().map(|x| x * x).sum();
+        assert!(
+            (sumsq - (n as f32) / 2.0).abs() < 1.0,
+            "sumsq={sumsq} expected {}",
+            n / 2
+        );
+    }
+
+    #[test]
+    fn window_long_asymmetric_next_short_ramp_width() {
+        // Long block with next_long=false: right ramp should be centred on
+        // 3n/4 with width bs0.
+        let n = 2048usize;
+        let bs0 = 256usize;
+        let w = build_window(n, true, true, false, bs0);
+        let right_start = (3 * n - bs0) / 4;
+        let right_end = (3 * n + bs0) / 4;
+        // Just before the ramp, window is flat 1.0.
+        assert!((w[right_start - 1] - 1.0).abs() < 1e-5);
+        // Just after the ramp, window is 0.
+        assert!(w[right_end].abs() < 1e-5);
+        // Middle of the ramp (position bs0/2 into the falling region) should
+        // be near sin(pi/4)^2 rotated — i.e. around 0.707.
+        let mid = right_start + bs0 / 4;
+        assert!(w[mid] > 0.5 && w[mid] < 1.0);
     }
 
     #[test]

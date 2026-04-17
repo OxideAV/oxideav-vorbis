@@ -7,14 +7,17 @@
 //! Decoder is feature-complete for the common q3-q10 file shapes: matches
 //! libvorbis / lewton output within float rounding on the test fixtures.
 //!
-//! Encoder is tier 2 — emits long blocks only, mono / stereo, with
-//! sum/difference channel coupling, ATH-scaled floor1, and a 128-entry
-//! residue VQ. Output decodes through both our own decoder and ffmpeg's
-//! libvorbis. Quality is well above the 100× Goertzel-ratio acceptance
-//! bar on synthesised tones (mono ~14000×, stereo ~8000×). Sample sizes
-//! land at 3-7× libvorbis @ 128 kbps for tones; closer for noise. See
-//! `encoder.rs` module-level doc for the deferred items (transient
-//! detection, point-stereo, libvorbis-Annex-B reference books).
+//! Encoder is tier 2 — mono / stereo, with sum/difference channel coupling,
+//! ATH-scaled floor1, a 128-entry residue VQ, and transient-driven
+//! short-block switching (asymmetric long↔short windows per Vorbis I
+//! §1.3.2 / §4.3.1). Output decodes through both our own decoder and
+//! ffmpeg's libvorbis. Quality is well above the 100× Goertzel-ratio
+//! acceptance bar on synthesised tones (mono ~14000×, stereo ~8000×) and
+//! the short-block path confines click energy to ~bs0/2 post-echo vs
+//! ~n_long/2 for a long-only baseline. Sample sizes land at 3-7× libvorbis
+//! @ 128 kbps for tones; closer for noise. See `encoder.rs` module-level
+//! doc for the deferred items (point-stereo, libvorbis-Annex-B reference
+//! books).
 
 pub mod audio_packet;
 pub mod bitreader;
