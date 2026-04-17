@@ -2,22 +2,24 @@
 // nag elsewhere.
 #![allow(clippy::needless_range_loop)]
 
-//! Vorbis audio codec.
+//! Vorbis I audio codec.
 //!
-//! Decoder is feature-complete for the common q3-q10 file shapes: matches
-//! libvorbis / lewton output within float rounding on the test fixtures.
+//! Decoder is feature-complete for real-world file shapes: floors type 1,
+//! residue types 0/1/2 with cascade books, mapping type 0 with any number
+//! of submaps and channel coupling steps, up to 255 channels, full
+//! asymmetric long↔short MDCT windows and overlap-add. Matches libvorbis
+//! / lewton output within float rounding on the fixture suite. Floor type
+//! 0 (LSP) is rejected with `Error::Unsupported` — no modern encoder
+//! produces it.
 //!
-//! Encoder is tier 2 — mono / stereo, with sum/difference channel coupling,
-//! ATH-scaled floor1, a 128-entry residue VQ, and transient-driven
-//! short-block switching (asymmetric long↔short windows per Vorbis I
-//! §1.3.2 / §4.3.1). Output decodes through both our own decoder and
-//! ffmpeg's libvorbis. Quality is well above the 100× Goertzel-ratio
-//! acceptance bar on synthesised tones (mono ~14000×, stereo ~8000×) and
-//! the short-block path confines click energy to ~bs0/2 post-echo vs
-//! ~n_long/2 for a long-only baseline. Sample sizes land at 3-7× libvorbis
-//! @ 128 kbps for tones; closer for noise. See `encoder.rs` module-level
-//! doc for the deferred items (point-stereo, libvorbis-Annex-B reference
-//! books).
+//! Encoder handles 1 or 2 channels at any sample rate with sum/difference
+//! channel coupling (Vorbis I §1.3.3), ATH-scaled floor1, a single
+//! 128-entry residue VQ covering {-5..+5}², and transient-driven
+//! short-block switching (asymmetric long↔short windows per §1.3.2 /
+//! §4.3.1). Output decodes through both this crate's decoder and
+//! ffmpeg's libvorbis. See the `encoder.rs` module-level doc for the
+//! known bitrate trade-offs relative to libvorbis (point-stereo,
+//! Annex-B reference books, floor0 emission).
 
 pub mod audio_packet;
 pub mod bitreader;
