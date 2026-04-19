@@ -35,26 +35,33 @@ pub mod residue;
 pub mod setup;
 pub mod setup_writer;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub const CODEC_ID_STR: &str = "vorbis";
 
 pub fn register(reg: &mut CodecRegistry) {
-    let cid = CodecId::new(CODEC_ID_STR);
     let caps = CodecCapabilities::audio("vorbis_sw")
         .with_lossy(true)
         .with_max_channels(255);
-    reg.register_decoder_impl(cid.clone(), caps.clone(), make_decoder);
-    reg.register_encoder_impl(cid.clone(), caps, make_encoder);
-
     // AVI / WAVEFORMATEX tags — six values have been stamped on Vorbis
     // AVI streams historically, differing in how the setup / codebook
     // headers are packed into extradata. All decode through the same
-    // path here. Priority 10, no probe.
-    for tag in &[0x674Fu16, 0x6750, 0x6751, 0x676F, 0x6770, 0x6771] {
-        reg.claim_tag(cid.clone(), CodecTag::wave_format(*tag), 10, None);
-    }
+    // path here.
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder)
+            .tags([
+                CodecTag::wave_format(0x674F),
+                CodecTag::wave_format(0x6750),
+                CodecTag::wave_format(0x6751),
+                CodecTag::wave_format(0x676F),
+                CodecTag::wave_format(0x6770),
+                CodecTag::wave_format(0x6771),
+            ]),
+    );
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
