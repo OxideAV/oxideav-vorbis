@@ -22,8 +22,7 @@
 //! Annex-B reference books, floor0 emission).
 
 pub mod audio_packet;
-pub mod bitreader;
-pub mod bitwriter;
+pub mod bits_ext;
 pub mod codebook;
 pub mod dbtable;
 pub mod decoder;

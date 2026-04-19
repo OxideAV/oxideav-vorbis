@@ -6,7 +6,7 @@
 //! ffmpeg/libvorbis for a 1-second 1ch 48 kHz sine wave at low quality
 //! (sine.ogg → A_VORBIS in MKV). Captured 2026-04-15 from the test rig.
 
-use oxideav_vorbis::bitreader::BitReader;
+use oxideav_core::bits::BitReaderLsb as BitReader;
 use oxideav_vorbis::floor::decode_floor_packet;
 use oxideav_vorbis::identification::parse_identification_header;
 use oxideav_vorbis::residue::decode_residue;

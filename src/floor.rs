@@ -4,9 +4,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::codebook::Codebook;
 use crate::setup::{Floor, Floor1};
+use oxideav_core::bits::BitReaderLsb as BitReader;
 
 /// Bit width for the first two amplitude values (Y[0], Y[1]) per floor1
 /// multiplier setting (Vorbis I §6.2.3 table).

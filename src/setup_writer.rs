@@ -11,9 +11,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitwriter::BitWriter;
 use crate::codebook::{Codebook, VqLookup};
 use crate::setup::{Floor, Floor1, Mapping, Residue, Setup};
+use oxideav_core::bits::BitWriterLsb as BitWriter;
 
 /// Serialise `setup` (with `audio_channels` in mind for mapping mux bits)
 /// into a Vorbis setup packet. The bytes start with 0x05 "vorbis" and end

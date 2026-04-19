@@ -5,9 +5,7 @@
 //! (an audible signal we can verify via Goertzel-style DFT magnitude).
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
 
 fn make_s16_frame(channels: u16, samples_per_channel: usize, pcm: &[i16]) -> Frame {
     let mut data = Vec::with_capacity(pcm.len() * 2);
@@ -142,6 +140,12 @@ fn sine_stereo_roundtrips_via_public_api() {
     let t_r = goertzel_mag(&right, 1000.0, sr);
     let o_l = goertzel_mag(&left, 5000.0, sr);
     let o_r = goertzel_mag(&right, 5000.0, sr);
-    assert!(t_l > o_l * 5.0, "L: 1 kHz should beat 5 kHz, got {t_l} vs {o_l}");
-    assert!(t_r > o_r * 5.0, "R: 1 kHz should beat 5 kHz, got {t_r} vs {o_r}");
+    assert!(
+        t_l > o_l * 5.0,
+        "L: 1 kHz should beat 5 kHz, got {t_l} vs {o_l}"
+    );
+    assert!(
+        t_r > o_r * 5.0,
+        "R: 1 kHz should beat 5 kHz, got {t_r} vs {o_r}"
+    );
 }

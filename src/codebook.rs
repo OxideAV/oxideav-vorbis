@@ -8,7 +8,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bits_ext::BitReaderExt;
+use oxideav_core::bits::BitReaderLsb as BitReader;
 
 #[derive(Clone, Debug)]
 pub struct Codebook {

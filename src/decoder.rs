@@ -7,12 +7,12 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::bitreader::BitReader;
 use crate::floor::{decode_floor_packet, synth_floor1, Floor1Decoded};
 use crate::identification::{parse_identification_header, Identification};
 use crate::imdct::{imdct_naive, sin_window_sample};
 use crate::residue::decode_residue;
 use crate::setup::{parse_setup, Floor, Setup};
+use oxideav_core::bits::BitReaderLsb as BitReader;
 
 /// Build a Vorbis decoder from the codec parameters.
 ///

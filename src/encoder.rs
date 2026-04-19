@@ -62,12 +62,12 @@ use oxideav_core::{
     TimeBase,
 };
 
-use crate::bitwriter::BitWriter;
 use crate::codebook::{parse_codebook, Codebook};
 use crate::dbtable::FLOOR1_INVERSE_DB;
 use crate::floor::synth_floor1;
 use crate::imdct::{build_window, forward_mdct_naive};
 use crate::setup::{Floor, Floor1, Residue, Setup};
+use oxideav_core::bits::BitWriterLsb as BitWriter;
 
 /// Short blocksize log2 (256 samples).
 pub const DEFAULT_BLOCKSIZE_SHORT_LOG2: u8 = 8;
@@ -471,7 +471,7 @@ pub fn build_encoder_setup_header(channels: u8) -> Vec<u8> {
 /// Decode codebooks from our setup header so the encoder can emit
 /// bit-exact codewords.
 fn extract_codebooks(setup: &[u8]) -> Result<Vec<Codebook>> {
-    use crate::bitreader::BitReader;
+    use oxideav_core::bits::BitReaderLsb as BitReader;
     if setup.len() < 7 || setup[0] != 0x05 || &setup[1..7] != b"vorbis" {
         return Err(Error::invalid("Vorbis encoder setup magic"));
     }
@@ -1772,7 +1772,8 @@ mod tests {
 
     #[test]
     fn vorbis_float_roundtrip() {
-        use crate::bitreader::BitReader;
+        use crate::bits_ext::BitReaderExt;
+        use oxideav_core::bits::BitReaderLsb as BitReader;
         for &v in &[1.0f32, -1.0, 0.5, -0.25, 16.0, 1e-5] {
             let mut w = BitWriter::new();
             write_vorbis_float(&mut w, v);

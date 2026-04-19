@@ -10,10 +10,10 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::floor::{decode_floor_packet, Floor1Decoded};
 use crate::identification::Identification;
 use crate::setup::Setup;
+use oxideav_core::bits::BitReaderLsb as BitReader;
 
 /// Result of partial audio-packet decoding: header metadata + per-channel
 /// floor decodes. Callers that just want to validate setup-header correctness

@@ -19,9 +19,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::codebook::Codebook;
 use crate::setup::Residue;
+use oxideav_core::bits::BitReaderLsb as BitReader;
 
 /// Decode `n_channels` residue vectors of length `n` from the bitstream and
 /// add them into `vectors[ch][bin]`. Channels marked `do_not_decode[ch] =
@@ -255,8 +255,8 @@ fn decode_partitioned(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitwriter::BitWriter;
     use crate::codebook::{Codebook, VqLookup};
+    use oxideav_core::bits::BitWriterLsb as BitWriter;
 
     /// Build a 1-entry zero-length classbook. `decode_scalar` consumes 0
     /// bits and returns entry 0 (single-used-entry special case).
