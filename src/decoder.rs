@@ -242,10 +242,9 @@ fn decode_one(d: &mut VorbisDecoder, packet: &Packet) -> Result<Frame> {
             &mut br,
         )?;
         // Add the submap residue back into the per-channel spectrum.
+        // Bulk per-bin add — SIMD kernel via `simd::add_inplace`.
         for (i, &ch) in ch_list.iter().enumerate() {
-            for k in 0..n_half {
-                spectrum[ch][k] += sub_vectors[i][k];
-            }
+            crate::simd::add_inplace(&mut spectrum[ch][..n_half], &sub_vectors[i][..n_half]);
         }
     }
 
@@ -339,20 +338,26 @@ fn decode_one(d: &mut VorbisDecoder, packet: &Packet) -> Result<Frame> {
     // `left_overlap_n` by construction (its size was chosen when saved).
     let mut output_samples = vec![Vec::<f32>::new(); n_channels];
     if !d.prev_tail.is_empty() {
+        // Precompute the rising/falling slope arrays once per packet (they
+        // depend only on the overlap length `plen`, which is identical for
+        // every channel). The slopes are cached globally across packets
+        // per `plen`, so subsequent calls just hand back a reference.
+        let first_plen = d.prev_tail[0].len().min(left_overlap_n);
+        let (rising, falling) = overlap_slopes(first_plen);
         for ch in 0..n_channels {
             let prev = &d.prev_tail[ch];
             let curr = &mut td[ch];
             // Sanity: if prev was stored with a differently-sized overlap
             // region (e.g. a stream-format bug upstream), clamp.
             let plen = prev.len().min(left_overlap_n);
-            // win_slope[i] = sin(pi/2 * sin^2(pi*(i+0.5)/(2*plen)))
-            // rising on the current block; prev was stored unwindowed, so
-            // we multiply it by the falling slope (= win_slope[plen-1-i]).
-            for i in 0..plen {
-                let rising = sin_window_sample(i, 2 * plen);
-                let falling = sin_window_sample(plen - 1 - i, 2 * plen);
-                let ci = left_win_start + i;
-                curr[ci] = curr[ci] * rising + prev[i] * falling;
+            if plen != first_plen {
+                // Paranoid fallback: recompute for this channel's `plen`
+                // if somehow it differs from the first one (shouldn't
+                // happen in a well-formed stream).
+                let (r, f) = overlap_slopes(plen);
+                crate::simd::overlap_add(curr, left_win_start, &prev[..plen], r, f);
+            } else {
+                crate::simd::overlap_add(curr, left_win_start, &prev[..plen], rising, falling);
             }
             // Emit from left_win_start to right_win_start.
             let mut emit = Vec::with_capacity(right_win_start - left_win_start);
@@ -438,4 +443,33 @@ fn ilog(value: u32) -> u32 {
     } else {
         32 - value.leading_zeros()
     }
+}
+
+/// Precomputed (rising, falling) slope pair for a given overlap length.
+///
+/// These are the window-slope weights applied during the previous/current
+/// block cross-fade (Vorbis I §1.3.4). Each block size only ever uses one
+/// or two `plen` values, so a leaked-static cache keyed on `plen` serves
+/// every packet without reallocating.
+fn overlap_slopes(plen: usize) -> (&'static [f32], &'static [f32]) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type SlopePair = (&'static [f32], &'static [f32]);
+    static CACHE: OnceLock<Mutex<HashMap<usize, SlopePair>>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&v) = map.lock().expect("overlap slope cache poisoned").get(&plen) {
+        return v;
+    }
+    let twolen = 2 * plen;
+    let rising: Box<[f32]> = (0..plen).map(|i| sin_window_sample(i, twolen)).collect();
+    let falling: Box<[f32]> = (0..plen)
+        .map(|i| sin_window_sample(plen - 1 - i, twolen))
+        .collect();
+    let r: &'static [f32] = Box::leak(rising);
+    let f: &'static [f32] = Box::leak(falling);
+    let entry = (r, f);
+    *map.lock()
+        .expect("overlap slope cache poisoned")
+        .entry(plen)
+        .or_insert(entry)
 }

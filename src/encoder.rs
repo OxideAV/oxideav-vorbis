@@ -973,10 +973,10 @@ impl VorbisEncoder {
 
         let trace = std::env::var_os("OXIDEAV_VORBIS_ENC_TRACE").is_some();
         for ch in 0..n_channels {
-            let mut windowed = vec![0f32; n];
-            for i in 0..n {
-                windowed[i] = block[ch][i] * window[i];
-            }
+            // Pre-window the input via the SIMD multiply kernel: copy then
+            // multiply in place.
+            let mut windowed = block[ch][..n].to_vec();
+            crate::simd::mul_inplace(&mut windowed, &window);
             let mut spec = vec![0f32; n_half];
             forward_mdct_naive(&windowed, &mut spec);
             // Apply 2/N scaling. Without this the spectrum magnitudes

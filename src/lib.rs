@@ -1,6 +1,7 @@
 // Parallel-array index loops are idiomatic in audio codec code; let clippy
 // nag elsewhere.
 #![allow(clippy::needless_range_loop)]
+#![cfg_attr(feature = "nightly", feature(portable_simd))]
 
 //! Vorbis I audio codec.
 //!
@@ -34,6 +35,7 @@ pub mod libvorbis_setup;
 pub mod residue;
 pub mod setup;
 pub mod setup_writer;
+pub mod simd;
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};

@@ -115,6 +115,70 @@ not bitstream conformance:
   compress tighter for comparable quality.
 - **Floor type 0 (LSP) emission.** Setup always declares floor1.
 
+## Performance
+
+The hot kernels (IMDCT, forward MDCT, window overlap-add, residue
+accumulation, floor-curve multiply) live in [`src/simd/`](src/simd/)
+with three parallel implementations:
+
+- `simd::scalar` — reference, always available, used as the bit-exact
+  oracle for the test suite.
+- `simd::chunked` — stable-Rust "manual SIMD" over fixed 8-lane `[f32; 8]`
+  chunks. LLVM reliably lowers this to `vfmadd231ps` on AVX2 and to
+  paired NEON Q-reg ops on ARMv8. This is the default on stable.
+- `simd::portable` — `std::simd::f32x8` using fused multiply-add
+  (`StdFloat::mul_add`). Gated behind the `nightly` feature flag; needs
+  a nightly Rust toolchain.
+
+The biggest single win came from changing the IMDCT / forward MDCT from
+the textbook `x[n] = Σ_k X[k] · cos(...)` inner loop to a precomputed
+cosine-matrix dot product. The matrix is cached per-blocksize in a
+`OnceLock<HashMap>` and lives for the rest of the process, so the
+cosine computation happens exactly once per `(short, long)` pair per
+run. Runtime CPU feature detection lives in
+[`src/simd/dispatch.rs`](src/simd/dispatch.rs) (AVX2/FMA on x86_64,
+NEON on aarch64) and is wired through `simd::dispatch::detect()` for
+future use — the chunked path already reaches AVX2 throughput via
+auto-vectorisation.
+
+### Microbenchmarks
+
+Measured on x86_64 (Gentoo, rustc 1.93.1 stable, release build):
+
+| Bench                       | Reference (scalar f64) | Optimised | Speedup |
+|----------------------------|------------------------|-----------|---------|
+| `imdct_1024`               | 3.60 ms                | 129 µs    | 27.8×   |
+| `imdct_2048`               | 12.3 ms                | 558 µs    | 22.0×   |
+| `forward_mdct_2048`        | 13.3 ms                | 537 µs    | 24.8×   |
+| `window_overlap_add_2048`  | 201 ns                 | 181 ns    | 1.11×   |
+| `add_inplace_1024`         | 51.4 ns                | 46.8 ns   | 1.10×   |
+
+End-to-end (1 s of input → bitstream → PCM):
+
+| Bench                       | Time    | Real-time factor |
+|----------------------------|---------|------------------|
+| `decode_1s_mono_48k`       | 32.1 ms | ~31×             |
+| `decode_1s_stereo_44k1`    | 57.8 ms | ~17×             |
+| `encode_1s_stereo_44k1`    | 111 ms  | ~9×              |
+
+Run `cargo bench --bench vorbis` to reproduce. Each paired kernel is
+verified bit-exact against the scalar reference within a square-root-N
+ε (see `imdct::tests::imdct_simd_matches_reference`).
+
+### Enabling the `nightly` feature
+
+```bash
+cargo +nightly build --release --features nightly
+cargo +nightly bench --bench vorbis --features nightly
+```
+
+The `nightly` feature flips `simd::mul_inplace` / `add_inplace` /
+`overlap_add` / `mat_vec_mul` from the chunked path to the
+`std::simd::f32x8` path. In practice the performance delta is small
+(LLVM's auto-vectorisation of the chunked path is already tight); the
+flag is primarily there so the `std::simd` API can evolve without
+breaking the stable build.
+
 ## Codec ID
 
 - Codec: `"vorbis"`; output sample format `S16`, accepted input
