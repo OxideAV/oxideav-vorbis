@@ -5,8 +5,13 @@
 //! Each entry is the linear-magnitude multiplier corresponding to that dB
 //! position.
 //!
-//! Values are taken verbatim from the Vorbis I reference and are required
-//! for bit-exact output compatibility with libvorbis.
+//! Values are taken verbatim from the Vorbis I reference implementation
+//! (libvorbis `lib/lookups.c`, constant `FLOOR_fromdB_LOOKUP`) and are
+//! required for bit-exact output compatibility with libvorbis.
+//!
+//! libvorbis is © 2002-2020 Xiph.Org Foundation, distributed under the
+//! BSD-3-Clause license — see the NOTICES file at the crate root for
+//! the full notice and license text that applies to this table.
 
 #[rustfmt::skip]
 pub const FLOOR1_INVERSE_DB: [f32; 256] = [

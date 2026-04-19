@@ -188,3 +188,8 @@ breaking the stable build.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+This crate additionally incorporates the floor1 inverse-dB table from
+libvorbis (© 2002-2020 Xiph.Org Foundation, BSD-3-Clause). The upstream
+notice and license text are in [NOTICES](NOTICES) and must be preserved
+in redistributions.
