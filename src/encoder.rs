@@ -1,9 +1,26 @@
 //! Vorbis encoder (tier 2 — ffmpeg-interop quality).
 //!
-//! Supports mono and stereo at any sample rate. The setup header carries
+//! Supports 1..=8 channels at any sample rate. The setup header carries
 //! both the short (256) and long (2048) block configurations and the
 //! runtime picks per-block via a lookahead-driven transient detector
-//! (Vorbis I §1.3.2 / §4.3.1 asymmetric windows). The setup contains:
+//! (Vorbis I §1.3.2 / §4.3.1 asymmetric windows). For >2 channel streams
+//! the encoder picks coupling pairs following the standard Vorbis I
+//! channel assignments (§4.3.9): L-R pairs and BL-BR pairs are coupled,
+//! while the center and LFE channels (if present) stay uncoupled. The
+//! decoder already handles arbitrary coupling-step lists.
+//!
+//! Channel layouts (matching the Vorbis I channel-mapping conventions):
+//!
+//! - 1ch: mono
+//! - 2ch: L, R — couple (0,1)
+//! - 3ch: L, C, R — couple (0,2)
+//! - 4ch: FL, FR, BL, BR — couple (0,1), (2,3)
+//! - 5ch: FL, C, FR, BL, BR — couple (0,2), (3,4)
+//! - 6ch (5.1): FL, C, FR, BL, BR, LFE — couple (0,2), (3,4)
+//! - 7ch: FL, C, FR, SL, SR, BL, BR — couple (0,2), (3,4), (5,6)
+//! - 8ch (7.1): FL, C, FR, SL, SR, BL, BR, LFE — couple (0,2), (3,4), (5,6)
+//!
+//! The setup contains:
 //!
 //! - A Y-value codebook (128 entries, length 7, dim 1) for floor1
 //!   amplitudes.
@@ -384,21 +401,59 @@ fn write_residue_section(w: &mut BitWriter, end: u32, classbook: u32, vqbook: u3
     w.write_u32(vqbook, 8);
 }
 
-/// Write a mapping with optional channel coupling, 1 submap, specified
-/// floor + residue. When `couple_stereo` is true the mapping declares one
-/// coupling step (magnitude=0, angle=1) and the audio_channels MUST be 2 —
-/// the decoder applies inverse coupling per Vorbis I §1.3.3 and §9.2.
-fn write_mapping_section(w: &mut BitWriter, floor_idx: u32, residue_idx: u32, couple_stereo: bool) {
+/// ilog(x) = number of bits needed to represent x; ilog(0) = 0,
+/// ilog(1) = 1, ilog(2) = 2, ilog(3) = 2, ilog(4) = 3, etc.
+fn ilog(value: u32) -> u32 {
+    if value == 0 {
+        0
+    } else {
+        32 - value.leading_zeros()
+    }
+}
+
+/// Return the standard coupling-pair list for a given channel count,
+/// matching the Vorbis I channel-mapping conventions documented at the
+/// top of this module. Always returns `(magnitude, angle)` pairs in
+/// ascending channel order.
+pub(crate) fn standard_coupling_steps(channels: u8) -> Vec<(u8, u8)> {
+    match channels {
+        2 => vec![(0, 1)],
+        3 => vec![(0, 2)], // L, C, R — couple L↔R
+        4 => vec![(0, 1), (2, 3)], // FL, FR, BL, BR
+        5 => vec![(0, 2), (3, 4)], // FL, C, FR, BL, BR
+        6 => vec![(0, 2), (3, 4)], // 5.1: FL, C, FR, BL, BR, LFE
+        7 => vec![(0, 2), (3, 4), (5, 6)], // FL, C, FR, SL, SR, BL, BR
+        8 => vec![(0, 2), (3, 4), (5, 6)], // 7.1: FL, C, FR, SL, SR, BL, BR, LFE
+        _ => Vec::new(),
+    }
+}
+
+/// Write a mapping with the given coupling-pair list, 1 submap, specified
+/// floor + residue. `channels` is used to compute the coupling field width
+/// (`ilog(channels-1)` bits per magnitude/angle field, per Vorbis I §4.2.4
+/// step 6). `coupling_pairs` must only contain valid channel indices <
+/// channels, with magnitude != angle, and no channel appearing as an
+/// angle more than once (Vorbis I §4.3.9).
+fn write_mapping_section(
+    w: &mut BitWriter,
+    floor_idx: u32,
+    residue_idx: u32,
+    coupling_pairs: &[(u8, u8)],
+    channels: u8,
+) {
     w.write_u32(0, 16); // mapping type = 0
     w.write_bit(false); // submaps flag = 0 → 1 submap
-    if couple_stereo {
-        w.write_bit(true); // coupling flag = 1
-        w.write_u32(0, 8); // coupling steps - 1 = 0 → 1 step
-                           // For 2 channels, ilog(channels-1)=ilog(1)=1 bit per field.
-        w.write_u32(0, 1); // magnitude = ch 0
-        w.write_u32(1, 1); // angle = ch 1
-    } else {
+    if coupling_pairs.is_empty() {
         w.write_bit(false);
+    } else {
+        w.write_bit(true); // coupling flag = 1
+        debug_assert!(!coupling_pairs.is_empty() && coupling_pairs.len() <= 256);
+        w.write_u32(coupling_pairs.len() as u32 - 1, 8);
+        let field_bits = ilog((channels as u32).saturating_sub(1));
+        for &(mag, ang) in coupling_pairs {
+            w.write_u32(mag as u32, field_bits);
+            w.write_u32(ang as u32, field_bits);
+        }
     }
     w.write_u32(0, 2); // reserved
                        // submap 0:
@@ -409,13 +464,14 @@ fn write_mapping_section(w: &mut BitWriter, floor_idx: u32, residue_idx: u32, co
 
 /// Build our own setup header: 3 codebooks (Y, class, VQ); 2 floors
 /// (short + long); 2 residues (short + long); 2 mappings (short + long);
-/// 2 modes (short = blockflag 0, long = blockflag 1). For stereo
-/// (`channels == 2`) the mappings declare one coupling step (mag=0,
-/// ang=1) — the encoder applies forward sum/difference coupling before
-/// residue coding, the decoder applies the inverse before IMDCT.
+/// 2 modes (short = blockflag 0, long = blockflag 1). For multichannel
+/// streams (`channels >= 2`) the mappings declare the standard coupling
+/// pair list for that channel count (see module docs) — the encoder
+/// applies forward sum/difference coupling before residue coding, the
+/// decoder applies the inverse before IMDCT.
 pub fn build_encoder_setup_header(channels: u8) -> Vec<u8> {
     let extra_x_long = long_floor_extra_x();
-    let couple = channels == 2;
+    let couples = standard_coupling_steps(channels);
     let mut w = BitWriter::with_capacity(512);
     for &b in &[0x05u32, 0x76, 0x6f, 0x72, 0x62, 0x69, 0x73] {
         w.write_u32(b, 8);
@@ -447,8 +503,8 @@ pub fn build_encoder_setup_header(channels: u8) -> Vec<u8> {
 
     // 2 mappings.
     w.write_u32(2 - 1, 6);
-    write_mapping_section(&mut w, 0, 0, couple);
-    write_mapping_section(&mut w, 1, 1, couple);
+    write_mapping_section(&mut w, 0, 0, &couples, channels);
+    write_mapping_section(&mut w, 1, 1, &couples, channels);
 
     // 2 modes.
     w.write_u32(2 - 1, 6);
@@ -508,9 +564,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("Vorbis encoder: channels required"))?;
-    if !(1..=2).contains(&channels) {
+    if !(1..=8).contains(&channels) {
         return Err(Error::unsupported(format!(
-            "Vorbis encoder: {channels}-channel encode not supported yet (mono + stereo only)"
+            "Vorbis encoder: {channels}-channel encode not supported (1..=8 supported; the Vorbis I spec does not define standard mappings beyond 8)"
         )));
     }
     let sample_rate = params
