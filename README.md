@@ -1,6 +1,6 @@
 # oxideav-vorbis
 
-Pure-Rust **Vorbis I** audio codec — full decoder and mono/stereo
+Pure-Rust **Vorbis I** audio codec — full decoder and 1..=8 channel
 encoder. Zero C dependencies, no FFI, no `*-sys` crates.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -78,7 +78,7 @@ let extradata = enc.output_params().extradata.clone();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The encoder accepts 1 or 2 channels at any sample rate. Output
+The encoder accepts 1..=8 channels at any sample rate. Output
 decodes through both this crate's decoder and ffmpeg's libvorbis.
 
 What's implemented:
@@ -90,8 +90,11 @@ What's implemented:
   `roundtrip_click_short_beats_long_only_baseline` test for a
   measurement.
 - ATH-scaled floor1 analysis (8 posts short, 32 posts long).
-- Sum/difference channel coupling (§1.3.3) for stereo — lossless,
-  round-trips via the decoder's inverse step.
+- Sum/difference channel coupling (§1.3.3) — lossless, round-trips
+  via the decoder's inverse step. Multichannel streams use the
+  standard Vorbis I mappings (L/C/R, 4ch quad, 5.1, 7.1) with
+  coupled L-R, back-L/back-R, and side-L/side-R pairs; center and
+  LFE channels stay uncoupled.
 - A single 128-entry, dim-2 VQ residue book covering {-5..+5}²,
   with exhaustive nearest-neighbour search per partition.
 - Residue type 1 (concatenated per-channel) for both block sizes.
@@ -101,9 +104,6 @@ What's implemented:
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **More than 2 channels on encode.** The decoder handles up to
-  255; the encoder setup builder only wires mono and stereo
-  mappings.
 - **Point-stereo encoding.** Stereo always emits lossless
   sum/difference coupling. Libvorbis switches to lossy point
   stereo above a threshold frequency to roughly halve the angle

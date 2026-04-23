@@ -42,7 +42,7 @@
 //! analysis (peak in the window between adjacent posts, divided by
 //! `FLOOR_SCALE` so residues have headroom, ATH-clamped at the bottom) →
 //! floor curve via `synth_floor1` → residue = spectrum / floor_curve →
-//! forward channel couple (stereo only) → per-partition exhaustive VQ
+//! forward channel couple (per coupling pair in the mapping) → per-partition exhaustive VQ
 //! search → emit packet. Consecutive blocks overlap by
 //! `left_win_end - left_win_start` samples: `n/2` for long↔long and
 //! short↔short, `bs0/2 = 128` for any transition involving a short
