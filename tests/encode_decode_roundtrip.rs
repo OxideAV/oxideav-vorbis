@@ -185,6 +185,58 @@ fn sine_5_1_roundtrips_via_public_api() {
     }
 }
 
+/// Cascade / multi-class residue bitrate gate via the public API. On a
+/// sparse-in-frequency signal (pure sine tone) the cascade+multi-class
+/// setup should spend considerably fewer residue bits than the prior
+/// single-128-entry-book / single-classification encoder would have. We
+/// use a conservative bound (total_bytes < baseline_residue_bytes / 2)
+/// to guard against accidental regressions that would give back the
+/// 30-60% reduction we've just banked.
+#[test]
+fn sine_mono_cascade_beats_single_book_via_public_api() {
+    let n = 2048 * 4;
+    let sr = 48_000.0;
+    let pcm: Vec<i16> = (0..n)
+        .map(|i| {
+            let t = i as f64 / sr;
+            let s = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() * 0.5;
+            (s * 32768.0) as i16
+        })
+        .collect();
+    // Run the encoder once and count total bytes of all emitted packets.
+    let mut reg = CodecRegistry::new();
+    oxideav_vorbis::register(&mut reg);
+    let mut params = CodecParameters::audio(CodecId::new("vorbis"));
+    params.channels = Some(1);
+    params.sample_rate = Some(48_000);
+    params.sample_format = Some(SampleFormat::S16);
+    let mut enc = reg.make_encoder(&params).expect("encoder");
+    enc.send_frame(&make_s16_frame(1, n, &pcm)).expect("send");
+    enc.flush().expect("flush");
+    let mut total_bytes = 0usize;
+    let mut n_packets = 0usize;
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => {
+                total_bytes += p.data.len();
+                n_packets += 1;
+            }
+            Err(Error::Eof) | Err(Error::NeedMore) => break,
+            Err(e) => panic!("encoder error: {e}"),
+        }
+    }
+    // Single-book baseline residue cost per long-block mono packet:
+    // 512 partitions × 8 bits = 4096 bits = 512 bytes.
+    let baseline_residue_only = n_packets * 512;
+    eprintln!(
+        "mono 1 kHz cascade total={total_bytes} bytes baseline-residue-only={baseline_residue_only} bytes ({n_packets} packets)"
+    );
+    assert!(
+        total_bytes * 2 < baseline_residue_only,
+        "cascade not saving enough bits: {total_bytes} vs baseline-residue-only {baseline_residue_only}"
+    );
+}
+
 /// 7.1 channel round-trip via the public API.
 #[test]
 fn sine_7_1_roundtrips_via_public_api() {

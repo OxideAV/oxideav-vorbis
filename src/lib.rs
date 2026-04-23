@@ -12,14 +12,17 @@
 //! Matches libvorbis / lewton output within float rounding on the
 //! fixture suite.
 //!
-//! Encoder handles 1 or 2 channels at any sample rate with sum/difference
-//! channel coupling (Vorbis I §1.3.3), ATH-scaled floor1, a single
-//! 128-entry residue VQ covering {-5..+5}², and transient-driven
-//! short-block switching (asymmetric long↔short windows per §1.3.2 /
-//! §4.3.1). Output decodes through both this crate's decoder and
-//! ffmpeg's libvorbis. See the `encoder.rs` module-level doc for the
-//! known bitrate trade-offs relative to libvorbis (point-stereo,
-//! Annex-B reference books, floor0 emission).
+//! Encoder handles 1..=8 channels at any sample rate with sum/difference
+//! channel coupling (Vorbis I §1.3.3), ATH-scaled floor1, a multi-class
+//! type-2 residue stage cascading a 128-entry main VQ ({-5..+5}²) and a
+//! 16-entry fine-correction VQ ({-0.6, -0.2, 0.2, 0.6}²) under a
+//! variable-length classbook that spends one bit on the common
+//! both-silent partition pair. Transient-driven short-block switching
+//! uses the asymmetric long↔short windows per §1.3.2 / §4.3.1. Output
+//! decodes through both this crate's decoder and ffmpeg's libvorbis.
+//! See the `encoder.rs` module-level doc for the remaining bitrate
+//! trade-offs relative to libvorbis (point-stereo, Annex-B reference
+//! books, floor0 emission).
 
 pub mod audio_packet;
 pub mod bits_ext;
