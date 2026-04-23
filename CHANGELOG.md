@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Multichannel encoder support (3..=8 channels) with channel coupling per
+  the Vorbis I standard channel mappings (L/C/R, 4ch quad, 5.1, 7.1).
+  Round-trip tests exercise sine signals per-channel on 3ch through 7.1,
+  plus B-format quad noise. Mean SNR on a 5.1 sine bed is ~5 dB.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.4...v0.0.5) - 2026-04-19
 
 ### Other

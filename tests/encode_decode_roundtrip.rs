@@ -149,3 +149,70 @@ fn sine_stereo_roundtrips_via_public_api() {
         "R: 1 kHz should beat 5 kHz, got {t_r} vs {o_r}"
     );
 }
+
+/// 5.1 channel round-trip via the public CodecRegistry API. Each channel
+/// gets a distinct tone; after decode the per-channel Goertzel magnitude
+/// at that tone must dominate over a common off-band frequency.
+#[test]
+fn sine_5_1_roundtrips_via_public_api() {
+    let n = 2048 * 4;
+    let sr = 48_000.0;
+    let freqs = [440.0f64, 520.0, 660.0, 880.0, 1100.0, 140.0];
+    let mut pcm: Vec<i16> = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let t = i as f64 / sr;
+        for &f in &freqs {
+            let s = (2.0 * std::f64::consts::PI * f * t).sin() * 0.4;
+            pcm.push((s * 32768.0) as i16);
+        }
+    }
+    let out = encode_decode(6, n, &pcm);
+    assert!(!out.is_empty());
+    // Deinterleave.
+    let mut per_ch: Vec<Vec<i16>> = vec![Vec::new(); 6];
+    for chunk in out.chunks_exact(6) {
+        for (ch, &s) in chunk.iter().enumerate() {
+            per_ch[ch].push(s);
+        }
+    }
+    for (ch, &f) in freqs.iter().enumerate() {
+        let t = goertzel_mag(&per_ch[ch], f, sr);
+        let o = goertzel_mag(&per_ch[ch], 4000.0, sr);
+        assert!(
+            t > o,
+            "5.1 ch{ch}: target {f} ({t}) must beat 4 kHz off-band ({o})"
+        );
+    }
+}
+
+/// 7.1 channel round-trip via the public API.
+#[test]
+fn sine_7_1_roundtrips_via_public_api() {
+    let n = 2048 * 4;
+    let sr = 48_000.0;
+    let freqs = [440.0f64, 520.0, 660.0, 770.0, 990.0, 880.0, 1100.0, 140.0];
+    let mut pcm: Vec<i16> = Vec::with_capacity(n * 8);
+    for i in 0..n {
+        let t = i as f64 / sr;
+        for &f in &freqs {
+            let s = (2.0 * std::f64::consts::PI * f * t).sin() * 0.35;
+            pcm.push((s * 32768.0) as i16);
+        }
+    }
+    let out = encode_decode(8, n, &pcm);
+    assert!(!out.is_empty());
+    let mut per_ch: Vec<Vec<i16>> = vec![Vec::new(); 8];
+    for chunk in out.chunks_exact(8) {
+        for (ch, &s) in chunk.iter().enumerate() {
+            per_ch[ch].push(s);
+        }
+    }
+    for (ch, &f) in freqs.iter().enumerate() {
+        let t = goertzel_mag(&per_ch[ch], f, sr);
+        let o = goertzel_mag(&per_ch[ch], 4200.0, sr);
+        assert!(
+            t > o,
+            "7.1 ch{ch}: target {f} ({t}) must beat 4.2 kHz off-band ({o})"
+        );
+    }
+}
