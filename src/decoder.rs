@@ -7,7 +7,7 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::floor::{decode_floor_packet, synth_floor1, Floor1Decoded};
+use crate::floor::{decode_floor_packet, synth_floor0, synth_floor1, FloorDecoded};
 use crate::identification::{parse_identification_header, Identification};
 use crate::imdct::{imdct_naive, sin_window_sample};
 use crate::residue::decode_residue;
@@ -173,7 +173,7 @@ fn decode_one(d: &mut VorbisDecoder, packet: &Packet) -> Result<Frame> {
     }
 
     // Per-channel floor decode.
-    let mut floors_decoded: Vec<Floor1Decoded> = Vec::with_capacity(n_channels);
+    let mut floors_decoded: Vec<FloorDecoded> = Vec::with_capacity(n_channels);
     let mut no_residue = vec![false; n_channels];
     for ch in 0..n_channels {
         let submap = if mapping.submaps > 1 {
@@ -185,15 +185,25 @@ fn decode_one(d: &mut VorbisDecoder, packet: &Packet) -> Result<Frame> {
         let floor = &d.setup.floors[floor_idx];
         let dec = decode_floor_packet(floor, &d.setup.codebooks, &mut br)?;
         if trace {
+            let (kind, unused, extra) = match &dec {
+                FloorDecoded::Floor1(f) => ("floor1", f.unused, format!("y_len={}", f.y.len())),
+                FloorDecoded::Floor0(f) => (
+                    "floor0",
+                    f.amplitude == 0,
+                    format!("amp={} coeff_len={}", f.amplitude, f.coefficients.len()),
+                ),
+                FloorDecoded::Unused => ("unused", true, String::new()),
+            };
             eprintln!(
-                "[vorbis] floor ch{}: unused={} y_len={} bitpos={}",
+                "[vorbis] {} ch{}: unused={} {} bitpos={}",
+                kind,
                 ch,
-                dec.unused,
-                dec.y.len(),
+                unused,
+                extra,
                 br.bit_position()
             );
         }
-        no_residue[ch] = dec.unused;
+        no_residue[ch] = dec.is_unused();
         floors_decoded.push(dec);
     }
 
@@ -285,12 +295,17 @@ fn decode_one(d: &mut VorbisDecoder, packet: &Packet) -> Result<Frame> {
             0
         };
         let floor_idx = mapping.submap_floor[submap as usize] as usize;
-        match &d.setup.floors[floor_idx] {
-            Floor::Type1(f1) => {
-                synth_floor1(f1, &floors_decoded[ch], n_half, &mut spectrum[ch])?;
+        match (&d.setup.floors[floor_idx], &floors_decoded[ch]) {
+            (Floor::Type1(f1), FloorDecoded::Floor1(fd)) => {
+                synth_floor1(f1, fd, n_half, &mut spectrum[ch])?;
             }
-            Floor::Type0(_) => {
-                return Err(Error::unsupported("Vorbis floor 0 decode not implemented"));
+            (Floor::Type0(f0), FloorDecoded::Floor0(fd)) => {
+                synth_floor0(f0, fd, n_half, &mut spectrum[ch])?;
+            }
+            _ => {
+                return Err(Error::invalid(
+                    "Vorbis: floor type mismatch between setup and decoded packet",
+                ));
             }
         }
     }

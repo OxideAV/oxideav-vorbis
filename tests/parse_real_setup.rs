@@ -188,7 +188,7 @@ fn parses_real_setup_from_disk() {
         let floor_idx = mapping.submap_floor[submap as usize] as usize;
         let floor = &setup.floors[floor_idx];
         let dec = decode_floor_packet(floor, &setup.codebooks, &mut br).unwrap();
-        *nr = dec.unused;
+        *nr = dec.is_unused();
     }
     for sm in 0..mapping.submaps as usize {
         let ch_list: Vec<usize> = (0..n_channels)

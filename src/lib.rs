@@ -5,13 +5,12 @@
 
 //! Vorbis I audio codec.
 //!
-//! Decoder is feature-complete for real-world file shapes: floors type 1,
-//! residue types 0/1/2 with cascade books, mapping type 0 with any number
-//! of submaps and channel coupling steps, up to 255 channels, full
-//! asymmetric long↔short MDCT windows and overlap-add. Matches libvorbis
-//! / lewton output within float rounding on the fixture suite. Floor type
-//! 0 (LSP) is rejected with `Error::Unsupported` — no modern encoder
-//! produces it.
+//! Decoder is feature-complete for real-world file shapes: floor types
+//! 0 (LSP) + 1, residue types 0/1/2 with cascade books, mapping type 0
+//! with any number of submaps and channel coupling steps, up to 255
+//! channels, full asymmetric long↔short MDCT windows and overlap-add.
+//! Matches libvorbis / lewton output within float rounding on the
+//! fixture suite.
 //!
 //! Encoder handles 1 or 2 channels at any sample rate with sum/difference
 //! channel coupling (Vorbis I §1.3.3), ATH-scaled floor1, a single

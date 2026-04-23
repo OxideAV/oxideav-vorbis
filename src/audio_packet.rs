@@ -10,7 +10,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::floor::{decode_floor_packet, Floor1Decoded};
+use crate::floor::{decode_floor_packet, FloorDecoded};
 use crate::identification::Identification;
 use crate::setup::Setup;
 use oxideav_core::bits::BitReaderLsb as BitReader;
@@ -25,9 +25,10 @@ pub struct PartialAudioPacket {
     pub previous_window_flag: bool,
     pub next_window_flag: bool,
     pub blocksize: u32,
-    /// Per-channel floor decode (or `Floor1Decoded { unused: true, ... }` for
-    /// channels whose floor packet says the channel is silent this block).
-    pub floors: Vec<Floor1Decoded>,
+    /// Per-channel floor decode. For silent channels the variant is
+    /// either `FloorDecoded::Floor1 { unused: true, .. }` (floor1) or
+    /// `FloorDecoded::Floor0 { amplitude: 0, .. }` (floor0).
+    pub floors: Vec<FloorDecoded>,
 }
 
 pub fn decode_audio_packet_partial(

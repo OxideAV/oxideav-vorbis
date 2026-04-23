@@ -22,12 +22,14 @@ by running `ffmpeg -c:a libvorbis -q:a 3` and extracting the setup
 header from the resulting Ogg stream.
 
 Algorithms in `src/codebook.rs` (marker-based Huffman construction,
-cf. libvorbis `lib/sharedbook.c` `_make_words`) and `src/floor.rs`
+cf. libvorbis `lib/sharedbook.c` `_make_words`), `src/floor.rs`
 (floor1 inverse rendering, cf. libvorbis `lib/floor1.c`
-`floor1_inverse2`) are independent Rust re-implementations of the
-algorithms described in the Vorbis I specification, cross-checked
-against libvorbis for bit-exact conformance. They do not reproduce
-libvorbis source code but are listed here for completeness.
+`floor1_inverse2`; floor0 LSP synthesis, cf. libvorbis
+`lib/floor0.c` `floor0_inverse2` and `lib/lsp.c` `vorbis_lsp_to_curve`)
+are independent Rust re-implementations of the algorithms described
+in the Vorbis I specification, cross-checked against libvorbis for
+bit-exact conformance. They do not reproduce libvorbis source code
+but are listed here for completeness.
 
 libvorbis is distributed under the following terms:
 
