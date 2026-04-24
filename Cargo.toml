@@ -26,7 +26,7 @@ oxideav-core = "0.1"
 oxideav-codec = "0.1"
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "vorbis"

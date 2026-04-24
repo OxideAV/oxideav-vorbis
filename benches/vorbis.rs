@@ -8,7 +8,9 @@
 //! Scalar-vs-SIMD comparisons use the `scalar_*` / `simd_*` naming so
 //! the paired runs show up next to each other in the Criterion report.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 
 use oxideav_codec::CodecRegistry;
 use oxideav_core::{
