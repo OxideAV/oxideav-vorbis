@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.5...v0.0.6) - 2026-04-25
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- bump criterion 0.5 → 0.8
+- cascade + multi-class residue (type 2) cuts bitrate ~60%
+- update README + encoder docs for 1..=8 channel encode
+- multichannel encoder round-trip tests + CHANGELOG
+- generalise encoder setup coupling to 1..=8 channels
+- add floor type 0 (LSP) decoder
+- add NOTICES with libvorbis BSD-3 attribution
+
 ### Added
 
 - Multichannel encoder support (3..=8 channels) with channel coupling per
