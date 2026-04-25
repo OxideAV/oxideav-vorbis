@@ -155,9 +155,7 @@ pub fn decode_floor0_packet(
     let book_bits = ilog(floor.number_of_books as u32);
     let booknumber = br.read_u32(book_bits)?;
     if booknumber as usize >= floor.book_list.len() {
-        return Err(Error::invalid(
-            "Vorbis floor0: book number out of range",
-        ));
+        return Err(Error::invalid("Vorbis floor0: book number out of range"));
     }
     let book_idx = floor.book_list[booknumber as usize] as usize;
     if book_idx >= codebooks.len() {

@@ -23,7 +23,6 @@ nightly = []
 
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

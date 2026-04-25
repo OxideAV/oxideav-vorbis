@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Frame, MediaType, SampleFormat, TimeBase,
 };

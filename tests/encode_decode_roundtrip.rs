@@ -4,7 +4,7 @@
 //! Covers silence (smallest reasonable packet payload) and a 1 kHz sine
 //! (an audible signal we can verify via Goertzel-style DFT magnitude).
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
 
 fn make_s16_frame(channels: u16, samples_per_channel: usize, pcm: &[i16]) -> Frame {

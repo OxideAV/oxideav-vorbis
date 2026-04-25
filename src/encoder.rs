@@ -89,7 +89,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat,
     TimeBase,
@@ -552,10 +552,10 @@ fn ilog(value: u32) -> u32 {
 pub(crate) fn standard_coupling_steps(channels: u8) -> Vec<(u8, u8)> {
     match channels {
         2 => vec![(0, 1)],
-        3 => vec![(0, 2)], // L, C, R — couple L↔R
-        4 => vec![(0, 1), (2, 3)], // FL, FR, BL, BR
-        5 => vec![(0, 2), (3, 4)], // FL, C, FR, BL, BR
-        6 => vec![(0, 2), (3, 4)], // 5.1: FL, C, FR, BL, BR, LFE
+        3 => vec![(0, 2)],                 // L, C, R — couple L↔R
+        4 => vec![(0, 1), (2, 3)],         // FL, FR, BL, BR
+        5 => vec![(0, 2), (3, 4)],         // FL, C, FR, BL, BR
+        6 => vec![(0, 2), (3, 4)],         // 5.1: FL, C, FR, BL, BR, LFE
         7 => vec![(0, 2), (3, 4), (5, 6)], // FL, C, FR, SL, SR, BL, BR
         8 => vec![(0, 2), (3, 4), (5, 6)], // 7.1: FL, C, FR, SL, SR, BL, BR, LFE
         _ => Vec::new(),
@@ -1405,11 +1405,9 @@ impl VorbisEncoder {
             // Does any class have a book at this pass? If not, skip
             // (matches decoder: partitions whose class has no book at
             // this pass consume zero bits).
-            let any_book_at_pass = residue
-                .books
-                .iter()
-                .enumerate()
-                .any(|(c, row)| (residue.cascade[c] & (1u8 << pass)) != 0 && row[pass as usize] >= 0);
+            let any_book_at_pass = residue.books.iter().enumerate().any(|(c, row)| {
+                (residue.cascade[c] & (1u8 << pass)) != 0 && row[pass as usize] >= 0
+            });
             if !any_book_at_pass && pass > 0 {
                 break; // no more passes will have books either
             }
@@ -1421,7 +1419,11 @@ impl VorbisEncoder {
                     let mut class_number: u32 = 0;
                     for k in 0..classwords_per_codeword {
                         let pidx = partition_idx + k;
-                        let cl = if pidx < n_partitions { classes[pidx] } else { 0 };
+                        let cl = if pidx < n_partitions {
+                            classes[pidx]
+                        } else {
+                            0
+                        };
                         class_number = class_number * classifications as u32 + cl;
                     }
                     write_huffman(w, classbook, class_number);
@@ -1920,7 +1922,10 @@ mod tests {
         // Codebook 1: classbook (dim 2, 4 entries, variable-length [1,2,3,3]).
         assert_eq!(setup.codebooks[1].dimensions, CLASSBOOK_DIM as u16);
         assert_eq!(setup.codebooks[1].entries, CLASSBOOK_ENTRIES);
-        assert_eq!(setup.codebooks[1].codeword_lengths, CLASSBOOK_LENGTHS.to_vec());
+        assert_eq!(
+            setup.codebooks[1].codeword_lengths,
+            CLASSBOOK_LENGTHS.to_vec()
+        );
         // Codebook 2: main VQ, 128 entries, dim 2, lookup type 1, min=-5.
         assert_eq!(setup.codebooks[2].entries, VQ_ENTRIES);
         assert_eq!(setup.codebooks[2].dimensions, 2);
@@ -2685,9 +2690,8 @@ mod tests {
     fn encoder_setup_coupling_for_all_channel_counts() {
         for ch in 1u8..=8 {
             let bytes = build_encoder_setup_header(ch);
-            let setup = parse_setup(&bytes, ch).unwrap_or_else(|e| {
-                panic!("channel count {ch} setup header failed to parse: {e}")
-            });
+            let setup = parse_setup(&bytes, ch)
+                .unwrap_or_else(|e| panic!("channel count {ch} setup header failed to parse: {e}"));
             let expected = standard_coupling_steps(ch);
             assert_eq!(
                 setup.mappings[0].coupling.len(),
@@ -2715,10 +2719,7 @@ mod tests {
     /// Round-trip helper for multichannel PCM. `pcm_per_channel` is a
     /// vector of per-channel f32 samples in [-1, 1]. Returns decoded S16
     /// samples per channel (already deinterleaved).
-    fn encode_decode_multichannel(
-        channels: u16,
-        pcm_per_channel: &[Vec<f32>],
-    ) -> Vec<Vec<i16>> {
+    fn encode_decode_multichannel(channels: u16, pcm_per_channel: &[Vec<f32>]) -> Vec<Vec<i16>> {
         assert_eq!(pcm_per_channel.len(), channels as usize);
         let n = pcm_per_channel[0].len();
         let mut interleaved_i16 = Vec::with_capacity(n * channels as usize);
@@ -2764,8 +2765,7 @@ mod tests {
                 for chunk in plane.chunks_exact(stride) {
                     for ch in 0..channels as usize {
                         let off = ch * 2;
-                        per_ch[ch]
-                            .push(i16::from_le_bytes([chunk[off], chunk[off + 1]]));
+                        per_ch[ch].push(i16::from_le_bytes([chunk[off], chunk[off + 1]]));
                     }
                 }
             }
@@ -2783,9 +2783,8 @@ mod tests {
         rms_floor: f64,
     ) {
         let sr = 48_000.0;
-        let rms =
-            (decoded.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / decoded.len() as f64)
-                .sqrt();
+        let rms = (decoded.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / decoded.len() as f64)
+            .sqrt();
         let t = goertzel_mag(decoded, target_freq, sr);
         let o = goertzel_mag(decoded, off_freq, sr);
         eprintln!("{tag}: rms={rms} t({target_freq})={t} o({off_freq})={o}");
@@ -2844,13 +2843,7 @@ mod tests {
         assert_eq!(decoded.len(), 4);
         let names = ["FL", "FR", "BL", "BR"];
         for (ch, (&f, n)) in freqs.iter().zip(names.iter()).enumerate() {
-            assert_channel_energy(
-                &format!("4ch/{n}"),
-                &decoded[ch],
-                f,
-                f + 2500.0,
-                200.0,
-            );
+            assert_channel_energy(&format!("4ch/{n}"), &decoded[ch], f, f + 2500.0, 200.0);
         }
     }
 
@@ -2880,13 +2873,7 @@ mod tests {
             // floor setup's ATH curve (100 Hz break point) — compare
             // against 4 kHz off-band rather than freq+2500 to keep the
             // off-band in the midband the floor handles well.
-            assert_channel_energy(
-                &format!("5.1/{n}"),
-                &decoded[ch],
-                f,
-                4000.0,
-                150.0,
-            );
+            assert_channel_energy(&format!("5.1/{n}"), &decoded[ch], f, 4000.0, 150.0);
         }
     }
 
@@ -2911,13 +2898,7 @@ mod tests {
         assert_eq!(decoded.len(), 8);
         let names = ["FL", "C", "FR", "SL", "SR", "BL", "BR", "LFE"];
         for (ch, (&f, n)) in freqs.iter().zip(names.iter()).enumerate() {
-            assert_channel_energy(
-                &format!("7.1/{n}"),
-                &decoded[ch],
-                f,
-                4200.0,
-                100.0,
-            );
+            assert_channel_energy(&format!("7.1/{n}"), &decoded[ch], f, 4200.0, 100.0);
         }
     }
 
@@ -2934,14 +2915,17 @@ mod tests {
             (seed >> 8) as i32
         };
         let pcm: Vec<Vec<f32>> = (0..4)
-            .map(|_| (0..n).map(|_| (rand() as f32 / (1 << 23) as f32) * 0.25).collect())
+            .map(|_| {
+                (0..n)
+                    .map(|_| (rand() as f32 / (1 << 23) as f32) * 0.25)
+                    .collect()
+            })
             .collect();
         let decoded = encode_decode_multichannel(4, &pcm);
         assert_eq!(decoded.len(), 4);
         for (ch, plane) in decoded.iter().enumerate() {
-            let rms =
-                (plane.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / plane.len() as f64)
-                    .sqrt();
+            let rms = (plane.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / plane.len() as f64)
+                .sqrt();
             eprintln!("B-format ch{ch} rms={rms}");
             // Input noise at amp 0.25 → input RMS ~ 2800 (0.25 * 32768 /
             // sqrt(3)); lossy encode floor/residue typically leaves at
@@ -3168,10 +3152,7 @@ mod tests {
             // (140 Hz) and the center (520 Hz) see extra floor-quantisation
             // error from the short-block-only ATH curve below ~200 Hz; we
             // use the loose bound so CI stays green without over-tuning.
-            assert!(
-                snr > -10.0,
-                "5.1 ch{ch} SNR ({snr} dB) unreasonably low"
-            );
+            assert!(snr > -10.0, "5.1 ch{ch} SNR ({snr} dB) unreasonably low");
             if snr.is_finite() {
                 snr_total += snr;
             }

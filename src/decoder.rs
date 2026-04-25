@@ -1,8 +1,8 @@
 //! Vorbis decoder top-level: stitches the bitstream parsers, floor +
 //! residue decoders, channel coupling, IMDCT and windowed overlap-add into
-//! a [`oxideav_codec::Decoder`] implementation.
+//! a [`oxideav_core::Decoder`] implementation.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };

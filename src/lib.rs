@@ -39,8 +39,8 @@ pub mod setup;
 pub mod setup_writer;
 pub mod simd;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "vorbis";
 

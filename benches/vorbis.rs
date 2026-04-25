@@ -12,7 +12,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
 };
@@ -123,7 +123,7 @@ fn bench_bulk_ops(c: &mut Criterion) {
 fn build_encoder(
     channels: u16,
     sample_rate: u32,
-) -> (CodecRegistry, Box<dyn oxideav_codec::Encoder>) {
+) -> (CodecRegistry, Box<dyn oxideav_core::Encoder>) {
     let mut reg = CodecRegistry::new();
     oxideav_vorbis::register(&mut reg);
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
