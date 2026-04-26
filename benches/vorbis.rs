@@ -14,7 +14,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat,
 };
 use oxideav_vorbis::imdct::{
     forward_mdct_naive, forward_mdct_reference, imdct_naive, imdct_reference,
@@ -134,18 +134,14 @@ fn build_encoder(
     (reg, enc)
 }
 
-fn make_s16_frame(channels: u16, sr: u32, samples: u32, pcm: &[i16]) -> Frame {
+fn make_s16_frame(_channels: u16, _sr: u32, samples: u32, pcm: &[i16]) -> Frame {
     let mut data = Vec::with_capacity(pcm.len() * 2);
     for s in pcm {
         data.extend_from_slice(&s.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate: sr,
         samples,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![data],
     })
 }

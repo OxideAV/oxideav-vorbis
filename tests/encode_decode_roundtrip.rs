@@ -5,20 +5,16 @@
 //! (an audible signal we can verify via Goertzel-style DFT magnitude).
 
 use oxideav_core::CodecRegistry;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
 
-fn make_s16_frame(channels: u16, samples_per_channel: usize, pcm: &[i16]) -> Frame {
+fn make_s16_frame(_channels: u16, samples_per_channel: usize, pcm: &[i16]) -> Frame {
     let mut data = Vec::with_capacity(pcm.len() * 2);
     for s in pcm {
         data.extend_from_slice(&s.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate: 48_000,
         samples: samples_per_channel as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, 48_000),
         data: vec![data],
     })
 }
@@ -56,8 +52,8 @@ fn encode_decode(channels: u16, samples_per_channel: usize, interleaved: &[i16])
     for pkt in &packets {
         dec.send_packet(pkt).expect("send_packet");
         while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-            assert_eq!(af.format, SampleFormat::S16);
-            assert_eq!(af.channels, channels);
+            // Stream-level format/channels are validated via the
+            // CodecParameters round-trip above; nothing to assert per-frame.
             let plane = &af.data[0];
             for chunk in plane.chunks_exact(2) {
                 out.push(i16::from_le_bytes([chunk[0], chunk[1]]));

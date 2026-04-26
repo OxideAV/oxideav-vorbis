@@ -728,6 +728,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("Vorbis encoder: sample_rate required"))?;
+    let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
 
     let id_hdr = build_identification_header(
         channels as u8,
@@ -761,6 +762,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         time_base: TimeBase::new(1, sample_rate as i64),
         channels,
         sample_rate,
+        input_sample_format,
         blocksize_short,
         blocksize_long,
         input_buf: vec![Vec::with_capacity(blocksize_long * 4); channels as usize],
@@ -789,6 +791,10 @@ struct VorbisEncoder {
     time_base: TimeBase,
     channels: u16,
     sample_rate: u32,
+    /// Sample format expected on incoming `AudioFrame`s. Sourced from the
+    /// `CodecParameters.sample_format` at construction (defaults to S16
+    /// when unset). The slim AudioFrame doesn't carry it per-frame.
+    input_sample_format: SampleFormat,
     blocksize_short: usize,
     blocksize_long: usize,
     input_buf: Vec<Vec<f32>>,
@@ -860,17 +866,15 @@ fn window_bounds(
 
 impl VorbisEncoder {
     fn push_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != self.channels {
-            return Err(Error::invalid(format!(
-                "Vorbis encoder: expected {} channels, got {}",
-                self.channels, frame.channels
-            )));
-        }
+        // Stream-level validation (channel count, sample rate, sample
+        // format) is owned by the factory at construction — see
+        // `make_encoder`. `self.input_sample_format` carries the format
+        // the caller advertised in `CodecParameters`.
         let n = frame.samples as usize;
         if n == 0 {
             return Ok(());
         }
-        match frame.format {
+        match self.input_sample_format {
             SampleFormat::S16 => {
                 let plane = frame
                     .data
@@ -2128,12 +2132,8 @@ mod tests {
         let mut enc = make_encoder(&params).unwrap();
         let block = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 48_000,
             samples: block as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![vec![0u8; block * 2]],
         });
         enc.send_frame(&frame).expect("send_frame");
@@ -2161,12 +2161,8 @@ mod tests {
         params.sample_rate = Some(48_000);
         let mut enc = make_encoder(&params).unwrap();
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: 48_000,
             samples: 64,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![vec![0u8; 64 * 4]],
         });
         enc.send_frame(&frame).unwrap();
@@ -2216,12 +2212,8 @@ mod tests {
             data.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels,
-            sample_rate: 48_000,
             samples: samples_per_channel as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![data],
         });
         enc.send_frame(&frame).unwrap();
@@ -2403,6 +2395,7 @@ mod tests {
                 time_base: TimeBase::new(1, sample_rate as i64),
                 channels,
                 sample_rate,
+                input_sample_format: SampleFormat::S16,
                 blocksize_short,
                 blocksize_long,
                 input_buf: vec![Vec::with_capacity(blocksize_long * 4); channels as usize],
@@ -2424,12 +2417,8 @@ mod tests {
             data.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels,
-            sample_rate: 48_000,
             samples: samples_per_channel as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![data],
         });
         enc.send_frame(&frame).unwrap();
@@ -2504,12 +2493,8 @@ mod tests {
             data.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 48_000,
             samples: total as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![data],
         });
         enc.send_frame(&frame).unwrap();
@@ -2650,12 +2635,8 @@ mod tests {
         let block = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
         let n_blocks = 4;
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 48_000,
             samples: (block * n_blocks) as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![vec![0u8; block * n_blocks * 2]],
         });
         enc.send_frame(&frame).unwrap();
@@ -2740,12 +2721,8 @@ mod tests {
         params.sample_rate = Some(48_000);
         let mut enc = make_encoder(&params).unwrap();
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels,
-            sample_rate: 48_000,
             samples: n as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![data],
         });
         enc.send_frame(&frame).unwrap();
@@ -2968,12 +2945,8 @@ mod tests {
             data.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels,
-            sample_rate: 48_000,
             samples: n as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 48_000),
             data: vec![data],
         });
         enc.send_frame(&frame).unwrap();

@@ -88,13 +88,16 @@ fn main() {
     assert!(pkts.len() >= 4);
     let headers = [&pkts[0][..], &pkts[1][..], &pkts[2][..]];
     let extradata = xiph_lace(&headers);
+    // Source stream-level info from the identification header up-front;
+    // the slim AudioFrame doesn't carry channels/sample_rate per-frame.
+    let id = oxideav_vorbis::parse_identification_header(headers[0]).expect("parse id header");
+    let channels: u16 = id.audio_channels as u16;
+    let sample_rate: u32 = id.audio_sample_rate;
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.extradata = extradata;
     let mut dec = make_decoder(&params).expect("make_decoder");
     let mut out_samples: Vec<i16> = Vec::new();
     let mut total_frames = 0usize;
-    let mut sample_rate = 0u32;
-    let mut channels = 0u16;
     for (i, p) in pkts.iter().enumerate().skip(3) {
         let packet = Packet::new(0, TimeBase::new(1, 48_000), p.clone());
         if let Err(e) = dec.send_packet(&packet) {
@@ -104,8 +107,6 @@ fn main() {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 total_frames += 1;
-                sample_rate = a.sample_rate;
-                channels = a.channels;
                 if let Some(plane) = a.data.first() {
                     for chunk in plane.chunks_exact(2) {
                         out_samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
@@ -114,7 +115,7 @@ fn main() {
                 if i <= 5 {
                     eprintln!(
                         "pkt{}: {} samples, {}ch, sr={}",
-                        i, a.samples, a.channels, a.sample_rate
+                        i, a.samples, channels, sample_rate
                     );
                 }
             }

@@ -11,9 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_core::Encoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Frame, MediaType, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, MediaType};
 use oxideav_vorbis::encoder::make_encoder;
 
 const SR: u32 = 48_000;
@@ -158,12 +156,8 @@ fn encode(channels: u16, samples: &[i16]) -> (Vec<u8>, Vec<Vec<u8>>) {
         data.extend_from_slice(&s.to_le_bytes());
     }
     let frame = Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate: SR,
         samples: n_per_ch as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, SR as i64),
         data: vec![data],
     });
     enc.send_frame(&frame).expect("send_frame");

@@ -10,9 +10,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Frame, MediaType, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, MediaType};
 use oxideav_vorbis::encoder::make_encoder;
 
 fn write_ogg_pages(
@@ -180,12 +178,8 @@ fn main() {
         data.extend_from_slice(&s.to_le_bytes());
     }
     let frame = Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: nch,
-        sample_rate: sr,
         samples: (pcm.len() / nch as usize) as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![data],
     });
     enc.send_frame(&frame).expect("send_frame");

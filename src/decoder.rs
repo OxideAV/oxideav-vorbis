@@ -4,7 +4,7 @@
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result,
 };
 
 use crate::floor::{decode_floor_packet, synth_floor0, synth_floor1, FloorDecoded};
@@ -32,7 +32,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let setup = parse_setup(&packets[2], id.audio_channels)?;
     let blocksize_short = 1u32 << id.blocksize_0;
     let blocksize_long = 1u32 << id.blocksize_1;
-    let time_base = TimeBase::new(1, id.audio_sample_rate as i64);
 
     Ok(Box::new(VorbisDecoder {
         codec_id: params.codec_id.clone(),
@@ -40,7 +39,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         setup,
         blocksize_short,
         blocksize_long,
-        time_base,
         prev_tail: Vec::new(),
         pending: None,
         eof: false,
@@ -54,7 +52,6 @@ struct VorbisDecoder {
     setup: Setup,
     blocksize_short: u32,
     blocksize_long: u32,
-    time_base: TimeBase,
     /// Per-channel "right tail" samples saved from the previous packet's
     /// IMDCT output. This is a raw (unwindowed) slice of the previous
     /// block in the range `[right_win_start, right_win_end)` — exactly
@@ -405,12 +402,8 @@ fn decode_one(d: &mut VorbisDecoder, packet: &Packet) -> Result<Frame> {
     }
 
     Ok(Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: n_channels as u16,
-        sample_rate: d.id.audio_sample_rate,
         samples: n_samples,
         pts: Some(pts),
-        time_base: d.time_base,
         data: vec![interleaved],
     }))
 }
