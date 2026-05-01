@@ -13,9 +13,7 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use oxideav_core::CodecRegistry;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat};
 use oxideav_vorbis::imdct::{
     forward_mdct_naive, forward_mdct_reference, imdct_naive, imdct_reference,
 };

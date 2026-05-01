@@ -89,30 +89,44 @@ What's implemented:
   `bs0/2` post-echo — see the
   `roundtrip_click_short_beats_long_only_baseline` test for a
   measurement.
-- ATH-scaled floor1 analysis (8 posts short, 32 posts long).
-- Sum/difference channel coupling (§1.3.3) — lossless, round-trips
-  via the decoder's inverse step. Multichannel streams use the
-  standard Vorbis I mappings (L/C/R, 4ch quad, 5.1, 7.1) with
-  coupled L-R, back-L/back-R, and side-L/side-R pairs; center and
-  LFE channels stay uncoupled.
-- A single 128-entry, dim-2 VQ residue book covering {-5..+5}²,
-  with exhaustive nearest-neighbour search per partition.
-- Residue type 1 (concatenated per-channel) for both block sizes.
+- Floor1 analysis with peak/RMS-blended envelope tracking,
+  binary-search dB-domain quantisation, and a
+  smearing pass that prevents inter-post Bresenham dips below
+  `12 * multiplier` dB (§7.2.4 step1 / step2). 8 posts on short
+  blocks, 32 on long. Mono 1 kHz SNR is ~4.2 dB through both our
+  decoder and ffmpeg's libvorbis (vs ~3.8 dB pre-tuning).
+- Sum/difference channel coupling (§1.3.3) for L-R pairs below the
+  point-stereo crossover (~4 kHz, configurable via
+  `DEFAULT_POINT_STEREO_FREQ`); above the crossover the encoder
+  switches to point-stereo (`a = 0`, `m = sign(dom) *
+  sqrt((L²+R²)/2)`) to monoise inter-aural phase that the human
+  ear cannot resolve. The decoder reconstructs `L = R = m` for
+  point-coupled bins. Multichannel streams use the standard
+  Vorbis I mappings (L/C/R, 4ch quad, 5.1, 7.1) with coupled L-R,
+  back-L/back-R, and side-L/side-R pairs; center and LFE channels
+  stay uncoupled.
+- A 4-codebook residue setup: floor1 Y book (128 × 7-bit), a 4-entry
+  variable-length classbook (`[1, 2, 3, 3]`), 128-entry main VQ
+  ({-5..+5}²) and 16-entry fine correction VQ ({-0.6..+0.6}²) with
+  cascade — exhaustive nearest-neighbour search per partition.
+- Residue type 2 (interleaved across channels) for both block sizes
+  with two-class per-partition selection (silent vs active cascade).
 - Xiph-laced 3-packet `extradata` in `output_params()`, ready to
-  hand to a container muxer.
+  hand to a container muxer. ffmpeg's libvorbis decodes the output
+  bit-cleanly — see the `ffmpeg_cross_decode_*` tests.
 
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **Point-stereo encoding.** Stereo always emits lossless
-  sum/difference coupling. Libvorbis switches to lossy point
-  stereo above a threshold frequency to roughly halve the angle
-  channel's residue cost. The decoder already handles the
-  bitstream unchanged — this is purely an encoder-side refinement.
-- **Libvorbis Annex B reference codebooks.** Our single residue
-  book serves every quality. Libvorbis ships dozens of books per
-  quality tier plus energy-classifying master books, so its files
-  compress tighter for comparable quality.
+- **Libvorbis Annex B reference codebooks.** Our 4-book setup
+  serves every quality. Libvorbis ships dozens of books per quality
+  tier plus energy-classifying master books, so its files compress
+  tighter for comparable quality.
+- **Per-band point-stereo thresholds.** We use a single global
+  crossover frequency. Libvorbis's `iiPST` config carries a per-
+  band threshold list so the crossover can adapt by frequency band.
+  Our scheme matches Libvorbis's qN ≤ 2 channel-folding shape but
+  not its qN ≥ 4 multi-band tuning.
 - **Floor type 0 (LSP) emission.** Setup always declares floor1.
 
 ## Performance

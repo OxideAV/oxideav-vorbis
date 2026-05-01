@@ -3,9 +3,7 @@
 //! a [`oxideav_core::Decoder`] implementation.
 
 use oxideav_core::Decoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::floor::{decode_floor_packet, synth_floor0, synth_floor1, FloorDecoded};
 use crate::identification::{parse_identification_header, Identification};

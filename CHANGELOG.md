@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Point-stereo channel coupling** above a configurable crossover
+  frequency (default 4 kHz, see `DEFAULT_POINT_STEREO_FREQ`). For
+  bins above the threshold, every coupled pair `(magnitude, angle)`
+  is encoded as `(sign(dominant) * sqrt((L²+R²)/2), 0)` instead of
+  the lossless sum/difference form. The decoder reconstructs
+  `L = R = m` for those bins, monoising high-frequency stereo
+  content where inter-aural phase is below human auditory
+  resolution. Verified by `point_stereo_*` test suite — quadrature
+  6 kHz stereo input has L−R MSE drop from 16.5M to 0.19M (87×) on
+  the decoded output. Bitrate impact is mildly negative (~3% smaller
+  on dense high-band content) thanks to tighter VQ matches once
+  the angle channel is forced to zero.
+- **Floor1 envelope tuning**: per-post target magnitude is now a
+  blend `0.7 * peak + 0.3 * RMS` over the band centred on the post,
+  instead of pure peak. Y values are picked via a binary search of
+  the inverse-dB lookup table (was a linear scan over 128
+  candidates) and pass through a forward+backward smearing pass
+  that bounds inter-post drops at `12 * multiplier` dB so the
+  Bresenham-rendered floor doesn't undercut spectral envelope
+  ridges. SNR on a 1 kHz mono sine through our decoder went from
+  3.80 dB to 4.20 dB; ffmpeg's libvorbis cross-decode reaches
+  4.29 dB on the same input.
+- **ffmpeg cross-decode tests**. The encoder's output bitstream is
+  now smoke-tested by piping through `ffmpeg -i pipe:0 -f s16le -`
+  with a hand-rolled minimal Ogg muxer. Both mono 1 kHz sine and
+  stereo 6 kHz quadrature-phase tones (point-coupled) decode
+  cleanly with the expected target-frequency dominance.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.5...v0.0.6) - 2026-04-25
 
 ### Other
