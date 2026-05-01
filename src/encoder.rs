@@ -79,9 +79,11 @@
 //!    inputs now spend one bit per "both-silent" partition pair — but
 //!    libvorbis ships dozens of books per quality setting with
 //!    energy-indexed master codebooks for finer rate-distortion tuning.
-//!    The Vorbis I Annex B reference codebooks would let us match
-//!    libvorbis bitrates at the cost of a much larger setup header and a
-//!    quality-indexed picker.
+//!    Trained VQ residue codebooks (LBG-clustered from a license-clean
+//!    audio corpus) would let us close the bitrate gap; task #93
+//!    tracks that work — round 1 ships the trainer scaffold in
+//!    `src/bin/vq-train.rs` + `src/trainer.rs`, with corpus + book set
+//!    + encoder dispatch landing in subsequent rounds.
 //!
 //! 3. **Floor type 0 (LSP)**: never seen in modern Vorbis files; not
 //!    implemented on the encode side. Our setup header always uses

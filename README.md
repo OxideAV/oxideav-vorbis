@@ -118,10 +118,15 @@ What's implemented:
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **Libvorbis Annex B reference codebooks.** Our 4-book setup
-  serves every quality. Libvorbis ships dozens of books per quality
-  tier plus energy-classifying master books, so its files compress
-  tighter for comparable quality.
+- **Trained-VQ residue codebooks.** Our 4-book setup uses a 2-book
+  degenerate placeholder for the active residue stage; an in-tree
+  LBG (Linde-Buzo-Gray) VQ trainer is landing in stages under task
+  #93 (round 1: trainer scaffold + corpus survey shipped, see
+  `src/bin/vq-train.rs` and `TRAINING_CORPUS.md`; corpus + book set
+  to be picked in round 2; encoder dispatch among trained books is
+  round 3+). Libvorbis ships dozens of books per quality tier plus
+  energy-classifying master books, so until trained books land its
+  files compress tighter for comparable quality.
 - **Per-band point-stereo thresholds.** We use a single global
   crossover frequency. Libvorbis's `iiPST` config carries a per-
   band threshold list so the crossover can adapt by frequency band.

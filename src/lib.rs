@@ -21,8 +21,8 @@
 //! uses the asymmetric long↔short windows per §1.3.2 / §4.3.1. Output
 //! decodes through both this crate's decoder and ffmpeg's libvorbis.
 //! See the `encoder.rs` module-level doc for the remaining bitrate
-//! trade-offs relative to libvorbis (point-stereo, Annex-B reference
-//! books, floor0 emission).
+//! trade-offs relative to libvorbis (point-stereo, trained-VQ residue
+//! codebooks landing under task #93, floor0 emission).
 
 pub mod audio_packet;
 pub mod bits_ext;
@@ -38,6 +38,7 @@ pub mod residue;
 pub mod setup;
 pub mod setup_writer;
 pub mod simd;
+pub mod trainer;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
