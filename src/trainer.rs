@@ -1,20 +1,20 @@
-//! VQ codebook trainer (round-1 scaffold for task #93).
+//! VQ codebook trainer for task #93.
 //!
 //! Vorbis I residue coding (§8) maps each MDCT spectrum bin (after
-//! floor-curve division) into a vector-quantised codeword. The encoder
-//! currently ships a degenerate 2-book setup (see `encoder.rs`); to
-//! match libvorbis bitrates we need codebooks trained on real audio.
-//! Workspace policy bars all libvorbis-derived `.vqh` files, so we
-//! train our own clean-room books with the standard
+//! floor-curve division) into a vector-quantised codeword. To match
+//! libvorbis bitrates we train our own clean-room books on real audio
+//! with the standard
 //! [Linde-Buzo-Gray (LBG)](https://en.wikipedia.org/wiki/Linde-Buzo-Gray_algorithm)
 //! algorithm (Linde/Buzo/Gray 1980 IEEE Trans. on Communications).
+//! Workspace policy bars libvorbis-derived `.vqh` files; the trainer is
+//! the only path to obtaining residue codebooks.
 //!
-//! Pipeline:
+//! Pipeline (used by [`extract_residue_partition_vectors`]):
 //!
 //! 1. **PCM in.** Caller hands us 16-bit signed little-endian PCM at a
 //!    given sample rate (44.1 / 48 kHz typical). Multi-channel samples
 //!    are downmixed to mono — partition statistics are channel-invariant
-//!    after coupling. (Round-2 may add per-channel training.)
+//!    after coupling.
 //! 2. **Window + forward MDCT.** Reuses [`crate::imdct::build_window`]
 //!    and [`crate::imdct::forward_mdct_naive`] — the same primitives the
 //!    encoder uses on the hot path. Block size defaults to the long
@@ -23,25 +23,35 @@
 //! 3. **2/N scaling.** Matches the encoder's `fwd_scale = 2.0 / n`
 //!    normalisation so the trained codebook lives in the same numerical
 //!    range as encode-time inputs.
-//! 4. **Partition split.** Each MDCT half-spectrum (length `n / 2`) is
-//!    sliced into vectors of dimension `dim` (the VQ-codebook
-//!    dimension). For the encoder's current `partition_size = 2`, this
-//!    is one vector per spectrum bin pair.
-//! 5. **LBG cluster.** Initialise with the vector mean (size 1), then
+//! 4. **Floor1 divide.** Runs the encoder's floor1 analysis (round 2 —
+//!    `analyse_floor1` + `compute_floor1_codes` + `synth_floor1`) and
+//!    divides the spectrum by the rendered floor curve. Without this
+//!    step the trained centroids would live in raw-spectrum space, two
+//!    orders of magnitude smaller than the encoder's runtime residue
+//!    values, and the trained-classifier threshold would not transfer.
+//! 5. **Partition split.** Each residue half-spectrum (length `n / 2`)
+//!    is sliced into vectors of dimension `dim` (the VQ-codebook
+//!    dimension). For the trained classifier, dim=16 yields 8 partition
+//!    slices per centroid (one per 2-bin partition group).
+//! 6. **LBG cluster.** Initialise with the vector mean (size 1), then
 //!    repeatedly split + Lloyd-refine until the codebook reaches the
 //!    requested `codewords` count.
-//! 6. **Emit.** Write a Rust source file containing
+//! 7. **Emit.** Write a Rust source file containing
 //!    `pub const TRAINED_BOOK_<N>: VqCodebook = VqCodebook { ... };`
 //!    declarations.
 //!
-//! The trainer is intentionally agnostic about *which* books to train
-//! and how the encoder will dispatch among them. That's round-2 work.
+//! The legacy [`extract_partition_vectors`] (no floor1 divide) is kept
+//! around for tests + future raw-spectrum-domain experiments, but the
+//! production path is [`extract_residue_partition_vectors`].
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use crate::encoder::{analyse_floor1, build_encoder_setup_header, compute_floor1_codes};
+use crate::floor::synth_floor1;
 use crate::imdct::{build_window, forward_mdct_naive};
+use crate::setup::{parse_setup, Floor};
 
 /// Training configuration. Defaults match the encoder's long-block
 /// residue extraction so trained books drop into the existing setup
@@ -201,6 +211,106 @@ pub fn extract_partition_vectors(pcm: &[f32], blocksize: usize, dim: usize) -> V
         }
         // Slice the spectrum into dim-sized partition vectors.
         for chunk in spectrum.chunks_exact(dim) {
+            vectors.push(chunk.to_vec());
+        }
+    }
+    vectors
+}
+
+/// Like [`extract_partition_vectors`] but applies the encoder's full
+/// floor1 analysis pipeline before slicing — so trained centroids live
+/// in the same numerical space as the encoder's runtime residue values
+/// (`spec[k] / floor_curve[k]`), not raw post-MDCT spectrum bins.
+///
+/// This matters for the partition classifier in
+/// `crate::trained_classifier` (the path-link is omitted to avoid
+/// rustdoc private-item complaints; the module is `pub(crate)`):
+/// residue values are O(1) magnitude (the floor envelope tracks the
+/// spectrum), while raw spectrum bins are typically 2-3 orders of
+/// magnitude smaller. Books trained from the residue distribution
+/// give a learned threshold that lines up with the encoder's runtime
+/// partition L2's.
+///
+/// `sample_rate` is the corpus's PCM sample rate — needed by floor1
+/// analysis for ATH (absolute threshold of hearing) scaling. Set to
+/// the standard 44_100 unless your corpus is at a different rate.
+pub fn extract_residue_partition_vectors(
+    pcm: &[f32],
+    blocksize: usize,
+    dim: usize,
+    sample_rate: u32,
+) -> Vec<Vec<f32>> {
+    if blocksize == 0 || dim == 0 {
+        return Vec::new();
+    }
+    let half = blocksize / 2;
+    if half % dim != 0 {
+        return Vec::new();
+    }
+    let stride = half;
+    if pcm.len() < blocksize {
+        return Vec::new();
+    }
+    // Build the encoder's standard mono setup so we have a real Floor1
+    // structure (long-block floor) to feed into `analyse_floor1` /
+    // `synth_floor1`. Bail out empty if anything in the setup pipeline
+    // changes shape — the trainer is corpus-agnostic but it does depend
+    // on the encoder's setup-builder staying stable.
+    let setup_hdr = build_encoder_setup_header(1);
+    let setup = match parse_setup(&setup_hdr, 1) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    if setup.floors.len() < 2 {
+        return Vec::new();
+    }
+    // Index 1 = long-block floor (see `build_encoder_setup_header`).
+    let floor = match &setup.floors[1] {
+        Floor::Type1(f) => f.clone(),
+        _ => return Vec::new(),
+    };
+
+    let window = build_window(blocksize, true, true, true, blocksize / 8);
+    let scale = 2.0 / blocksize as f32;
+    let n_blocks = (pcm.len() - blocksize) / stride + 1;
+    let mut vectors = Vec::with_capacity(n_blocks * (half / dim));
+    let mut windowed = vec![0f32; blocksize];
+    let mut spectrum = vec![0f32; half];
+    let mut curve = vec![1f32; half];
+    let mut residue = vec![0f32; half];
+    for b in 0..n_blocks {
+        let start = b * stride;
+        for i in 0..blocksize {
+            windowed[i] = pcm[start + i] * window[i];
+        }
+        forward_mdct_naive(&windowed, &mut spectrum);
+        for v in spectrum.iter_mut() {
+            *v *= scale;
+        }
+        // Floor analysis → quantised codes → re-render the curve the way
+        // the decoder will see it. The encoder's `encode_block` does the
+        // same dance: analyse + compute_codes + synth, then divide.
+        let target_y = analyse_floor1(&floor, &spectrum, half, sample_rate);
+        let codes = compute_floor1_codes(&floor, &target_y);
+        let decoded = crate::floor::Floor1Decoded {
+            unused: false,
+            y: codes,
+        };
+        for c in curve.iter_mut() {
+            *c = 1f32;
+        }
+        if synth_floor1(&floor, &decoded, half, &mut curve).is_err() {
+            continue;
+        }
+        for k in 0..half {
+            residue[k] = if curve[k].abs() > 1e-30 {
+                spectrum[k] / curve[k]
+            } else {
+                0.0
+            };
+        }
+        // Slice the residue spectrum into dim-sized partition vectors.
+        for chunk in residue.chunks_exact(dim) {
             vectors.push(chunk.to_vec());
         }
     }

@@ -1,10 +1,11 @@
-//! VQ codebook trainer CLI (round-1 scaffold for task #93).
+//! VQ codebook trainer CLI for task #93.
 //!
 //! Reads raw 16-bit signed little-endian PCM from `--input` (or stdin
 //! when `--input -`), runs the in-tree LBG trainer in
-//! `oxideav_vorbis::trainer`, and emits a Rust source file containing
-//! one or more trained `VqCodebook` constants. The output file is
-//! intended to be `include!`'d by `encoder.rs` in round 2.
+//! [`oxideav_vorbis::trainer`], and emits a Rust source file containing
+//! one or more trained `VqCodebook` constants. The encoder consumes the
+//! generated `src/trained_books.rs` via `include!` in `lib.rs` →
+//! `crate::trained_classifier::TrainedPartitionClassifier` (round 2).
 //!
 //! ```text
 //! Usage: vq-train [OPTIONS]
@@ -12,8 +13,8 @@
 //! Options:
 //!   --input <path>       Input PCM file, or "-" for stdin (default: stdin)
 //!   --channels <N>       Channels in input PCM (default: 1)
-//!   --sample-rate <N>    Sample rate, used only for documentation in the
-//!                        generated header comment (default: 44100)
+//!   --sample-rate <N>    Sample rate, used by the trainer's floor1
+//!                        analysis for ATH scaling (default: 44100)
 //!   --blocksize <N>      MDCT block size, must be a power of two
 //!                        (default: 2048 — encoder long block)
 //!   --books <N>          Number of codebooks to train (default: 4)
@@ -24,8 +25,9 @@
 //!   -h, --help           Print this help and exit.
 //! ```
 //!
-//! Round-1 deliverable: the trainer scaffold lands but does **not**
-//! wire trained books into the encoder's residue stage. That's round 2.
+//! See [`scripts/fetch-vq-corpus.sh`](../../scripts/fetch-vq-corpus.sh)
+//! for the LibriVox PD speech + Musopen Chopin (CC0) training corpus
+//! used to generate the in-tree `trained_books.rs`.
 
 use std::fs::File;
 use std::io::{self, BufWriter};
@@ -33,8 +35,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use oxideav_vorbis::trainer::{
-    emit_books_rs, extract_partition_vectors, read_pcm_s16le_to_mono, train_books, TrainerConfig,
-    TrainerError,
+    emit_books_rs, extract_residue_partition_vectors, read_pcm_s16le_to_mono, train_books,
+    TrainerConfig, TrainerError,
 };
 
 #[derive(Debug)]
@@ -170,10 +172,15 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[vq-train] {} mono samples loaded", pcm.len());
 
     eprintln!(
-        "[vq-train] extracting partition vectors (blocksize={}, dim={})",
-        args.blocksize, args.dim
+        "[vq-train] extracting residue partition vectors (blocksize={}, dim={}, sr={})",
+        args.blocksize, args.dim, args.sample_rate
     );
-    let vectors = extract_partition_vectors(&pcm, args.blocksize, args.dim);
+    // Round 2: extract POST-FLOOR-DIVIDE residue vectors so the trained
+    // centroids live in the same numerical space as the encoder's
+    // runtime residue values. See `extract_residue_partition_vectors`
+    // doc for why raw spectrum extraction (round 1) was a units mismatch.
+    let vectors =
+        extract_residue_partition_vectors(&pcm, args.blocksize, args.dim, args.sample_rate);
     eprintln!("[vq-train] extracted {} training vectors", vectors.len());
 
     let cfg = TrainerConfig {

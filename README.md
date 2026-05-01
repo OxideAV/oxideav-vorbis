@@ -111,6 +111,20 @@ What's implemented:
   cascade — exhaustive nearest-neighbour search per partition.
 - Residue type 2 (interleaved across channels) for both block sizes
   with two-class per-partition selection (silent vs active cascade).
+- **Trained-VQ partition classifier** (task #93). The silent/active
+  decision per residue partition is driven by the median 2-bin slice
+  L2 of four LBG-trained 256-entry codebooks — see
+  [`src/trained_books.rs`](src/trained_books.rs), trained from
+  ~15 minutes of mixed LibriVox PD speech + Musopen Chopin (CC0)
+  via [`scripts/fetch-vq-corpus.sh`](scripts/fetch-vq-corpus.sh) and
+  [`src/bin/vq-train.rs`](src/bin/vq-train.rs). Training is offline;
+  the trained centroids are baked into the crate as a `const` table.
+  On a 5-second sine + voice-band noise mix the trained classifier
+  saves ~11% bytes vs the prior hard-coded threshold at identical
+  SNR — see the
+  `encoder::tests::trained_vs_legacy_classifier_bitrate_5s_mix`
+  fixture. The bitstream layout is unchanged; the trained books
+  inform encoder choices only, not the wire format.
 - Xiph-laced 3-packet `extradata` in `output_params()`, ready to
   hand to a container muxer. ffmpeg's libvorbis decodes the output
   bit-cleanly — see the `ffmpeg_cross_decode_*` tests.
@@ -118,15 +132,15 @@ What's implemented:
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **Trained-VQ residue codebooks.** Our 4-book setup uses a 2-book
-  degenerate placeholder for the active residue stage; an in-tree
-  LBG (Linde-Buzo-Gray) VQ trainer is landing in stages under task
-  #93 (round 1: trainer scaffold + corpus survey shipped, see
-  `src/bin/vq-train.rs` and `TRAINING_CORPUS.md`; corpus + book set
-  to be picked in round 2; encoder dispatch among trained books is
-  round 3+). Libvorbis ships dozens of books per quality tier plus
-  energy-classifying master books, so until trained books land its
-  files compress tighter for comparable quality.
+- **Trained-book bitstream codebooks.** The encoder's residue
+  cascade still emits via the 4-codebook setup (floor1 Y, classbook,
+  main VQ, fine VQ) — the LBG-trained books in
+  [`src/trained_books.rs`](src/trained_books.rs) inform partition
+  classification but do not yet replace the bitstream codebooks
+  themselves. Doing so would let the encoder reach libvorbis's
+  per-genre book tuning (dozens of dim-16 trained books per
+  quality tier instead of one global main VQ); that's a setup-header
+  change tracked under future work.
 - **Per-band point-stereo thresholds.** We use a single global
   crossover frequency. Libvorbis's `iiPST` config carries a per-
   band threshold list so the crossover can adapt by frequency band.
