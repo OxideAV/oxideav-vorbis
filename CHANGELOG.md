@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Codebook lookup-type optimiser** (`codebook_optimizer` module,
+  task #173). New `detect_lookup1` / `optimise` / `optimise_setup`
+  functions inspect VQ codebooks at lookup_type 2 (flat per-entry
+  table) and promote them to lookup_type 1 (Cartesian-grid lookup)
+  when the per-entry data lies on a small shared grid. The detector
+  is exact-bit-equivalent: every entry's decoded f32 vector is
+  preserved through the rewrite (verified by round-trip tests
+  against `Codebook::vq_lookup`). Heuristic ceiling
+  `MAX_GRID_PER_DIM = 32` distinct values per dim — beyond that the
+  rewrite stops being worthwhile vs. the lookup_type-2 form. The
+  libvorbis q3 reference setup (`LIBVORBIS_SETUP_MONO_48K_Q3`)
+  consists entirely of lookup_type-0 (25 books) + lookup_type-1
+  (10 books), so the optimiser is a no-op there; on a synthetic
+  64-entry dim-2 trained-book-shaped lookup_type-2 input the
+  multiplicand-bit budget shrinks 93.8% (from 512 bits to 32 bits).
+  The in-tree LBG-trained books in `trained_books.rs` are encoder-
+  side only (not in the bitstream) and their unconstrained f32
+  centroids do not lie on a Cartesian grid; the detector correctly
+  reports `NotPossible` for that input shape — see the test
+  `real_trained_book_quantised_does_not_promote`. 13 new unit
+  + integration tests cover the detector heuristic, the round-trip
+  decode equivalence, and the libvorbis-setup no-op behaviour.
 - **Point-stereo channel coupling** above a configurable crossover
   frequency (default 4 kHz, see `DEFAULT_POINT_STEREO_FREQ`). For
   bins above the threshold, every coupled pair `(magnitude, angle)`

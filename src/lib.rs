@@ -31,6 +31,7 @@
 pub mod audio_packet;
 pub mod bits_ext;
 pub mod codebook;
+pub mod codebook_optimizer;
 pub mod dbtable;
 pub mod decoder;
 pub mod encoder;
