@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Floor type 0 (LSP) encoder** (`floor0_encoder` module, task #181).
+  New `make_encoder_floor0` constructor produces a Vorbis encoder that
+  emits floor0 packets end-to-end via LPC analysis + LSP conversion.
+  Pipeline per Vorbis I §6: windowed autocorrelation → Levinson-
+  Durbin recursion (`order = 16`) → LPC → LSP conversion via
+  symmetric / antisymmetric polynomial root-finding (Chebyshev grid
+  scan + bisection) → cosine quantisation against a 256-entry
+  `[-1, 1]²` VQ codebook → bitstream emission of `amplitude` +
+  book number + VQ codewords. The setup writer
+  `build_encoder_setup_header_floor0` produces a self-contained 2-
+  codebook setup (LSP VQ + constant-1.0 residue book) that decodes
+  through the existing `crate::decoder` path. Round-trip on a 440 +
+  880 Hz mono fixture (4 long blocks, 48 kHz) preserves the
+  fundamental-vs-off-band energy ratio. The
+  `floor0_encoder::should_use_floor0` helper exposes a per-frame
+  prediction-gain heuristic (Levinson-Durbin order 4 → ratio ≥ 4×)
+  for hybrid encoders that want to pick floor0 on tonal blocks and
+  floor1 on noise blocks. 8 new unit + integration tests cover the
+  codebook builder, LSP analysis, quantiser round-trip, setup parser
+  acceptance, and end-to-end decode of an encoded fixture.
 - **Codebook lookup-type optimiser** (`codebook_optimizer` module,
   task #173). New `detect_lookup1` / `optimise` / `optimise_setup`
   functions inspect VQ codebooks at lookup_type 2 (flat per-entry

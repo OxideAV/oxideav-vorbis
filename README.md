@@ -52,8 +52,9 @@ encoders produce (libvorbis / aoTuV across q0–q10):
 - Full asymmetric MDCT windows (short/long, per §1.3.2 / §4.3.1)
   and overlap-add across block-size transitions.
 
-Floor type 0 (LSP) is not implemented: no modern encoder produces
-it. The decoder rejects such streams with `Error::Unsupported`.
+Floor type 0 (LSP) is supported on the decode side and exercised by
+both the in-tree fixture suite and the floor0 encoder's round-trip
+tests (`floor0_encoder::tests::round_trip_tonal_fixture_via_our_decoder`).
 Output matches libvorbis / lewton within float rounding on the
 fixture suite.
 
@@ -98,13 +99,18 @@ What's implemented:
 - Sum/difference channel coupling (§1.3.3) for L-R pairs below the
   point-stereo crossover (~4 kHz, configurable via
   `DEFAULT_POINT_STEREO_FREQ`); above the crossover the encoder
-  switches to point-stereo (`a = 0`, `m = sign(dom) *
-  sqrt((L²+R²)/2)`) to monoise inter-aural phase that the human
-  ear cannot resolve. The decoder reconstructs `L = R = m` for
-  point-coupled bins. Multichannel streams use the standard
-  Vorbis I mappings (L/C/R, 4ch quad, 5.1, 7.1) with coupled L-R,
-  back-L/back-R, and side-L/side-R pairs; center and LFE channels
-  stay uncoupled.
+  splits the spectrum into critical-band sub-bands (4-6, 6-9, 9-13,
+  13-Nyquist kHz, see `POINT_STEREO_BAND_THRESHOLDS`) and applies
+  point-stereo per-band (`a = 0`, `m = sign(dom) * sqrt((L²+R²)/2)`)
+  only when the band's L/R correlation exceeds the band's threshold
+  (0.60 → 0.50 → 0.40 → 0.35 from low to high — HF bands are more
+  permissive because masking grows with frequency). Decorrelated
+  bands fall back to lossless sum/difference so phase information
+  is preserved where it matters perceptually. The decoder
+  reconstructs `L = R = m` for point-coupled bins. Multichannel
+  streams use the standard Vorbis I mappings (L/C/R, 4ch quad, 5.1,
+  7.1) with coupled L-R, back-L/back-R, and side-L/side-R pairs;
+  center and LFE channels stay uncoupled.
 - A 4-codebook residue setup: floor1 Y book (128 × 7-bit), a 4-entry
   variable-length classbook (`[1, 2, 3, 3]`), 128-entry main VQ
   ({-5..+5}²) and 16-entry fine correction VQ ({-0.6..+0.6}²) with
@@ -141,12 +147,16 @@ not bitstream conformance:
   per-genre book tuning (dozens of dim-16 trained books per
   quality tier instead of one global main VQ); that's a setup-header
   change tracked under future work.
-- **Per-band point-stereo thresholds.** We use a single global
-  crossover frequency. Libvorbis's `iiPST` config carries a per-
-  band threshold list so the crossover can adapt by frequency band.
-  Our scheme matches Libvorbis's qN ≤ 2 channel-folding shape but
-  not its qN ≥ 4 multi-band tuning.
-- **Floor type 0 (LSP) emission.** Setup always declares floor1.
+- **Floor type 0 (LSP) emission.** The default `make_encoder`
+  constructor still always declares floor1. A separate
+  `floor0_encoder::make_encoder_floor0` constructor (task #181) emits
+  floor0 packets end-to-end via LPC analysis (autocorrelation +
+  Levinson-Durbin) followed by LPC→LSP conversion; the
+  `floor0_encoder::should_use_floor0` helper provides the
+  prediction-gain heuristic for hybrid encoders that want to switch
+  per-frame. The default constructor doesn't yet wire those together
+  — picking floor0 vs floor1 from a single setup requires plumbing
+  both into the same mapping, tracked as future work.
 
 ## Performance
 

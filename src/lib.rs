@@ -36,6 +36,7 @@ pub mod dbtable;
 pub mod decoder;
 pub mod encoder;
 pub mod floor;
+pub mod floor0_encoder;
 pub mod identification;
 pub mod imdct;
 pub mod libvorbis_setup;
