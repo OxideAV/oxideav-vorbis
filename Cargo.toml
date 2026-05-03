@@ -26,6 +26,10 @@ oxideav-core = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Used by tests/docs_corpus.rs to demux the .ogg input fixtures from
+# docs/audio/vorbis/fixtures/ before feeding the per-stream Vorbis
+# packets to our decoder.
+oxideav-ogg = "0.1"
 
 [[bench]]
 name = "vorbis"
