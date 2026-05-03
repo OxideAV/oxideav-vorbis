@@ -34,12 +34,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-// Trait imports are load-bearing — they bring `next_packet` /
-// `send_packet` / `receive_frame` into scope on the boxed trait
-// objects below. `as _` silences the unused-imports lint clippy
-// raises in that idiom.
-use oxideav_core::{Decoder as _, Demuxer as _, Error, Frame, NullCodecResolver, ReadSeek};
+use oxideav_core::{Error, Frame, NullCodecResolver, ReadSeek};
 use oxideav_vorbis::decoder::make_decoder;
+// `Box<dyn Decoder>` / `Box<dyn Demuxer>` resolve their trait methods
+// directly through the dyn-vtable, so the `Decoder` / `Demuxer` traits
+// don't need to be in scope at the call site here.
 
 /// Locate `docs/audio/vorbis/fixtures/<name>/`. Tests run with CWD
 /// set to the crate root, so we walk two levels up to reach the
