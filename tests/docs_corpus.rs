@@ -34,7 +34,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_core::{Decoder, Demuxer, Error, Frame, NullCodecResolver, ReadSeek};
+// Trait imports are load-bearing — they bring `next_packet` /
+// `send_packet` / `receive_frame` into scope on the boxed trait
+// objects below. `as _` silences the unused-imports lint clippy
+// raises in that idiom.
+use oxideav_core::{Decoder as _, Demuxer as _, Error, Frame, NullCodecResolver, ReadSeek};
 use oxideav_vorbis::decoder::make_decoder;
 
 /// Locate `docs/audio/vorbis/fixtures/<name>/`. Tests run with CWD
@@ -366,11 +370,10 @@ fn compare(ours: &DecodedPcm, refp: &RefPcm) -> Vec<ChannelStat> {
 
     let mut stats: Vec<ChannelStat> = (0..chs).map(|_| ChannelStat::new()).collect();
     for f in 0..n {
-        for ch in 0..chs {
+        for (ch, s) in stats.iter_mut().enumerate() {
             let our = ours.samples[f * ours.channels as usize + ch] as i64;
             let r = refp.samples[f * refp.channels as usize + ch] as i64;
             let err = (our - r).abs();
-            let s = &mut stats[ch];
             s.total += 1;
             if err == 0 {
                 s.exact += 1;
