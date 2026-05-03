@@ -209,7 +209,11 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
             Ok(p) => p,
             Err(Error::Eof) => break,
             Err(e) => {
-                eprintln!("{}: demux error after {} samples: {e}", case.name, samples.len());
+                eprintln!(
+                    "{}: demux error after {} samples: {e}",
+                    case.name,
+                    samples.len()
+                );
                 break;
             }
         };
@@ -280,8 +284,8 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
     let mut data: Option<&[u8]> = None;
     while i + 8 <= bytes.len() {
         let id = &bytes[i..i + 4];
-        let sz = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
-            as usize;
+        let sz =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
         let body_start = i + 8;
         let body_end = body_start + sz;
         if body_end > bytes.len() {
@@ -292,8 +296,7 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
                 if sz < 16 {
                     return None;
                 }
-                let format_tag =
-                    u16::from_le_bytes([bytes[body_start], bytes[body_start + 1]]);
+                let format_tag = u16::from_le_bytes([bytes[body_start], bytes[body_start + 1]]);
                 channels = u16::from_le_bytes([bytes[body_start + 2], bytes[body_start + 3]]);
                 sample_rate = u32::from_le_bytes([
                     bytes[body_start + 4],
