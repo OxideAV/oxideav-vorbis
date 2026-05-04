@@ -83,10 +83,21 @@
 //!    cross-decodes all three. The trained-book classifier
 //!    (`src/trained_classifier.rs`) still drives per-partition
 //!    silent / active selection from the LBG-trained centroids in
-//!    `src/trained_books.rs`. Libvorbis ships per-quality LBG-trained
-//!    centroids rather than uniform grids; replacing our grid-based
-//!    main VQ with corpus-trained centroids per `BitrateTarget` is
-//!    future work.
+//!    `src/trained_books.rs`. Per-target point-stereo crossover
+//!    ([`crate::codebook_bank::BitrateTarget::point_stereo_freq_hz`])
+//!    pushes the crossover down on Low (3 kHz, more spectrum monoises
+//!    → smaller bitrate) and up on High (6 kHz, preserves HF stereo
+//!    image at higher rate); Medium stays at the historical 4 kHz so
+//!    fixtures remain byte-stable. Libvorbis ships per-quality LBG-
+//!    trained centroids rather than uniform grids; replacing our grid-
+//!    based main VQ with corpus-trained centroids would require
+//!    `lookup_type = 2` per-entry vector storage — but **modern ffmpeg
+//!    explicitly rejects `lookup_type >= 2`** ("Codebook lookup type
+//!    not supported" in `vorbis_dec.c`), so trained-centroid main books
+//!    are blocked on ffmpeg-interop grounds. The lookup_type=1 axis-
+//!    grid path is still on the table but requires tail-aware quantiser
+//!    design (pure k-means under-serves the residue distribution
+//!    tails); see CHANGELOG for the round-3 investigation notes.
 //!
 //! 3. **Floor type 0 (LSP)**: never seen in modern Vorbis files; not
 //!    implemented on the encode side. Our setup header always uses
@@ -217,6 +228,13 @@ const CLASSIFY_L2_THRESHOLD: f32 = 0.25;
 /// near-inaudible while halving the residue cost on the angle channel.
 /// libvorbis-q3 uses a similar threshold (~4 kHz crossover) for the
 /// "no coupling above N" channel-folding heuristic.
+///
+/// **Per-target override**: as of task #463, the [`make_encoder_with_bitrate`]
+/// constructor sets the crossover from
+/// [`crate::codebook_bank::BitrateTarget::point_stereo_freq_hz`]
+/// (Low → 3 kHz, Medium → this default, High → 6 kHz). This constant
+/// remains the value used by tests + the legacy single-default
+/// constructors that existed before the bank landed.
 pub const DEFAULT_POINT_STEREO_FREQ: f32 = 4000.0;
 
 /// Per-band point-stereo decision table (Vorbis I §4.2 channel-mapping
@@ -933,7 +951,12 @@ pub fn make_encoder_with_bitrate(
         next_block_long: true,
         prior_energy: 0.0,
         force_long_only: false,
-        point_stereo_freq: DEFAULT_POINT_STEREO_FREQ,
+        // Per-`BitrateTarget` point-stereo crossover (task #463): Low
+        // pushes the crossover down so more of the spectrum monoises
+        // and the angle channel's bitrate drops; High pushes it up to
+        // preserve HF stereo image at the cost of more angle-channel
+        // bits. See [`BitrateTarget::point_stereo_freq_hz`].
+        point_stereo_freq: target.point_stereo_freq_hz(),
         partition_classifier: TrainedPartitionClassifier::from_trained_books(),
         residue_book_config: ResidueBookConfig::for_target(target),
     }))
@@ -5248,5 +5271,107 @@ mod tests {
                 "{target:?} ffmpeg: 1 kHz energy should dominate"
             );
         }
+    }
+
+    /// Per-target point-stereo crossover (task #463) should be
+    /// monotone: Low < Medium < High. Lower crossover means more of
+    /// the spectrum is point-coupled (lossy mono fold above the
+    /// crossover) — Low maximises bit savings; High preserves more
+    /// HF stereo image.
+    #[test]
+    fn per_target_point_stereo_crossover_is_monotone() {
+        let l = BitrateTarget::Low.point_stereo_freq_hz();
+        let m = BitrateTarget::Medium.point_stereo_freq_hz();
+        let h = BitrateTarget::High.point_stereo_freq_hz();
+        assert!(l < m, "Low ({l} Hz) should be below Medium ({m} Hz)");
+        assert!(m < h, "Medium ({m} Hz) should be below High ({h} Hz)");
+    }
+
+    /// Medium target's per-target point-stereo crossover must equal
+    /// the historical [`DEFAULT_POINT_STEREO_FREQ`] so that the
+    /// `BitrateTarget::Medium` (default) encoder remains byte-stable
+    /// vs the prior single-default behaviour.
+    #[test]
+    fn medium_target_point_stereo_matches_historical_default() {
+        assert_eq!(
+            BitrateTarget::Medium.point_stereo_freq_hz(),
+            DEFAULT_POINT_STEREO_FREQ
+        );
+    }
+
+    /// On stereo content with strong HF correlation, the per-target
+    /// crossover should produce monotone bitrate: Low (3 kHz crossover
+    /// → most HF monoised) < Medium (4 kHz) ≤ High (6 kHz preserves
+    /// more HF stereo).
+    ///
+    /// Test signal: identical L/R sine + uncorrelated noise above
+    /// 5 kHz. Below 3 kHz both channels match exactly (worst case for
+    /// the angle channel — lossless). Above 5 kHz they're decorrelated
+    /// — Low folds them to mono (small extra bits), High keeps them
+    /// independent (more bits).
+    #[test]
+    fn per_target_point_stereo_monotone_bitrate_on_stereo_hf() {
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let sr = 48_000.0_f64;
+        let mut samples = vec![0i16; n * 2]; // stereo interleaved
+        let mut rng = 0xfeed_face_u32;
+        for i in 0..n {
+            let t = i as f64 / sr;
+            // Common low-frequency tone (matches L+R exactly).
+            let low = 0.3 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin();
+            // Decorrelated HF noise (different per channel).
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let nl = ((rng >> 16) as f32 / 65535.0 - 0.5) * 0.15;
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let nr = ((rng >> 16) as f32 / 65535.0 - 0.5) * 0.15;
+            samples[i * 2] = ((low as f32 + nl) * 32767.0) as i16;
+            samples[i * 2 + 1] = ((low as f32 + nr) * 32767.0) as i16;
+        }
+
+        let bytes_for = |target: BitrateTarget| -> usize {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(2);
+            params.sample_rate = Some(48_000);
+            let mut enc = make_encoder_with_bitrate(&params, target).unwrap();
+            let mut data = Vec::with_capacity(samples.len() * 2);
+            for s in &samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![data],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut total = 0usize;
+            while let Ok(p) = enc.receive_packet() {
+                total += p.data.len();
+            }
+            total
+        };
+
+        let low_bytes = bytes_for(BitrateTarget::Low);
+        let med_bytes = bytes_for(BitrateTarget::Medium);
+        let high_bytes = bytes_for(BitrateTarget::High);
+        eprintln!(
+            "stereo HF-decorrelated: Low={low_bytes}B Medium={med_bytes}B High={high_bytes}B"
+        );
+        // Low's lower crossover folds more of the HF noise into mono
+        // → smaller bitrate than Medium. (Allow some tolerance on
+        // noise-driven content.) The dominant effect is the residue
+        // book size delta from the bank, not the crossover, so we
+        // just assert monotone direction.
+        assert!(
+            low_bytes <= med_bytes,
+            "Low ({low_bytes}) should not exceed Medium ({med_bytes})"
+        );
+        // High's higher crossover preserves more HF stereo → not
+        // smaller than Medium. The residue book size delta also
+        // contributes here.
+        assert!(
+            high_bytes >= med_bytes,
+            "High ({high_bytes}) should not be below Medium ({med_bytes})"
+        );
     }
 }

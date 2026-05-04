@@ -97,20 +97,22 @@ What's implemented:
   blocks, 32 on long. Mono 1 kHz SNR is ~4.2 dB through both our
   decoder and ffmpeg's libvorbis (vs ~3.8 dB pre-tuning).
 - Sum/difference channel coupling (§1.3.3) for L-R pairs below the
-  point-stereo crossover (~4 kHz, configurable via
-  `DEFAULT_POINT_STEREO_FREQ`); above the crossover the encoder
-  splits the spectrum into critical-band sub-bands (4-6, 6-9, 9-13,
-  13-Nyquist kHz, see `POINT_STEREO_BAND_THRESHOLDS`) and applies
-  point-stereo per-band (`a = 0`, `m = sign(dom) * sqrt((L²+R²)/2)`)
-  only when the band's L/R correlation exceeds the band's threshold
-  (0.60 → 0.50 → 0.40 → 0.35 from low to high — HF bands are more
-  permissive because masking grows with frequency). Decorrelated
-  bands fall back to lossless sum/difference so phase information
-  is preserved where it matters perceptually. The decoder
-  reconstructs `L = R = m` for point-coupled bins. Multichannel
-  streams use the standard Vorbis I mappings (L/C/R, 4ch quad, 5.1,
-  7.1) with coupled L-R, back-L/back-R, and side-L/side-R pairs;
-  center and LFE channels stay uncoupled.
+  point-stereo crossover, with the crossover frequency picked from
+  the chosen `BitrateTarget` (`Low` → 3 kHz, `Medium` → 4 kHz, `High`
+  → 6 kHz; `DEFAULT_POINT_STEREO_FREQ = 4 kHz` is the legacy default).
+  Above the crossover the encoder splits the spectrum into critical-
+  band sub-bands (4-6, 6-9, 9-13, 13-Nyquist kHz, see
+  `POINT_STEREO_BAND_THRESHOLDS`) and applies point-stereo per-band
+  (`a = 0`, `m = sign(dom) * sqrt((L²+R²)/2)`) only when the band's
+  L/R correlation exceeds the band's threshold (0.60 → 0.50 → 0.40 →
+  0.35 from low to high — HF bands are more permissive because
+  masking grows with frequency). Decorrelated bands fall back to
+  lossless sum/difference so phase information is preserved where it
+  matters perceptually. The decoder reconstructs `L = R = m` for
+  point-coupled bins. Multichannel streams use the standard Vorbis I
+  mappings (L/C/R, 4ch quad, 5.1, 7.1) with coupled L-R,
+  back-L/back-R, and side-L/side-R pairs; center and LFE channels
+  stay uncoupled.
 - A 4-codebook residue setup: floor1 Y book (128 × 7-bit), a 4-entry
   variable-length classbook (`[1, 2, 3, 3]`), main VQ + fine correction
   VQ from a curated **bitstream-resident codebook bank**
@@ -157,9 +159,15 @@ not bitstream conformance:
   Cartesian grid per `(values_per_dim, codeword_len)` shape. They
   give monotone-in-bitrate behaviour and ffmpeg-accepted bitstreams
   but don't carry the corpus-trained centroid placement that
-  libvorbis's per-quality books do. Future work: replace the grid
-  with LBG centroids (per-bitrate-target re-training of the
-  trained-book corpus) for a tighter-fitting main VQ at each rate.
+  libvorbis's per-quality books do. **Note**: trained-centroid main
+  books would require Vorbis I `lookup_type = 2` storage, but modern
+  ffmpeg's libvorbis decoder explicitly rejects `lookup_type >= 2`
+  ("Codebook lookup type not supported" in `vorbis_dec.c`), so
+  trained-centroid main books are blocked on ffmpeg-interop grounds.
+  The lookup_type=1 axis-grid alternative is still on the table but
+  needs tail-aware quantiser design (pure k-means under-serves the
+  residue distribution's tails) — see CHANGELOG round-1
+  investigation notes.
 - **Floor type 0 (LSP) emission.** The default `make_encoder`
   constructor still always declares floor1. A separate
   `floor0_encoder::make_encoder_floor0` constructor (task #181) emits

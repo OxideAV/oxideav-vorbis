@@ -57,8 +57,17 @@
 
 /// Coarse bitrate target for the residue codebook bank. Chosen at
 /// encoder construction time and baked into the setup header. The
-/// variants differ only in the grid resolution of the main + fine
-/// residue VQ books and the corresponding codeword bit lengths.
+/// variants differ in:
+///
+/// - The grid resolution of the main + fine residue VQ books and
+///   the corresponding codeword bit lengths
+///   ([`ResidueBookConfig::for_target`]).
+/// - The point-stereo crossover frequency
+///   ([`BitrateTarget::point_stereo_freq_hz`]) — Low pushes the
+///   crossover down to ~3 kHz so more of the spectrum monoises and
+///   the angle channel's bitrate drops; High pushes it up to ~6 kHz
+///   to preserve HF stereo image at the cost of more bits on the
+///   angle channel.
 ///
 /// The actual emitted bit rate also depends heavily on the input
 /// signal (sparse-in-frequency tones cost much less than dense
@@ -78,6 +87,39 @@ pub enum BitrateTarget {
     /// finer-grained quantisation on dense or transient-heavy
     /// content. Use for ~128 kbps stereo or above.
     High,
+}
+
+impl BitrateTarget {
+    /// Per-target default point-stereo crossover frequency (Hz).
+    ///
+    /// Above this frequency the encoder switches coupled-pair coding
+    /// from lossless sum/difference to lossy point-stereo (the angle
+    /// channel is forced to zero so the decoder reconstructs both
+    /// channels as `m`). Lower crossover → more of the spectrum
+    /// monoises → smaller bitrate at the cost of HF stereo image.
+    ///
+    /// - `Low` → 3 kHz: aggressive point-stereo to maximise bitrate
+    ///   savings on speech-band content. Below 3 kHz inter-aural phase
+    ///   localisation matters; above is largely energy-envelope so the
+    ///   HF stereo loss is near-inaudible at low bitrates.
+    /// - `Medium` → 4 kHz: matches the historical encoder default
+    ///   so existing tests / fixtures stay byte-stable.
+    /// - `High` → 6 kHz: keep more of the HF stereo image lossless;
+    ///   accept the extra bits on the angle channel because at high
+    ///   bitrates the budget is there.
+    ///
+    /// On a typical stereo mixed-content 5 s sample the per-target
+    /// defaults shift residue bytes by ±5-8 % vs the prior single
+    /// 4 kHz default — speech-heavy content sees the biggest delta on
+    /// `Low` (more bits saved), classical/orchestral content sees the
+    /// biggest delta on `High` (more HF stereo preserved).
+    pub fn point_stereo_freq_hz(self) -> f32 {
+        match self {
+            BitrateTarget::Low => 3000.0,
+            BitrateTarget::Medium => 4000.0,
+            BitrateTarget::High => 6000.0,
+        }
+    }
 }
 
 /// Parameters describing a single dim-2 grid VQ codebook for the

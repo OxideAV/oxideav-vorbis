@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-`BitrateTarget` point-stereo crossover frequency** (task #463).
+  `BitrateTarget::point_stereo_freq_hz` now returns a per-target
+  default that the encoder constructor wires into the per-block
+  point-stereo coupling decision: `Low` → 3 kHz (more spectrum
+  monoised, smaller bitrate on speech-band content), `Medium` → 4 kHz
+  (matches `DEFAULT_POINT_STEREO_FREQ` so existing fixtures stay
+  byte-stable), `High` → 6 kHz (preserves more HF stereo image at
+  higher rate). On a 4-block stereo HF-decorrelated mix the bank
+  produces 10589 B (Low) / 11447 B (Medium) / 14026 B (High) — a
+  monotone bitrate ladder that respects each target's intent. ffmpeg
+  cross-decodes all three targets unchanged. 3 new unit tests gate
+  the monotone-crossover invariant, the Medium byte-stability
+  preservation vs `DEFAULT_POINT_STEREO_FREQ`, and the per-target
+  bitrate monotonicity on stereo HF-decorrelated content.
+
+  **Followup investigation: trained main-VQ centroids per
+  `BitrateTarget`** (task #463 round-1, NOT landed). Replacing the
+  grid-based main residue VQ with LBG-trained centroids would require
+  either (a) `lookup_type = 2` per-entry vector storage in the setup
+  header — but **modern ffmpeg's libvorbis decoder explicitly rejects
+  `lookup_type >= 2`** ("Codebook lookup type not supported" in
+  `vorbis_dec.c`), making lookup_type=2 incompatible with ffmpeg
+  cross-decode; or (b) `lookup_type = 1` with non-uniform per-axis
+  multiplicands trained via 1-D LBG on the residue distribution —
+  empirically this regresses SNR vs the uniform grid because pure
+  k-means centroids cluster near zero and under-serve the residue
+  distribution's tails, which tail-aware quantiser design (mu-law /
+  Lloyd-Max with range constraint) would address. Both alternatives
+  shipped behind paths in this round were reverted on the grounds
+  above; the encoder docs now document the ffmpeg-interop
+  constraint to save future agents the same investigation cycle.
+
 - **Bitstream-resident residue codebook bank** (`codebook_bank` module).
   New `BitrateTarget::{Low, Medium, High}` enum drives selection of a
   curated dim-2 grid VQ pair (main + fine) at encoder construction
