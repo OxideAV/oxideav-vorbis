@@ -14,23 +14,27 @@
 //!
 //! Encoder handles 1..=8 channels at any sample rate with sum/difference
 //! channel coupling (Vorbis I §1.3.3), ATH-scaled floor1, a multi-class
-//! type-2 residue stage cascading a 128-entry main VQ ({-5..+5}²) and a
-//! 16-entry fine-correction VQ ({-0.6, -0.2, 0.2, 0.6}²) under a
-//! variable-length classbook that spends one bit on the common
-//! both-silent partition pair. Per-partition silent/active selection is
-//! driven by the trained-book classifier in `trained_classifier.rs`
-//! (task #93 round 2) — the threshold is the median of the
-//! LBG-trained 2-bin slice L2 distribution from the LibriVox + Musopen
-//! Chopin training corpus baked into `trained_books.rs`. Transient-
-//! driven short-block switching uses the asymmetric long↔short windows
-//! per §1.3.2 / §4.3.1. Output decodes through both this crate's
-//! decoder and ffmpeg's libvorbis. See the `encoder.rs` module-level
-//! doc for the remaining bitrate trade-offs relative to libvorbis
-//! (point-stereo, bitstream-resident trained books, floor0 emission).
+//! type-2 residue stage cascading bitstream-resident main + fine VQ
+//! books from the [`codebook_bank`] (`Low | Medium | High`
+//! `BitrateTarget` variants — each a perfect-fill canonical-Huffman
+//! tree with the spec-canonical `lookup1_values == values_per_dim`
+//! relation) under a variable-length classbook that spends one bit on
+//! the common both-silent partition pair. Per-partition silent/active
+//! selection is driven by the trained-book classifier in
+//! `trained_classifier.rs` (task #93 round 2) — the threshold is the
+//! median of the LBG-trained 2-bin slice L2 distribution from the
+//! LibriVox + Musopen Chopin training corpus baked into
+//! `trained_books.rs`. Transient-driven short-block switching uses
+//! the asymmetric long↔short windows per §1.3.2 / §4.3.1. Output
+//! decodes through both this crate's decoder and ffmpeg's libvorbis.
+//! See the `encoder.rs` module-level doc for the remaining bitrate
+//! trade-offs relative to libvorbis (point-stereo, LBG-trained main
+//! VQ centroids, floor0 emission).
 
 pub mod audio_packet;
 pub mod bits_ext;
 pub mod codebook;
+pub mod codebook_bank;
 pub mod codebook_optimizer;
 pub mod dbtable;
 pub mod decoder;

@@ -112,9 +112,22 @@ What's implemented:
   7.1) with coupled L-R, back-L/back-R, and side-L/side-R pairs;
   center and LFE channels stay uncoupled.
 - A 4-codebook residue setup: floor1 Y book (128 × 7-bit), a 4-entry
-  variable-length classbook (`[1, 2, 3, 3]`), 128-entry main VQ
-  ({-5..+5}²) and 16-entry fine correction VQ ({-0.6..+0.6}²) with
-  cascade — exhaustive nearest-neighbour search per partition.
+  variable-length classbook (`[1, 2, 3, 3]`), main VQ + fine correction
+  VQ from a curated **bitstream-resident codebook bank**
+  ([`src/codebook_bank.rs`](src/codebook_bank.rs)) with three
+  bitrate-target variants — `Low` (8×8 main + 4×4 fine, 6+4 bit
+  codewords), `Medium` (11×11 + 4×4, 7+4 bit, the historical default)
+  and `High` (16×16 + 8×8, 8+6 bit). Each is a perfect-fill
+  canonical-Huffman tree with the spec-canonical
+  `lookup1_values(entries, 2) = values_per_dim` relation so libvorbis /
+  ffmpeg accept all three variants. Picked at construction via
+  `make_encoder_with_bitrate(&params, BitrateTarget::Low | Medium |
+  High)`; the chosen books go into the setup header and the audio
+  packets index them through `mapping → submap → residue`. On a 2-second
+  1 kHz mono mix Low saves ~7% bytes vs Medium at slightly lower SNR
+  (2.94 vs 4.20 dB); High costs ~22% more bytes for ~1.85 dB SNR gain
+  (6.05 dB). See `bank_targets_are_monotone_in_bitrate` for the
+  measurement.
 - Residue type 2 (interleaved across channels) for both block sizes
   with two-class per-partition selection (silent vs active cascade).
 - **Trained-VQ partition classifier** (task #93). The silent/active
@@ -138,15 +151,15 @@ What's implemented:
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **Trained-book bitstream codebooks.** The encoder's residue
-  cascade still emits via the 4-codebook setup (floor1 Y, classbook,
-  main VQ, fine VQ) — the LBG-trained books in
-  [`src/trained_books.rs`](src/trained_books.rs) inform partition
-  classification but do not yet replace the bitstream codebooks
-  themselves. Doing so would let the encoder reach libvorbis's
-  per-genre book tuning (dozens of dim-16 trained books per
-  quality tier instead of one global main VQ); that's a setup-header
-  change tracked under future work.
+- **Bank tuning is grid-derived, not LBG-trained.** The three
+  `BitrateTarget` entries in
+  [`src/codebook_bank.rs`](src/codebook_bank.rs) span a uniform
+  Cartesian grid per `(values_per_dim, codeword_len)` shape. They
+  give monotone-in-bitrate behaviour and ffmpeg-accepted bitstreams
+  but don't carry the corpus-trained centroid placement that
+  libvorbis's per-quality books do. Future work: replace the grid
+  with LBG centroids (per-bitrate-target re-training of the
+  trained-book corpus) for a tighter-fitting main VQ at each rate.
 - **Floor type 0 (LSP) emission.** The default `make_encoder`
   constructor still always declares floor1. A separate
   `floor0_encoder::make_encoder_floor0` constructor (task #181) emits

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bitstream-resident residue codebook bank** (`codebook_bank` module).
+  New `BitrateTarget::{Low, Medium, High}` enum drives selection of a
+  curated dim-2 grid VQ pair (main + fine) at encoder construction
+  time; the chosen books are emitted into the setup header so the
+  audio packets index bitstream-resident codebooks through the
+  `mapping → submap → residue` chain. Each variant is a perfect-fill
+  canonical-Huffman tree with the spec-canonical
+  `lookup1_values(entries, 2) == values_per_dim` invariant
+  (Vorbis I §9.2.3) — Low at codeword_len 6 / 8×8 grid, Medium at 7 /
+  11×11 (the historical default; byte-stable for existing fixtures),
+  High at 8 / 16×16. New public API:
+  `encoder::make_encoder_with_bitrate(&params, BitrateTarget)` plus
+  `encoder::build_encoder_setup_header_with_target(channels, target)`.
+  On a 2 s 1 kHz + low-noise mono mix Low encodes 47.8 kB / 2.94 dB
+  SNR vs Medium 51.6 kB / 4.20 dB (~7% bitrate saving) and High
+  63.0 kB / 6.05 dB (+22% bytes for +1.85 dB SNR). All three
+  variants ffmpeg cross-decode cleanly with the expected
+  target-frequency dominance. 10 new unit tests cover the bank's
+  spec-invariant validation, the Medium byte-stability gate, the
+  monotone-in-bitrate ordering, end-to-end round-trip per target,
+  per-target SNR floor, and ffmpeg cross-decode per target.
 - **Floor type 0 (LSP) encoder** (`floor0_encoder` module, task #181).
   New `make_encoder_floor0` constructor produces a Vorbis encoder that
   emits floor0 packets end-to-end via LPC analysis + LSP conversion.

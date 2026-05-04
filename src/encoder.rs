@@ -75,19 +75,18 @@
 //!    encoder-side phase encoding. The decoder already handles the
 //!    general inverse, so enabling this is an encoder-side refinement.
 //!
-//! 2. **Bigger residue VQ family**: our setup ships three residue books
-//!    (the 128-entry main VQ, the 16-entry fine correction book, and the
-//!    4-entry variable-length classbook) and two classifications. The
-//!    trained-book classifier (task #93 round 2,
-//!    `src/trained_classifier.rs`) drives the per-partition silent /
-//!    active decision from LBG-trained centroids in
-//!    `src/trained_books.rs` — saving ~11% bytes vs the prior hard-coded
-//!    threshold on a 5 s sine + voice-band noise mix at identical SNR.
-//!    Libvorbis still ships dozens of bitstream codebooks per quality
-//!    setting with energy-indexed master codebooks for finer rate-
-//!    distortion tuning; replacing the encoder's main + fine VQ with
-//!    bitstream-resident trained books (rather than just using them as
-//!    a classifier oracle) is future work.
+//! 2. **Bitstream-resident codebook bank**: the encoder now selects its
+//!    main + fine residue VQ books from a curated `BitrateTarget`-keyed
+//!    bank ([`crate::codebook_bank`], `Low | Medium | High`). Each
+//!    variant is a perfect-fill canonical-Huffman tree with the
+//!    spec-canonical `lookup1_values == values_per_dim` relation; ffmpeg
+//!    cross-decodes all three. The trained-book classifier
+//!    (`src/trained_classifier.rs`) still drives per-partition
+//!    silent / active selection from the LBG-trained centroids in
+//!    `src/trained_books.rs`. Libvorbis ships per-quality LBG-trained
+//!    centroids rather than uniform grids; replacing our grid-based
+//!    main VQ with corpus-trained centroids per `BitrateTarget` is
+//!    future work.
 //!
 //! 3. **Floor type 0 (LSP)**: never seen in modern Vorbis files; not
 //!    implemented on the encode side. Our setup header always uses
@@ -102,6 +101,7 @@ use oxideav_core::{
 };
 
 use crate::codebook::{parse_codebook, Codebook};
+use crate::codebook_bank::{BitrateTarget, GridBookSpec, ResidueBookConfig};
 use crate::dbtable::FLOOR1_INVERSE_DB;
 use crate::floor::synth_floor1;
 use crate::imdct::{build_window, forward_mdct_naive};
@@ -134,16 +134,28 @@ const VQ_DIM: usize = 2;
 /// but 128 entries at length 7 is a perfect-fill tree). Entries 0..120
 /// span the (e%11, e/11) grid in {-5..5}^2; entries 121..127 wrap modulo
 /// 11 and alias to (0..6, -5) — the encoder never picks them.
+///
+/// These constants describe the historical default (Medium) bank; the
+/// encoder now selects the actual book shape from
+/// [`crate::codebook_bank::ResidueBookConfig`] at construction time.
+/// They're kept around for documentation and as the test-suite's
+/// reference against which the Medium bank entry is checked.
+#[allow(dead_code)]
 const VQ_VALUES_PER_DIM: u32 = 11;
+#[allow(dead_code)]
 const VQ_MIN: f32 = -5.0;
+#[allow(dead_code)]
 const VQ_DELTA: f32 = 1.0;
 /// Number of VQ entries actually used (11×11). Encoder's exhaustive
 /// search restricts itself to this range.
+#[allow(dead_code)]
 const VQ_USED_ENTRIES: u32 = 121;
 /// Total VQ book entries — must be 2^VQ_CODEWORD_LEN to keep the Huffman
 /// tree well-formed.
+#[allow(dead_code)]
 const VQ_ENTRIES: u32 = 128;
 /// Length of each VQ codeword — log2(VQ_ENTRIES) = 7.
+#[allow(dead_code)]
 const VQ_CODEWORD_LEN: u32 = 7;
 
 /// Fine-correction VQ book (codebook 3). Dim 2, 16 entries (full tree at
@@ -152,10 +164,15 @@ const VQ_CODEWORD_LEN: u32 = 7;
 /// the nearest integer-grid point, the fine book quantises the remaining
 /// residual-of-residual to within ±0.2. Every entry is "used" (4x4=16)
 /// so the codebook is exactly full.
+#[allow(dead_code)]
 const FINE_VQ_VALUES_PER_DIM: u32 = 4;
+#[allow(dead_code)]
 const FINE_VQ_MIN: f32 = -0.6;
+#[allow(dead_code)]
 const FINE_VQ_DELTA: f32 = 0.4;
+#[allow(dead_code)]
 const FINE_VQ_ENTRIES: u32 = 16;
+#[allow(dead_code)]
 const FINE_VQ_CODEWORD_LEN: u32 = 4;
 
 /// Residue classbook: 4 entries indexed as `part0_class * 2 + part1_class`
@@ -471,22 +488,34 @@ fn write_setup_codebook_class(w: &mut BitWriter) {
 /// has 7 unused slots at the top. libvorbis tolerates this; our codebook
 /// builder accepts it as well (`build_decoder` checks for overspec, not
 /// underspec).
+#[allow(dead_code)]
 fn write_setup_codebook_vq(w: &mut BitWriter) {
-    w.write_u32(0x564342, 24);
+    let cfg = ResidueBookConfig::for_target(BitrateTarget::Medium);
+    write_setup_codebook_grid(w, &cfg.main);
+}
+
+/// Generic dim-2 grid VQ codebook writer driven by a [`GridBookSpec`]
+/// from the bitstream codebook bank ([`crate::codebook_bank`]). All
+/// entries share the same `codeword_len` so the canonical Huffman tree
+/// is full when `entries == 2^codeword_len` and underspec when
+/// `entries_used < entries` (libvorbis accepts both shapes).
+fn write_setup_codebook_grid(w: &mut BitWriter, spec: &GridBookSpec) {
+    w.write_u32(0x564342, 24); // sync "BCV"
     w.write_u32(VQ_DIM as u32, 16);
-    w.write_u32(VQ_ENTRIES, 24);
-    w.write_bit(false);
-    w.write_bit(false);
-    for _ in 0..VQ_ENTRIES {
-        w.write_u32(VQ_CODEWORD_LEN - 1, 5);
+    w.write_u32(spec.entries, 24);
+    w.write_bit(false); // ordered
+    w.write_bit(false); // sparse
+    for _ in 0..spec.entries {
+        w.write_u32(spec.codeword_len - 1, 5);
     }
     w.write_u32(1, 4); // lookup_type = 1
-    write_vorbis_float(w, VQ_MIN);
-    write_vorbis_float(w, VQ_DELTA);
-    w.write_u32(3, 4); // value_bits - 1 = 3 → 4 bits (need to hold 0..10)
+    write_vorbis_float(w, spec.min);
+    write_vorbis_float(w, spec.delta);
+    let value_bits = spec.value_bits();
+    w.write_u32(value_bits - 1, 4);
     w.write_bit(false); // sequence_p
-    for m in 0..VQ_VALUES_PER_DIM {
-        w.write_u32(m, 4);
+    for m in 0..spec.values_per_dim {
+        w.write_u32(m, value_bits);
     }
 }
 
@@ -495,6 +524,7 @@ fn write_setup_codebook_vq(w: &mut BitWriter) {
 /// [0..3]. Entry e decodes to `((e % 4) * delta + min, (e / 4) * delta +
 /// min)`; the 4×4 grid spans {-0.6, -0.2, 0.2, 0.6}^2 — exactly covers the
 /// ±0.5 quantisation half-step of the main book (whose delta is 1.0).
+#[allow(dead_code)]
 fn write_setup_codebook_fine(w: &mut BitWriter) {
     w.write_u32(0x564342, 24);
     w.write_u32(VQ_DIM as u32, 16);
@@ -694,6 +724,21 @@ fn write_mapping_section(
 /// applies forward sum/difference coupling before residue coding, the
 /// decoder applies the inverse before IMDCT.
 pub fn build_encoder_setup_header(channels: u8) -> Vec<u8> {
+    build_encoder_setup_header_with_target(channels, BitrateTarget::Medium)
+}
+
+/// Build a setup header with a specific [`BitrateTarget`]'s residue
+/// codebook bank ([`crate::codebook_bank`]). The setup layout is
+/// otherwise identical to [`build_encoder_setup_header`] — same Y / class
+/// books, same floor1 sections, same residue cascade structure — only
+/// the main + fine residue VQ codebooks change shape per target.
+///
+/// The chosen variant is what the audio packets will reference through
+/// the `mapping → submap → residue` chain; the decoder side picks up the
+/// new codebook shape from the bitstream and routes the cascade
+/// accordingly. No decoder change is needed.
+pub fn build_encoder_setup_header_with_target(channels: u8, target: BitrateTarget) -> Vec<u8> {
+    let cfg = ResidueBookConfig::for_target(target);
     let extra_x_long = long_floor_extra_x();
     let couples = standard_coupling_steps(channels);
     let mut w = BitWriter::with_capacity(512);
@@ -705,8 +750,8 @@ pub fn build_encoder_setup_header(channels: u8) -> Vec<u8> {
     w.write_u32(4 - 1, 8);
     write_setup_codebook_y(&mut w);
     write_setup_codebook_class(&mut w);
-    write_setup_codebook_vq(&mut w);
-    write_setup_codebook_fine(&mut w);
+    write_setup_codebook_grid(&mut w, &cfg.main);
+    write_setup_codebook_grid(&mut w, &cfg.fine);
 
     // 1 time-domain placeholder.
     w.write_u32(0, 6);
@@ -807,6 +852,22 @@ pub fn build_extradata(id: &[u8], comment: &[u8], setup: &[u8]) -> Vec<u8> {
 // ============================== Encoder driver ==============================
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_with_bitrate(params, BitrateTarget::default())
+}
+
+/// Build a Vorbis encoder whose bitstream-resident residue codebooks
+/// come from the [`crate::codebook_bank`] entry for `target`. This is
+/// the explicit-bitrate-target API; [`make_encoder`] is equivalent to
+/// `make_encoder_with_bitrate(params, BitrateTarget::default())`.
+///
+/// The chosen target is baked into the setup header at construction time
+/// — the audio packets index those bitstream-resident books for the
+/// rest of the stream. Pick at construction; you can't switch mid-stream
+/// without re-emitting the headers.
+pub fn make_encoder_with_bitrate(
+    params: &CodecParameters,
+    target: BitrateTarget,
+) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("Vorbis encoder: channels required"))?;
@@ -828,7 +889,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         DEFAULT_BLOCKSIZE_LONG_LOG2,
     );
     let comment_hdr = build_comment_header(&[]);
-    let setup_hdr = build_encoder_setup_header(channels as u8);
+    let setup_hdr = build_encoder_setup_header_with_target(channels as u8, target);
     let extradata = build_extradata(&id_hdr, &comment_hdr, &setup_hdr);
     let codebooks = extract_codebooks(&setup_hdr)?;
 
@@ -874,6 +935,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         force_long_only: false,
         point_stereo_freq: DEFAULT_POINT_STEREO_FREQ,
         partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+        residue_book_config: ResidueBookConfig::for_target(target),
     }))
 }
 
@@ -928,6 +990,11 @@ struct VorbisEncoder {
     /// trained centroid 2-bin slice L2 distribution. See
     /// `src/trained_classifier.rs`.
     partition_classifier: TrainedPartitionClassifier,
+    /// Bitstream-resident residue book bank choice. Selects which
+    /// codebook bank ([`crate::codebook_bank`]) was emitted into the
+    /// setup header at construction time and therefore which
+    /// `entries_used` bound the exhaustive VQ search uses.
+    residue_book_config: ResidueBookConfig,
 }
 
 /// Short-window size for the transient detector (samples). Chosen as
@@ -1607,13 +1674,16 @@ impl VorbisEncoder {
                                 target[j] = interleaved[bin + j];
                             }
                         }
-                        // Main VQ: restrict exhaustive search to the 121
-                        // grid entries; the 7 padding entries alias to
-                        // low-valued grid points and would bias search.
-                        // Every other book (classbook, fine VQ) uses all
-                        // entries exactly once so we search the full set.
+                        // Main VQ: restrict exhaustive search to the
+                        // bank-configured grid entries (`entries_used`);
+                        // remaining padding entries alias to low-valued
+                        // grid points and would bias search. Fine VQ
+                        // and classbook use all entries exactly once
+                        // so we search the full set there.
                         let max_entries = if book_idx as u32 == 2 {
-                            VQ_USED_ENTRIES
+                            self.residue_book_config.main.entries_used
+                        } else if book_idx as u32 == 3 {
+                            self.residue_book_config.fine.entries_used
                         } else {
                             book.entries
                         };
@@ -2832,6 +2902,7 @@ mod tests {
                 force_long_only: true,
                 point_stereo_freq: DEFAULT_POINT_STEREO_FREQ,
                 partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+                residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
             });
         }
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
@@ -3508,6 +3579,7 @@ mod tests {
             force_long_only: false,
             point_stereo_freq: DEFAULT_POINT_STEREO_FREQ,
             partition_classifier: classifier,
+            residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -3937,6 +4009,7 @@ mod tests {
             force_long_only: false,
             point_stereo_freq,
             partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+            residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -4859,5 +4932,321 @@ mod tests {
             target > off * 5.0,
             "ffmpeg cross-decode point-stereo: 6 kHz energy should dominate (target={target}, off={off})"
         );
+    }
+
+    // ========== Codebook bank tests ==========
+
+    /// The Medium bank entry must produce a setup whose codebook 2 / 3
+    /// shapes match the historical default. This is the byte-stability
+    /// gate: the default encoder API (`make_encoder`) routes through
+    /// `make_encoder_with_bitrate(_, BitrateTarget::Medium)`, so any
+    /// drift here breaks fixtures.
+    #[test]
+    fn medium_bank_setup_matches_legacy_shape() {
+        let bytes = build_encoder_setup_header_with_target(2, BitrateTarget::Medium);
+        let setup = parse_setup(&bytes, 2).expect("Medium setup parses");
+        // Main VQ: 128 entries / dim 2 / length 7.
+        assert_eq!(setup.codebooks[2].entries, 128);
+        assert_eq!(setup.codebooks[2].dimensions, 2);
+        assert!(setup.codebooks[2].codeword_lengths.iter().all(|&l| l == 7));
+        let v = setup.codebooks[2].vq.as_ref().unwrap();
+        assert_eq!(v.lookup_type, 1);
+        assert!((v.min - (-5.0)).abs() < 1e-5);
+        assert!((v.delta - 1.0).abs() < 1e-5);
+        // Fine VQ: 16 entries / dim 2 / length 4.
+        assert_eq!(setup.codebooks[3].entries, 16);
+        let fv = setup.codebooks[3].vq.as_ref().unwrap();
+        assert!((fv.min - (-0.6)).abs() < 1e-5);
+    }
+
+    /// Low / Medium / High banks must each produce a parseable setup
+    /// that round-trips through our parser. Smoke-tests that the bank
+    /// dimensions and value_bits are wire-format-legal.
+    #[test]
+    fn all_bank_targets_produce_parseable_setups() {
+        for target in [
+            BitrateTarget::Low,
+            BitrateTarget::Medium,
+            BitrateTarget::High,
+        ] {
+            let bytes = build_encoder_setup_header_with_target(2, target);
+            let setup = parse_setup(&bytes, 2)
+                .unwrap_or_else(|e| panic!("setup for {target:?} failed to parse: {e}"));
+            assert_eq!(setup.codebooks.len(), 4, "{target:?}: codebook count");
+            assert_eq!(setup.floors.len(), 2, "{target:?}: floor count");
+            assert_eq!(setup.residues.len(), 2, "{target:?}: residue count");
+            // Main VQ shape must match the bank entry.
+            let cfg = ResidueBookConfig::for_target(target);
+            assert_eq!(
+                setup.codebooks[2].entries, cfg.main.entries,
+                "{target:?}: main entries"
+            );
+            assert!(
+                setup.codebooks[2]
+                    .codeword_lengths
+                    .iter()
+                    .all(|&l| l as u32 == cfg.main.codeword_len),
+                "{target:?}: main codeword lengths"
+            );
+            assert_eq!(
+                setup.codebooks[3].entries, cfg.fine.entries,
+                "{target:?}: fine entries"
+            );
+        }
+    }
+
+    /// Byte-savings gate: round-trip the same 2-second sine + low-noise
+    /// mix through Low / Medium / High encoders and validate that
+    /// (a) Low produces fewer bytes than Medium and (b) High produces
+    /// more bytes (or the same) than Medium. The crucial property is
+    /// monotone bitrate ordering by target — picking a smaller bank
+    /// must save bits.
+    #[test]
+    fn bank_targets_are_monotone_in_bitrate() {
+        let n_seconds = 2usize;
+        let sr_hz = 48_000usize;
+        let n = sr_hz * n_seconds;
+        let mut samples = Vec::with_capacity(n);
+        let mut rng: u32 = 0xC0FF_EE42;
+        let mut next = || {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for i in 0..n {
+            let t = i as f32 / sr_hz as f32;
+            let sine = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.4;
+            let noise = next() * 0.1;
+            let s = (sine + noise).clamp(-1.0, 1.0);
+            samples.push((s * 30_000.0) as i16);
+        }
+        let mut bytes_per_target = Vec::new();
+        for target in [
+            BitrateTarget::Low,
+            BitrateTarget::Medium,
+            BitrateTarget::High,
+        ] {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(1);
+            params.sample_rate = Some(sr_hz as u32);
+            let mut enc = make_encoder_with_bitrate(&params, target).unwrap();
+            let mut data = Vec::with_capacity(samples.len() * 2);
+            for s in &samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![data],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut total = 0usize;
+            while let Ok(p) = enc.receive_packet() {
+                total += p.data.len();
+            }
+            eprintln!("bitrate-target {target:?}: {total} bytes");
+            bytes_per_target.push((target, total));
+        }
+        let low_bytes = bytes_per_target[0].1;
+        let medium_bytes = bytes_per_target[1].1;
+        let high_bytes = bytes_per_target[2].1;
+        // Low must beat Medium on residue cost. Setup header overhead
+        // is ~constant, so this isolates the per-packet residue savings.
+        // Low uses 6-bit codewords vs Medium's 7-bit → at least one bit
+        // saved per active partition. On a 2-second mono mix that's
+        // hundreds of bytes.
+        assert!(
+            low_bytes < medium_bytes,
+            "Low ({low_bytes}) should produce fewer bytes than Medium ({medium_bytes})"
+        );
+        // High uses 8-bit codewords on the main book → bigger setup
+        // header AND bigger residue per active partition. It should
+        // not be smaller than Medium.
+        assert!(
+            high_bytes >= medium_bytes,
+            "High ({high_bytes}) should not be smaller than Medium ({medium_bytes})"
+        );
+    }
+
+    /// Encode-decode round-trip via every bank entry: each must produce
+    /// non-empty output that decodes back to non-zero PCM with the
+    /// expected target frequency dominating an off-band reference.
+    #[test]
+    fn each_bank_target_roundtrips_via_our_decoder() {
+        use crate::decoder::make_decoder as make_dec;
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
+        for target in [
+            BitrateTarget::Low,
+            BitrateTarget::Medium,
+            BitrateTarget::High,
+        ] {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(1);
+            params.sample_rate = Some(48_000);
+            let mut enc = make_encoder_with_bitrate(&params, target).expect("encoder for target");
+            let mut data = Vec::with_capacity(samples.len() * 2);
+            for s in &samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![data],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut packets = Vec::new();
+            while let Ok(p) = enc.receive_packet() {
+                packets.push(p);
+            }
+            let dec_params = enc.output_params().clone();
+            let mut dec = make_dec(&dec_params).expect("decoder accepts target setup");
+            let mut decoded: Vec<i16> = Vec::new();
+            for pkt in &packets {
+                dec.send_packet(pkt).unwrap();
+                if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                    for chunk in a.data[0].chunks_exact(2) {
+                        decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    }
+                }
+            }
+            assert!(
+                !decoded.is_empty(),
+                "{target:?}: decoded PCM unexpectedly empty"
+            );
+            let target_mag = goertzel_mag(&decoded, 1000.0, 48_000.0);
+            let off_mag = goertzel_mag(&decoded, 7000.0, 48_000.0);
+            eprintln!("bank {target:?}: target_1k={target_mag:.0} off_7k={off_mag:.0}");
+            assert!(
+                target_mag > off_mag * 2.0,
+                "{target:?}: 1 kHz energy ({target_mag}) should dominate over 7 kHz ({off_mag})"
+            );
+        }
+    }
+
+    /// SNR floor per bank target. Each should keep the cascade SNR floor
+    /// for a 1 kHz mono sine. High has tighter quantisation → must hit
+    /// at least Medium's floor; Low can drop a bit but must stay
+    /// audibly intact.
+    #[test]
+    fn each_bank_target_preserves_snr_floor() {
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 8;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
+        let skip = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        for (target, snr_min) in [
+            (BitrateTarget::Low, 2.5_f64),
+            (BitrateTarget::Medium, 3.8),
+            (BitrateTarget::High, 3.8),
+        ] {
+            let pcm = encode_with_bitrate_target(1, n, &samples, target);
+            let snr = snr_db(&samples, &pcm, skip);
+            eprintln!("bank {target:?} 1 kHz SNR = {snr:.2} dB (floor {snr_min})");
+            assert!(
+                snr >= snr_min,
+                "{target:?}: SNR {snr:.2} below floor {snr_min}"
+            );
+        }
+    }
+
+    /// Helper: encode + our-decoder round-trip with a specific bank
+    /// target. Returns interleaved S16 PCM.
+    fn encode_with_bitrate_target(
+        channels: u16,
+        samples_per_channel: usize,
+        pcm_i16_interleaved: &[i16],
+        target: BitrateTarget,
+    ) -> Vec<i16> {
+        use crate::decoder::make_decoder as make_dec;
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.channels = Some(channels);
+        params.sample_rate = Some(48_000);
+        let mut enc = make_encoder_with_bitrate(&params, target).unwrap();
+        let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
+        for s in pcm_i16_interleaved {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            samples: samples_per_channel as u32,
+            pts: Some(0),
+            data: vec![data],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        let dec_params = enc.output_params().clone();
+        let mut dec = make_dec(&dec_params).expect("decoder accepts our extradata");
+        let mut out: Vec<i16> = Vec::new();
+        for pkt in &packets {
+            dec.send_packet(pkt).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for chunk in a.data[0].chunks_exact(2) {
+                    out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+            }
+        }
+        out
+    }
+
+    /// ffmpeg cross-decode for each bank entry. Best-effort; SKIPs when
+    /// ffmpeg is unavailable. Verifies that all three bank shapes
+    /// produce ffmpeg-acceptable bitstreams (libvorbis is famously
+    /// strict about codebook tree structure — over- or under-spec
+    /// trees cause hard rejects).
+    #[test]
+    fn ffmpeg_cross_decode_each_bank_target() {
+        if !ffmpeg_cross_decode_available() {
+            eprintln!("SKIP: ffmpeg not on PATH");
+            return;
+        }
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
+        for target in [
+            BitrateTarget::Low,
+            BitrateTarget::Medium,
+            BitrateTarget::High,
+        ] {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(1);
+            params.sample_rate = Some(48_000);
+            let mut enc = make_encoder_with_bitrate(&params, target).unwrap();
+            let mut data = Vec::with_capacity(samples.len() * 2);
+            for s in &samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![data],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut packets = Vec::new();
+            while let Ok(p) = enc.receive_packet() {
+                packets.push(p);
+            }
+            let extradata = enc.output_params().extradata.clone();
+            let ogg = mux_to_ogg(&extradata, &packets);
+            let pcm_ffmpeg = match ffmpeg_decode_to_s16le(&ogg, 1) {
+                Some(p) => p,
+                None => {
+                    panic!("{target:?}: ffmpeg rejected our Ogg stream");
+                }
+            };
+            assert!(
+                !pcm_ffmpeg.is_empty(),
+                "{target:?}: ffmpeg decoded zero samples"
+            );
+            let target_mag = goertzel_mag(&pcm_ffmpeg, 1000.0, 48_000.0);
+            let off_mag = goertzel_mag(&pcm_ffmpeg, 7000.0, 48_000.0);
+            eprintln!("ffmpeg bank {target:?}: target_1k={target_mag:.0} off_7k={off_mag:.0}");
+            assert!(
+                target_mag > off_mag * 5.0,
+                "{target:?} ffmpeg: 1 kHz energy should dominate"
+            );
+        }
     }
 }
