@@ -190,9 +190,9 @@ impl BitrateTarget {
     pub fn global_corr_override_threshold(self) -> f32 {
         match self {
             BitrateTarget::Low => 0.92,
-            BitrateTarget::Medium => 1.01,    // > 1.0 → always disabled
-            BitrateTarget::High => 1.01,      // same
-            BitrateTarget::HighTail => 1.01,  // same
+            BitrateTarget::Medium => 1.01,   // > 1.0 → always disabled
+            BitrateTarget::High => 1.01,     // same
+            BitrateTarget::HighTail => 1.01, // same
         }
     }
 
@@ -545,10 +545,18 @@ mod tests {
     /// third residue class; Low and Medium should not.
     #[test]
     fn extra_main_present_on_high_targets_only() {
-        assert!(ResidueBookConfig::for_target(BitrateTarget::Low).extra_main.is_none());
-        assert!(ResidueBookConfig::for_target(BitrateTarget::Medium).extra_main.is_none());
-        assert!(ResidueBookConfig::for_target(BitrateTarget::High).extra_main.is_some());
-        assert!(ResidueBookConfig::for_target(BitrateTarget::HighTail).extra_main.is_some());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::Low)
+            .extra_main
+            .is_none());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::Medium)
+            .extra_main
+            .is_none());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::High)
+            .extra_main
+            .is_some());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::HighTail)
+            .extra_main
+            .is_some());
     }
 
     /// The Medium variant must match the encoder's historical book shape

@@ -850,7 +850,7 @@ fn extended_residue_books() -> (Vec<u8>, Vec<[i16; 8]>, u32) {
     cascades[1] = 0b0000_0011;
     books[1][0] = 2; // main
     books[1][1] = 3; // fine
-    // class 2: high-energy — extra_main (book 4) + fine (book 3)
+                     // class 2: high-energy — extra_main (book 4) + fine (book 3)
     cascades[2] = 0b0000_0011;
     books[2][0] = 4; // extra_main
     books[2][1] = 3; // fine (shared with class 1)
@@ -2027,8 +2027,7 @@ impl VorbisEncoder {
             let mi0 = mapping.coupling[0].0 as usize;
             let ai0 = mapping.coupling[0].1 as usize;
             if mi0 < residues.len() && ai0 < residues.len() {
-                let full_corr =
-                    band_lr_correlation(&residues[mi0], &residues[ai0], 0, n_half);
+                let full_corr = band_lr_correlation(&residues[mi0], &residues[ai0], 0, n_half);
                 if full_corr >= self.global_corr_override_threshold {
                     // Full-band point-stereo: lower effective crossover to bin 0
                     // so all bins are treated as "above the crossover" and
@@ -4275,8 +4274,7 @@ mod tests {
             force_floor0: false,
             mode_bits: 1,
             floor0_available: false,
-            global_corr_override_threshold: BitrateTarget::Medium
-                .global_corr_override_threshold(),
+            global_corr_override_threshold: BitrateTarget::Medium.global_corr_override_threshold(),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -4712,8 +4710,7 @@ mod tests {
             force_floor0: false,
             mode_bits: 1,
             floor0_available: false,
-            global_corr_override_threshold: BitrateTarget::Medium
-                .global_corr_override_threshold(),
+            global_corr_override_threshold: BitrateTarget::Medium.global_corr_override_threshold(),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -5682,7 +5679,11 @@ mod tests {
             // 5 codebooks: Y + classbook + main + fine + extra_main.
             // Low / Medium use 2-class residue → 4 codebooks.
             let expected_cb = if cfg.extra_main.is_some() { 5 } else { 4 };
-            assert_eq!(setup.codebooks.len(), expected_cb, "{target:?}: codebook count");
+            assert_eq!(
+                setup.codebooks.len(),
+                expected_cb,
+                "{target:?}: codebook count"
+            );
             assert_eq!(setup.floors.len(), 2, "{target:?}: floor count");
             assert_eq!(setup.residues.len(), 2, "{target:?}: residue count");
             // Main VQ shape must match the bank entry.
@@ -6677,7 +6678,9 @@ mod tests {
                 total_bytes += p.data.len();
             }
             let kbps = (total_bytes * 8) as f64 / (duration_s as f64 * 1000.0);
-            eprintln!("bitrate_calibration {target:?}: {total_bytes} bytes → {kbps:.1} kbps stereo");
+            eprintln!(
+                "bitrate_calibration {target:?}: {total_bytes} bytes → {kbps:.1} kbps stereo"
+            );
             kbps_per_target.push((target, kbps));
         }
 
