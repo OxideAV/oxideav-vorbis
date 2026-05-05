@@ -135,6 +135,91 @@ impl BitrateTarget {
             BitrateTarget::HighTail => 4000.0,
         }
     }
+
+    /// Per-target silence percentile for the trained-book partition classifier.
+    ///
+    /// The trained classifier pre-sorts all 2-bin slice L2 magnitudes from the
+    /// LBG-trained corpus codebooks and uses the `p`-th percentile as the
+    /// silence/active cut-point (`TrainedPartitionClassifier::from_percentile`).
+    ///
+    /// Higher values silence more partitions (lower bitrate, more coding noise
+    /// in quiet regions); lower values keep more partitions active (higher
+    /// bitrate, lower error).
+    ///
+    /// - `Low` → 0.70 (70th percentile): aggressive silencing — roughly 70%
+    ///   of "corpus-typical" partitions are treated as silent. This is the
+    ///   primary bitrate lever at the `Low` rate target alongside the smaller
+    ///   codebook grid.
+    /// - `Medium` → 0.50 (50th percentile / median): the historical default,
+    ///   bytes-stable with the pre-per-target-classifier encoder.
+    /// - `High` → 0.35: fewer silent partitions — more residue bits devoted
+    ///   to moderate-energy bands. Works alongside the larger book to push
+    ///   quality up.
+    /// - `HighTail` → 0.40: slightly looser than `High`; the mu-law grid
+    ///   captures more energy from active partitions, so we don't need to
+    ///   activate quite as many partitions to hit the same quality.
+    pub fn silence_percentile(self) -> f32 {
+        match self {
+            BitrateTarget::Low => 0.70,
+            BitrateTarget::Medium => 0.50,
+            BitrateTarget::High => 0.35,
+            BitrateTarget::HighTail => 0.40,
+        }
+    }
+
+    /// Per-target frame-level full-band correlation threshold for M/S
+    /// coupling override.
+    ///
+    /// In addition to the per-band per-frame point-stereo decision
+    /// (driven by `POINT_STEREO_BAND_THRESHOLDS`), the encoder can
+    /// observe the *global* inter-channel correlation across the entire
+    /// MDCT spectrum. When the full-frame correlation exceeds this
+    /// threshold the encoder extends point-stereo aggressively: it
+    /// effectively lowers the crossover bin so more of the sub-crossover
+    /// region also uses point-stereo for that one frame. This is most
+    /// effective on speech (near-mono content) where consecutive frames
+    /// are highly correlated across the full band.
+    ///
+    /// - `Low` → 0.92: apply full-band point-stereo very aggressively
+    ///   on near-mono content (saves the most bits per frame).
+    /// - `Medium` / `High` / `HighTail` → 1.01 (disabled): never
+    ///   trigger the global override. Medium keeps the historical
+    ///   byte-stable point-stereo behaviour so existing fixtures are
+    ///   unaffected; High/HighTail preserve HF stereo image at those
+    ///   bitrates where the extra bits are affordable.
+    pub fn global_corr_override_threshold(self) -> f32 {
+        match self {
+            BitrateTarget::Low => 0.92,
+            BitrateTarget::Medium => 1.01,    // > 1.0 → always disabled
+            BitrateTarget::High => 1.01,      // same
+            BitrateTarget::HighTail => 1.01,  // same
+        }
+    }
+
+    /// Per-target residue `begin` offset (in interleaved bins) for the long
+    /// block residue window. Setting `begin > 0` skips the very lowest
+    /// spectral bins from VQ coding, relying on the floor curve alone to
+    /// represent them. At low bitrates this saves bits without audible loss
+    /// because:
+    ///   1. The floor already captures DC and sub-60 Hz energy from the
+    ///      `xlist[0]` post at bin 0.
+    ///   2. Residue VQ at the very lowest bins wastes codeword budget on
+    ///      near-DC energy that is dominated by masking from higher bands.
+    ///
+    /// - `Low` → 2 (skip first bin-pair): trades 2 bins of VQ for ~2 fewer
+    ///   active-class bits per channel per frame at essentially zero perceived
+    ///   cost.
+    /// - `Medium` / `High` / `HighTail` → 0: encode the full spectrum (the
+    ///   extra bins cost little at higher bitrates and preserve mathematical
+    ///   fidelity).
+    pub fn residue_begin_offset(self) -> u32 {
+        match self {
+            BitrateTarget::Low => 2,
+            BitrateTarget::Medium => 0,
+            BitrateTarget::High => 0,
+            BitrateTarget::HighTail => 0,
+        }
+    }
 }
 
 /// Parameters describing a single dim-2 grid VQ codebook for the
@@ -252,12 +337,22 @@ impl GridBookSpec {
 
 /// A complete residue codebook configuration. Carries the
 /// `(main, fine)` pair plus the bank label so the encoder knows
-/// which target it built against.
+/// which target it built against. An optional `extra_main` book
+/// enables a third "high-energy" residue class for targets that
+/// benefit from finer VQ on the loudest partitions.
 #[derive(Copy, Clone, Debug)]
 pub struct ResidueBookConfig {
     pub target: BitrateTarget,
     pub main: GridBookSpec,
     pub fine: GridBookSpec,
+    /// Optional second main-VQ book used as residue class 2 ("high-energy"
+    /// partitions). When `Some`, the setup ships three residue classes:
+    /// class 0 = silent (no book), class 1 = active (main + fine cascade),
+    /// class 2 = high-energy (extra_main + fine cascade). The classbook
+    /// widens to `(dim=2, 9 entries)` to accommodate the 3×3 class-pair
+    /// encoding with the same variable-length scheme. When `None` the
+    /// historical 2-class setup is used (bytes-stable).
+    pub extra_main: Option<GridBookSpec>,
 }
 
 impl ResidueBookConfig {
@@ -285,6 +380,10 @@ impl ResidueBookConfig {
                 // Medium so stage-2 quantisation noise is higher but
                 // the per-active-partition cost matches Medium's.
                 fine: GridBookSpec::new(4, -0.5, 0.333, 4),
+                // No extra class at Low — 2 classes is sufficient and
+                // a 3-entry classbook would widen the per-partition
+                // header codeword beyond what the Low rate budget allows.
+                extra_main: None,
             },
             BitrateTarget::Medium => Self {
                 target,
@@ -296,6 +395,9 @@ impl ResidueBookConfig {
                 // codeword_len=4 → entries=16, lookup_values=4.
                 // 4×4 grid {-0.6..+0.6} step 0.4.
                 fine: GridBookSpec::new(4, -0.6, 0.4, 4),
+                // No extra class for Medium either — keep the historical
+                // 2-class setup byte-stable.
+                extra_main: None,
             },
             BitrateTarget::High => Self {
                 target,
@@ -309,6 +411,13 @@ impl ResidueBookConfig {
                 // step than Medium so stage-2 reduces residual error
                 // farther.
                 fine: GridBookSpec::new(8, -0.7, 0.2, 6),
+                // Extra main book for high-energy partitions (class 2):
+                // codeword_len=9 → entries=512, lookup_values=22.
+                // 22×22 grid {-10.5..+10.5} step 1 covers larger
+                // residue excursions (transient peaks, heavy bass lines)
+                // at one extra codeword bit vs the main book.
+                // lookup1_values(512, 2) = 22 since 22²=484 ≤ 512 < 23²=529.
+                extra_main: Some(GridBookSpec::new(22, -10.5, 1.0, 9)),
             },
             BitrateTarget::HighTail => Self {
                 target,
@@ -332,6 +441,13 @@ impl ResidueBookConfig {
                 // the Medium grid covers it adequately; the win is
                 // entirely in the main book.
                 fine: GridBookSpec::new(4, -0.6, 0.4, 4),
+                // Extra main book for HighTail high-energy class:
+                // same dimension as the non-uniform main but on a
+                // wider uniform grid for partitions whose residual
+                // exceeds the mu-law range (large excursions that
+                // land outside the HighTail main book's {-8..+8} grid).
+                // codeword_len=9 → entries=512, lookup_values=22.
+                extra_main: Some(GridBookSpec::new(22, -10.5, 1.0, 9)),
             },
         }
     }
@@ -391,40 +507,48 @@ mod tests {
     ///   bitstream parser reads exactly `values_per_dim`
     ///   multiplicands per book — Vorbis I §9.2.3).
     /// - `value_bits` holds the largest multiplicand index.
+    fn check_book_invariants(label: &str, target: BitrateTarget, book: GridBookSpec) {
+        assert!(
+            book.entries_used <= book.entries,
+            "{target:?}/{label}: entries_used {} > entries {}",
+            book.entries_used,
+            book.entries
+        );
+        assert_eq!(
+            book.entries,
+            1u32 << book.codeword_len,
+            "{target:?}/{label}: entries must equal 2^codeword_len"
+        );
+        assert_eq!(
+            lookup1_values(book.entries, 2),
+            book.values_per_dim,
+            "{target:?}/{label}: lookup1_values invariant violated"
+        );
+        assert!(
+            (1u32 << book.value_bits()) >= book.values_per_dim,
+            "{target:?}/{label}: value_bits insufficient"
+        );
+    }
+
     #[test]
     fn all_configs_have_valid_dimensions() {
         for cfg in ResidueBookConfig::all() {
-            for (label, book) in [("main", cfg.main), ("fine", cfg.fine)] {
-                assert!(
-                    book.entries_used <= book.entries,
-                    "{:?}/{}: entries_used {} > entries {}",
-                    cfg.target,
-                    label,
-                    book.entries_used,
-                    book.entries
-                );
-                assert_eq!(
-                    book.entries,
-                    1u32 << book.codeword_len,
-                    "{:?}/{}: entries must equal 2^codeword_len",
-                    cfg.target,
-                    label
-                );
-                assert_eq!(
-                    lookup1_values(book.entries, 2),
-                    book.values_per_dim,
-                    "{:?}/{}: lookup1_values invariant violated",
-                    cfg.target,
-                    label
-                );
-                assert!(
-                    (1u32 << book.value_bits()) >= book.values_per_dim,
-                    "{:?}/{}: value_bits insufficient",
-                    cfg.target,
-                    label
-                );
+            check_book_invariants("main", cfg.target, cfg.main);
+            check_book_invariants("fine", cfg.target, cfg.fine);
+            if let Some(em) = cfg.extra_main {
+                check_book_invariants("extra_main", cfg.target, em);
             }
         }
+    }
+
+    /// High and HighTail targets should ship an extra_main book for the
+    /// third residue class; Low and Medium should not.
+    #[test]
+    fn extra_main_present_on_high_targets_only() {
+        assert!(ResidueBookConfig::for_target(BitrateTarget::Low).extra_main.is_none());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::Medium).extra_main.is_none());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::High).extra_main.is_some());
+        assert!(ResidueBookConfig::for_target(BitrateTarget::HighTail).extra_main.is_some());
     }
 
     /// The Medium variant must match the encoder's historical book shape

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **3-class residue for High / HighTail targets** (task #93 round 3 /
+  codebook expansion). `High` and `HighTail` now ship a fifth
+  bitstream-resident codebook — an `extra_main` 22×22 grid
+  (`{-10.5..+10.5}`, step 1, 9-bit codewords, `lookup1_values(512,2)=22`)
+  — and declare a 3-class residue layout: class 0 = silent (no VQ),
+  class 1 = active (main + fine cascade), class 2 = high-energy
+  (extra_main + fine cascade). The classbook widens to a 16-entry
+  uniform-length (len=4) book so the 9-entry 3×3 class-pair space
+  fits without violating the Kraft inequality. Partitions in the top
+  15% of the trained L2 distribution are routed through the
+  extra_main book for finer quantisation. `Low` and `Medium` keep the
+  historical 2-class layout (bytes-stable). All five-codebook setups
+  are accepted by ffmpeg's libvorbis parser (gated by the extended
+  `all_bank_targets_produce_parseable_setups` fixture).
+
+- **Per-target silence percentile for the trained partition
+  classifier**. `BitrateTarget::silence_percentile()` returns
+  target-specific silence thresholds: `Low` → 0.70 (aggressive
+  silencing for speech-band content), `Medium` → 0.50 (historical
+  default / byte-stable), `High` → 0.35 (fewer silent partitions,
+  more residue bits for moderate-energy bands), `HighTail` → 0.40
+  (slightly looser than High — the mu-law grid captures more energy
+  per active partition). `make_encoder_with_bitrate` picks the right
+  percentile automatically.
+
+- **Per-target residue `begin` offset**. `BitrateTarget::residue_begin_offset()`
+  skips the lowest 2 interleaved bins from VQ coding for `Low`
+  (floor curve alone represents near-DC energy), saving a small
+  number of classword bits at essentially zero perceived cost.
+  `Medium` / `High` / `HighTail` encode the full spectrum (begin=0).
+
+- **Frame-level global M/S correlation override for `Low` target**.
+  `BitrateTarget::global_corr_override_threshold()` returns 0.92 for
+  `Low` — when a frame's full-band L/R correlation exceeds 0.92 the
+  encoder extends point-stereo to the full spectrum for that frame,
+  maximising bit savings on near-mono speech content. `Medium` /
+  `High` / `HighTail` leave the threshold at > 1.0 (disabled),
+  keeping the historical per-band-only point-stereo decisions
+  unchanged.
+
 ### Changed
 
 - **`register` entry point unified on `RuntimeContext`** (task #502).

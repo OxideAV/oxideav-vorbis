@@ -69,7 +69,8 @@ const DEFAULT_SILENCE_PERCENTILE: f32 = 0.50;
 
 /// One-time-built classifier wrapping the trained codebooks. Holds the
 /// derived silence threshold so per-partition classification is a single
-/// f32 compare on the hot path.
+/// f32 compare on the hot path. Also optionally holds a second "high
+/// energy" threshold for the 3-class case (class 2 = high-energy active).
 #[derive(Clone, Debug)]
 pub(crate) struct TrainedPartitionClassifier {
     /// Squared L2 threshold: a partition with `partition_l2_squared <
@@ -80,6 +81,11 @@ pub(crate) struct TrainedPartitionClassifier {
     /// only.
     #[cfg_attr(not(test), allow(dead_code))]
     threshold_l2: f32,
+    /// Optional second threshold for class 2 (high-energy). When `Some`,
+    /// partitions with `l2_sq > high_threshold_l2_squared` classify as
+    /// class 2 (high-energy) instead of class 1 (active). When `None`
+    /// the classifier is 2-class only (0 = silent, 1 = active).
+    high_threshold_l2_squared: Option<f32>,
 }
 
 impl TrainedPartitionClassifier {
@@ -97,12 +103,21 @@ impl TrainedPartitionClassifier {
         Self {
             threshold_l2: 0.25,
             threshold_l2_squared: 0.25 * 0.25,
+            high_threshold_l2_squared: None,
         }
     }
 
     /// Build a classifier with a custom silence percentile in `(0.0, 1.0)`.
     /// Out-of-range values are clamped.
     pub(crate) fn from_percentile(p: f32) -> Self {
+        Self::from_percentile_with_high(p, None)
+    }
+
+    /// Build a 3-class classifier: silence threshold at percentile `p`,
+    /// high-energy threshold at percentile `p_high`. When `p_high` is
+    /// `Some`, partitions above that percentile classify as class 2
+    /// (high-energy) rather than class 1 (active). `p_high` must be > `p`.
+    pub(crate) fn from_percentile_with_high(p: f32, p_high: Option<f32>) -> Self {
         let p = p.clamp(0.001, 0.999);
         let mut slice_l2s = Vec::with_capacity(8192);
         for book in TRAINED_BOOKS.iter() {
@@ -132,6 +147,7 @@ impl TrainedPartitionClassifier {
             return Self {
                 threshold_l2_squared: 0.25 * 0.25,
                 threshold_l2: 0.25,
+                high_threshold_l2_squared: None,
             };
         }
         // Sort ascending so the percentile lookup is O(1).
@@ -140,24 +156,45 @@ impl TrainedPartitionClassifier {
         let idx = idx.min(slice_l2s.len() - 1);
         let threshold_l2_squared = slice_l2s[idx];
         let threshold_l2 = threshold_l2_squared.sqrt();
+        let high_threshold_l2_squared = p_high.map(|ph| {
+            let ph = ph.clamp(p + 0.001, 0.999);
+            let hi = ((slice_l2s.len() as f32) * ph) as usize;
+            let hi = hi.min(slice_l2s.len() - 1);
+            slice_l2s[hi]
+        });
         Self {
             threshold_l2_squared,
             threshold_l2,
+            high_threshold_l2_squared,
         }
     }
 
     /// Classify a partition by its already-summed squared L2.
-    /// Returns `0` for silent (below the trained threshold) or `1` for
-    /// active (above the threshold). The two-class output layout matches
-    /// the encoder's existing 2-classification residue setup so this is a
-    /// drop-in replacement for the prior hard-coded threshold.
+    /// Returns:
+    /// - `0` if `l2_sq <= silence_threshold` (silent, no VQ bits)
+    /// - `2` if `l2_sq > high_threshold` and a high_threshold is set
+    ///        (high-energy active, uses extra_main + fine cascade)
+    /// - `1` otherwise (active, uses main + fine cascade)
+    ///
+    /// For 2-class setups (`high_threshold_l2_squared == None`) only
+    /// returns 0 or 1, matching the existing residue layout exactly.
     #[inline]
     pub(crate) fn classify(&self, partition_l2_squared: f32) -> u32 {
-        if partition_l2_squared > self.threshold_l2_squared {
-            1
-        } else {
-            0
+        if partition_l2_squared <= self.threshold_l2_squared {
+            return 0;
         }
+        if let Some(hi) = self.high_threshold_l2_squared {
+            if partition_l2_squared > hi {
+                return 2;
+            }
+        }
+        1
+    }
+
+    /// Whether this classifier produces 3 output classes (0, 1, 2).
+    /// When `false`, only classes 0 and 1 are emitted — the 2-class layout.
+    pub(crate) fn has_high_class(&self) -> bool {
+        self.high_threshold_l2_squared.is_some()
     }
 
     /// Diagnostic: the unsquared threshold the classifier resolves to.

@@ -767,9 +767,25 @@ fn write_residue_section_multi(
     cascades: &[u8],
     books: &[[i16; 8]],
 ) {
+    write_residue_section_multi_with_begin(w, 0, end, classifications, classbook, cascades, books);
+}
+
+/// Like `write_residue_section_multi` but with a configurable `begin` offset.
+/// `begin` is the first interleaved bin index that VQ coding covers; bins
+/// below this are skipped (the floor curve alone represents them). When
+/// `begin = 0` the behaviour is identical to `write_residue_section_multi`.
+fn write_residue_section_multi_with_begin(
+    w: &mut BitWriter,
+    begin: u32,
+    end: u32,
+    classifications: u32,
+    classbook: u32,
+    cascades: &[u8],
+    books: &[[i16; 8]],
+) {
     debug_assert_eq!(cascades.len() as u32, classifications);
     debug_assert_eq!(books.len() as u32, classifications);
-    w.write_u32(0, 24); // begin
+    w.write_u32(begin, 24); // begin
     w.write_u32(end, 24);
     w.write_u32(RESIDUE_PARTITION_SIZE - 1, 24);
     w.write_u32(classifications - 1, 6);
@@ -814,6 +830,60 @@ fn standard_residue_books() -> (Vec<u8>, Vec<[i16; 8]>) {
     books[1][0] = 2;
     books[1][1] = 3;
     (cascades, books)
+}
+
+/// Build the (cascades, books, classifications) triple for a 3-class
+/// residue layout used when an `extra_main` book is present:
+/// - class 0 = silent (no books)
+/// - class 1 = active (pass 0 = main VQ [book 2], pass 1 = fine [book 3])
+/// - class 2 = high-energy (pass 0 = extra_main [book 4], pass 1 = fine [book 3])
+///
+/// The residue's `classifications` field must be set to 3 when using
+/// this layout. The classbook must be the 9-entry variant written by
+/// `write_setup_codebook_class_3way`.
+fn extended_residue_books() -> (Vec<u8>, Vec<[i16; 8]>, u32) {
+    let n_classes = 3usize;
+    let mut cascades = vec![0u8; n_classes];
+    let mut books: Vec<[i16; 8]> = vec![[-1; 8]; n_classes];
+    // class 0: silent — no cascade bits set (defaults)
+    // class 1: active — main (book 2) + fine (book 3)
+    cascades[1] = 0b0000_0011;
+    books[1][0] = 2; // main
+    books[1][1] = 3; // fine
+    // class 2: high-energy — extra_main (book 4) + fine (book 3)
+    cascades[2] = 0b0000_0011;
+    books[2][0] = 4; // extra_main
+    books[2][1] = 3; // fine (shared with class 1)
+    (cascades, books, 3)
+}
+
+/// Codebook for the 3-class residue classbook: dim=2, 9 entries covering
+/// all pairs in {0,1,2}² encoded as `high_class * 3 + low_class`. The
+/// entries use a variable-length Huffman code biased toward the most common
+/// pair (0,0 = "both silent", entry 0) being the shortest codeword.
+///
+/// Kraft-sum check for the chosen lengths `[1, 3, 4, 3, 4, 5, 4, 5, 5]`:
+///   1/2 + 1/8 + 1/16 + 1/8 + 1/16 + 1/32 + 1/16 + 1/32 + 1/32
+///   = 16/32 + 4/32 + 2/32 + 4/32 + 2/32 + 1/32 + 2/32 + 1/32 + 1/32
+///   = 33/32 > 1 → INVALID as-is; use uniform length 4 (16 entries for 9
+///   used, padding 7 unused).
+///
+/// Use a uniform-length classbook: 16 entries at codeword_len=4 (full tree),
+/// 9 used (entries 0..8 = the 3×3 class pair table). Entries 9..15 are
+/// padding; the encoder's exhaustive class-number computation always produces
+/// values < 9 for 3 classes, so padding entries are never emitted.
+fn write_setup_codebook_class_3way(w: &mut BitWriter) {
+    // 16-entry classbook at length 4, dim=2, no VQ (lookup_type=0).
+    let n_entries: u32 = 16; // 2^4, exactly fills the Huffman tree
+    w.write_u32(0x564342, 24); // sync "BCV"
+    w.write_u32(CLASSBOOK_DIM, 16); // dim = 2 (same classwords_per_codeword)
+    w.write_u32(n_entries, 24);
+    w.write_bit(false); // ordered = false
+    w.write_bit(false); // sparse = false (all 16 entries are valid)
+    for _ in 0..n_entries {
+        w.write_u32(3, 5); // codeword_length - 1 = 3 → length 4
+    }
+    w.write_u32(0, 4); // lookup_type = 0 (scalar, no VQ)
 }
 
 /// ilog(x) = number of bits needed to represent x; ilog(0) = 0,
@@ -912,17 +982,32 @@ pub fn build_encoder_setup_header_with_target(channels: u8, target: BitrateTarge
     let cfg = ResidueBookConfig::for_target(target);
     let extra_x_long = long_floor_extra_x();
     let couples = standard_coupling_steps(channels);
+    let begin_offset = target.residue_begin_offset();
     let mut w = BitWriter::with_capacity(512);
     for &b in &[0x05u32, 0x76, 0x6f, 0x72, 0x62, 0x69, 0x73] {
         w.write_u32(b, 8);
     }
 
-    // 4 codebooks: Y (0), classbook (1), main VQ (2), fine VQ (3).
-    w.write_u32(4 - 1, 8);
-    write_setup_codebook_y(&mut w);
-    write_setup_codebook_class(&mut w);
-    write_setup_codebook_grid(&mut w, &cfg.main);
-    write_setup_codebook_grid(&mut w, &cfg.fine);
+    let use_3class = cfg.extra_main.is_some();
+
+    if use_3class {
+        let extra = cfg.extra_main.unwrap();
+        // 5 codebooks: Y (0), classbook-3way (1), main VQ (2), fine VQ (3),
+        // extra_main VQ (4).
+        w.write_u32(5 - 1, 8);
+        write_setup_codebook_y(&mut w);
+        write_setup_codebook_class_3way(&mut w);
+        write_setup_codebook_grid(&mut w, &cfg.main);
+        write_setup_codebook_grid(&mut w, &cfg.fine);
+        write_setup_codebook_grid(&mut w, &extra);
+    } else {
+        // 4 codebooks: Y (0), classbook (1), main VQ (2), fine VQ (3).
+        w.write_u32(4 - 1, 8);
+        write_setup_codebook_y(&mut w);
+        write_setup_codebook_class(&mut w);
+        write_setup_codebook_grid(&mut w, &cfg.main);
+        write_setup_codebook_grid(&mut w, &cfg.fine);
+    }
 
     // 1 time-domain placeholder.
     w.write_u32(0, 6);
@@ -935,33 +1020,60 @@ pub fn build_encoder_setup_header_with_target(channels: u8, target: BitrateTarge
     w.write_u32(1, 16);
     write_floor1_section(&mut w, 10, 5, &extra_x_long, 0);
 
-    // 2 residues: both type 2 (interleaved across channels), multi-class
-    // cascade layout (see `standard_residue_books`). For residue type 2
-    // the decoder's working vector is a `n_channels * n_half` interleaved
-    // sequence; residue.end must match that size (§8.6.5), so multiply the
-    // per-channel half-block size by the channel count.
-    let (cascades, books) = standard_residue_books();
+    // 2 residues: both type 2 (interleaved across channels). For residue
+    // type 2 the decoder's working vector is a `n_channels * n_half`
+    // interleaved sequence; residue.end must match that size (§8.6.5).
+    // `begin_offset` skips the lowest spectral bins from VQ at Low rate.
     let short_end = 128u32 * channels.max(1) as u32;
     let long_end = 1024u32 * channels.max(1) as u32;
+    // The classbook index is always 1 (the classbook is at position 1 in
+    // both the 2-class and 3-class setups).
+    let classbook_idx = 1u32;
     w.write_u32(2 - 1, 6);
     w.write_u32(2, 16); // residue type = 2
-    write_residue_section_multi(
-        &mut w,
-        short_end,
-        RESIDUE_CLASSIFICATIONS,
-        1,
-        &cascades,
-        &books,
-    );
-    w.write_u32(2, 16);
-    write_residue_section_multi(
-        &mut w,
-        long_end,
-        RESIDUE_CLASSIFICATIONS,
-        1,
-        &cascades,
-        &books,
-    );
+    if use_3class {
+        let (cascades3, books3, n_classes3) = extended_residue_books();
+        write_residue_section_multi_with_begin(
+            &mut w,
+            begin_offset,
+            short_end,
+            n_classes3,
+            classbook_idx,
+            &cascades3,
+            &books3,
+        );
+        w.write_u32(2, 16);
+        write_residue_section_multi_with_begin(
+            &mut w,
+            begin_offset,
+            long_end,
+            n_classes3,
+            classbook_idx,
+            &cascades3,
+            &books3,
+        );
+    } else {
+        let (cascades, books) = standard_residue_books();
+        write_residue_section_multi_with_begin(
+            &mut w,
+            begin_offset,
+            short_end,
+            RESIDUE_CLASSIFICATIONS,
+            classbook_idx,
+            &cascades,
+            &books,
+        );
+        w.write_u32(2, 16);
+        write_residue_section_multi_with_begin(
+            &mut w,
+            begin_offset,
+            long_end,
+            RESIDUE_CLASSIFICATIONS,
+            classbook_idx,
+            &cascades,
+            &books,
+        );
+    }
 
     // 2 mappings.
     w.write_u32(2 - 1, 6);
@@ -1231,11 +1343,36 @@ pub fn make_encoder_with_bitrate(
         // preserve HF stereo image at the cost of more angle-channel
         // bits. See [`BitrateTarget::point_stereo_freq_hz`].
         point_stereo_freq: target.point_stereo_freq_hz(),
-        partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+        // Per-target silence percentile + optional 3-class high-energy
+        // threshold. For targets with an extra_main book (High / HighTail)
+        // we build a 3-class classifier: partitions in the top 15th
+        // percentile of the trained L2 distribution are classified as
+        // class 2 (high-energy) and routed through the extra_main VQ book
+        // for finer quantisation. For 2-class targets (Low / Medium) the
+        // second argument is None and classify() only returns 0 or 1.
+        partition_classifier: {
+            let cfg = ResidueBookConfig::for_target(target);
+            if cfg.extra_main.is_some() {
+                // 3-class: silence at p, high-energy at p_high=0.85
+                // (top 15% of the trained L2 distribution use the
+                // extra_main book for denser quantisation).
+                TrainedPartitionClassifier::from_percentile_with_high(
+                    target.silence_percentile(),
+                    Some(0.85),
+                )
+            } else {
+                TrainedPartitionClassifier::from_percentile(target.silence_percentile())
+            }
+        },
         residue_book_config: ResidueBookConfig::for_target(target),
         force_floor0: false,
         mode_bits,
         floor0_available,
+        // Per-target global correlation override threshold: enables
+        // full-band point-stereo on frames where L/R are near-identical
+        // (e.g. near-mono speech). Disabled (threshold > 1.0) for High
+        // and HighTail where HF stereo image is preserved.
+        global_corr_override_threshold: target.global_corr_override_threshold(),
     }))
 }
 
@@ -1311,6 +1448,14 @@ struct VorbisEncoder {
     /// setup has no floor0 sections to dispatch into. See
     /// `build_encoder_setup_header_with_target_dual_floor`.
     floor0_available: bool,
+    /// Full-frame inter-channel correlation threshold for the global
+    /// M/S coupling override. When the per-frame full-band L/R
+    /// correlation exceeds this value the encoder extends point-stereo
+    /// down into the normally-lossless sub-crossover region for that
+    /// frame. Values > 1.0 effectively disable the override (High /
+    /// HighTail targets). Sourced from
+    /// [`BitrateTarget::global_corr_override_threshold`].
+    global_corr_override_threshold: f32,
 }
 
 /// Short-window size for the transient detector (samples). Chosen as
@@ -1865,27 +2010,65 @@ impl VorbisEncoder {
         // (most partitions classify as silent and emit one classbook bit).
         let point_stereo_bin =
             point_stereo_threshold_bin(self.point_stereo_freq, self.sample_rate, n_half);
+        // Per-frame global M/S override: measure the full-band inter-channel
+        // correlation across the first coupling pair. When it exceeds
+        // `global_corr_override_threshold` (only meaningful for Low and
+        // Medium targets where the threshold is ≤ 1.0), the channels are
+        // near-identical (e.g. near-mono speech content) and we can extend
+        // point-stereo to cover the entire spectrum rather than just the
+        // sub-band above the crossover. This saves considerable residue bits
+        // on correlated frames without measurable perceptual loss (the
+        // auditory system detects inter-aural differences, not phase in
+        // already-correlated signals).
+        let effective_point_stereo_bin = if self.global_corr_override_threshold <= 1.0
+            && n_channels >= 2
+            && !mapping.coupling.is_empty()
+        {
+            let mi0 = mapping.coupling[0].0 as usize;
+            let ai0 = mapping.coupling[0].1 as usize;
+            if mi0 < residues.len() && ai0 < residues.len() {
+                let full_corr =
+                    band_lr_correlation(&residues[mi0], &residues[ai0], 0, n_half);
+                if full_corr >= self.global_corr_override_threshold {
+                    // Full-band point-stereo: lower effective crossover to bin 0
+                    // so all bins are treated as "above the crossover" and
+                    // handled by the per-band correlation gate with a very
+                    // permissive threshold.
+                    0usize
+                } else {
+                    point_stereo_bin
+                }
+            } else {
+                point_stereo_bin
+            }
+        } else {
+            point_stereo_bin
+        };
         // Pre-compute per-band [start_bin, end_bin) ranges + correlation
         // threshold above the global crossover. Bands are derived from
         // POINT_STEREO_BAND_THRESHOLDS — the bin layout depends on
         // `n_half` and the sample rate so we recompute per block.
-        let band_ranges = compute_point_stereo_bands(self.sample_rate, n_half, point_stereo_bin);
+        let band_ranges =
+            compute_point_stereo_bands(self.sample_rate, n_half, effective_point_stereo_bin);
         for &(mag, ang) in &mapping.coupling {
             let mi = mag as usize;
             let ai = ang as usize;
             if mi >= residues.len() || ai >= residues.len() || mi == ai {
                 continue;
             }
-            // Below the crossover: lossless sum/difference for every bin.
-            for k in 0..point_stereo_bin.min(n_half) {
+            // Below the effective crossover: lossless sum/difference.
+            // When the global-corr override fired, effective_point_stereo_bin=0
+            // and this loop body executes zero iterations (all handled in the
+            // per-band section below).
+            for k in 0..effective_point_stereo_bin.min(n_half) {
                 let l = residues[mi][k];
                 let r = residues[ai][k];
                 let (m, a) = forward_couple(l, r);
                 residues[mi][k] = m;
                 residues[ai][k] = a;
             }
-            // Above the crossover: per-band correlation gate. Each band
-            // independently picks point-stereo (corr >= threshold) or
+            // Above the effective crossover: per-band correlation gate. Each
+            // band independently picks point-stereo (corr >= threshold) or
             // sum/difference (corr < threshold) for the whole band.
             for &(b_start, b_end, threshold) in &band_ranges {
                 let corr = band_lr_correlation(&residues[mi], &residues[ai], b_start, b_end);
@@ -2162,16 +2345,25 @@ impl VorbisEncoder {
                                 target[j] = interleaved[bin + j];
                             }
                         }
-                        // Main VQ: restrict exhaustive search to the
-                        // bank-configured grid entries (`entries_used`);
-                        // remaining padding entries alias to low-valued
-                        // grid points and would bias search. Fine VQ
-                        // and classbook use all entries exactly once
-                        // so we search the full set there.
+                        // VQ search entry limit. For grid books with
+                        // padding entries (values_per_dim² < entries)
+                        // we restrict the search to `entries_used` so
+                        // the encoder never picks a padding codeword
+                        // that aliases to a low-valued grid point.
+                        // Fine VQ (book 3) uses all entries exactly
+                        // once; classbook and extra_main (book 4) are
+                        // searched in full. In the 3-class setup the
+                        // extra_main is at book index 4.
                         let max_entries = if book_idx as u32 == 2 {
                             self.residue_book_config.main.entries_used
                         } else if book_idx as u32 == 3 {
                             self.residue_book_config.fine.entries_used
+                        } else if book_idx as u32 == 4 {
+                            // extra_main: cap at entries_used similarly.
+                            self.residue_book_config
+                                .extra_main
+                                .map(|em| em.entries_used)
+                                .unwrap_or(book.entries)
                         } else {
                             book.entries
                         };
@@ -3401,6 +3593,8 @@ mod tests {
                 // floor1-only setup → 2 modes → 1 mode bit, no floor0
                 mode_bits: 1,
                 floor0_available: false,
+                global_corr_override_threshold: BitrateTarget::Medium
+                    .global_corr_override_threshold(),
             });
         }
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
@@ -4081,6 +4275,8 @@ mod tests {
             force_floor0: false,
             mode_bits: 1,
             floor0_available: false,
+            global_corr_override_threshold: BitrateTarget::Medium
+                .global_corr_override_threshold(),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -4509,11 +4705,15 @@ mod tests {
             prior_energy: 0.0,
             force_long_only: false,
             point_stereo_freq,
-            partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+            partition_classifier: TrainedPartitionClassifier::from_percentile(
+                BitrateTarget::Medium.silence_percentile(),
+            ),
             residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
             force_floor0: false,
             mode_bits: 1,
             floor0_available: false,
+            global_corr_override_threshold: BitrateTarget::Medium
+                .global_corr_override_threshold(),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -5477,11 +5677,15 @@ mod tests {
             let bytes = build_encoder_setup_header_with_target(2, target);
             let setup = parse_setup(&bytes, 2)
                 .unwrap_or_else(|e| panic!("setup for {target:?} failed to parse: {e}"));
-            assert_eq!(setup.codebooks.len(), 4, "{target:?}: codebook count");
+            let cfg = ResidueBookConfig::for_target(target);
+            // High / HighTail have an extra_main book (3-class residue) →
+            // 5 codebooks: Y + classbook + main + fine + extra_main.
+            // Low / Medium use 2-class residue → 4 codebooks.
+            let expected_cb = if cfg.extra_main.is_some() { 5 } else { 4 };
+            assert_eq!(setup.codebooks.len(), expected_cb, "{target:?}: codebook count");
             assert_eq!(setup.floors.len(), 2, "{target:?}: floor count");
             assert_eq!(setup.residues.len(), 2, "{target:?}: residue count");
             // Main VQ shape must match the bank entry.
-            let cfg = ResidueBookConfig::for_target(target);
             assert_eq!(
                 setup.codebooks[2].entries, cfg.main.entries,
                 "{target:?}: main entries"
@@ -6133,11 +6337,14 @@ mod tests {
             // a 256-sample short block can starve.
             force_long_only: true,
             point_stereo_freq: target.point_stereo_freq_hz(),
-            partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+            partition_classifier: TrainedPartitionClassifier::from_percentile(
+                target.silence_percentile(),
+            ),
             residue_book_config: ResidueBookConfig::for_target(target),
             force_floor0: true,
             mode_bits,
             floor0_available,
+            global_corr_override_threshold: target.global_corr_override_threshold(),
         })
     }
 
@@ -6386,6 +6593,132 @@ mod tests {
             delta >= 0.1,
             "HighTail should improve SNR by ≥ 0.1 dB on heavy-tailed source: \
              tail={tail_snr:.2} medium={med_snr:.2} delta={delta:+.2}"
+        );
+    }
+
+    /// BitrateTarget nominal rate ordering: each target should produce a
+    /// measured stereo bit-rate (kbps) in a sensible ascending range.
+    ///
+    /// Absolute nominal rates (Low≈64, Medium≈128, High≈192, HighTail≈256)
+    /// are aspirational; the encoder is not yet production-quality and real
+    /// rates on a mixed sine+noise source differ substantially from those
+    /// targets. Instead this test asserts:
+    ///
+    /// 1. Strict ordering: Low kbps < Medium kbps < High kbps (the monotone
+    ///    bitrate property already covered by `bank_targets_are_monotone_in_bitrate`
+    ///    at the byte level, now verified at the kbps level too).
+    /// 2. Plausible lower bound: all targets produce at least 10 kbps stereo
+    ///    (so the stream is non-trivially encoded, not almost-silent).
+    /// 3. Plausible upper bound: no target exceeds 600 kbps stereo (we're
+    ///    not accidentally emitting uncompressed PCM bits).
+    ///
+    /// The test also eprintln!s the measured kbps for each target so CI
+    /// logs show the current calibration point.
+    #[test]
+    fn bitrate_calibration_stereo_mixed_content() {
+        let duration_s = 3usize;
+        let sr_hz = 48_000usize;
+        let channels = 2u16;
+        let n_per_ch = sr_hz * duration_s;
+
+        // Build a realistic mixed-content signal: 440 Hz + 880 Hz + 1760 Hz
+        // (musical harmonics) mixed with broadband noise at −18 dBFS so the
+        // residue isn't trivially near-silence.
+        let mut rng: u32 = 0xABCD_EF01;
+        let mut next_rng = || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let sr_f = sr_hz as f64;
+        let mut data_l: Vec<i16> = Vec::with_capacity(n_per_ch);
+        let mut data_r: Vec<i16> = Vec::with_capacity(n_per_ch);
+        for i in 0..n_per_ch {
+            let t = i as f64 / sr_f;
+            let sig = (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 0.25
+                + (2.0 * std::f64::consts::PI * 880.0 * t).sin() * 0.15
+                + (2.0 * std::f64::consts::PI * 1760.0 * t).sin() * 0.10;
+            let noise = next_rng() as f64 * 0.05;
+            let l = (sig + noise + next_rng() as f64 * 0.02).clamp(-1.0, 1.0);
+            let r = (sig - noise + next_rng() as f64 * 0.02).clamp(-1.0, 1.0);
+            data_l.push((l * 32767.0) as i16);
+            data_r.push((r * 32767.0) as i16);
+        }
+        // Interleave L / R.
+        let mut interleaved: Vec<i16> = Vec::with_capacity(n_per_ch * 2);
+        for i in 0..n_per_ch {
+            interleaved.push(data_l[i]);
+            interleaved.push(data_r[i]);
+        }
+
+        let mut kbps_per_target: Vec<(BitrateTarget, f64)> = Vec::new();
+        for target in [
+            BitrateTarget::Low,
+            BitrateTarget::Medium,
+            BitrateTarget::High,
+            BitrateTarget::HighTail,
+        ] {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(channels);
+            params.sample_rate = Some(sr_hz as u32);
+            let mut enc = make_encoder_with_bitrate(&params, target).unwrap();
+            let mut raw = Vec::with_capacity(interleaved.len() * 2);
+            for s in &interleaved {
+                raw.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n_per_ch as u32,
+                pts: Some(0),
+                data: vec![raw],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut total_bytes = 0usize;
+            while let Ok(p) = enc.receive_packet() {
+                total_bytes += p.data.len();
+            }
+            let kbps = (total_bytes * 8) as f64 / (duration_s as f64 * 1000.0);
+            eprintln!("bitrate_calibration {target:?}: {total_bytes} bytes → {kbps:.1} kbps stereo");
+            kbps_per_target.push((target, kbps));
+        }
+
+        let low_kbps = kbps_per_target[0].1;
+        let med_kbps = kbps_per_target[1].1;
+        let high_kbps = kbps_per_target[2].1;
+        let htail_kbps = kbps_per_target[3].1;
+
+        // Plausible bounds: non-trivial (>10 kbps) and not exploding.
+        for (target, kbps) in &kbps_per_target {
+            assert!(
+                *kbps > 10.0,
+                "{target:?}: measured kbps ({kbps:.1}) implausibly low (near-silent output?)"
+            );
+            assert!(
+                *kbps < 600.0,
+                "{target:?}: measured kbps ({kbps:.1}) implausibly high (uncompressed-like output?)"
+            );
+        }
+
+        // Strict ascending ordering: Low < Medium < High.
+        assert!(
+            low_kbps < med_kbps,
+            "Low ({low_kbps:.1} kbps) should be cheaper than Medium ({med_kbps:.1} kbps)"
+        );
+        assert!(
+            med_kbps < high_kbps,
+            "Medium ({med_kbps:.1} kbps) should be cheaper than High ({high_kbps:.1} kbps)"
+        );
+        // HighTail uses the same base codeword_len=7 as Medium for the
+        // main book but also ships an extra_main 9-bit book for the
+        // high-energy class — so its bitrate lands between Medium and
+        // High. Verify it doesn't exceed High and costs more than Medium.
+        assert!(
+            htail_kbps > med_kbps,
+            "HighTail ({htail_kbps:.1} kbps) should exceed Medium ({med_kbps:.1} kbps) \
+             due to the extra_main book on high-energy partitions"
+        );
+        assert!(
+            htail_kbps <= high_kbps,
+            "HighTail ({htail_kbps:.1} kbps) should not exceed High ({high_kbps:.1} kbps)"
         );
     }
 

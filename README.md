@@ -111,51 +111,45 @@ What's implemented:
   mappings (L/C/R, 4ch quad, 5.1, 7.1) with coupled L-R,
   back-L/back-R, and side-L/side-R pairs; center and LFE channels
   stay uncoupled.
-- A 4-codebook residue setup: floor1 Y book (128 × 7-bit), a 4-entry
-  variable-length classbook (`[1, 2, 3, 3]`), main VQ + fine correction
-  VQ from a curated **bitstream-resident codebook bank**
-  ([`src/codebook_bank.rs`](src/codebook_bank.rs)) with four
-  bitrate-target variants — `Low` (8×8 main + 4×4 fine, 6+4 bit
-  codewords), `Medium` (11×11 + 4×4, 7+4 bit, the historical default),
-  `High` (16×16 + 8×8, 8+6 bit) and `HighTail` (11×11 + 4×4, 7+4 bit
-  codewords like Medium but with a **mu-law-companded non-uniform
-  axis grid** on the main book — denser quantisation steps near zero
-  where the residue distribution lives, sparser at the tails). Each is
-  a perfect-fill canonical-Huffman tree with the spec-canonical
-  `lookup1_values(entries, 2) = values_per_dim` relation so libvorbis /
-  ffmpeg accept all four variants. Picked at construction via
+- A **bitstream-resident codebook bank** with four `BitrateTarget`
+  variants ([`src/codebook_bank.rs`](src/codebook_bank.rs)) —
+  `Low` (8×8 main + 4×4 fine, 6+4 bit codewords), `Medium` (11×11 +
+  4×4, 7+4 bit, the historical default), `High` (16×16 + 8×8, 8+6 bit)
+  and `HighTail` (11×11 + 4×4, 7+4 bit like Medium but with a
+  **mu-law-companded non-uniform axis grid** on the main book). All are
+  perfect-fill canonical-Huffman trees with the spec-canonical
+  `lookup1_values(entries, 2) = values_per_dim` relation accepted by
+  libvorbis / ffmpeg. `High` and `HighTail` additionally ship a fifth
+  codebook — an `extra_main` 22×22 grid (`{-10.5..+10.5}`, step 1,
+  9-bit codewords, `lookup1_values(512,2)=22`) — enabling a 3-class
+  residue layout: class 0 = silent, class 1 = active (main + fine),
+  class 2 = high-energy (extra_main + fine). Picked at construction via
   `make_encoder_with_bitrate(&params, BitrateTarget::Low | Medium |
-  High | HighTail)`; the chosen books go into the setup header and the
-  audio packets index them through `mapping → submap → residue`. On a
-  2-second 1 kHz mono mix Low saves ~7% bytes vs Medium at slightly
-  lower SNR (2.94 vs 4.20 dB); High costs ~22% more bytes for ~1.85 dB
-  SNR gain (6.05 dB); HighTail keeps Medium's per-frame budget
-  identical (only +11 setup-header bits for the wider `value_bits=5`
-  multiplicand field) and improves SNR by ~0.15-0.30 dB on heavy-tailed
-  natural content (the floor1 stage absorbs much of the spectral
-  envelope, so the end-to-end PCM-domain SNR delta is smaller than
-  the +1.5 dB the mu-law grid achieves on a raw Laplacian source —
-  see [`src/tail_quantiser.rs`](src/tail_quantiser.rs) for the
-  quantiser-only quality test). See
-  `bank_targets_are_monotone_in_bitrate` and
-  `high_tail_beats_medium_on_heavy_tailed_source` for the
-  measurements.
+  High | HighTail)`.
 - Residue type 2 (interleaved across channels) for both block sizes
-  with two-class per-partition selection (silent vs active cascade).
-- **Trained-VQ partition classifier** (task #93). The silent/active
-  decision per residue partition is driven by the median 2-bin slice
-  L2 of four LBG-trained 256-entry codebooks — see
-  [`src/trained_books.rs`](src/trained_books.rs), trained from
-  ~15 minutes of mixed LibriVox PD speech + Musopen Chopin (CC0)
-  via [`scripts/fetch-vq-corpus.sh`](scripts/fetch-vq-corpus.sh) and
-  [`src/bin/vq-train.rs`](src/bin/vq-train.rs). Training is offline;
-  the trained centroids are baked into the crate as a `const` table.
-  On a 5-second sine + voice-band noise mix the trained classifier
-  saves ~11% bytes vs the prior hard-coded threshold at identical
-  SNR — see the
+  with **per-target partition classification** — silence / active / (for
+  High/HighTail) high-energy — driven by the trained L2 percentile
+  thresholds: `Low` 70th percentile (aggressive silencing), `Medium`
+  50th (historical), `High` 35th (keep more partitions active), `HighTail`
+  40th. `Low` additionally skips the lowest 2 bins from VQ (begin=2)
+  to save classword bits on near-DC energy already represented by
+  the floor curve.
+- **Trained-VQ partition classifier** (task #93). The silent/active/
+  high-energy decision per residue partition is driven by the 2-bin
+  slice L2 distribution of four LBG-trained 256-entry codebooks — see
+  [`src/trained_books.rs`](src/trained_books.rs), trained from ~15 minutes
+  of LibriVox PD speech + Musopen Chopin (CC0). On a 5-second sine +
+  voice-band noise mix the trained classifier saves ~11% bytes vs the
+  prior hard-coded threshold at identical SNR — see the
   `encoder::tests::trained_vs_legacy_classifier_bitrate_5s_mix`
-  fixture. The bitstream layout is unchanged; the trained books
-  inform encoder choices only, not the wire format.
+  fixture. The bitstream layout is unchanged; trained books inform
+  encoder choices only.
+- **Frame-level global M/S correlation override** for the `Low` target:
+  when the full-frame L/R correlation exceeds 0.92 the encoder extends
+  point-stereo to the entire spectrum for that frame, maximising bit
+  savings on near-mono speech. `Medium` / `High` / `HighTail` keep the
+  threshold disabled (> 1.0) to preserve the historical per-band-only
+  stereo decisions.
 - Xiph-laced 3-packet `extradata` in `output_params()`, ready to
   hand to a container muxer. ffmpeg's libvorbis decodes the output
   bit-cleanly — see the `ffmpeg_cross_decode_*` tests.
