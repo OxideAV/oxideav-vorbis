@@ -128,7 +128,7 @@ fn build_encoder(
     params.channels = Some(channels);
     params.sample_rate = Some(sample_rate);
     params.sample_format = Some(SampleFormat::S16);
-    let enc = reg.make_encoder(&params).expect("encoder accepts params");
+    let enc = reg.first_encoder(&params).expect("encoder accepts params");
     (reg, enc)
 }
 
@@ -190,7 +190,7 @@ fn bench_decode_packets(c: &mut Criterion) {
             params.sample_rate = Some(48_000);
             params.sample_format = Some(SampleFormat::S16);
             params.extradata = extradata.clone();
-            let mut dec = reg.make_decoder(&params).expect("decoder");
+            let mut dec = reg.first_decoder(&params).expect("decoder");
             let mut total = 0usize;
             for p in &pkts {
                 dec.send_packet(p).expect("send");
@@ -212,7 +212,7 @@ fn bench_decode_packets(c: &mut Criterion) {
             params.sample_rate = Some(44_100);
             params.sample_format = Some(SampleFormat::S16);
             params.extradata = extradata_s.clone();
-            let mut dec = reg.make_decoder(&params).expect("decoder");
+            let mut dec = reg.first_decoder(&params).expect("decoder");
             let mut total = 0usize;
             for p in &pkts_s {
                 dec.send_packet(p).expect("send");
@@ -246,7 +246,7 @@ fn bench_encode(c: &mut Criterion) {
             params.channels = Some(ch);
             params.sample_rate = Some(sr);
             params.sample_format = Some(SampleFormat::S16);
-            let mut enc = reg.make_encoder(&params).expect("encoder");
+            let mut enc = reg.first_encoder(&params).expect("encoder");
             enc.send_frame(&make_s16_frame(ch, sr, n as u32, &pcm))
                 .expect("send_frame");
             enc.flush().expect("flush");

@@ -61,7 +61,7 @@ fn encode_decode(pcm_i16: &[i16]) -> (usize, Vec<i16>) {
     params.channels = Some(1);
     params.sample_rate = Some(44_100);
     params.sample_format = Some(SampleFormat::S16);
-    let mut enc = reg.make_encoder(&params).expect("encoder accepts params");
+    let mut enc = reg.first_encoder(&params).expect("encoder accepts params");
     let mut data = Vec::with_capacity(pcm_i16.len() * 2);
     for s in pcm_i16 {
         data.extend_from_slice(&s.to_le_bytes());
@@ -87,7 +87,7 @@ fn encode_decode(pcm_i16: &[i16]) -> (usize, Vec<i16>) {
     }
     let dec_params = enc.output_params().clone();
     let mut dec = reg
-        .make_decoder(&dec_params)
+        .first_decoder(&dec_params)
         .expect("decoder accepts our extradata");
     let mut decoded = Vec::with_capacity(pcm_i16.len());
     for p in packets {

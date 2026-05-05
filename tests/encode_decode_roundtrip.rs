@@ -28,7 +28,7 @@ fn encode_decode(channels: u16, samples_per_channel: usize, interleaved: &[i16])
     params.sample_rate = Some(48_000);
     params.sample_format = Some(SampleFormat::S16);
 
-    let mut enc = reg.make_encoder(&params).expect("encoder accepts params");
+    let mut enc = reg.first_encoder(&params).expect("encoder accepts params");
     enc.send_frame(&make_s16_frame(channels, samples_per_channel, interleaved))
         .expect("send_frame");
     enc.flush().expect("flush");
@@ -46,7 +46,7 @@ fn encode_decode(channels: u16, samples_per_channel: usize, interleaved: &[i16])
 
     let dec_params = enc.output_params().clone();
     let mut dec = reg
-        .make_decoder(&dec_params)
+        .first_decoder(&dec_params)
         .expect("decoder accepts our extradata");
     let mut out = Vec::new();
     for pkt in &packets {
@@ -206,7 +206,7 @@ fn sine_mono_cascade_beats_single_book_via_public_api() {
     params.channels = Some(1);
     params.sample_rate = Some(48_000);
     params.sample_format = Some(SampleFormat::S16);
-    let mut enc = reg.make_encoder(&params).expect("encoder");
+    let mut enc = reg.first_encoder(&params).expect("encoder");
     enc.send_frame(&make_s16_frame(1, n, &pcm)).expect("send");
     enc.flush().expect("flush");
     let mut total_bytes = 0usize;
