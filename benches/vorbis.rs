@@ -123,7 +123,7 @@ fn build_encoder(
     sample_rate: u32,
 ) -> (CodecRegistry, Box<dyn oxideav_core::Encoder>) {
     let mut reg = CodecRegistry::new();
-    oxideav_vorbis::register(&mut reg);
+    oxideav_vorbis::register_codecs(&mut reg);
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.channels = Some(channels);
     params.sample_rate = Some(sample_rate);
@@ -184,7 +184,7 @@ fn bench_decode_packets(c: &mut Criterion) {
     c.bench_function("decode_1s_mono_48k", |b| {
         b.iter(|| {
             let mut reg = CodecRegistry::new();
-            oxideav_vorbis::register(&mut reg);
+            oxideav_vorbis::register_codecs(&mut reg);
             let mut params = CodecParameters::audio(CodecId::new("vorbis"));
             params.channels = Some(1);
             params.sample_rate = Some(48_000);
@@ -206,7 +206,7 @@ fn bench_decode_packets(c: &mut Criterion) {
     c.bench_function("decode_1s_stereo_44k1", |b| {
         b.iter(|| {
             let mut reg = CodecRegistry::new();
-            oxideav_vorbis::register(&mut reg);
+            oxideav_vorbis::register_codecs(&mut reg);
             let mut params = CodecParameters::audio(CodecId::new("vorbis"));
             params.channels = Some(2);
             params.sample_rate = Some(44_100);
@@ -241,7 +241,7 @@ fn bench_encode(c: &mut Criterion) {
     c.bench_function("encode_1s_stereo_44k1", |b| {
         b.iter(|| {
             let mut reg = CodecRegistry::new();
-            oxideav_vorbis::register(&mut reg);
+            oxideav_vorbis::register_codecs(&mut reg);
             let mut params = CodecParameters::audio(CodecId::new("vorbis"));
             params.channels = Some(ch);
             params.sample_rate = Some(sr);

@@ -21,7 +21,7 @@ fn make_s16_frame(_channels: u16, samples_per_channel: usize, pcm: &[i16]) -> Fr
 
 fn encode_decode(channels: u16, samples_per_channel: usize, interleaved: &[i16]) -> Vec<i16> {
     let mut reg = CodecRegistry::new();
-    oxideav_vorbis::register(&mut reg);
+    oxideav_vorbis::register_codecs(&mut reg);
 
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.channels = Some(channels);
@@ -201,7 +201,7 @@ fn sine_mono_cascade_beats_single_book_via_public_api() {
         .collect();
     // Run the encoder once and count total bytes of all emitted packets.
     let mut reg = CodecRegistry::new();
-    oxideav_vorbis::register(&mut reg);
+    oxideav_vorbis::register_codecs(&mut reg);
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.channels = Some(1);
     params.sample_rate = Some(48_000);

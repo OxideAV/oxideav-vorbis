@@ -56,7 +56,7 @@ fn reference_signal_5s_mono_441() -> Vec<i16> {
 /// payload bytes plus the decoded PCM (so the caller can compare SNR).
 fn encode_decode(pcm_i16: &[i16]) -> (usize, Vec<i16>) {
     let mut reg = CodecRegistry::new();
-    oxideav_vorbis::register(&mut reg);
+    oxideav_vorbis::register_codecs(&mut reg);
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.channels = Some(1);
     params.sample_rate = Some(44_100);

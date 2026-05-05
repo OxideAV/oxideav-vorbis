@@ -21,13 +21,12 @@ them as a Xiph-laced concatenation — the format `oxideav-ogg` and
 `oxideav-mkv` already produce for Vorbis tracks.
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_core::{Frame, MediaType};
+use oxideav_core::{Frame, MediaType, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-oxideav_vorbis::register(&mut codecs);
+let mut ctx = RuntimeContext::new();
+oxideav_vorbis::register(&mut ctx);
 
-let mut dec = codecs.make_decoder(&stream_params)?;
+let mut dec = ctx.codecs.make_decoder(&stream_params)?;
 dec.send_packet(&packet)?;
 while let Ok(Frame::Audio(af)) = dec.receive_frame() {
     // af.format == SampleFormat::S16, interleaved in af.data[0]
@@ -61,18 +60,17 @@ fixture suite.
 ## Encoder
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+use oxideav_core::{CodecId, CodecParameters, RuntimeContext, SampleFormat};
 
-let mut codecs = CodecRegistry::new();
-oxideav_vorbis::register(&mut codecs);
+let mut ctx = RuntimeContext::new();
+oxideav_vorbis::register(&mut ctx);
 
 let mut params = CodecParameters::audio(CodecId::new("vorbis"));
 params.channels = Some(2);
 params.sample_rate = Some(48_000);
 params.sample_format = Some(SampleFormat::S16);
 
-let mut enc = codecs.make_encoder(&params)?;
+let mut enc = ctx.codecs.make_encoder(&params)?;
 enc.send_frame(&frame)?;   // S16 or F32 interleaved
 let pkt = enc.receive_packet()?;
 let extradata = enc.output_params().extradata.clone();
