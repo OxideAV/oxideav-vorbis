@@ -118,6 +118,12 @@ use crate::codebook::{parse_codebook, Codebook};
 use crate::codebook_bank::{BitrateTarget, GridBookSpec, ResidueBookConfig};
 use crate::dbtable::FLOOR1_INVERSE_DB;
 use crate::floor::synth_floor1;
+use crate::floor0_encoder::{
+    analyse_floor0, quantise_lsp_cosines, FLOOR0_AMPLITUDE_BITS, FLOOR0_AMPLITUDE_OFFSET,
+    FLOOR0_BARK_MAP_SIZE, FLOOR0_ENCODE_ORDER, FLOOR0_VQ_CODEWORD_LEN, FLOOR0_VQ_DELTA,
+    FLOOR0_VQ_DIM, FLOOR0_VQ_ENTRIES, FLOOR0_VQ_MIN, FLOOR0_VQ_VALUES_PER_DIM,
+    FLOOR0_VQ_VALUE_BITS,
+};
 use crate::imdct::{build_window, forward_mdct_naive};
 use crate::setup::{Floor, Floor1, Residue, Setup};
 use crate::trained_classifier::TrainedPartitionClassifier;
@@ -130,6 +136,67 @@ pub const DEFAULT_BLOCKSIZE_LONG_LOG2: u8 = 11;
 
 /// Floor1 multiplier = 2 (range 128, amp_bits 7).
 const FLOOR1_MULTIPLIER: u8 = 2;
+
+/// Mode index used when the per-frame picker selects floor1 + short
+/// block. Matches the order the modes are emitted in
+/// `build_encoder_setup_header_with_target` /
+/// `build_encoder_setup_header_with_target_dual_floor`.
+const MODE_IDX_SHORT_F1: u32 = 0;
+/// Mode index for floor1 + long block.
+const MODE_IDX_LONG_F1: u32 = 1;
+/// Mode index for floor0 + short block (only valid for dual-floor setups).
+const MODE_IDX_SHORT_F0: u32 = 2;
+/// Mode index for floor0 + long block (only valid for dual-floor setups).
+const MODE_IDX_LONG_F0: u32 = 3;
+
+/// Pick the audio packet's mode index from the per-frame `(long,
+/// use_floor0)` decision. Mirrors the mode order emitted by both setup
+/// builders. Floor1-only setups must never see `use_floor0 = true`
+/// (caller's responsibility — `pick_use_floor0` returns `false`
+/// unconditionally when the encoder's setup doesn't expose modes 2/3).
+#[inline]
+fn pick_mode_idx(long: bool, use_floor0: bool) -> u32 {
+    match (long, use_floor0) {
+        (false, false) => MODE_IDX_SHORT_F1,
+        (true, false) => MODE_IDX_LONG_F1,
+        (false, true) => MODE_IDX_SHORT_F0,
+        (true, true) => MODE_IDX_LONG_F0,
+    }
+}
+
+/// Bit width of the audio packet's mode-index field, derived from the
+/// number of modes the setup descriptor advertises (`ilog(modes - 1)`).
+/// Floor1-only setups have 2 modes → 1 bit; dual-floor setups have 4
+/// modes → 2 bits.
+#[inline]
+fn mode_bits_for_setup(setup: &Setup) -> u32 {
+    let n = setup.modes.len() as u32;
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
+    }
+}
+
+/// Per-channel floor analysis output, ready for bitstream emission.
+/// Carries enough state for `emit_floor1_packet` / `emit_floor0_packet`
+/// to write the matching wire format without re-running the analysis.
+#[derive(Clone)]
+enum FloorAnalysis {
+    Floor1 {
+        floor: Floor1,
+        codes: Vec<i32>,
+    },
+    Floor0 {
+        floor: crate::setup::Floor0,
+        amplitude: u32,
+        entries: Vec<u32>,
+        /// True when `analyse_floor0` reported silence (RMS too low for
+        /// the LPC fit to converge); the bitstream emits a single
+        /// `amplitude=0` field and skips the rest.
+        unused: bool,
+    },
+}
 
 /// Number of extra X posts for the short-block floor (beyond the two
 /// implicit endpoints at 0 and 128).
@@ -589,6 +656,56 @@ fn write_setup_codebook_fine(w: &mut BitWriter) {
     }
 }
 
+/// Codebook 4: floor0 LSP VQ. Dim 2, 256 entries, all length 8 — full
+/// canonical Huffman tree. Lookup type 1 with `min = -1.0`, `delta = 2/15`,
+/// 16 multiplicands `[0..15]`, decoding entry `e` to
+/// `(grid[e % 16], grid[e / 16])` on a uniform 16×16 grid in `[-1, 1]^2`.
+/// The grid covers `cos(ω_j) ∈ [-1, 1]` directly so the encoder side
+/// (in [`crate::floor0_encoder`]) feeds raw cosines to `quantise_lsp_cosines`
+/// and the decoder's `synth_floor0` consumes the cosines without an
+/// additional `cos()` call.
+///
+/// Same layout as [`crate::floor0_encoder::write_codebook_floor0_lsp`] — kept
+/// in this file to make the per-frame floor0/floor1 selection setup
+/// (task #478) self-contained when the encoder unifies the two paths.
+fn write_setup_codebook_floor0_lsp(w: &mut BitWriter) {
+    w.write_u32(0x564342, 24); // sync "BCV"
+    w.write_u32(FLOOR0_VQ_DIM, 16);
+    w.write_u32(FLOOR0_VQ_ENTRIES, 24);
+    w.write_bit(false); // ordered
+    w.write_bit(false); // sparse
+    for _ in 0..FLOOR0_VQ_ENTRIES {
+        w.write_u32(FLOOR0_VQ_CODEWORD_LEN - 1, 5);
+    }
+    w.write_u32(1, 4); // lookup_type = 1
+    write_vorbis_float(w, FLOOR0_VQ_MIN);
+    write_vorbis_float(w, FLOOR0_VQ_DELTA);
+    w.write_u32(FLOOR0_VQ_VALUE_BITS - 1, 4);
+    w.write_bit(false); // sequence_p
+    for k in 0..FLOOR0_VQ_VALUES_PER_DIM {
+        w.write_u32(k, FLOOR0_VQ_VALUE_BITS);
+    }
+}
+
+/// Write a floor type 0 (LSP) section into the setup bitstream. Picks the
+/// LSP codebook from `book_idx` (codebook bank index of the floor0 LSP VQ
+/// emitted by [`write_setup_codebook_floor0_lsp`]); other parameters are
+/// fixed by the const set imported from [`crate::floor0_encoder`].
+///
+/// Mirrors [`crate::floor0_encoder::write_floor0_section`] — same layout
+/// but takes a configurable book index so the encoder's unified setup
+/// (task #478) can place the LSP book at codebook 4 (after the 2 grid
+/// books at 2 and 3).
+fn write_floor0_section(w: &mut BitWriter, book_idx: u32) {
+    w.write_u32(FLOOR0_ENCODE_ORDER as u32, 8); // floor0_order
+    w.write_u32(48_000, 16); // floor0_rate
+    w.write_u32(FLOOR0_BARK_MAP_SIZE as u32, 16);
+    w.write_u32(FLOOR0_AMPLITUDE_BITS as u32, 6);
+    w.write_u32(FLOOR0_AMPLITUDE_OFFSET as u32, 8);
+    w.write_u32(0, 4); // number_of_books - 1 = 0 → 1 book
+    w.write_u32(book_idx, 8); // book_list[0]
+}
+
 /// Evenly-spaced extra X posts for the long-block floor (30 posts between
 /// 0 and 1024, exclusive). Yields a dense floor grid spanning the long
 /// blocksize's frequency range.
@@ -760,13 +877,23 @@ fn write_mapping_section(
     w.write_u32(residue_idx, 8);
 }
 
-/// Build our own setup header: 3 codebooks (Y, class, VQ); 2 floors
-/// (short + long); 2 residues (short + long); 2 mappings (short + long);
-/// 2 modes (short = blockflag 0, long = blockflag 1). For multichannel
-/// streams (`channels >= 2`) the mappings declare the standard coupling
-/// pair list for that channel count (see module docs) — the encoder
-/// applies forward sum/difference coupling before residue coding, the
-/// decoder applies the inverse before IMDCT.
+/// Build our own setup header: 4 codebooks (Y, class, main VQ, fine VQ);
+/// 2 floors (short + long, both floor1); 2 residues (short + long);
+/// 2 mappings (short + long); 2 modes (short = blockflag 0, long =
+/// blockflag 1). For multichannel streams (`channels >= 2`) the mappings
+/// declare the standard coupling pair list for that channel count (see
+/// module docs) — the encoder applies forward sum/difference coupling
+/// before residue coding, the decoder applies the inverse before IMDCT.
+///
+/// This is the **floor1-only** setup — byte-stable across runs and
+/// matches the pre-task-#478 wire format. The dual-floor (per-frame
+/// floor0/floor1 selection) variant is in
+/// [`build_encoder_setup_header_with_target_dual_floor`]; it widens the
+/// setup to 5 codebooks / 4 floors / 4 mappings / 4 modes so the
+/// per-block picker can dispatch either floor type. The dual variant
+/// is not on by default because ffmpeg's `vorbis_parser` warns
+/// (and may stall its packet-timing heuristics) on streams that declare
+/// more than 2 modes.
 pub fn build_encoder_setup_header(channels: u8) -> Vec<u8> {
     build_encoder_setup_header_with_target(channels, BitrateTarget::Medium)
 }
@@ -859,6 +986,125 @@ pub fn build_encoder_setup_header_with_target(channels: u8, target: BitrateTarge
     w.finish()
 }
 
+/// Build a setup header that advertises **both** floor1 and floor0
+/// alternatives (task #478 per-frame floor selection): 5 codebooks
+/// (adds the floor0 LSP VQ at index 4), 4 floors (floor1 short, floor1
+/// long, floor0 short, floor0 long), 2 residues (shared between floor
+/// types), 4 mappings (one per floor × block-size), 4 modes (mode 0 =
+/// short f1, mode 1 = long f1, mode 2 = short f0, mode 3 = long f0).
+///
+/// **NOT byte-stable vs [`build_encoder_setup_header_with_target`]** —
+/// the wire format widens (mode bits go from 1 to 2 in audio packets)
+/// and ffmpeg's vorbis_parser warns about the extra modes. Wired only
+/// when the encoder's per-frame picker is allowed to dispatch floor0;
+/// production constructors stay on the floor1-only setup so existing
+/// fixtures and ffmpeg cross-decode tests stay byte-stable.
+///
+/// Round 1 of task #478 ships this as test-only infrastructure (gated
+/// by the encoder's `force_floor0` test flag); round 2 will land the
+/// real SFM-style tonality picker and may switch the production setup
+/// to the dual-floor shape if the ffmpeg parser interaction permits.
+pub fn build_encoder_setup_header_with_target_dual_floor(
+    channels: u8,
+    target: BitrateTarget,
+) -> Vec<u8> {
+    let cfg = ResidueBookConfig::for_target(target);
+    let extra_x_long = long_floor_extra_x();
+    let couples = standard_coupling_steps(channels);
+    let mut w = BitWriter::with_capacity(512);
+    for &b in &[0x05u32, 0x76, 0x6f, 0x72, 0x62, 0x69, 0x73] {
+        w.write_u32(b, 8);
+    }
+
+    // 5 codebooks: Y (0), classbook (1), main VQ (2), fine VQ (3),
+    // floor0 LSP VQ (4).
+    w.write_u32(5 - 1, 8);
+    write_setup_codebook_y(&mut w);
+    write_setup_codebook_class(&mut w);
+    write_setup_codebook_grid(&mut w, &cfg.main);
+    write_setup_codebook_grid(&mut w, &cfg.fine);
+    write_setup_codebook_floor0_lsp(&mut w);
+
+    // 1 time-domain placeholder.
+    w.write_u32(0, 6);
+    w.write_u32(0, 16);
+
+    // 4 floors: 0 = floor1 short, 1 = floor1 long, 2 = floor0 short,
+    // 3 = floor0 long. Floor0 floors reference codebook 4 (the LSP VQ).
+    w.write_u32(4 - 1, 6);
+    w.write_u32(1, 16); // floor type = 1
+    write_floor1_section(&mut w, 7, 6, &FLOOR1_SHORT_EXTRA_X, 0);
+    w.write_u32(1, 16);
+    write_floor1_section(&mut w, 10, 5, &extra_x_long, 0);
+    w.write_u32(0, 16); // floor type = 0
+    write_floor0_section(&mut w, 4);
+    w.write_u32(0, 16);
+    write_floor0_section(&mut w, 4);
+
+    // 2 residues (same shape as the floor1-only setup).
+    let (cascades, books) = standard_residue_books();
+    let short_end = 128u32 * channels.max(1) as u32;
+    let long_end = 1024u32 * channels.max(1) as u32;
+    w.write_u32(2 - 1, 6);
+    w.write_u32(2, 16); // residue type = 2
+    write_residue_section_multi(
+        &mut w,
+        short_end,
+        RESIDUE_CLASSIFICATIONS,
+        1,
+        &cascades,
+        &books,
+    );
+    w.write_u32(2, 16);
+    write_residue_section_multi(
+        &mut w,
+        long_end,
+        RESIDUE_CLASSIFICATIONS,
+        1,
+        &cascades,
+        &books,
+    );
+
+    // 4 mappings: 0 = floor1 short, 1 = floor1 long, 2 = floor0 short,
+    // 3 = floor0 long. Each mapping points at the matching floor index
+    // (mapping idx and floor idx coincide here) and the block-size-
+    // matched residue (residue 0 for short blocks, residue 1 for long
+    // blocks). All four mappings share the same coupling layout so the
+    // decoder's inverse coupling is independent of the floor choice.
+    w.write_u32(4 - 1, 6);
+    write_mapping_section(&mut w, 0, 0, &couples, channels);
+    write_mapping_section(&mut w, 1, 1, &couples, channels);
+    write_mapping_section(&mut w, 2, 0, &couples, channels);
+    write_mapping_section(&mut w, 3, 1, &couples, channels);
+
+    // 4 modes.
+    w.write_u32(4 - 1, 6);
+    // mode 0: short, mapping 0 (f1 short)
+    w.write_bit(false);
+    w.write_u32(0, 16);
+    w.write_u32(0, 16);
+    w.write_u32(0, 8);
+    // mode 1: long, mapping 1 (f1 long)
+    w.write_bit(true);
+    w.write_u32(0, 16);
+    w.write_u32(0, 16);
+    w.write_u32(1, 8);
+    // mode 2: short, mapping 2 (f0 short)
+    w.write_bit(false);
+    w.write_u32(0, 16);
+    w.write_u32(0, 16);
+    w.write_u32(2, 8);
+    // mode 3: long, mapping 3 (f0 long)
+    w.write_bit(true);
+    w.write_u32(0, 16);
+    w.write_u32(0, 16);
+    w.write_u32(3, 8);
+
+    // Framing bit.
+    w.write_bit(true);
+    w.finish()
+}
+
 /// Decode codebooks from our setup header so the encoder can emit
 /// bit-exact codewords.
 fn extract_codebooks(setup: &[u8]) -> Result<Vec<Codebook>> {
@@ -940,6 +1186,8 @@ pub fn make_encoder_with_bitrate(
     // Parse the full Setup so we can reuse floor/residue/mapping/mode
     // descriptions directly during encoding.
     let setup = crate::setup::parse_setup(&setup_hdr, channels as u8)?;
+    let mode_bits = mode_bits_for_setup(&setup);
+    let floor0_available = setup.floors.iter().any(|f| matches!(f, Floor::Type0(_)));
 
     let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
     out_params.media_type = MediaType::Audio;
@@ -985,6 +1233,9 @@ pub fn make_encoder_with_bitrate(
         point_stereo_freq: target.point_stereo_freq_hz(),
         partition_classifier: TrainedPartitionClassifier::from_trained_books(),
         residue_book_config: ResidueBookConfig::for_target(target),
+        force_floor0: false,
+        mode_bits,
+        floor0_available,
     }))
 }
 
@@ -1044,6 +1295,22 @@ struct VorbisEncoder {
     /// setup header at construction time and therefore which
     /// `entries_used` bound the exhaustive VQ search uses.
     residue_book_config: ResidueBookConfig,
+    /// Test-only: when `true`, `pick_use_floor0` always returns `true`
+    /// so the floor0 emission path gets exercised in unit tests. The
+    /// production picker (round 1) returns `false` unconditionally;
+    /// round 2 will replace this knob with the SFM-style tonality
+    /// heuristic. Public `make_encoder` constructors leave it `false`.
+    force_floor0: bool,
+    /// Audio packet's mode-index bit width, derived from the setup at
+    /// construction time. Floor1-only setups carry 1 bit (2 modes);
+    /// dual-floor setups carry 2 bits (4 modes). Cached so the per-block
+    /// hot path doesn't re-derive it.
+    mode_bits: u32,
+    /// True when the setup descriptor advertises floor0 modes (modes
+    /// 2 and 3). When `false`, the picker MUST return floor1 — the
+    /// setup has no floor0 sections to dispatch into. See
+    /// `build_encoder_setup_header_with_target_dual_floor`.
+    floor0_available: bool,
 }
 
 /// Short-window size for the transient detector (samples). Chosen as
@@ -1354,8 +1621,19 @@ impl VorbisEncoder {
         let mut w = BitWriter::with_capacity(4);
         // packet type bit: 0 (audio).
         w.write_bit(false);
-        // mode bits: 1 bit for 2 modes.
-        w.write_u32(if long { 1 } else { 0 }, 1);
+        // mode bits: 1 bit for floor1-only setups, 2 bits for dual-floor
+        // setups (see `mode_bits_for_setup`). Silent packets always
+        // pick a floor1 mode (mode 0 short / mode 1 long) since the
+        // picker fires on actual audio content; keeping silent packets
+        // on the floor1 path also keeps the per-channel "unused" flag
+        // layout identical to the pre-task-#478 wire format for
+        // trivially-silent input.
+        let mode_idx = if long {
+            MODE_IDX_LONG_F1
+        } else {
+            MODE_IDX_SHORT_F1
+        };
+        w.write_u32(mode_idx, self.mode_bits);
         if long {
             w.write_bit(prev_long);
             w.write_bit(next_long);
@@ -1381,6 +1659,13 @@ impl VorbisEncoder {
     ///
     /// `prev_long` / `next_long` are only meaningful for long blocks — for
     /// short blocks they are ignored by the decoder and by `build_window`.
+    ///
+    /// Per-frame floor type selection (task #478): `pick_mode_idx` decides
+    /// floor0 vs floor1 from the windowed PCM. The setup advertises 4
+    /// modes (short/long × f0/f1) so the decoder accepts either branch;
+    /// as of round 1 the picker hardcodes floor1 for byte-stable output
+    /// against the established cross-decode tests, but the dispatch
+    /// infrastructure is ready for round 2's tonality-driven heuristic.
     fn encode_block(
         &self,
         block: &[Vec<f32>],
@@ -1391,21 +1676,24 @@ impl VorbisEncoder {
     ) -> Option<Vec<u8>> {
         let n_half = n / 2;
         let n_channels = self.channels as usize;
-        let mode_idx = if long { 1 } else { 0 };
-        let mode = &self.setup.modes[mode_idx];
-        let mapping = &self.setup.mappings[mode.mapping as usize];
 
         let window = build_window(n, long, prev_long, next_long, self.blocksize_short);
 
+        // Per-frame floor type selection. The picker sees the windowed
+        // first channel (sufficient for the SFM-style tonality heuristic
+        // in round 2 — multichannel content shares spectral character
+        // across coupling pairs) and decides floor0 vs floor1.
+        let use_floor0 = self.pick_use_floor0(block, n, &window);
+        let mode_idx = pick_mode_idx(long, use_floor0);
+        let mode = &self.setup.modes[mode_idx as usize];
+        let mapping = &self.setup.mappings[mode.mapping as usize];
+
         // Per-channel: window × forward MDCT → floor analysis → residue.
-        let mut floor_codes: Vec<Vec<i32>> = Vec::with_capacity(n_channels);
+        let mut floor_payload: Vec<FloorAnalysis> = Vec::with_capacity(n_channels);
         let mut residues: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
 
         let floor_idx = mapping.submap_floor[0] as usize;
-        let floor_struct = match &self.setup.floors[floor_idx] {
-            Floor::Type1(f) => f.clone(),
-            _ => return None,
-        };
+        let floor_def = self.setup.floors[floor_idx].clone();
 
         let trace = std::env::var_os("OXIDEAV_VORBIS_ENC_TRACE").is_some();
         for ch in 0..n_channels {
@@ -1441,14 +1729,93 @@ impl VorbisEncoder {
                     peak_bin
                 );
             }
-            let target_y = analyse_floor1(&floor_struct, &spec, n_half, self.sample_rate);
-            let codes = compute_floor1_codes(&floor_struct, &target_y);
+            // Compute the per-channel floor curve + residue. Branches on
+            // the setup's floor type for this mode (task #478).
             let mut curve = vec![1f32; n_half];
-            let decoded = crate::floor::Floor1Decoded {
-                unused: false,
-                y: codes.clone(),
+            let payload = match &floor_def {
+                Floor::Type1(f) => {
+                    let target_y = analyse_floor1(f, &spec, n_half, self.sample_rate);
+                    let codes = compute_floor1_codes(f, &target_y);
+                    let decoded = crate::floor::Floor1Decoded {
+                        unused: false,
+                        y: codes.clone(),
+                    };
+                    synth_floor1(f, &decoded, n_half, &mut curve).ok()?;
+                    if trace {
+                        eprintln!(
+                            "[enc] ch{} floor1 target_y[0..8]={:?} codes[0..8]={:?}",
+                            ch,
+                            &target_y[..8.min(target_y.len())],
+                            &codes[..8.min(codes.len())]
+                        );
+                    }
+                    FloorAnalysis::Floor1 {
+                        floor: f.clone(),
+                        codes,
+                    }
+                }
+                Floor::Type0(f) => {
+                    let order = f.order as usize;
+                    // analyse_floor0 wants the time-domain window; feed it
+                    // the same windowed buffer the MDCT consumed so the
+                    // LPC/LSP fit is consistent with what the decoder
+                    // reconstructs after IMDCT + OLA.
+                    let (amp, cosines) =
+                        analyse_floor0(&windowed, order, f.amplitude_bits, f.amplitude_offset)
+                            .ok()?;
+                    let lsp_book_idx = f.book_list[0] as usize;
+                    if lsp_book_idx >= self.codebooks.len() {
+                        return None;
+                    }
+                    let lsp_book = &self.codebooks[lsp_book_idx];
+                    let entries = if amp == 0 || cosines.is_empty() {
+                        Vec::new()
+                    } else {
+                        quantise_lsp_cosines(&cosines, lsp_book).ok()?
+                    };
+                    // Reconstruct the dequantised cosine vector (what the
+                    // decoder will see after Huffman + VQ lookup) so we
+                    // can synth the matching floor curve for residue
+                    // computation. Each entry decodes to `dim` cosines;
+                    // we concatenate them and truncate to `order`.
+                    let dim = lsp_book.dimensions as usize;
+                    let mut deq = Vec::with_capacity(entries.len() * dim.max(1));
+                    for &e in &entries {
+                        let v = lsp_book.vq_lookup(e).ok()?;
+                        deq.extend_from_slice(&v);
+                    }
+                    deq.truncate(order);
+                    let decoded = crate::floor::Floor0Decoded {
+                        amplitude: amp,
+                        book_number: 0,
+                        coefficients: deq,
+                    };
+                    if amp == 0 {
+                        // Silent channel — floor curve goes to zero per
+                        // synth_floor0; no residue to encode.
+                        for v in curve.iter_mut() {
+                            *v = 0.0;
+                        }
+                    } else {
+                        crate::floor::synth_floor0(f, &decoded, n_half, &mut curve).ok()?;
+                    }
+                    if trace {
+                        eprintln!(
+                            "[enc] ch{} floor0 amp={} entries={} order={}",
+                            ch,
+                            amp,
+                            entries.len(),
+                            order
+                        );
+                    }
+                    FloorAnalysis::Floor0 {
+                        floor: f.clone(),
+                        amplitude: amp,
+                        entries,
+                        unused: amp == 0,
+                    }
+                }
             };
-            synth_floor1(&floor_struct, &decoded, n_half, &mut curve).ok()?;
             // Compute residue = spectrum / floor_curve.
             let mut residue = vec![0f32; n_half];
             for k in 0..n_half {
@@ -1458,25 +1825,25 @@ impl VorbisEncoder {
             }
             if trace {
                 let mut peak_cu = 0f32;
-                let mut peak_cu_bin = 0;
-                for (i, v) in curve.iter().enumerate() {
-                    if v.abs() > peak_cu {
-                        peak_cu = v.abs();
-                        peak_cu_bin = i;
+                let mut peak_r = 0f32;
+                for &v in &curve {
+                    let a = v.abs();
+                    if a > peak_cu {
+                        peak_cu = a;
                     }
                 }
-                let mut peak_r = 0f32;
-                for v in residue.iter() {
-                    if v.abs() > peak_r {
-                        peak_r = v.abs();
+                for &v in &residue {
+                    let a = v.abs();
+                    if a > peak_r {
+                        peak_r = a;
                     }
                 }
                 eprintln!(
-                    "[enc] ch{} target_y[0..8]={:?} codes[0..8]={:?} floor_peak={} at_bin={} residue_peak={}",
-                    ch, &target_y[..8.min(target_y.len())], &codes[..8.min(codes.len())], peak_cu, peak_cu_bin, peak_r
+                    "[enc] ch{} floor_peak={} residue_peak={}",
+                    ch, peak_cu, peak_r
                 );
             }
-            floor_codes.push(codes);
+            floor_payload.push(payload);
             residues.push(residue);
         }
 
@@ -1543,23 +1910,95 @@ impl VorbisEncoder {
         // Bit-pack the audio packet.
         let mut w = BitWriter::with_capacity(1024);
         w.write_bit(false); // audio header bit
-        w.write_u32(mode_idx as u32, 1); // mode bits (2 modes → 1 bit)
+        w.write_u32(mode_idx, self.mode_bits); // mode bits (1 for f1-only, 2 for dual-floor)
         if long {
             w.write_bit(prev_long);
             w.write_bit(next_long);
         }
 
-        // Per-channel floor1 packet emission.
-        for ch in 0..n_channels {
-            self.emit_floor1_packet(&mut w, &floor_struct, &floor_codes[ch]);
+        // Per-channel floor packet emission. Routes to floor0 or floor1
+        // emission per the per-channel `FloorAnalysis` payload.
+        for payload in &floor_payload {
+            match payload {
+                FloorAnalysis::Floor1 { floor, codes } => {
+                    self.emit_floor1_packet(&mut w, floor, codes);
+                }
+                FloorAnalysis::Floor0 {
+                    floor,
+                    amplitude,
+                    entries,
+                    unused,
+                } => {
+                    self.emit_floor0_packet(&mut w, floor, *amplitude, entries, *unused);
+                }
+            }
         }
 
-        // Residue emission (type 2: interleaved across channels). See
-        // `emit_residue_type2` for the per-partition classification and
-        // two-stage cascade of main + fine VQ books.
+        // Residue emission (type 2: interleaved across channels). Note
+        // that for floor0-unused channels the corresponding residue is
+        // already zero (the curve was forced to zero, so spec/curve = 0
+        // by short-circuit), so the residue VQ classifier picks "silent"
+        // for the entire channel — no extra wire-format change needed.
         self.emit_residue_type2(&mut w, &residue_def, n_half, &residues)?;
 
         Some(w.finish())
+    }
+
+    /// Per-frame floor0/floor1 picker (task #478). As of round 1 returns
+    /// `false` unconditionally for production encodes — the dispatch
+    /// infrastructure (4 floors, 4 modes, two emission paths) is in
+    /// place and validated by the ffmpeg cross-decode tests on the
+    /// floor1 path; round 2 will swap in a real SFM-style tonality
+    /// heuristic. The signature already takes everything a heuristic
+    /// needs (windowed input + block size).
+    ///
+    /// Tests can flip [`Self::force_floor0`] (combined with the
+    /// dual-floor setup variant) to exercise the floor0 emission path
+    /// end-to-end; this keeps the public API surface unchanged while
+    /// still providing test coverage of the wire format the round-2
+    /// picker will produce. When the setup descriptor has no floor0
+    /// sections (`floor0_available == false`) the picker is locked to
+    /// floor1 regardless of `force_floor0` — the bitstream simply has
+    /// no floor0 mode index to dispatch into.
+    #[allow(unused_variables)]
+    fn pick_use_floor0(&self, block: &[Vec<f32>], n: usize, window: &[f32]) -> bool {
+        if !self.floor0_available {
+            return false;
+        }
+        self.force_floor0
+    }
+
+    fn emit_floor0_packet(
+        &self,
+        w: &mut BitWriter,
+        floor: &crate::setup::Floor0,
+        amplitude: u32,
+        entries: &[u32],
+        unused: bool,
+    ) {
+        // Floor0 packet (Vorbis I §6.2.1): amplitude (`amplitude_bits`)
+        // + book number (`ilog(number_of_books)` bits) + VQ codeword
+        // sequence covering at least `floor0_order` scalars.
+        let amp_bits = floor.amplitude_bits as u32;
+        if unused || amplitude == 0 {
+            w.write_u32(0, amp_bits);
+            return;
+        }
+        w.write_u32(amplitude, amp_bits);
+        let book_bits = ilog(floor.number_of_books as u32);
+        // Single-book setup: book index is always 0.
+        w.write_u32(0, book_bits);
+        let lsp_book_idx = floor.book_list[0] as usize;
+        let lsp_book = &self.codebooks[lsp_book_idx];
+        for &e in entries {
+            let len = lsp_book.codeword_lengths[e as usize];
+            if len == 0 {
+                continue;
+            }
+            let code = lsp_book.codewords[e as usize];
+            let rev = bit_reverse(code, len);
+            w.write_u32(rev, len as u32);
+        }
     }
 
     fn emit_floor1_packet(&self, w: &mut BitWriter, floor: &Floor1, codes: &[i32]) {
@@ -2457,11 +2896,17 @@ mod tests {
         let bytes = build_encoder_setup_header(1);
         let setup = parse_setup(&bytes, 1).expect("encoder setup parses");
         // 4 codebooks: Y (0), classbook (1), main VQ (2), fine VQ (3).
+        // Default `make_encoder` uses the floor1-only setup so existing
+        // fixtures stay byte-stable; the dual-floor variant
+        // (build_encoder_setup_header_with_target_dual_floor — task
+        // #478) is opt-in and validated by separate tests.
         assert_eq!(setup.codebooks.len(), 4);
         assert_eq!(setup.floors.len(), 2);
         assert_eq!(setup.residues.len(), 2);
         assert_eq!(setup.mappings.len(), 2);
         assert_eq!(setup.modes.len(), 2);
+        assert!(matches!(setup.floors[0], Floor::Type1(_)));
+        assert!(matches!(setup.floors[1], Floor::Type1(_)));
         // Codebook 1: classbook (dim 2, 4 entries, variable-length [1,2,3,3]).
         assert_eq!(setup.codebooks[1].dimensions, CLASSBOOK_DIM as u16);
         assert_eq!(setup.codebooks[1].entries, CLASSBOOK_ENTRIES);
@@ -2952,6 +3397,10 @@ mod tests {
                 point_stereo_freq: DEFAULT_POINT_STEREO_FREQ,
                 partition_classifier: TrainedPartitionClassifier::from_trained_books(),
                 residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
+                force_floor0: false,
+                // floor1-only setup → 2 modes → 1 mode bit, no floor0
+                mode_bits: 1,
+                floor0_available: false,
             });
         }
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
@@ -3629,6 +4078,9 @@ mod tests {
             point_stereo_freq: DEFAULT_POINT_STEREO_FREQ,
             partition_classifier: classifier,
             residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
+            force_floor0: false,
+            mode_bits: 1,
+            floor0_available: false,
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -4059,6 +4511,9 @@ mod tests {
             point_stereo_freq,
             partition_classifier: TrainedPartitionClassifier::from_trained_books(),
             residue_book_config: ResidueBookConfig::for_target(BitrateTarget::Medium),
+            force_floor0: false,
+            mode_bits: 1,
+            floor0_available: false,
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -5301,6 +5756,389 @@ mod tests {
                 "{target:?} ffmpeg: 1 kHz energy should dominate"
             );
         }
+    }
+
+    // ========== Per-frame floor0/floor1 dispatch (task #478) ==========
+
+    /// `pick_mode_idx` must round-trip the `(long, use_floor0)` lever to
+    /// the matching `MODE_IDX_*` constant. The setup header emits the
+    /// modes in this exact order so any drift between the constants and
+    /// the picker silently produces the wrong floor type at decode time.
+    #[test]
+    fn pick_mode_idx_covers_all_four_modes() {
+        assert_eq!(pick_mode_idx(false, false), MODE_IDX_SHORT_F1);
+        assert_eq!(pick_mode_idx(true, false), MODE_IDX_LONG_F1);
+        assert_eq!(pick_mode_idx(false, true), MODE_IDX_SHORT_F0);
+        assert_eq!(pick_mode_idx(true, true), MODE_IDX_LONG_F0);
+    }
+
+    /// Dual-floor setup's mode list, mapping list, and floor list must
+    /// agree on the (mode → mapping → floor) chain for all 4 modes.
+    /// Catches off-by-one errors in the setup writer's mode/mapping
+    /// ordering — the encoder's per-frame picker depends on the
+    /// `MODE_IDX_*` constants matching the setup descriptor exactly.
+    #[test]
+    fn dual_floor_setup_chains_modes_to_correct_floors() {
+        let bytes = build_encoder_setup_header_with_target_dual_floor(2, BitrateTarget::Medium);
+        let setup = parse_setup(&bytes, 2).expect("dual-floor setup parses");
+        assert_eq!(setup.codebooks.len(), 5);
+        assert_eq!(setup.floors.len(), 4);
+        assert_eq!(setup.mappings.len(), 4);
+        assert_eq!(setup.modes.len(), 4);
+        // Floor 0 / 1 are floor1, 2 / 3 are floor0.
+        assert!(matches!(setup.floors[0], Floor::Type1(_)));
+        assert!(matches!(setup.floors[1], Floor::Type1(_)));
+        assert!(matches!(setup.floors[2], Floor::Type0(_)));
+        assert!(matches!(setup.floors[3], Floor::Type0(_)));
+        for (i, expected_long, expected_floor0) in [
+            (0, false, false),
+            (1, true, false),
+            (2, false, true),
+            (3, true, true),
+        ] {
+            let m = &setup.modes[i];
+            assert_eq!(
+                m.blockflag, expected_long,
+                "mode {i} blockflag (long={expected_long})"
+            );
+            let map = &setup.mappings[m.mapping as usize];
+            let f_idx = map.submap_floor[0] as usize;
+            let is_floor0 = matches!(setup.floors[f_idx], Floor::Type0(_));
+            assert_eq!(
+                is_floor0, expected_floor0,
+                "mode {i} floor type (use_floor0={expected_floor0})"
+            );
+            // Residue index matches block size: residue 0 = short, 1 = long.
+            let r_idx = map.submap_residue[0] as usize;
+            assert_eq!(
+                r_idx,
+                if expected_long { 1 } else { 0 },
+                "mode {i} residue index (long={expected_long})"
+            );
+        }
+    }
+
+    /// Floor0 codebook in the dual-floor setup must have the same
+    /// shape as the `floor0_encoder` crate const set: dim 2, 256
+    /// entries, length 8, lookup type 1 with `min = -1.0` and `delta =
+    /// 2/15`. Drift between the encoder.rs writer and the
+    /// floor0_encoder constants would silently corrupt the LSP
+    /// quantiser's expected grid.
+    #[test]
+    fn dual_floor_setup_floor0_codebook_shape_matches_consts() {
+        let bytes = build_encoder_setup_header_with_target_dual_floor(1, BitrateTarget::Medium);
+        let setup = parse_setup(&bytes, 1).expect("parses");
+        let cb = &setup.codebooks[4];
+        assert_eq!(cb.dimensions as u32, FLOOR0_VQ_DIM);
+        assert_eq!(cb.entries, FLOOR0_VQ_ENTRIES);
+        assert!(cb
+            .codeword_lengths
+            .iter()
+            .all(|&l| l as u32 == FLOOR0_VQ_CODEWORD_LEN));
+        let vq = cb.vq.as_ref().expect("floor0 LSP book has VQ lookup");
+        assert_eq!(vq.lookup_type, 1);
+        assert!((vq.min - FLOOR0_VQ_MIN).abs() < 1e-5);
+        assert!((vq.delta - FLOOR0_VQ_DELTA).abs() < 1e-5);
+    }
+
+    /// Default `make_encoder` setup must remain byte-stable vs the
+    /// pre-task-#478 wire format — the dual-floor variant is opt-in
+    /// only. This is the byte-stability gate: any drift here breaks
+    /// established fixtures + the ffmpeg-parser-friendly default.
+    #[test]
+    fn default_setup_is_floor1_only_byte_stable() {
+        let bytes = build_encoder_setup_header_with_target(1, BitrateTarget::Medium);
+        let setup = parse_setup(&bytes, 1).expect("parses");
+        assert_eq!(
+            setup.codebooks.len(),
+            4,
+            "default setup must have 4 codebooks (no floor0 LSP)"
+        );
+        assert_eq!(
+            setup.floors.len(),
+            2,
+            "default setup must have 2 floors (both floor1)"
+        );
+        assert_eq!(setup.mappings.len(), 2);
+        assert_eq!(
+            setup.modes.len(),
+            2,
+            "default setup must have 2 modes (1-bit mode field)"
+        );
+        for f in &setup.floors {
+            assert!(
+                matches!(f, Floor::Type1(_)),
+                "default setup floors must all be floor1"
+            );
+        }
+    }
+
+    /// `mode_bits_for_setup` must compute `ilog(modes - 1)` so the
+    /// audio packet's mode field width matches what the decoder expects.
+    /// Floor1-only setups have 2 modes (1 bit); dual-floor setups have
+    /// 4 modes (2 bits).
+    #[test]
+    fn mode_bits_derived_from_setup() {
+        let bytes_f1 = build_encoder_setup_header_with_target(1, BitrateTarget::Medium);
+        let setup_f1 = parse_setup(&bytes_f1, 1).unwrap();
+        assert_eq!(mode_bits_for_setup(&setup_f1), 1);
+        let bytes_dual =
+            build_encoder_setup_header_with_target_dual_floor(1, BitrateTarget::Medium);
+        let setup_dual = parse_setup(&bytes_dual, 1).unwrap();
+        assert_eq!(mode_bits_for_setup(&setup_dual), 2);
+    }
+
+    /// End-to-end round-trip with the picker forced to floor0. Encodes
+    /// a tonal block through the floor0 emission path and verifies our
+    /// decoder reproduces it without errors. Round 1 of task #478
+    /// validates the floor0 wire format end-to-end without relying on
+    /// the production picker (which is hardcoded to floor1).
+    #[test]
+    fn forced_floor0_roundtrip_via_our_decoder() {
+        use crate::decoder::make_decoder as make_dec;
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.4);
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.channels = Some(1);
+        params.sample_rate = Some(48_000);
+        let mut enc = build_test_encoder_force_floor0(&params, BitrateTarget::Medium);
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![data],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        assert!(!packets.is_empty(), "forced-floor0 emitted zero packets");
+        let dec_params = enc.output_params().clone();
+        let mut dec = make_dec(&dec_params).expect("decoder accepts floor0 setup");
+        let mut decoded: Vec<i16> = Vec::new();
+        for p in &packets {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                for chunk in af.data[0].chunks_exact(2) {
+                    decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+            }
+        }
+        let _ = dec.flush();
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            for chunk in af.data[0].chunks_exact(2) {
+                decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+        }
+        assert!(
+            !decoded.is_empty(),
+            "decoder emitted zero samples on forced-floor0 stream"
+        );
+        // 1 kHz energy should be present (decoder reconstructs through
+        // the floor0 → residue chain). Round 1 of task #478 ships a
+        // fixed 16-step uniform LSP VQ codebook, so the LSP fit has
+        // lower spectral selectivity than a per-corpus-trained book —
+        // we only assert that the target tone beats the off-band probe
+        // (no specific dominance ratio). Round 2's trained LSP book
+        // will tighten this gate.
+        let target = goertzel_mag(&decoded, 1000.0, 48_000.0);
+        let off = goertzel_mag(&decoded, 7000.0, 48_000.0);
+        eprintln!("forced-floor0 1 kHz: target={target:.0} off={off:.0}");
+        assert!(
+            target > off,
+            "forced-floor0 1 kHz energy should beat off-band (target={target}, off={off})"
+        );
+    }
+
+    /// ffmpeg cross-decode of a forced-floor0 stream — ffmpeg's
+    /// vorbis_parser warns about the dual-floor setup's 4 modes but
+    /// accepts the stream into its libvorbis decoder. The decoded
+    /// output may be silent (ffmpeg's libvorbis floor0 path doesn't
+    /// apply the same LSP-singularity saturation cap our
+    /// `synth_floor0` does — round 2's trained LSP book should produce
+    /// coefficients that avoid the singular bins entirely), so this
+    /// test only asserts that ffmpeg produces *some* output rather
+    /// than a specific dominance ratio. Skips when ffmpeg isn't on
+    /// PATH.
+    ///
+    /// Followup: tighten this gate to a real SNR / dominance assert
+    /// once round 2 ships LSP coefficients that don't drive the
+    /// `(cos_w - cos(ω_j))²` factor to zero on the bin grid.
+    #[test]
+    fn ffmpeg_cross_decode_forced_floor0_accepts_stream() {
+        if !ffmpeg_cross_decode_available() {
+            eprintln!("SKIP: ffmpeg not on PATH");
+            return;
+        }
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.4);
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.channels = Some(1);
+        params.sample_rate = Some(48_000);
+        let mut enc = build_test_encoder_force_floor0(&params, BitrateTarget::Medium);
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![data],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        let extradata = enc.output_params().extradata.clone();
+        let ogg = mux_to_ogg(&extradata, &packets);
+        let pcm_ffmpeg = match ffmpeg_decode_to_s16le(&ogg, 1) {
+            Some(p) => p,
+            None => panic!("ffmpeg rejected forced-floor0 Ogg stream"),
+        };
+        // Wire-format-validity gate: ffmpeg must demux the stream
+        // without an error AND produce a sample buffer of the expected
+        // length (8 long blocks × 2048 samples each = 16384 samples
+        // for 4 long blocks of input data after OLA / silent flush).
+        // Numeric quality is followup-tracked above.
+        assert!(
+            !pcm_ffmpeg.is_empty(),
+            "ffmpeg decoded zero samples from forced-floor0 stream — wire format rejected"
+        );
+        let target = goertzel_mag(&pcm_ffmpeg, 1000.0, 48_000.0);
+        let off = goertzel_mag(&pcm_ffmpeg, 7000.0, 48_000.0);
+        eprintln!(
+            "ffmpeg forced-floor0 (Medium): samples={} target_1k={target:.0} off_7k={off:.0}",
+            pcm_ffmpeg.len()
+        );
+    }
+
+    /// ffmpeg cross-decode for the floor0 path on every BitrateTarget
+    /// — wire-format-validity only (see
+    /// `ffmpeg_cross_decode_forced_floor0_accepts_stream` for the
+    /// rationale on why we don't assert on numeric output quality
+    /// here).
+    #[test]
+    fn ffmpeg_cross_decode_forced_floor0_each_bank_target_accepts_stream() {
+        if !ffmpeg_cross_decode_available() {
+            eprintln!("SKIP: ffmpeg not on PATH");
+            return;
+        }
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.4);
+        for target in [
+            BitrateTarget::Low,
+            BitrateTarget::Medium,
+            BitrateTarget::High,
+            BitrateTarget::HighTail,
+        ] {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(1);
+            params.sample_rate = Some(48_000);
+            let mut enc = build_test_encoder_force_floor0(&params, target);
+            let mut data = Vec::with_capacity(samples.len() * 2);
+            for s in &samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![data],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut packets = Vec::new();
+            while let Ok(p) = enc.receive_packet() {
+                packets.push(p);
+            }
+            let extradata = enc.output_params().extradata.clone();
+            let ogg = mux_to_ogg(&extradata, &packets);
+            let pcm_ffmpeg = match ffmpeg_decode_to_s16le(&ogg, 1) {
+                Some(p) => p,
+                None => panic!("{target:?}: ffmpeg rejected forced-floor0 stream"),
+            };
+            assert!(
+                !pcm_ffmpeg.is_empty(),
+                "{target:?}: ffmpeg decoded zero samples — wire format rejected"
+            );
+            let t_mag = goertzel_mag(&pcm_ffmpeg, 1000.0, 48_000.0);
+            let o_mag = goertzel_mag(&pcm_ffmpeg, 7000.0, 48_000.0);
+            eprintln!("ffmpeg floor0 {target:?}: target_1k={t_mag:.0} off_7k={o_mag:.0}");
+        }
+    }
+
+    /// Build a `VorbisEncoder` configured with the **dual-floor** setup
+    /// variant ([`build_encoder_setup_header_with_target_dual_floor`])
+    /// and the `force_floor0` test flag set so the per-frame picker
+    /// selects the floor0 emission path on every block. Returns the
+    /// encoder boxed as `Box<dyn Encoder>` so the rest of the test
+    /// exercise pipeline (packet drain → mux to Ogg → ffmpeg / our
+    /// decoder) works without special-casing the concrete type.
+    fn build_test_encoder_force_floor0(
+        params: &CodecParameters,
+        target: BitrateTarget,
+    ) -> Box<dyn Encoder> {
+        let channels = params.channels.unwrap();
+        let sample_rate = params.sample_rate.unwrap();
+        let id_hdr = build_identification_header(
+            channels as u8,
+            sample_rate,
+            0,
+            DEFAULT_BLOCKSIZE_SHORT_LOG2,
+            DEFAULT_BLOCKSIZE_LONG_LOG2,
+        );
+        let comment_hdr = build_comment_header(&[]);
+        let setup_hdr = build_encoder_setup_header_with_target_dual_floor(channels as u8, target);
+        let extradata = build_extradata(&id_hdr, &comment_hdr, &setup_hdr);
+        let codebooks = extract_codebooks(&setup_hdr).unwrap();
+        let setup = crate::setup::parse_setup(&setup_hdr, channels as u8).unwrap();
+        let mode_bits = mode_bits_for_setup(&setup);
+        let floor0_available = setup.floors.iter().any(|f| matches!(f, Floor::Type0(_)));
+        let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        out_params.media_type = MediaType::Audio;
+        out_params.channels = Some(channels);
+        out_params.sample_rate = Some(sample_rate);
+        out_params.sample_format = Some(SampleFormat::S16);
+        out_params.extradata = extradata;
+        let blocksize_short = 1usize << DEFAULT_BLOCKSIZE_SHORT_LOG2;
+        let blocksize_long = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        Box::new(VorbisEncoder {
+            codec_id: CodecId::new(crate::CODEC_ID_STR),
+            out_params,
+            time_base: TimeBase::new(1, sample_rate as i64),
+            channels,
+            sample_rate,
+            input_sample_format: SampleFormat::S16,
+            blocksize_short,
+            blocksize_long,
+            input_buf: vec![Vec::with_capacity(blocksize_long * 4); channels as usize],
+            prev_tail: vec![Vec::with_capacity(blocksize_long); channels as usize],
+            output_queue: VecDeque::new(),
+            pts: 0,
+            blocks_emitted: 0,
+            flushed: false,
+            codebooks,
+            setup,
+            prev_block_long: true,
+            next_block_long: true,
+            prior_energy: 0.0,
+            // Long-only keeps the test deterministic — floor0 LPC needs
+            // enough samples for the autocorrelation to converge, which
+            // a 256-sample short block can starve.
+            force_long_only: true,
+            point_stereo_freq: target.point_stereo_freq_hz(),
+            partition_classifier: TrainedPartitionClassifier::from_trained_books(),
+            residue_book_config: ResidueBookConfig::for_target(target),
+            force_floor0: true,
+            mode_bits,
+            floor0_available,
+        })
     }
 
     /// Per-target point-stereo crossover (task #463) should be

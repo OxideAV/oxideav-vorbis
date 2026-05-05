@@ -183,15 +183,32 @@ not bitstream conformance:
   and is the supported path for quality improvements at the same
   per-frame codeword budget.
 - **Floor type 0 (LSP) emission.** The default `make_encoder`
-  constructor still always declares floor1. A separate
+  constructor declares floor1 only — the wire format is byte-stable
+  vs the pre-task-#478 layout so existing fixtures and ffmpeg
+  cross-decode tests don't drift. A separate
   `floor0_encoder::make_encoder_floor0` constructor (task #181) emits
   floor0 packets end-to-end via LPC analysis (autocorrelation +
-  Levinson-Durbin) followed by LPC→LSP conversion; the
-  `floor0_encoder::should_use_floor0` helper provides the
-  prediction-gain heuristic for hybrid encoders that want to switch
-  per-frame. The default constructor doesn't yet wire those together
-  — picking floor0 vs floor1 from a single setup requires plumbing
-  both into the same mapping, tracked as future work.
+  Levinson-Durbin) followed by LPC→LSP conversion. As of task #478
+  round 1 the main encoder also ships the **dispatch infrastructure**
+  for per-frame floor0/floor1 selection: a `dual_floor` setup variant
+  ([`build_encoder_setup_header_with_target_dual_floor`]) that
+  advertises 5 codebooks / 4 floors / 4 mappings / 4 modes (short/long
+  × f0/f1), a `pick_use_floor0` per-block picker (round 1 hardcoded to
+  `false` so production output stays byte-stable), and a unified
+  `encode_block` that branches on the per-mode floor type. Round 2
+  will swap in a real SFM-style tonality picker. The dual-floor setup
+  is tested through both our decoder
+  (`forced_floor0_roundtrip_via_our_decoder`) and ffmpeg's parser
+  acceptance gate
+  (`ffmpeg_cross_decode_forced_floor0_each_bank_target_accepts_stream`)
+  — ffmpeg's vorbis_parser warns about the 4-mode setup and its
+  libvorbis decoder produces silent output on our forced-floor0
+  packets (the LSP-singularity saturation cap added to
+  `crate::floor::synth_floor0` is local; ffmpeg's libvorbis lacks it
+  and outputs NaN / zeros at the singular bins). Followup: round 2's
+  trained LSP book should produce coefficients that avoid the
+  singular bins entirely, after which ffmpeg cross-decode of the
+  floor0 path will reach numeric quality parity with the floor1 path.
 
 ## Performance
 

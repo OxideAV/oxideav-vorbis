@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-frame floor0/floor1 selection — dispatch infrastructure**
+  (task #478 round 1). The main encoder now ships the per-block
+  floor-type dispatch machinery: a `dual_floor` setup variant
+  (`build_encoder_setup_header_with_target_dual_floor`) that
+  advertises 5 codebooks (Y, classbook, main VQ, fine VQ, **floor0
+  LSP VQ**) / 4 floors (floor1 short, floor1 long, floor0 short,
+  floor0 long) / 4 mappings (one per block-size × floor-type pair) /
+  4 modes (mode 0 = short f1, 1 = long f1, 2 = short f0, 3 = long
+  f0); a per-block `pick_use_floor0` picker (round 1: hardcoded to
+  `false` so production output stays byte-stable, round 2 will land
+  the SFM-style tonality heuristic); a unified `encode_block` that
+  branches on the per-mode floor type and routes to either
+  `emit_floor1_packet` (existing) or the new `emit_floor0_packet`
+  (LPC + LSP analysis from `floor0_encoder::analyse_floor0` →
+  `quantise_lsp_cosines`); a derived `mode_bits_for_setup` helper so
+  the audio packet's mode-index field width adapts to the setup at
+  construction time (1 bit for floor1-only, 2 bits for dual-floor).
+  Default `make_encoder` keeps emitting the floor1-only setup so
+  existing fixtures + the ffmpeg cross-decode tests stay byte-stable
+  (gated by `default_setup_is_floor1_only_byte_stable`,
+  `medium_setup_unchanged_after_high_tail_landed`, and the existing
+  `ffmpeg_cross_decode_*` suite). The dual-floor variant is opt-in:
+  test infrastructure (`build_test_encoder_force_floor0`) lets unit
+  tests exercise the floor0 emission end-to-end through both our
+  decoder (`forced_floor0_roundtrip_via_our_decoder`) and ffmpeg's
+  parser acceptance gate
+  (`ffmpeg_cross_decode_forced_floor0_each_bank_target_accepts_stream`,
+  validated on Low/Medium/High/HighTail). New public API:
+  `build_encoder_setup_header_with_target_dual_floor`. Defensive
+  saturation cap added to `crate::floor::synth_floor0` so
+  near-LSP-singularity bins produce a finite very-large floor value
+  instead of `inf` — without the cap, encoder paths that compute
+  `residue = spec / curve` would emit residue ≈ 0 at the singular
+  bins and the decoder's `spec = curve * residue` would compute
+  `inf * 0 = NaN`, propagating through IMDCT to silent output. 6 new
+  unit + integration tests gate the dispatch infrastructure (mode
+  index ↔ setup chaining, floor0 codebook shape, mode-bits derivation,
+  byte-stability of the default setup, end-to-end forced-floor0
+  round-trip, ffmpeg dual-floor wire-format-validity per bank).
+  **Followups not in scope for this round**: real per-frame tonality
+  picker (round 2 — wire `floor0_encoder::should_use_floor0` into
+  `pick_use_floor0`); LBG-trained floor0 LSP codebook (round 2 — the
+  current 16-step uniform grid drives `(cos_w - cos(ω_j))²` to zero
+  on the bin grid, producing LSP singularities that are local to our
+  decoder via the synth saturation cap but show as silence through
+  ffmpeg's libvorbis); ffmpeg cross-decode numeric quality parity
+  for the floor0 path (blocked on the trained LSP book — the
+  wire-format-validity gate already lands).
 - **Tail-aware mu-law quantiser for lookup_type=1 main residue book**
   (`tail_quantiser` module, task #478). New `BitrateTarget::HighTail`
   variant ships a non-uniform mu-law-companded multiplicand axis on

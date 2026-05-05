@@ -575,6 +575,20 @@ pub fn synth_floor0(
             // back to zero here, matching the "silent bin" behaviour.
             -amp_offset * 0.11512925
         };
+        // Saturate the exponent before exp() so near-LSP-singularity bins
+        // produce a finite (very large) floor value rather than `inf`.
+        // The matching cap on the floor1 path is `FLOOR1_INVERSE_DB[255]`
+        // = exp(0.11512925 * 159.5) ≈ 9.4e7; we use the same numerical
+        // ceiling here so floor0 and floor1 agree on what counts as
+        // "saturated loud".
+        //
+        // Without this cap, encoder paths that compute `residue =
+        // spec / curve` would emit residue ≈ 0 at those bins, and the
+        // decoder's `spec = curve * residue` would compute `inf * 0 =
+        // NaN`. NaN then propagates through IMDCT → silent output.
+        // The cap keeps both sides finite while remaining bit-exact for
+        // every non-singular bin.
+        let exponent = exponent.min(0.11512925 * 159.5);
         let linear_floor = exponent.exp();
 
         // Walk forward while map[i] matches this one (step 5/8 of spec).
