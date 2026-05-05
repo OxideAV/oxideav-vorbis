@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.6...v0.0.7) - 2026-05-05
+
+### Other
+
+- per-frame floor0/floor1 dispatch infrastructure (task #478)
+- tail-aware mu-law quantiser for lookup_type=1 main residue
+- per-BitrateTarget point-stereo crossover
+- bitstream-resident codebook bank
+- drop unused trait imports
+- clippy fixes
+- rustfmt fixes
+- wire docs/audio/vorbis/fixtures/ corpus into integration tests
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- floor0 LSP path (task #181)
+- add lookup-type optimiser (task #173)
+- trained-VQ partition classifier (task #93 round 2)
+- in-tree LBG VQ codebook trainer + corpus survey (task #93 round 1)
+- point-stereo coupling + floor1 envelope tuning
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **Per-frame floor0/floor1 selection — dispatch infrastructure**
