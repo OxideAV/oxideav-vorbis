@@ -92,12 +92,15 @@
 //!    trained centroids rather than uniform grids; replacing our grid-
 //!    based main VQ with corpus-trained centroids would require
 //!    `lookup_type = 2` per-entry vector storage — but **modern ffmpeg
-//!    explicitly rejects `lookup_type >= 2`** ("Codebook lookup type
-//!    not supported" in `vorbis_dec.c`), so trained-centroid main books
-//!    are blocked on ffmpeg-interop grounds. The lookup_type=1 axis-
-//!    grid path is still on the table but requires tail-aware quantiser
-//!    design (pure k-means under-serves the residue distribution
-//!    tails); see CHANGELOG for the round-3 investigation notes.
+//!    explicitly rejects `lookup_type >= 2`** (the bitstream parser
+//!    bails on any lookup_type beyond the implicit-grid form), so
+//!    trained-centroid main books are blocked on ffmpeg-interop
+//!    grounds. The lookup_type=1 axis-grid alternative is now
+//!    exercised via the [`crate::codebook_bank::BitrateTarget::HighTail`]
+//!    variant (mu-law-companded non-uniform multiplicands — see
+//!    [`crate::tail_quantiser`] — task #478) and is the supported
+//!    path for SNR improvements at the same per-frame codeword
+//!    budget.
 //!
 //! 3. **Floor type 0 (LSP)**: never seen in modern Vorbis files; not
 //!    implemented on the encode side. Our setup header always uses
@@ -517,6 +520,11 @@ fn write_setup_codebook_vq(w: &mut BitWriter) {
 /// entries share the same `codeword_len` so the canonical Huffman tree
 /// is full when `entries == 2^codeword_len` and underspec when
 /// `entries_used < entries` (libvorbis accepts both shapes).
+///
+/// When `spec.multiplicands_override` is `Some`, emits the slice's
+/// integers verbatim (non-uniform axis grid — see
+/// [`crate::tail_quantiser`]); otherwise emits the default uniform
+/// `0, 1, ..., values_per_dim-1` integer sequence.
 fn write_setup_codebook_grid(w: &mut BitWriter, spec: &GridBookSpec) {
     w.write_u32(0x564342, 24); // sync "BCV"
     w.write_u32(VQ_DIM as u32, 16);
@@ -532,8 +540,26 @@ fn write_setup_codebook_grid(w: &mut BitWriter, spec: &GridBookSpec) {
     let value_bits = spec.value_bits();
     w.write_u32(value_bits - 1, 4);
     w.write_bit(false); // sequence_p
-    for m in 0..spec.values_per_dim {
-        w.write_u32(m, value_bits);
+    if let Some(mults) = spec.multiplicands_override {
+        // Non-uniform axis (mu-law / Lloyd-Max). The slice length
+        // equals values_per_dim by construction; debug-asserted here
+        // so any future drift fails loudly in tests.
+        debug_assert_eq!(
+            mults.len() as u32,
+            spec.values_per_dim,
+            "multiplicands_override length must equal values_per_dim"
+        );
+        for &m in mults {
+            debug_assert!(
+                m < (1u32 << value_bits),
+                "multiplicand override {m} exceeds value_bits {value_bits} cap"
+            );
+            w.write_u32(m, value_bits);
+        }
+    } else {
+        for m in 0..spec.values_per_dim {
+            w.write_u32(m, value_bits);
+        }
     }
 }
 
@@ -4991,6 +5017,7 @@ mod tests {
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
+            BitrateTarget::HighTail,
         ] {
             let bytes = build_encoder_setup_header_with_target(2, target);
             let setup = parse_setup(&bytes, 2)
@@ -5103,6 +5130,7 @@ mod tests {
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
+            BitrateTarget::HighTail,
         ] {
             let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
             params.channels = Some(1);
@@ -5161,6 +5189,7 @@ mod tests {
             (BitrateTarget::Low, 2.5_f64),
             (BitrateTarget::Medium, 3.8),
             (BitrateTarget::High, 3.8),
+            (BitrateTarget::HighTail, 3.8),
         ] {
             let pcm = encode_with_bitrate_target(1, n, &samples, target);
             let snr = snr_db(&samples, &pcm, skip);
@@ -5231,6 +5260,7 @@ mod tests {
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
+            BitrateTarget::HighTail,
         ] {
             let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
             params.channels = Some(1);
@@ -5372,6 +5402,199 @@ mod tests {
         assert!(
             high_bytes >= med_bytes,
             "High ({high_bytes}) should not be below Medium ({med_bytes})"
+        );
+    }
+
+    // ========== Tail-aware quantiser tests (task #478) ==========
+
+    /// HighTail must produce a setup where codebook 2's lookup_type 1
+    /// `multiplicands` field is the mu-law non-uniform sequence (not
+    /// the uniform `0, 1, ..., 10` that Medium produces). This is the
+    /// bitstream-side gate: any drift here means the encoder isn't
+    /// actually shipping the tail-aware grid.
+    #[test]
+    fn high_tail_setup_carries_non_uniform_multiplicands() {
+        let bytes = build_encoder_setup_header_with_target(2, BitrateTarget::HighTail);
+        let setup = parse_setup(&bytes, 2).expect("HighTail setup parses");
+        // Same shape as Medium: 128 entries / dim 2 / length 7.
+        assert_eq!(setup.codebooks[2].entries, 128);
+        assert_eq!(setup.codebooks[2].dimensions, 2);
+        assert!(setup.codebooks[2].codeword_lengths.iter().all(|&l| l == 7));
+        let v = setup.codebooks[2].vq.as_ref().unwrap();
+        assert_eq!(v.lookup_type, 1);
+        // value_bits widened to 5 (vs Medium's 4).
+        assert_eq!(v.value_bits, 5);
+        // The multiplicands must be the non-uniform mu-law sequence,
+        // NOT the uniform 0..11.
+        assert_eq!(
+            v.multiplicands.as_slice(),
+            crate::tail_quantiser::HIGH_TAIL_MAIN_MULTIPLICANDS,
+            "HighTail multiplicands must equal the mu-law sequence"
+        );
+        // Sanity: the decoded grid is denser near zero than at the
+        // tails (the entire point of mu-law).
+        let mut decoded: Vec<f32> = v
+            .multiplicands
+            .iter()
+            .map(|&m| m as f32 * v.delta + v.min)
+            .collect();
+        decoded.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = decoded.len();
+        let centre_step = (decoded[n / 2] - decoded[n / 2 - 1]).abs();
+        let tail_step = (decoded[n - 1] - decoded[n - 2]).abs();
+        assert!(
+            centre_step < tail_step,
+            "HighTail decoded grid not denser at centre: centre={centre_step} tail={tail_step}"
+        );
+    }
+
+    /// Codebook bank's Medium variant must NOT change shape because
+    /// HighTail landed. This is the byte-stability gate against
+    /// accidental breakage of fixtures.
+    #[test]
+    fn medium_setup_unchanged_after_high_tail_landed() {
+        let bytes = build_encoder_setup_header_with_target(2, BitrateTarget::Medium);
+        let setup = parse_setup(&bytes, 2).expect("Medium setup parses");
+        let v = setup.codebooks[2].vq.as_ref().unwrap();
+        // Medium must still ship the historical uniform 0..10 with
+        // value_bits=4, min=-5.0, delta=1.0. If this drifts, the
+        // entire fixture suite breaks.
+        assert_eq!(v.value_bits, 4);
+        assert!((v.min - (-5.0)).abs() < 1e-5);
+        assert!((v.delta - 1.0).abs() < 1e-5);
+        let expected_uniform: Vec<u32> = (0..11).collect();
+        assert_eq!(v.multiplicands, expected_uniform);
+    }
+
+    /// HighTail must encode-decode round-trip through our decoder
+    /// AND match the SNR floor that Medium hits on the same input
+    /// (the per-frame codeword budget is identical — 7 bits per
+    /// active partition — so HighTail must not regress vs Medium).
+    /// On heavy-tailed natural content HighTail is expected to
+    /// improve SNR; on a simple sine the deltas are smaller.
+    #[test]
+    fn high_tail_snr_does_not_regress_vs_medium() {
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 8;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
+        let skip = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        let med_pcm = encode_with_bitrate_target(1, n, &samples, BitrateTarget::Medium);
+        let tail_pcm = encode_with_bitrate_target(1, n, &samples, BitrateTarget::HighTail);
+        let med_snr = snr_db(&samples, &med_pcm, skip);
+        let tail_snr = snr_db(&samples, &tail_pcm, skip);
+        eprintln!("HighTail vs Medium 1 kHz mono: medium={med_snr:.2} dB tail={tail_snr:.2} dB");
+        // HighTail's per-frame budget == Medium's, so the only delta
+        // is the grid placement. A 1 kHz tone is not heavy-tailed —
+        // most of the residue energy is concentrated at the tone bin
+        // — so we don't demand HighTail BEAT Medium here, only that
+        // it doesn't regress more than 0.5 dB. The headline win is
+        // measured below on the heavy-tailed Laplacian-like source.
+        assert!(
+            tail_snr + 0.5 >= med_snr,
+            "HighTail SNR regressed > 0.5 dB vs Medium: tail={tail_snr:.2} medium={med_snr:.2}"
+        );
+    }
+
+    /// Headline quality lever for task #478: on a heavy-tailed
+    /// natural-content-like source (the post-floor residue
+    /// distribution model: broadband noise plus a tonal carrier),
+    /// HighTail's mu-law axis grid should deliver measurably better
+    /// SNR than Medium's uniform grid at the same per-frame codeword
+    /// budget.
+    ///
+    /// Gate is +0.1 dB SNR delta. The theoretical mu-law-vs-uniform
+    /// quantiser-only delta on a true Laplacian source is ~1.5 dB
+    /// (verified by [`tail_quantiser::tests::mu_law_grid_outperforms_uniform_on_laplacian_source`]),
+    /// but the encoder pipeline's floor1 stage already absorbs much
+    /// of the spectral envelope before the residue ever reaches the
+    /// VQ search — so the end-to-end PCM-domain SNR delta is much
+    /// smaller (typically +0.15 to +0.30 dB). +0.1 dB is well above
+    /// the noise floor of repeated runs and proves the quality
+    /// lever is monotone-positive without false-negative risk.
+    #[test]
+    fn high_tail_beats_medium_on_heavy_tailed_source() {
+        // Synthesize a Laplacian-amplitude noisy signal: heavy-tailed
+        // distribution that mu-law companding is designed to serve.
+        let sr_hz = 48_000.0_f32;
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 8;
+        let mut rng = 0xCAFE_F00D_u32;
+        let mut next = || {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (rng >> 16) as f32 / 65535.0
+        };
+        let mut samples = Vec::with_capacity(n);
+        for i in 0..n {
+            // Carrier sine plus Laplacian-amplitude broadband noise:
+            // tonal centre + heavy-tailed bin distribution.
+            let t = i as f32 / sr_hz;
+            let sine = (2.0 * std::f32::consts::PI * 1500.0 * t).sin() * 0.3;
+            let u = next();
+            let s = if u < 0.5 { -1.0 } else { 1.0 };
+            let mag = -(1.0 - 2.0 * (u - 0.5).abs()).max(1e-6).ln() * 0.05;
+            let noise = s * mag.min(0.3);
+            let combined = (sine + noise).clamp(-0.99, 0.99);
+            samples.push((combined * 30_000.0) as i16);
+        }
+        let skip = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
+        let med_pcm = encode_with_bitrate_target(1, n, &samples, BitrateTarget::Medium);
+        let tail_pcm = encode_with_bitrate_target(1, n, &samples, BitrateTarget::HighTail);
+        let med_snr = snr_db(&samples, &med_pcm, skip);
+        let tail_snr = snr_db(&samples, &tail_pcm, skip);
+        let delta = tail_snr - med_snr;
+        eprintln!(
+            "HighTail vs Medium on Laplacian-noise + 1.5 kHz tone: \
+             medium={med_snr:.2} dB tail={tail_snr:.2} dB delta={delta:+.2} dB"
+        );
+        assert!(
+            delta >= 0.1,
+            "HighTail should improve SNR by ≥ 0.1 dB on heavy-tailed source: \
+             tail={tail_snr:.2} medium={med_snr:.2} delta={delta:+.2}"
+        );
+    }
+
+    /// HighTail must round-trip through ffmpeg's libvorbis decoder
+    /// (the ffmpeg-interop gate). Non-uniform multiplicands are
+    /// wire-format-legal per Vorbis I §3.2.1 — any integer sequence
+    /// within `[0, 2^value_bits)` decodes correctly — but the test
+    /// here pins the assertion against ffmpeg's actual behaviour.
+    /// Best-effort: SKIPs when ffmpeg isn't on PATH.
+    #[test]
+    fn ffmpeg_cross_decode_high_tail() {
+        if !ffmpeg_cross_decode_available() {
+            eprintln!("SKIP: ffmpeg not on PATH");
+            return;
+        }
+        let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
+        let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.channels = Some(1);
+        params.sample_rate = Some(48_000);
+        let mut enc = make_encoder_with_bitrate(&params, BitrateTarget::HighTail).unwrap();
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![data],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        let extradata = enc.output_params().extradata.clone();
+        let ogg = mux_to_ogg(&extradata, &packets);
+        let pcm_ffmpeg = ffmpeg_decode_to_s16le(&ogg, 1)
+            .expect("ffmpeg must accept HighTail's non-uniform multiplicands");
+        assert!(!pcm_ffmpeg.is_empty(), "ffmpeg decoded zero samples");
+        let target_mag = goertzel_mag(&pcm_ffmpeg, 1000.0, 48_000.0);
+        let off_mag = goertzel_mag(&pcm_ffmpeg, 7000.0, 48_000.0);
+        eprintln!("ffmpeg HighTail: target_1k={target_mag:.0} off_7k={off_mag:.0}");
+        assert!(
+            target_mag > off_mag * 5.0,
+            "HighTail ffmpeg: 1 kHz energy ({target_mag}) should dominate over 7 kHz ({off_mag})"
         );
     }
 }

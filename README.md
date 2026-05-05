@@ -116,20 +116,32 @@ What's implemented:
 - A 4-codebook residue setup: floor1 Y book (128 × 7-bit), a 4-entry
   variable-length classbook (`[1, 2, 3, 3]`), main VQ + fine correction
   VQ from a curated **bitstream-resident codebook bank**
-  ([`src/codebook_bank.rs`](src/codebook_bank.rs)) with three
+  ([`src/codebook_bank.rs`](src/codebook_bank.rs)) with four
   bitrate-target variants — `Low` (8×8 main + 4×4 fine, 6+4 bit
-  codewords), `Medium` (11×11 + 4×4, 7+4 bit, the historical default)
-  and `High` (16×16 + 8×8, 8+6 bit). Each is a perfect-fill
-  canonical-Huffman tree with the spec-canonical
+  codewords), `Medium` (11×11 + 4×4, 7+4 bit, the historical default),
+  `High` (16×16 + 8×8, 8+6 bit) and `HighTail` (11×11 + 4×4, 7+4 bit
+  codewords like Medium but with a **mu-law-companded non-uniform
+  axis grid** on the main book — denser quantisation steps near zero
+  where the residue distribution lives, sparser at the tails). Each is
+  a perfect-fill canonical-Huffman tree with the spec-canonical
   `lookup1_values(entries, 2) = values_per_dim` relation so libvorbis /
-  ffmpeg accept all three variants. Picked at construction via
+  ffmpeg accept all four variants. Picked at construction via
   `make_encoder_with_bitrate(&params, BitrateTarget::Low | Medium |
-  High)`; the chosen books go into the setup header and the audio
-  packets index them through `mapping → submap → residue`. On a 2-second
-  1 kHz mono mix Low saves ~7% bytes vs Medium at slightly lower SNR
-  (2.94 vs 4.20 dB); High costs ~22% more bytes for ~1.85 dB SNR gain
-  (6.05 dB). See `bank_targets_are_monotone_in_bitrate` for the
-  measurement.
+  High | HighTail)`; the chosen books go into the setup header and the
+  audio packets index them through `mapping → submap → residue`. On a
+  2-second 1 kHz mono mix Low saves ~7% bytes vs Medium at slightly
+  lower SNR (2.94 vs 4.20 dB); High costs ~22% more bytes for ~1.85 dB
+  SNR gain (6.05 dB); HighTail keeps Medium's per-frame budget
+  identical (only +11 setup-header bits for the wider `value_bits=5`
+  multiplicand field) and improves SNR by ~0.15-0.30 dB on heavy-tailed
+  natural content (the floor1 stage absorbs much of the spectral
+  envelope, so the end-to-end PCM-domain SNR delta is smaller than
+  the +1.5 dB the mu-law grid achieves on a raw Laplacian source —
+  see [`src/tail_quantiser.rs`](src/tail_quantiser.rs) for the
+  quantiser-only quality test). See
+  `bank_targets_are_monotone_in_bitrate` and
+  `high_tail_beats_medium_on_heavy_tailed_source` for the
+  measurements.
 - Residue type 2 (interleaved across channels) for both block sizes
   with two-class per-partition selection (silent vs active cascade).
 - **Trained-VQ partition classifier** (task #93). The silent/active
@@ -153,21 +165,23 @@ What's implemented:
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **Bank tuning is grid-derived, not LBG-trained.** The three
+- **Bank tuning is grid-derived, not LBG-trained.** The four
   `BitrateTarget` entries in
-  [`src/codebook_bank.rs`](src/codebook_bank.rs) span a uniform
-  Cartesian grid per `(values_per_dim, codeword_len)` shape. They
-  give monotone-in-bitrate behaviour and ffmpeg-accepted bitstreams
-  but don't carry the corpus-trained centroid placement that
-  libvorbis's per-quality books do. **Note**: trained-centroid main
-  books would require Vorbis I `lookup_type = 2` storage, but modern
-  ffmpeg's libvorbis decoder explicitly rejects `lookup_type >= 2`
-  ("Codebook lookup type not supported" in `vorbis_dec.c`), so
-  trained-centroid main books are blocked on ffmpeg-interop grounds.
-  The lookup_type=1 axis-grid alternative is still on the table but
-  needs tail-aware quantiser design (pure k-means under-serves the
-  residue distribution's tails) — see CHANGELOG round-1
-  investigation notes.
+  [`src/codebook_bank.rs`](src/codebook_bank.rs) cover uniform grids
+  (Low / Medium / High) and a mu-law-companded non-uniform axis
+  grid (HighTail — closed-form, derived from the textbook companding
+  curve, not corpus-trained). They give monotone-in-bitrate behaviour
+  and ffmpeg-accepted bitstreams but don't carry the per-corpus
+  centroid placement that libvorbis's per-quality books do.
+  **Trained-centroid main books** would require Vorbis I
+  `lookup_type = 2` storage, but modern ffmpeg's libvorbis decoder
+  explicitly rejects `lookup_type >= 2` (the bitstream parser bails
+  on any lookup_type beyond the implicit-grid form), so
+  trained-centroid main books remain blocked on ffmpeg-interop
+  grounds. The lookup_type=1 axis-grid alternative is now exercised
+  via the HighTail variant ([`src/tail_quantiser.rs`](src/tail_quantiser.rs))
+  and is the supported path for quality improvements at the same
+  per-frame codeword budget.
 - **Floor type 0 (LSP) emission.** The default `make_encoder`
   constructor still always declares floor1. A separate
   `floor0_encoder::make_encoder_floor0` constructor (task #181) emits

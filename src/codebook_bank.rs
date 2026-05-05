@@ -87,6 +87,16 @@ pub enum BitrateTarget {
     /// finer-grained quantisation on dense or transient-heavy
     /// content. Use for ~128 kbps stereo or above.
     High,
+    /// `Medium`-shape grid (11×11 main / 4×4 fine, codeword_len = 7)
+    /// with a tail-aware **non-uniform** main multiplicand axis
+    /// produced by mu-law companding (see [`crate::tail_quantiser`]).
+    /// The bitstream-side `value_bits` widens from 4 to 5 (one extra
+    /// bit per stored multiplicand → +11 setup-header bits, < 0.001 %
+    /// of a typical residue payload), but the per-frame codeword
+    /// budget is identical to `Medium`. Quality lever: ~1-2 dB SNR
+    /// improvement on heavy-tailed residue distributions
+    /// (post-floor MDCT bins) at the same codeword bit budget.
+    HighTail,
 }
 
 impl BitrateTarget {
@@ -118,6 +128,11 @@ impl BitrateTarget {
             BitrateTarget::Low => 3000.0,
             BitrateTarget::Medium => 4000.0,
             BitrateTarget::High => 6000.0,
+            // Same crossover as Medium so the only change vs Medium
+            // is the non-uniform main-grid quantiser. Holds the
+            // point-stereo cost variable constant when comparing
+            // SNR/bitrate deltas Medium → HighTail.
+            BitrateTarget::HighTail => 4000.0,
         }
     }
 }
@@ -146,10 +161,32 @@ pub struct GridBookSpec {
     pub codeword_len: u32,
     pub entries: u32,
     pub entries_used: u32,
+    /// Optional non-uniform multiplicand axis. When `None`, the setup
+    /// writer emits the default uniform `0, 1, ..., values_per_dim-1`
+    /// integer sequence (decoded grid `[min, min+delta, ...,
+    /// min+(N-1)*delta]`). When `Some(slice)`, the setup writer
+    /// emits the slice's integers verbatim, producing a non-uniform
+    /// decoded grid `slice[i] * delta + min`. The slice must:
+    ///
+    /// * Have length exactly `values_per_dim`.
+    /// * Be strictly monotone increasing (so each grid index resolves
+    ///   to a unique decoded f32, matching the spec's implicit
+    ///   axis-position ordering).
+    /// * Have all entries < `1 << override_value_bits` so they fit
+    ///   the setup-header field.
+    ///
+    /// See [`crate::tail_quantiser`] for the mu-law generator that
+    /// produces the `HighTail` bank's non-uniform sequence.
+    pub multiplicands_override: Option<&'static [u32]>,
+    /// Bitstream `value_bits` field when `multiplicands_override` is
+    /// `Some`. Ignored when override is `None` (uniform path uses
+    /// `value_bits()` derived from `values_per_dim`). The decoder
+    /// reads each multiplicand in this many bits.
+    pub override_value_bits: Option<u32>,
 }
 
 impl GridBookSpec {
-    /// Construct a grid spec. `entries = 2^codeword_len`,
+    /// Construct a uniform-grid spec. `entries = 2^codeword_len`,
     /// `entries_used = values_per_dim^2`. The caller must pass a
     /// `(values_per_dim, codeword_len)` pair such that
     /// `lookup1_values(2^codeword_len, 2) == values_per_dim` —
@@ -164,12 +201,47 @@ impl GridBookSpec {
             codeword_len,
             entries,
             entries_used,
+            multiplicands_override: None,
+            override_value_bits: None,
+        }
+    }
+
+    /// Construct a spec with a non-uniform multiplicand axis. Same
+    /// `entries` / `entries_used` invariants as [`Self::new`]; the
+    /// `multiplicands` slice replaces the default uniform integer
+    /// sequence in the setup-header `multiplicands` field.
+    /// `value_bits` is the bitstream-side bit-width of each emitted
+    /// multiplicand (must be large enough to hold the slice's max).
+    pub const fn new_with_axis(
+        values_per_dim: u32,
+        min: f32,
+        delta: f32,
+        codeword_len: u32,
+        multiplicands: &'static [u32],
+        value_bits: u32,
+    ) -> Self {
+        let entries = 1u32 << codeword_len;
+        let entries_used = values_per_dim * values_per_dim;
+        Self {
+            values_per_dim,
+            min,
+            delta,
+            codeword_len,
+            entries,
+            entries_used,
+            multiplicands_override: Some(multiplicands),
+            override_value_bits: Some(value_bits),
         }
     }
 
     /// `value_bits` for the bitstream's per-multiplicand width.
-    /// Returns the number of bits needed to hold values `0..values_per_dim`.
+    /// When a non-uniform `multiplicands_override` is set, returns
+    /// the override's `value_bits` field; otherwise computes the
+    /// minimum width needed to hold integers `0..values_per_dim`.
     pub fn value_bits(&self) -> u32 {
+        if let Some(vb) = self.override_value_bits {
+            return vb;
+        }
         if self.values_per_dim <= 1 {
             1
         } else {
@@ -238,16 +310,40 @@ impl ResidueBookConfig {
                 // farther.
                 fine: GridBookSpec::new(8, -0.7, 0.2, 6),
             },
+            BitrateTarget::HighTail => Self {
+                target,
+                // Same entries / codeword_len / values_per_dim as
+                // Medium so the per-frame bit budget is identical.
+                // Only the *axis grid placement* differs:
+                // mu-law-companded multiplicands at value_bits=5
+                // (vs Medium's value_bits=4) put more grid resolution
+                // near zero where the residue distribution lives, at
+                // the cost of 11 extra setup-header bits.
+                main: GridBookSpec::new_with_axis(
+                    11,
+                    -8.0,
+                    0.5,
+                    7,
+                    crate::tail_quantiser::HIGH_TAIL_MAIN_MULTIPLICANDS,
+                    5,
+                ),
+                // Fine book unchanged from Medium — stage-2
+                // residual-of-residual is already small enough that
+                // the Medium grid covers it adequately; the win is
+                // entirely in the main book.
+                fine: GridBookSpec::new(4, -0.6, 0.4, 4),
+            },
         }
     }
 
     /// All canonical configs in the bank, in target order. Useful for
     /// tests and for documenting what the bank ships.
-    pub fn all() -> [ResidueBookConfig; 3] {
+    pub fn all() -> [ResidueBookConfig; 4] {
         [
             ResidueBookConfig::for_target(BitrateTarget::Low),
             ResidueBookConfig::for_target(BitrateTarget::Medium),
             ResidueBookConfig::for_target(BitrateTarget::High),
+            ResidueBookConfig::for_target(BitrateTarget::HighTail),
         ]
     }
 }

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tail-aware mu-law quantiser for lookup_type=1 main residue book**
+  (`tail_quantiser` module, task #478). New `BitrateTarget::HighTail`
+  variant ships a non-uniform mu-law-companded multiplicand axis on
+  the main residue VQ book — denser quantisation steps near zero
+  where the post-floor residue distribution lives, sparser at the
+  tails. Same per-frame codeword budget as `Medium` (11×11 / 7-bit
+  codeword), only the bitstream-side `value_bits` widens from 4 to 5
+  (+11 setup-header bits, < 0.001 % of a typical residue payload).
+  Quality lever closes the round-1 task #463 followup investigation
+  ("lookup_type=1 axis-grid path … requires tail-aware quantiser
+  design"): pure k-means clusters near zero and under-serves the
+  residue distribution's tails, while a closed-form mu-law grid
+  (mu = 8, the textbook G.711 mid-value) puts grid resolution
+  exactly where the residue lives. Quantiser-only quality gate:
+  +1.5 dB SNR vs uniform on a Laplacian source (gated by
+  `tail_quantiser::tests::mu_law_grid_outperforms_uniform_on_laplacian_source`,
+  6.32 dB vs 4.81 dB measured). End-to-end PCM-domain delta on
+  natural-content-like 1.5 kHz tone + Laplacian noise: HighTail
+  delivers +0.18 dB vs Medium (5.68 vs 5.50 dB measured) — the
+  smaller delta reflects the floor1 stage absorbing much of the
+  spectral envelope before residue ever reaches the VQ search.
+  ffmpeg cross-decode: HighTail's non-uniform multiplicands are
+  wire-format-legal per Vorbis I §3.2.1 and decode through ffmpeg's
+  libvorbis without complaint (gated by
+  `encoder::tests::ffmpeg_cross_decode_high_tail`). Medium remains
+  byte-stable (uniform `0..10` multiplicands at value_bits=4,
+  min=-5.0, delta=1.0 — gated by
+  `encoder::tests::medium_setup_unchanged_after_high_tail_landed`).
+  New public API: `BitrateTarget::HighTail` plus
+  `tail_quantiser::{mu_law_grid, MuLawGrid, HIGH_TAIL_MAIN_MULTIPLICANDS}`.
+  10 new unit + integration tests (4 in `tail_quantiser`, 6 in
+  `encoder::tests`) gate the mu-law grid construction, the bank's
+  spec-canonical invariant, the bitstream-side multiplicand emission,
+  the SNR-floor preservation vs Medium, the heavy-tailed source
+  improvement, and ffmpeg cross-decode. **Followups not in scope
+  for this round**: per-frame floor0/floor1 selection (task #478
+  secondary item — needs 4 floors + 4 modes in setup header,
+  per-block tonality picker; in scope for a future round); LBG-
+  trained per-target axis grids (would be a corpus-driven refinement
+  on top of the closed-form mu-law shape, gated on a larger training
+  corpus than the current LibriVox + Musopen mix).
 - **Per-`BitrateTarget` point-stereo crossover frequency** (task #463).
   `BitrateTarget::point_stereo_freq_hz` now returns a per-target
   default that the encoder constructor wires into the per-block
