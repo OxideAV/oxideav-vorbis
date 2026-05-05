@@ -57,16 +57,6 @@
 
 use crate::trained_books::TRAINED_BOOKS;
 
-/// Default percentile of the trained-centroid 2-bin slice L2 distribution
-/// at which we cut the silent / active boundary. 0.5 = median: roughly
-/// half of training-corpus partitions classify silent, half active.
-///
-/// Higher values (closer to 1.0) make the encoder more aggressive about
-/// silencing partitions — cheaper bitrate, lower SNR. Lower values
-/// preserve more partitions as active — bigger files, higher SNR. The
-/// 50th-percentile default empirically matches libvorbis q3-q4 sparsity.
-const DEFAULT_SILENCE_PERCENTILE: f32 = 0.50;
-
 /// One-time-built classifier wrapping the trained codebooks. Holds the
 /// derived silence threshold so per-partition classification is a single
 /// f32 compare on the hot path. Also optionally holds a second "high
@@ -89,9 +79,15 @@ pub(crate) struct TrainedPartitionClassifier {
 }
 
 impl TrainedPartitionClassifier {
-    /// Build a classifier from the in-tree trained books.
+    /// Build a classifier from the in-tree trained books at the 50th-percentile
+    /// (median) silence threshold — the historical Medium-target default. Callers
+    /// that need a per-target threshold should use
+    /// [`Self::from_percentile`] with [`crate::codebook_bank::BitrateTarget::silence_percentile`].
+    // Used only from test helpers and integration tests; silence the dead-code
+    // lint in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_trained_books() -> Self {
-        Self::from_percentile(DEFAULT_SILENCE_PERCENTILE)
+        Self::from_percentile(0.50)
     }
 
     /// Build a classifier matching the legacy hard-coded threshold
@@ -173,7 +169,7 @@ impl TrainedPartitionClassifier {
     /// Returns:
     /// - `0` if `l2_sq <= silence_threshold` (silent, no VQ bits)
     /// - `2` if `l2_sq > high_threshold` and a high_threshold is set
-    ///        (high-energy active, uses extra_main + fine cascade)
+    ///   (high-energy active, uses extra_main + fine cascade)
     /// - `1` otherwise (active, uses main + fine cascade)
     ///
     /// For 2-class setups (`high_threshold_l2_squared == None`) only
@@ -193,6 +189,9 @@ impl TrainedPartitionClassifier {
 
     /// Whether this classifier produces 3 output classes (0, 1, 2).
     /// When `false`, only classes 0 and 1 are emitted — the 2-class layout.
+    // Used only from encoder's setup writer (non-test production code);
+    // guard the dead-code lint in case callers change.
+    #[allow(dead_code)]
     pub(crate) fn has_high_class(&self) -> bool {
         self.high_threshold_l2_squared.is_some()
     }
