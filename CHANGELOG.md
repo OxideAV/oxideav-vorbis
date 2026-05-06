@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.7...v0.0.8) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- add UltraLow BitrateTarget + tonality-aware floor1 (round 39)
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- fix dead_code + doc_lazy_continuation in trained_classifier.rs
+- fix formatting in codebook_bank.rs and encoder.rs
+- 3-class residue, per-target silence percentile, Low global M/S override, bitrate calibration test
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-vorbis/pull/502))
+
 ### Added
 
 - **3-class residue for High / HighTail targets** (task #93 round 3 /
