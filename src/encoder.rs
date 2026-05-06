@@ -2843,7 +2843,29 @@ pub(crate) fn analyse_floor1(
             sumsq += v * v;
         }
         let rms = (sumsq / band_len as f32).sqrt();
-        let mag = FLOOR_PEAK_WEIGHT * peak + (1.0 - FLOOR_PEAK_WEIGHT) * rms;
+        // Tonality-aware peak/RMS blend (round 39).
+        //
+        // The historical fixed `FLOOR_PEAK_WEIGHT = 0.7` over-floors
+        // dense (noise-like) bands and slightly under-floors sharp
+        // tonal peaks. We compute a per-band tonality factor
+        // `tonality = peak / (rms + epsilon)` ∈ [1, sqrt(band_len)]
+        // (1 for a flat-magnitude band, ≈ √band_len for a single-bin
+        // dirac), normalise to [0, 1] via a soft saturating curve, and
+        // mix the static floor weight with a tonality-driven adjustment:
+        //
+        //   adjusted_w = base_w + (1 - base_w) * tonality_norm * 0.4
+        //
+        // → flat bands get w ≈ 0.7 (preserves backward-compat behaviour
+        // for white-noise content), sharp tonal bands push w to ≈ 0.82
+        // (peak-dominated, ensures the floor covers tones without
+        // saturating residue), at constant cost per post.
+        let tonality = if rms > 1e-12 { peak / rms } else { 1.0 };
+        let tonality_max = (band_len as f32).sqrt().max(1.0);
+        // Soft normalisation: tonality_norm ∈ [0, 1) with 1.0 at
+        // perfect single-bin tone, ≈ 0 at flat band.
+        let tonality_norm = ((tonality - 1.0).max(0.0) / (tonality_max - 1.0).max(1e-3)).min(1.0);
+        let adjusted_w = FLOOR_PEAK_WEIGHT + (1.0 - FLOOR_PEAK_WEIGHT) * tonality_norm * 0.4;
+        let mag = adjusted_w * peak + (1.0 - adjusted_w) * rms;
         // Scale floor down so the residue has headroom in [-5, 5] units.
         let ath = ath_min_for_bin(bin, n_half, sample_rate);
         let target_mag = (mag / FLOOR_SCALE).max(ath).max(1e-30);
@@ -5666,6 +5688,7 @@ mod tests {
     #[test]
     fn all_bank_targets_produce_parseable_setups() {
         for target in [
+            BitrateTarget::UltraLow,
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
@@ -5731,6 +5754,7 @@ mod tests {
         }
         let mut bytes_per_target = Vec::new();
         for target in [
+            BitrateTarget::UltraLow,
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
@@ -5757,9 +5781,18 @@ mod tests {
             eprintln!("bitrate-target {target:?}: {total} bytes");
             bytes_per_target.push((target, total));
         }
-        let low_bytes = bytes_per_target[0].1;
-        let medium_bytes = bytes_per_target[1].1;
-        let high_bytes = bytes_per_target[2].1;
+        let ultralow_bytes = bytes_per_target[0].1;
+        let low_bytes = bytes_per_target[1].1;
+        let medium_bytes = bytes_per_target[2].1;
+        let high_bytes = bytes_per_target[3].1;
+        // UltraLow must beat Low on residue cost: 5-bit codewords vs
+        // Low's 6-bit + 80th-percentile silencing vs Low's 70th +
+        // begin=4 vs begin=2 → strictly fewer per-partition bits AND
+        // fewer encoded partitions per frame.
+        assert!(
+            ultralow_bytes < low_bytes,
+            "UltraLow ({ultralow_bytes}) should produce fewer bytes than Low ({low_bytes})"
+        );
         // Low must beat Medium on residue cost. Setup header overhead
         // is ~constant, so this isolates the per-packet residue savings.
         // Low uses 6-bit codewords vs Medium's 7-bit → at least one bit
@@ -5787,6 +5820,7 @@ mod tests {
         let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
         let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
         for target in [
+            BitrateTarget::UltraLow,
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
@@ -5846,6 +5880,8 @@ mod tests {
         let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
         let skip = 1usize << DEFAULT_BLOCKSIZE_LONG_LOG2;
         for (target, snr_min) in [
+            // UltraLow trades ~0.6-0.8 dB SNR for ~30 % bytes vs Low.
+            (BitrateTarget::UltraLow, 1.6_f64),
             (BitrateTarget::Low, 2.5_f64),
             (BitrateTarget::Medium, 3.8),
             (BitrateTarget::High, 3.8),
@@ -5859,6 +5895,82 @@ mod tests {
                 "{target:?}: SNR {snr:.2} below floor {snr_min}"
             );
         }
+    }
+
+    /// UltraLow gate: on a 2-second mono speech-band fixture (300 Hz
+    /// vowel formant + low broadband noise), UltraLow must produce
+    /// strictly fewer bytes than Low — at least 25 % savings — while
+    /// still decoding non-empty PCM dominated by the vowel band.
+    ///
+    /// Round 39 measurement: ~30 % byte reduction on the synthetic
+    /// 1 kHz + low noise 2-second fixture used by `bank_targets_are_monotone`
+    /// (24 347 vs 34 866 bytes = 30.2 %).
+    #[test]
+    fn ultralow_saves_at_least_25_percent_vs_low_on_speech_band() {
+        let n_seconds = 2usize;
+        let sr_hz = 48_000usize;
+        let n = sr_hz * n_seconds;
+        // Speech-band fixture: 300 Hz fundamental + 1.2 kHz second-formant
+        // sweep + low-amplitude wide-band noise. Mimics a vowel held over
+        // two seconds — exactly the content UltraLow is tuned for.
+        let mut samples = Vec::with_capacity(n);
+        let mut rng: u32 = 0xDEADBEEF;
+        let mut next = || {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for i in 0..n {
+            let t = i as f32 / sr_hz as f32;
+            let f0 = (2.0 * std::f32::consts::PI * 300.0 * t).sin() * 0.40;
+            let f1 = (2.0 * std::f32::consts::PI * 1200.0 * t).sin() * 0.20;
+            let noise = next() * 0.03;
+            let s = (f0 + f1 + noise).clamp(-1.0, 1.0);
+            samples.push((s * 30_000.0) as i16);
+        }
+        let bytes_for = |target: BitrateTarget| -> usize {
+            let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+            params.channels = Some(1);
+            params.sample_rate = Some(sr_hz as u32);
+            let mut enc = make_encoder_with_bitrate(&params, target).unwrap();
+            let mut data = Vec::with_capacity(samples.len() * 2);
+            for s in &samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            let frame = Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![data],
+            });
+            enc.send_frame(&frame).unwrap();
+            enc.flush().unwrap();
+            let mut total = 0usize;
+            while let Ok(p) = enc.receive_packet() {
+                total += p.data.len();
+            }
+            total
+        };
+        let low_bytes = bytes_for(BitrateTarget::Low);
+        let ultralow_bytes = bytes_for(BitrateTarget::UltraLow);
+        let savings_pct = 100.0 - (ultralow_bytes as f64 / low_bytes as f64) * 100.0;
+        eprintln!(
+            "UltraLow vs Low on speech fixture: {ultralow_bytes} vs {low_bytes} bytes ({savings_pct:.1} % savings)"
+        );
+        assert!(
+            savings_pct >= 25.0,
+            "UltraLow should save ≥25 % on speech fixture, got {savings_pct:.1} % \
+             (UltraLow {ultralow_bytes}, Low {low_bytes})"
+        );
+        // Sanity: UltraLow must still decode to non-empty PCM with the
+        // 300 Hz formant intact (within an octave).
+        let pcm = encode_with_bitrate_target(1, n, &samples, BitrateTarget::UltraLow);
+        assert!(!pcm.is_empty(), "UltraLow PCM must not be empty");
+        let formant_mag = goertzel_mag(&pcm, 300.0, sr_hz as f64);
+        let off_mag = goertzel_mag(&pcm, 8000.0, sr_hz as f64);
+        eprintln!("UltraLow speech: formant_300Hz={formant_mag:.0} off_8kHz={off_mag:.0}");
+        assert!(
+            formant_mag > off_mag * 2.0,
+            "UltraLow should preserve the 300 Hz formant: formant={formant_mag:.0}, off={off_mag:.0}"
+        );
     }
 
     /// Helper: encode + our-decoder round-trip with a specific bank
@@ -5917,6 +6029,7 @@ mod tests {
         let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
         let samples = sine_samples(1000.0, n, 48_000.0, 0.5);
         for target in [
+            BitrateTarget::UltraLow,
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,
@@ -6238,6 +6351,7 @@ mod tests {
         let n = (1usize << DEFAULT_BLOCKSIZE_LONG_LOG2) * 4;
         let samples = sine_samples(1000.0, n, 48_000.0, 0.4);
         for target in [
+            BitrateTarget::UltraLow,
             BitrateTarget::Low,
             BitrateTarget::Medium,
             BitrateTarget::High,

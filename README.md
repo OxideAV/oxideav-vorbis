@@ -88,16 +88,21 @@ What's implemented:
   `bs0/2` post-echo — see the
   `roundtrip_click_short_beats_long_only_baseline` test for a
   measurement.
-- Floor1 analysis with peak/RMS-blended envelope tracking,
+- Floor1 analysis with **tonality-aware peak/RMS envelope tracking**,
   binary-search dB-domain quantisation, and a
   smearing pass that prevents inter-post Bresenham dips below
   `12 * multiplier` dB (§7.2.4 step1 / step2). 8 posts on short
-  blocks, 32 on long. Mono 1 kHz SNR is ~4.2 dB through both our
-  decoder and ffmpeg's libvorbis (vs ~3.8 dB pre-tuning).
+  blocks, 32 on long. The blend weight starts at `FLOOR_PEAK_WEIGHT
+  = 0.7` and adapts upward (toward 0.82) on bands with high
+  `peak/rms` ratio (sharp tones) so floor coverage tracks tonality
+  without over-flooring dense bands. Mono 1 kHz SNR is ~4.6 dB
+  Medium / 6.0 dB High through both our decoder and ffmpeg's
+  libvorbis (vs ~3.8 dB pre-round-39 fixed-weight blend).
 - Sum/difference channel coupling (§1.3.3) for L-R pairs below the
   point-stereo crossover, with the crossover frequency picked from
-  the chosen `BitrateTarget` (`Low` → 3 kHz, `Medium` → 4 kHz, `High`
-  → 6 kHz; `DEFAULT_POINT_STEREO_FREQ = 4 kHz` is the legacy default).
+  the chosen `BitrateTarget` (`UltraLow` → 2 kHz, `Low` → 3 kHz,
+  `Medium` → 4 kHz, `High` → 6 kHz;
+  `DEFAULT_POINT_STEREO_FREQ = 4 kHz` is the legacy default).
   Above the crossover the encoder splits the spectrum into critical-
   band sub-bands (4-6, 6-9, 9-13, 13-Nyquist kHz, see
   `POINT_STEREO_BAND_THRESHOLDS`) and applies point-stereo per-band
@@ -111,29 +116,35 @@ What's implemented:
   mappings (L/C/R, 4ch quad, 5.1, 7.1) with coupled L-R,
   back-L/back-R, and side-L/side-R pairs; center and LFE channels
   stay uncoupled.
-- A **bitstream-resident codebook bank** with four `BitrateTarget`
+- A **bitstream-resident codebook bank** with five `BitrateTarget`
   variants ([`src/codebook_bank.rs`](src/codebook_bank.rs)) —
-  `Low` (8×8 main + 4×4 fine, 6+4 bit codewords), `Medium` (11×11 +
-  4×4, 7+4 bit, the historical default), `High` (16×16 + 8×8, 8+6 bit)
-  and `HighTail` (11×11 + 4×4, 7+4 bit like Medium but with a
-  **mu-law-companded non-uniform axis grid** on the main book). All are
-  perfect-fill canonical-Huffman trees with the spec-canonical
+  `UltraLow` (5×5 main + 4×4 fine, 5+4 bit codewords; ~48 kbps stereo
+  / telephony), `Low` (8×8 main + 4×4 fine, 6+4 bit codewords),
+  `Medium` (11×11 + 4×4, 7+4 bit, the historical default),
+  `High` (16×16 + 8×8, 8+6 bit) and `HighTail` (11×11 + 4×4, 7+4 bit
+  like Medium but with a **mu-law-companded non-uniform axis grid**
+  on the main book). All are perfect-fill canonical-Huffman trees
+  with the spec-canonical
   `lookup1_values(entries, 2) = values_per_dim` relation accepted by
   libvorbis / ffmpeg. `High` and `HighTail` additionally ship a fifth
   codebook — an `extra_main` 22×22 grid (`{-10.5..+10.5}`, step 1,
   9-bit codewords, `lookup1_values(512,2)=22`) — enabling a 3-class
   residue layout: class 0 = silent, class 1 = active (main + fine),
   class 2 = high-energy (extra_main + fine). Picked at construction via
-  `make_encoder_with_bitrate(&params, BitrateTarget::Low | Medium |
-  High | HighTail)`.
+  `make_encoder_with_bitrate(&params, BitrateTarget::UltraLow | Low |
+  Medium | High | HighTail)`. Round 39 byte counts on a 2 s 48 kHz
+  mono mix: UltraLow 24 347 / Low 34 866 / Medium 51 391 / High
+  79 107 (UltraLow saves 30.2 % vs Low, 33.2 % on a clean speech
+  fixture — see `ultralow_saves_at_least_25_percent_vs_low_on_speech_band`).
 - Residue type 2 (interleaved across channels) for both block sizes
   with **per-target partition classification** — silence / active / (for
   High/HighTail) high-energy — driven by the trained L2 percentile
-  thresholds: `Low` 70th percentile (aggressive silencing), `Medium`
-  50th (historical), `High` 35th (keep more partitions active), `HighTail`
-  40th. `Low` additionally skips the lowest 2 bins from VQ (begin=2)
-  to save classword bits on near-DC energy already represented by
-  the floor curve.
+  thresholds: `UltraLow` 80th percentile (most aggressive silencing),
+  `Low` 70th, `Medium` 50th (historical), `High` 35th (keep more
+  partitions active), `HighTail` 40th. `Low` skips the lowest 2 bins
+  from VQ (begin=2) and `UltraLow` skips the lowest 4 (begin=4) to
+  save classword bits on near-DC energy already represented by the
+  floor curve.
 - **Trained-VQ partition classifier** (task #93). The silent/active/
   high-energy decision per residue partition is driven by the 2-bin
   slice L2 distribution of four LBG-trained 256-entry codebooks — see
@@ -144,12 +155,13 @@ What's implemented:
   `encoder::tests::trained_vs_legacy_classifier_bitrate_5s_mix`
   fixture. The bitstream layout is unchanged; trained books inform
   encoder choices only.
-- **Frame-level global M/S correlation override** for the `Low` target:
-  when the full-frame L/R correlation exceeds 0.92 the encoder extends
-  point-stereo to the entire spectrum for that frame, maximising bit
-  savings on near-mono speech. `Medium` / `High` / `HighTail` keep the
-  threshold disabled (> 1.0) to preserve the historical per-band-only
-  stereo decisions.
+- **Frame-level global M/S correlation override** for the `UltraLow`
+  and `Low` targets: when the full-frame L/R correlation exceeds the
+  per-target threshold (`UltraLow` → 0.85, `Low` → 0.92) the encoder
+  extends point-stereo to the entire spectrum for that frame,
+  maximising bit savings on near-mono speech. `Medium` / `High` /
+  `HighTail` keep the threshold disabled (> 1.0) to preserve the
+  historical per-band-only stereo decisions.
 - Xiph-laced 3-packet `extradata` in `output_params()`, ready to
   hand to a container muxer. ffmpeg's libvorbis decodes the output
   bit-cleanly — see the `ffmpeg_cross_decode_*` tests.
@@ -157,14 +169,15 @@ What's implemented:
 Known limitations, relative to libvorbis, that affect bitrate but
 not bitstream conformance:
 
-- **Bank tuning is grid-derived, not LBG-trained.** The four
+- **Bank tuning is grid-derived, not LBG-trained.** The five
   `BitrateTarget` entries in
   [`src/codebook_bank.rs`](src/codebook_bank.rs) cover uniform grids
-  (Low / Medium / High) and a mu-law-companded non-uniform axis
-  grid (HighTail — closed-form, derived from the textbook companding
-  curve, not corpus-trained). They give monotone-in-bitrate behaviour
-  and ffmpeg-accepted bitstreams but don't carry the per-corpus
-  centroid placement that libvorbis's per-quality books do.
+  (UltraLow / Low / Medium / High) and a mu-law-companded non-uniform
+  axis grid (HighTail — closed-form, derived from the textbook
+  companding curve, not corpus-trained). They give
+  monotone-in-bitrate behaviour and ffmpeg-accepted bitstreams but
+  don't carry the per-corpus centroid placement that libvorbis's
+  per-quality books do.
   **Trained-centroid main books** would require Vorbis I
   `lookup_type = 2` storage, but modern ffmpeg's libvorbis decoder
   explicitly rejects `lookup_type >= 2` (the bitstream parser bails

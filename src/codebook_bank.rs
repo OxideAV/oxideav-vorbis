@@ -76,6 +76,16 @@
 /// 5-second corpus sample.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub enum BitrateTarget {
+    /// Telephony-band target: 5×5=25 main grid on `{-2..+2}` step 1 at
+    /// codeword_len=5 (1 codeword bit shorter than `Low`), matching
+    /// 4×4=16 fine on a coarser `{-0.4..+0.4}` step. Picks aggressive
+    /// silence percentile (0.80) and skips the lowest 4 bins from VQ
+    /// (begin=4) so near-DC energy carried entirely by the floor curve
+    /// gets no residue cost. Use for ~48 kbps stereo and below
+    /// (telephony, voice-only). Roughly ~30-35 % fewer residue bytes
+    /// than `Low` on quiet speech-band content with a corresponding
+    /// SNR drop (~0.6-0.8 dB on a 1 kHz mono sine).
+    UltraLow,
     /// Lowest-rate target: smaller grid, shorter codewords, biased for
     /// speech-band content. Use for ~64 kbps stereo or below.
     Low,
@@ -125,6 +135,11 @@ impl BitrateTarget {
     /// biggest delta on `High` (more HF stereo preserved).
     pub fn point_stereo_freq_hz(self) -> f32 {
         match self {
+            // Push crossover all the way down to 2 kHz: at telephony
+            // bitrates inter-aural phase localisation barely operates
+            // outside the speech formant band, and every additional
+            // mono band saves angle-channel bits.
+            BitrateTarget::UltraLow => 2000.0,
             BitrateTarget::Low => 3000.0,
             BitrateTarget::Medium => 4000.0,
             BitrateTarget::High => 6000.0,
@@ -160,6 +175,11 @@ impl BitrateTarget {
     ///   activate quite as many partitions to hit the same quality.
     pub fn silence_percentile(self) -> f32 {
         match self {
+            // Aggressive silencing at the very bottom of the bank: 80 %
+            // of "corpus-typical" partitions classify silent. Combined
+            // with the smaller 5×5 main grid this is the dominant
+            // bitrate lever for `UltraLow`.
+            BitrateTarget::UltraLow => 0.80,
             BitrateTarget::Low => 0.70,
             BitrateTarget::Medium => 0.50,
             BitrateTarget::High => 0.35,
@@ -189,6 +209,9 @@ impl BitrateTarget {
     ///   bitrates where the extra bits are affordable.
     pub fn global_corr_override_threshold(self) -> f32 {
         match self {
+            // Even more aggressive than `Low`: any frame with > 0.85
+            // full-band L/R correlation gets full-spectrum point-stereo.
+            BitrateTarget::UltraLow => 0.85,
             BitrateTarget::Low => 0.92,
             BitrateTarget::Medium => 1.01,   // > 1.0 → always disabled
             BitrateTarget::High => 1.01,     // same
@@ -214,6 +237,11 @@ impl BitrateTarget {
     ///   fidelity).
     pub fn residue_begin_offset(self) -> u32 {
         match self {
+            // Skip 4 bins (2 dim-2 partitions) — saves more classword
+            // bits than `Low` at a cost only audible above 200 Hz on
+            // 48 kHz material, which is far below the speech formants
+            // this target serves.
+            BitrateTarget::UltraLow => 4,
             BitrateTarget::Low => 2,
             BitrateTarget::Medium => 0,
             BitrateTarget::High => 0,
@@ -368,6 +396,26 @@ impl ResidueBookConfig {
     /// `{8, 11, 16}` (the largest n with n² ≤ 2^cwl).
     pub fn for_target(target: BitrateTarget) -> Self {
         match target {
+            BitrateTarget::UltraLow => Self {
+                target,
+                // codeword_len=5 → entries=32, lookup_values=5 (5²=25
+                // ≤ 32 < 36=6²). 5×5 grid {-2..+2} step 1 spans the
+                // historical residue range of speech-band content
+                // (post-floor MDCT magnitudes are mostly within ±2 at
+                // typical floor scales) at half the codeword bits per
+                // active partition vs Medium.
+                main: GridBookSpec::new(5, -2.0, 1.0, 5),
+                // codeword_len=4 → entries=16, lookup_values=4. 4×4
+                // grid {-0.4..+0.4} step 0.267. Slightly coarser than
+                // Low's fine grid; the bits saved on the fine cascade
+                // matter more at the bottom-of-bank rate point than
+                // the residual-of-residual error reduction.
+                fine: GridBookSpec::new(4, -0.4, 0.267, 4),
+                // No extra class — telephony-band content is
+                // overwhelmingly low-energy, so the third class would
+                // never pay back its classbook overhead.
+                extra_main: None,
+            },
             BitrateTarget::Low => Self {
                 target,
                 // codeword_len=6 → entries=64, lookup_values=8.
@@ -454,8 +502,9 @@ impl ResidueBookConfig {
 
     /// All canonical configs in the bank, in target order. Useful for
     /// tests and for documenting what the bank ships.
-    pub fn all() -> [ResidueBookConfig; 4] {
+    pub fn all() -> [ResidueBookConfig; 5] {
         [
+            ResidueBookConfig::for_target(BitrateTarget::UltraLow),
             ResidueBookConfig::for_target(BitrateTarget::Low),
             ResidueBookConfig::for_target(BitrateTarget::Medium),
             ResidueBookConfig::for_target(BitrateTarget::High),
@@ -542,9 +591,12 @@ mod tests {
     }
 
     /// High and HighTail targets should ship an extra_main book for the
-    /// third residue class; Low and Medium should not.
+    /// third residue class; UltraLow / Low / Medium should not.
     #[test]
     fn extra_main_present_on_high_targets_only() {
+        assert!(ResidueBookConfig::for_target(BitrateTarget::UltraLow)
+            .extra_main
+            .is_none());
         assert!(ResidueBookConfig::for_target(BitrateTarget::Low)
             .extra_main
             .is_none());
@@ -578,12 +630,14 @@ mod tests {
     }
 
     /// Variants should be ordered by codeword bit budget so caller-facing
-    /// "low / medium / high" intuition holds.
+    /// "ultra-low / low / medium / high" intuition holds.
     #[test]
     fn variants_ordered_by_codeword_budget() {
+        let u = ResidueBookConfig::for_target(BitrateTarget::UltraLow);
         let l = ResidueBookConfig::for_target(BitrateTarget::Low);
         let m = ResidueBookConfig::for_target(BitrateTarget::Medium);
         let h = ResidueBookConfig::for_target(BitrateTarget::High);
+        assert!(u.main.codeword_len < l.main.codeword_len);
         assert!(l.main.codeword_len < m.main.codeword_len);
         assert!(m.main.codeword_len < h.main.codeword_len);
     }
