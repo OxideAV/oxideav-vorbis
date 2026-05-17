@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.8...v0.0.9) - 2026-05-17
+
+### Other
+
+- per-target floor1 smearing delta (round 73)
+
 ### Added
 
 - **Per-target floor1 smearing delta (round 73).** The encoder's
