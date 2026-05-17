@@ -248,6 +248,50 @@ impl BitrateTarget {
             BitrateTarget::HighTail => 0,
         }
     }
+
+    /// Per-target floor1 smearing delta (in Y-quantiser units, i.e.
+    /// dB-units after the multiplier is applied — `Y * mult` indexes
+    /// `FLOOR1_INVERSE_DB` at ~0.5 dB/step, so at multiplier=2 each Y
+    /// unit is ~1 dB).
+    ///
+    /// The encoder's `smear_floor_posts` lifts any floor post that
+    /// sits more than `delta` units below either neighbour up to
+    /// `neighbour - delta`. This bounds how deeply the Bresenham-
+    /// rendered floor curve can dip between two loud posts. Smaller
+    /// `delta` → more aggressive lifting → higher effective floor →
+    /// **fewer residue bits** spent representing the dip. Larger
+    /// `delta` → less lifting → floor can dip deeper → more residue
+    /// bits → more detail in the rendered curve's low-amplitude
+    /// regions.
+    ///
+    /// At the low bitrate targets the bits saved on lifted residue
+    /// are far more valuable than the perceptual detail lost in the
+    /// dip (between loud posts the masking is already heavy and the
+    /// residue would just be reconstruction noise of inaudible low-
+    /// magnitude bins). At the high bitrate targets we have the
+    /// budget to encode the dip, so we let the floor drop further.
+    ///
+    /// - `UltraLow` → 8: most aggressive lifting — every floor dip >
+    ///   ~8 dB triggers post lifting, suppressing the deepest nulls
+    ///   between adjacent posts. Bitrate-dominant target where every
+    ///   saved residue bit counts.
+    /// - `Low` → 10: still aggressive, but allows ~10 dB nulls.
+    /// - `Medium` → 12: historical default — byte-stable with the
+    ///   pre-per-target encoder. Anchor for the existing fixture suite.
+    /// - `High` → 14: less aggressive lifting — preserves detail in
+    ///   low-amplitude inter-post regions at the cost of slightly more
+    ///   residue cost.
+    /// - `HighTail` → 12: matches Medium — the per-target lever for
+    ///   HighTail is the mu-law main grid, not the floor shape.
+    pub fn floor_smear_delta(self) -> i32 {
+        match self {
+            BitrateTarget::UltraLow => 8,
+            BitrateTarget::Low => 10,
+            BitrateTarget::Medium => 12,
+            BitrateTarget::High => 14,
+            BitrateTarget::HighTail => 12,
+        }
+    }
 }
 
 /// Parameters describing a single dim-2 grid VQ codebook for the

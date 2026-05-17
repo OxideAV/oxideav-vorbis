@@ -89,15 +89,22 @@ What's implemented:
   `roundtrip_click_short_beats_long_only_baseline` test for a
   measurement.
 - Floor1 analysis with **tonality-aware peak/RMS envelope tracking**,
-  binary-search dB-domain quantisation, and a
+  binary-search dB-domain quantisation, and a **per-target**
   smearing pass that prevents inter-post Bresenham dips below
-  `12 * multiplier` dB (§7.2.4 step1 / step2). 8 posts on short
-  blocks, 32 on long. The blend weight starts at `FLOOR_PEAK_WEIGHT
-  = 0.7` and adapts upward (toward 0.82) on bands with high
-  `peak/rms` ratio (sharp tones) so floor coverage tracks tonality
-  without over-flooring dense bands. Mono 1 kHz SNR is ~4.6 dB
-  Medium / 6.0 dB High through both our decoder and ffmpeg's
-  libvorbis (vs ~3.8 dB pre-round-39 fixed-weight blend).
+  `BitrateTarget::floor_smear_delta() * multiplier` dB
+  (§7.2.4 step1 / step2). 8 posts on short blocks, 32 on long.
+  The blend weight starts at `FLOOR_PEAK_WEIGHT = 0.7` and adapts
+  upward (toward 0.82) on bands with high `peak/rms` ratio (sharp
+  tones) so floor coverage tracks tonality without over-flooring
+  dense bands. The per-target smearing delta lever (round 73)
+  trades inter-post detail against residue bits:
+  `UltraLow → 8`, `Low → 10`, `Medium → 12` (byte-stable historical
+  default), `High → 14`, `HighTail → 12` — smaller delta lifts
+  dipped posts more aggressively, raising the effective floor and
+  saving residue bits at the cost of detail in low-amplitude
+  regions. Mono 1 kHz SNR is ~4.6 dB Medium / 6.0 dB High through
+  both our decoder and ffmpeg's libvorbis (vs ~3.8 dB pre-round-39
+  fixed-weight blend).
 - Sum/difference channel coupling (§1.3.3) for L-R pairs below the
   point-stereo crossover, with the crossover frequency picked from
   the chosen `BitrateTarget` (`UltraLow` → 2 kHz, `Low` → 3 kHz,
@@ -135,7 +142,9 @@ What's implemented:
   Medium | High | HighTail)`. Round 39 byte counts on a 2 s 48 kHz
   mono mix: UltraLow 24 347 / Low 34 866 / Medium 51 391 / High
   79 107 (UltraLow saves 30.2 % vs Low, 33.2 % on a clean speech
-  fixture — see `ultralow_saves_at_least_25_percent_vs_low_on_speech_band`).
+  fixture; round 73's per-target floor smearing delta widens the
+  speech-fixture UltraLow-vs-Low gap to **38.9 %** — see
+  `ultralow_saves_at_least_25_percent_vs_low_on_speech_band`).
 - Residue type 2 (interleaved across channels) for both block sizes
   with **per-target partition classification** — silence / active / (for
   High/HighTail) high-energy — driven by the trained L2 percentile

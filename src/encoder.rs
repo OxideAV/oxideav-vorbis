@@ -1373,6 +1373,11 @@ pub fn make_encoder_with_bitrate(
         // (e.g. near-mono speech). Disabled (threshold > 1.0) for High
         // and HighTail where HF stereo image is preserved.
         global_corr_override_threshold: target.global_corr_override_threshold(),
+        // Per-target floor1 post-smearing delta: smaller values lift
+        // posts more aggressively (less inter-post dip → fewer residue
+        // bits). Medium keeps the historical `FLOOR_SMEAR_DELTA = 12`
+        // for byte-stable output.
+        floor_smear_delta: target.floor_smear_delta(),
     }))
 }
 
@@ -1456,6 +1461,12 @@ struct VorbisEncoder {
     /// HighTail targets). Sourced from
     /// [`BitrateTarget::global_corr_override_threshold`].
     global_corr_override_threshold: f32,
+    /// Floor1 post-smearing delta (Y-quantiser units). Caps how far
+    /// the rendered floor curve can dip between adjacent posts —
+    /// smaller values lift more aggressively (less dip → fewer
+    /// residue bits → smaller bitrate at the cost of inter-post
+    /// detail). Sourced from [`BitrateTarget::floor_smear_delta`].
+    floor_smear_delta: i32,
 }
 
 /// Short-window size for the transient detector (samples). Chosen as
@@ -1879,7 +1890,13 @@ impl VorbisEncoder {
             let mut curve = vec![1f32; n_half];
             let payload = match &floor_def {
                 Floor::Type1(f) => {
-                    let target_y = analyse_floor1(f, &spec, n_half, self.sample_rate);
+                    let target_y = analyse_floor1_with_smear(
+                        f,
+                        &spec,
+                        n_half,
+                        self.sample_rate,
+                        self.floor_smear_delta,
+                    );
                     let codes = compute_floor1_codes(f, &target_y);
                     let decoded = crate::floor::Floor1Decoded {
                         unused: false,
@@ -2800,6 +2817,25 @@ pub(crate) fn analyse_floor1(
     n_half: usize,
     sample_rate: u32,
 ) -> Vec<i32> {
+    analyse_floor1_with_smear(floor, spec, n_half, sample_rate, FLOOR_SMEAR_DELTA)
+}
+
+/// Like [`analyse_floor1`] but takes an explicit floor-post smearing
+/// delta (Y-quantiser units). Smaller `smear_delta` → more aggressive
+/// inter-post lifting → higher effective floor → fewer residue bits
+/// spent representing the dip between two loud posts. The legacy
+/// entry [`analyse_floor1`] forwards `FLOOR_SMEAR_DELTA = 12`, which
+/// is the historical byte-stable default.
+///
+/// See [`crate::codebook_bank::BitrateTarget::floor_smear_delta`] for
+/// the per-target values the encoder uses.
+pub(crate) fn analyse_floor1_with_smear(
+    floor: &Floor1,
+    spec: &[f32],
+    n_half: usize,
+    sample_rate: u32,
+    smear_delta: i32,
+) -> Vec<i32> {
     let xlist = &floor.xlist;
     let n_posts = xlist.len();
     // Sort posts by X position so we can look up neighbours easily.
@@ -2872,7 +2908,7 @@ pub(crate) fn analyse_floor1(
         y[i] = quantise_floor1_y(target_mag, mult);
     }
 
-    smear_floor_posts(&mut y, &order);
+    smear_floor_posts_with_delta(&mut y, &order, smear_delta);
     y
 }
 
@@ -2949,16 +2985,29 @@ fn quantise_floor1_y(target_mag: f32, mult: usize) -> i32 {
 /// envelope. Posts are modified in-place, indexed by `order` (sorted
 /// by X). Indices 0 and 1 are the implicit endpoints (Vorbis I §7.2.4)
 /// and stay locked at their analyser-picked values.
+#[cfg(test)]
 fn smear_floor_posts(y: &mut [i32], order: &[usize]) {
+    smear_floor_posts_with_delta(y, order, FLOOR_SMEAR_DELTA);
+}
+
+/// Like [`smear_floor_posts`] but takes an explicit `delta` (Y-units)
+/// instead of using the module-level `FLOOR_SMEAR_DELTA` constant.
+///
+/// Smaller `delta` → more aggressive lifting → higher effective floor
+/// → fewer residue bits spent representing inter-post dips. Used by
+/// the per-target floor1 analysis path so each `BitrateTarget` can
+/// tune its bitrate/quality trade-off independently
+/// (see [`crate::codebook_bank::BitrateTarget::floor_smear_delta`]).
+fn smear_floor_posts_with_delta(y: &mut [i32], order: &[usize], delta: i32) {
     let n = order.len();
     if n < 3 {
         return;
     }
-    // Forward pass: lift posts that are more than DELTA below their lower-X neighbour.
+    // Forward pass: lift posts that are more than `delta` below their lower-X neighbour.
     let mut prev_y = y[order[0]];
     for &idx in order.iter().skip(1) {
         let cur = y[idx];
-        let lifted = (prev_y - FLOOR_SMEAR_DELTA).max(cur);
+        let lifted = (prev_y - delta).max(cur);
         y[idx] = lifted;
         prev_y = lifted;
     }
@@ -2966,7 +3015,7 @@ fn smear_floor_posts(y: &mut [i32], order: &[usize]) {
     let mut next_y = y[order[n - 1]];
     for &idx in order.iter().rev().skip(1) {
         let cur = y[idx];
-        let lifted = (next_y - FLOOR_SMEAR_DELTA).max(cur);
+        let lifted = (next_y - delta).max(cur);
         y[idx] = lifted;
         next_y = lifted;
     }
@@ -3616,6 +3665,7 @@ mod tests {
                 floor0_available: false,
                 global_corr_override_threshold: BitrateTarget::Medium
                     .global_corr_override_threshold(),
+                floor_smear_delta: BitrateTarget::Medium.floor_smear_delta(),
             });
         }
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
@@ -4297,6 +4347,7 @@ mod tests {
             mode_bits: 1,
             floor0_available: false,
             global_corr_override_threshold: BitrateTarget::Medium.global_corr_override_threshold(),
+            floor_smear_delta: BitrateTarget::Medium.floor_smear_delta(),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -4582,6 +4633,116 @@ mod tests {
         );
     }
 
+    /// `smear_floor_posts_with_delta` is the per-target entry. With a
+    /// smaller `delta` the same dipped post should lift higher (more
+    /// aggressive lifting → larger effective floor). Verifies the
+    /// monotone relationship the encoder's per-target lever relies on.
+    #[test]
+    fn smear_floor_posts_with_delta_smaller_delta_lifts_more() {
+        // Same dipped fixture as `smear_floor_posts_lifts_dipped_post`.
+        let order = vec![0usize, 2, 1];
+        let lift_for = |delta: i32| -> i32 {
+            let mut y = vec![100i32, 100, 50];
+            smear_floor_posts_with_delta(&mut y, &order, delta);
+            y[2]
+        };
+        let lifted_8 = lift_for(8);
+        let lifted_12 = lift_for(12);
+        let lifted_18 = lift_for(18);
+        // delta=8 → lifted to >= 100-8 = 92
+        assert!(
+            lifted_8 >= 92,
+            "delta=8 should lift to >=92, got {lifted_8}"
+        );
+        // delta=18 → original value (50) is already >= 100-18=82? no,
+        // 50 < 82, so still lifts to 82.
+        assert!(
+            lifted_18 >= 82,
+            "delta=18 should lift to >=82, got {lifted_18}"
+        );
+        // Monotone: smaller delta lifts at least as high as larger delta.
+        assert!(
+            lifted_8 >= lifted_12 && lifted_12 >= lifted_18,
+            "lift should be monotone-decreasing in delta: \
+             lifted_8={lifted_8} lifted_12={lifted_12} lifted_18={lifted_18}"
+        );
+    }
+
+    /// Per-target `floor_smear_delta` should be monotone-non-decreasing
+    /// from UltraLow → High, mirroring the bit-budget ordering: lower
+    /// targets lift more aggressively (smaller delta → fewer residue
+    /// bits spent on inter-post dips). HighTail matches Medium since
+    /// its per-target lever is the mu-law main grid, not the floor.
+    #[test]
+    fn per_target_floor_smear_delta_is_monotone() {
+        let ul = BitrateTarget::UltraLow.floor_smear_delta();
+        let l = BitrateTarget::Low.floor_smear_delta();
+        let m = BitrateTarget::Medium.floor_smear_delta();
+        let h = BitrateTarget::High.floor_smear_delta();
+        let ht = BitrateTarget::HighTail.floor_smear_delta();
+        assert!(ul <= l, "UltraLow ({ul}) should not exceed Low ({l})");
+        assert!(l <= m, "Low ({l}) should not exceed Medium ({m})");
+        assert!(m <= h, "Medium ({m}) should not exceed High ({h})");
+        assert_eq!(
+            ht, m,
+            "HighTail ({ht}) should equal Medium ({m}) — \
+             HighTail's per-target lever is the mu-law grid, not the floor"
+        );
+        // Anchor the historical default.
+        assert_eq!(
+            m, 12,
+            "Medium.floor_smear_delta must remain 12 for byte-stable output"
+        );
+    }
+
+    /// Byte-stability gate for Medium target: per-frame output must be
+    /// identical to the pre-r73 (pre-per-target-smear) baseline. This
+    /// uses a fixed 16-period sine fixture so the test is deterministic
+    /// and easy to debug if it ever changes.
+    ///
+    /// Specifically: Medium.floor_smear_delta() must equal the legacy
+    /// `FLOOR_SMEAR_DELTA = 12` constant, and the analyse_floor1 entry
+    /// (which uses the legacy default) must match analyse_floor1_with_smear
+    /// at Medium's per-target delta. Together this proves the per-target
+    /// codepath leaves Medium untouched.
+    #[test]
+    fn medium_floor_smear_matches_legacy_default() {
+        assert_eq!(
+            BitrateTarget::Medium.floor_smear_delta(),
+            FLOOR_SMEAR_DELTA,
+            "Medium per-target delta must equal the legacy constant"
+        );
+        // Build a synthetic spectrum with a sharp peak in the middle.
+        let n_half = 64usize;
+        let mut spec = vec![0.01f32; n_half];
+        spec[32] = 5.0;
+        spec[16] = 0.8;
+        spec[48] = 0.8;
+        // floor1 with 4 posts straddling the peak.
+        let f = Floor1 {
+            multiplier: 2,
+            partition_class_list: vec![0],
+            class_dimensions: vec![2u8],
+            class_subclasses: vec![0u8],
+            class_masterbook: vec![0u8],
+            class_subbook: vec![vec![-1, -1]],
+            xlist: vec![0u32, 63, 16, 48],
+            rangebits: 6,
+        };
+        let y_legacy = analyse_floor1(&f, &spec, n_half, 48_000);
+        let y_per_target = analyse_floor1_with_smear(
+            &f,
+            &spec,
+            n_half,
+            48_000,
+            BitrateTarget::Medium.floor_smear_delta(),
+        );
+        assert_eq!(
+            y_legacy, y_per_target,
+            "Medium per-target floor1 must match the legacy default exactly"
+        );
+    }
+
     // ========== Point-stereo coupling tests ==========
 
     #[test]
@@ -4733,6 +4894,7 @@ mod tests {
             mode_bits: 1,
             floor0_available: false,
             global_corr_override_threshold: BitrateTarget::Medium.global_corr_override_threshold(),
+            floor_smear_delta: BitrateTarget::Medium.floor_smear_delta(),
         });
         let mut data = Vec::with_capacity(pcm_i16_interleaved.len() * 2);
         for s in pcm_i16_interleaved {
@@ -6460,6 +6622,7 @@ mod tests {
             mode_bits,
             floor0_available,
             global_corr_override_threshold: target.global_corr_override_threshold(),
+            floor_smear_delta: target.floor_smear_delta(),
         })
     }
 

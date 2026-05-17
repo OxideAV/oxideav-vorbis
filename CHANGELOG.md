@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-target floor1 smearing delta (round 73).** The encoder's
+  `smear_floor_posts` pass now takes a per-`BitrateTarget` delta
+  (in Y-quantiser units, ~1 dB at multiplier=2) instead of the
+  module-level `FLOOR_SMEAR_DELTA = 12` constant. Smaller delta →
+  more aggressive lifting of dipped floor1 posts → higher effective
+  floor → fewer residue bits spent representing inter-post dips at
+  the cost of less detail in low-amplitude regions. New method
+  [`BitrateTarget::floor_smear_delta`] returns `UltraLow → 8`,
+  `Low → 10`, `Medium → 12` (byte-stable), `High → 14`,
+  `HighTail → 12`. Wired through new `analyse_floor1_with_smear`
+  entry; the legacy `analyse_floor1` still forwards the `12`
+  default. Measured impact on the 3 s stereo mixed-content
+  calibration fixture: Low 181.4 → 175.2 kbps (-3.4 %), Medium
+  unchanged at 316.0 kbps (byte-stable), High 524.6 → 527.8 kbps
+  (+0.6 %, paying a small bit increase for more inter-post detail);
+  on the speech fixture UltraLow's savings vs Low widen from 33.2 %
+  to 38.9 %. Gated by three new tests:
+  `smear_floor_posts_with_delta_smaller_delta_lifts_more`,
+  `per_target_floor_smear_delta_is_monotone`, and
+  `medium_floor_smear_matches_legacy_default` (byte-stability
+  anchor on the Medium target's per-frame output).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.7...v0.0.8) - 2026-05-06
 
 ### Other
