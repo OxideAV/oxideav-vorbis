@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-vorbis"
+version = "0.0.8"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-vorbis"
+authors = ["Mark Karpeles"]
+description = "Vorbis I audio codec — orphan-rebuild scaffold pending clean-room re-implementation."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-vorbis"
+keywords = ["multimedia", "audio", "vorbis", "ogg", "codec"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
