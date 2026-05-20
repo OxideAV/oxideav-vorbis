@@ -4,6 +4,13 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.8...v0.0.9) - 2026-05-20
+
+### Other
+
+- round 1: identification-header parser (Vorbis I §4.2.2)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Vorbis I identification-header parser (Vorbis I §4.2.2).**
