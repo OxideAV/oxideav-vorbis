@@ -6,6 +6,41 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I canonical Huffman tree builder + entry decoder (Vorbis I
+  §3.2.1).** `HuffmanTree::from_codebook(&VorbisCodebook)` /
+  `HuffmanTree::from_lengths(&[u8])` builds a canonical Vorbis decision
+  tree from the per-entry codeword-length table returned by
+  `parse_codebook`. Construction uses an open-position deque
+  (left-to-right) that pops the leftmost slot, splits it down to the
+  required depth, and places a leaf — realising the §3.2.1 "lowest
+  valued unused canonical codeword" assignment without ever
+  materialising codeword integers. The spec's worked example (lengths
+  `[2 4 4 4 4 2 3 3]` → codewords `00 0100 0101 0110 0111 10 110 111`)
+  round-trips bit-exactly. `HuffmanTree::decode_entry(&mut
+  BitReaderLsb)` walks the tree against an LSb-first packet bitstream
+  (first bit = MSb of canonical codeword) and returns the codebook
+  entry index — the underlying primitive for §3.3 scalar codebook reads
+  and §3.4 / §8.6 VQ codebook reads. Errata 20150226 single-entry
+  codebooks: a codebook with exactly one used entry whose recorded
+  length is `1` yields a 2-node tree (`root.left == root.right == sole
+  leaf`) so `decode_entry` returns the sole entry and sinks one bit
+  for either `0` or `1` (per the errata "decoders should tolerate that
+  the bit read from the stream be '1' instead of '0'"); single-entry
+  codebooks with `length != 1` are rejected. Underspecified /
+  overspecified trees (§3.2.1) surface as
+  `HuffmanBuildError::{UnderspecifiedTree, OverspecifiedTree}`;
+  out-of-range lengths (`1..=32`) and zero-used-entries surface as
+  `InvalidLength` / `EmptyTree`. End-of-packet mid-codeword surfaces
+  as `HuffmanDecodeError::UnexpectedEndOfPacket` per §3.3 "reading
+  past the end of a packet propagates the 'end-of-stream' condition
+  to the decoder". 13 new unit tests cover the spec worked example,
+  concatenated stream decode, sparse codebook with entry index
+  `0xFF`, single-entry both-bits tolerance, single-entry length≠1
+  rejection, fully-unused rejection, underspecified / overspecified /
+  invalid-length rejection, EOF on truncated input, balanced 16-entry
+  length-4 round-trip, max-length-32 entries, and `from_codebook` ↔
+  `from_lengths` equivalence (69 tests total, up from 56).
+
 * **Vorbis I codebook-header parser (Vorbis I §3.2.1).**
   `parse_codebook(&mut BitReaderLsb)` decodes a single Vorbis I
   codebook header — the most foundational sub-structure of the

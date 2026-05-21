@@ -11,10 +11,11 @@
 //! Round 1 landed the identification-header parser (Vorbis I §4.2.2);
 //! see [`identification`] for details. Round 2 adds the comment-header
 //! parser (Vorbis I §5); see [`comment`]. Round 3 adds the
-//! codebook-header parser (Vorbis I §3.2.1); see [`codebook`]. The
-//! enclosing setup-header walker (§4.2.4) and the audio-packet decode
-//! (§4.3) are still pending and [`decode_packet`] currently returns
-//! [`Error::NotImplemented`].
+//! codebook-header parser (Vorbis I §3.2.1); see [`codebook`]. Round 4
+//! adds the canonical Huffman tree builder + entry decoder; see
+//! [`huffman`]. The enclosing setup-header walker (§4.2.4) and the
+//! audio-packet decode (§4.3) are still pending and [`decode_packet`]
+//! currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -22,6 +23,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod codebook;
 pub mod comment;
+pub mod huffman;
 pub mod identification;
 
 pub use codebook::{
@@ -29,6 +31,9 @@ pub use codebook::{
 };
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
+};
+pub use huffman::{
+    BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,
 };
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
@@ -46,6 +51,12 @@ pub enum Error {
     Comment(CommentParseError),
     /// A codebook header (Vorbis I §3.2.1) failed to parse.
     Codebook(CodebookParseError),
+    /// A Huffman tree (Vorbis I §3.2.1) failed to build from a parsed
+    /// codebook's `codeword_lengths`.
+    HuffmanBuild(HuffmanBuildError),
+    /// A Huffman codeword could not be decoded from the packet
+    /// bitstream (Vorbis I §3.3).
+    HuffmanDecode(HuffmanDecodeError),
 }
 
 impl core::fmt::Display for Error {
@@ -58,6 +69,8 @@ impl core::fmt::Display for Error {
             Error::Identification(e) => write!(f, "{e}"),
             Error::Comment(e) => write!(f, "{e}"),
             Error::Codebook(e) => write!(f, "{e}"),
+            Error::HuffmanBuild(e) => write!(f, "{e}"),
+            Error::HuffmanDecode(e) => write!(f, "{e}"),
         }
     }
 }
@@ -68,6 +81,8 @@ impl std::error::Error for Error {
             Error::Identification(e) => Some(e),
             Error::Comment(e) => Some(e),
             Error::Codebook(e) => Some(e),
+            Error::HuffmanBuild(e) => Some(e),
+            Error::HuffmanDecode(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -88,6 +103,18 @@ impl From<CommentParseError> for Error {
 impl From<CodebookParseError> for Error {
     fn from(value: CodebookParseError) -> Self {
         Error::Codebook(value)
+    }
+}
+
+impl From<HuffmanBuildError> for Error {
+    fn from(value: HuffmanBuildError) -> Self {
+        Error::HuffmanBuild(value)
+    }
+}
+
+impl From<HuffmanDecodeError> for Error {
+    fn from(value: HuffmanDecodeError) -> Self {
+        Error::HuffmanDecode(value)
     }
 }
 

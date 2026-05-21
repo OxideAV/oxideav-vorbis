@@ -1,12 +1,13 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 3.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 4.
 
 ## Status — 2026-05-21
 
-**Round 3 landed: codebook-header parser (Vorbis I §3.2.1).** Round 2
-landed the comment-header parser (§5) on 2026-05-21; round 1 landed
-the identification-header parser (§4.2.2) on 2026-05-20.
+**Round 4 landed: canonical Huffman tree builder + entry decoder
+(Vorbis I §3.2.1).** Round 3 landed the codebook-header parser
+(§3.2.1) on 2026-05-21; round 2 the comment-header parser (§5); round
+1 the identification-header parser (§4.2.2) on 2026-05-20.
 
 The crate's prior implementation was retired under the workspace
 clean-room policy because module-level docstrings and inline comments
@@ -67,20 +68,57 @@ comment header.
 * All §3.2.1 invariants are enforced and surface as
   `codebook::ParseError` variants (`BadSyncPattern`, `ZeroEntries`,
   `OrderedOverflow`, `ReservedLookupType`, `UnexpectedEndOfPacket`).
-* 56 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
-  (sync, dense / sparse / ordered lengths, lookup types 0 / 1 / 2,
-  multiplicand decode, `ilog` / `float32_unpack` / `lookup1_values`
-  spec examples, and every documented `ParseError` failure mode).
+* [`HuffmanTree::from_codebook`] / [`HuffmanTree::from_lengths`]
+  builds a canonical Vorbis I Huffman decision tree (§3.2.1) from the
+  per-entry `codeword_lengths` table. Construction uses a left-to-right
+  open-position deque: each used entry pops the leftmost open slot and
+  either places a leaf there or splits it down to the entry's recorded
+  depth (allocating internal nodes + pushing both new children to the
+  deque front). The spec's worked example (lengths `[2 4 4 4 4 2 3 3]`
+  → codewords `00 0100 0101 0110 0111 10 110 111`) round-trips
+  exactly.
+* [`HuffmanTree::decode_entry`] walks the tree against an LSb-first
+  [`BitReaderLsb`]: each read bit selects `left` (0) or `right` (1)
+  until a leaf is hit, then returns the leaf's entry index. The first
+  bit read is the MSb of the canonical codeword per the §3.2.1 "the
+  leftmost bit is the MSb" convention; under §2.1.4 LSb-first packing
+  this means the encoder writes codewords with their MSb going into
+  the LSb of the next stream byte.
+* Errata 20150226 single-entry codebooks: a codebook with exactly one
+  used entry whose recorded length is `1` builds a synthetic tree
+  whose root's `left` and `right` both point at the same leaf, so
+  `decode_entry` returns that entry and sinks one bit on either a `0`
+  or a `1` (per the errata "decoders should tolerate that the bit
+  read from the stream be '1' instead of '0'"). Single-entry
+  codebooks with `length != 1` are rejected with
+  [`HuffmanBuildError::SingleEntryWrongLength`].
+* Underspecified / overspecified detection (§3.2.1 errata 20150226):
+  any leftover open deque positions after every used entry has been
+  placed → [`HuffmanBuildError::UnderspecifiedTree`]; popping the
+  deque dry before all entries are placed →
+  [`HuffmanBuildError::OverspecifiedTree`]. Out-of-range lengths
+  (anything outside `1..=32`) surface as
+  [`HuffmanBuildError::InvalidLength`], and zero used entries as
+  [`HuffmanBuildError::EmptyTree`].
+* 69 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+  codebook-header parse, and **13 cover §3.2.1 Huffman tree** (spec
+  worked example, concatenated worked-example stream decode, sparse
+  codebook with entry index `0xFF`, single-entry codebook 0-or-1
+  tolerance per errata 20150226, single-entry length≠1 rejection,
+  fully-unused codebook rejection, underspecified / overspecified
+  rejection, invalid-length rejection, truncated-packet EOF
+  surfacing, balanced 16-entry length-4 round-trip, max-length-32
+  entries, and `from_codebook` ↔ `from_lengths` equivalence).
 
 ### What does not yet work
 
 * Setup-header outer walker (§4.2.4) — wires multiple codebooks
   together plus floors / residues / mappings / modes.
-* Huffman tree construction from `VorbisCodebook::codeword_lengths`
-  and codeword decode from the audio packet bitstream (§3.2.1
-  "Huffman decision tree representation" + §3.3 "Use of the codebook
-  abstraction"). The round-3 parser returns the raw length table; a
-  tree builder + walker is the round-4 followup.
+* Vector-decode wrapper applying the lookup table to a Huffman entry
+  (§3.3 "VQ context": entry → vector via `multiplicands` +
+  `minimum_value` / `delta_value` / `sequence_p`). The round-4 walker
+  returns the raw entry index; vector unpacking is the round-5
+  followup.
 * Floors (§6, §7), residues (§8), mappings (§4.3), modes (§4.3.1).
 * Audio-packet decode (§4.3.2): mode / window decode, floor curve,
   residue, channel coupling, inverse MDCT, overlap-add.
@@ -96,7 +134,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1, 2 and 3 were implemented against, and only against:
+Rounds 1 — 4 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -106,6 +144,12 @@ Rounds 1, 2 and 3 were implemented against, and only against:
   vector format), §5.2.3 (encoder-side recap). Round 3 used §3.1
   (codebook overview), §3.2.1 (codebook decode algorithm), §9.2.1
   (`ilog`), §9.2.2 (`float32_unpack`), §9.2.3 (`lookup1_values`).
+  Round 4 used §3.2.1 "Huffman decision tree representation" (the
+  worked-example codeword table for lengths `[2 4 4 4 4 2 3 3]` plus
+  the underspecified / overspecified discussion), the §3.2.1 errata
+  20150226 "Single entry codebooks" addendum, and §3.3 "Use of the
+  codebook abstraction" (decode-time bit-walking semantics + the
+  end-of-packet condition).
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -137,6 +181,15 @@ crate that wraps or implements the format).
 [`ilog`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/codebook/fn.ilog.html
 [`float32_unpack`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/codebook/fn.float32_unpack.html
 [`lookup1_values`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/codebook/fn.lookup1_values.html
+[`HuffmanTree::from_codebook`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/struct.HuffmanTree.html#method.from_codebook
+[`HuffmanTree::from_lengths`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/struct.HuffmanTree.html#method.from_lengths
+[`HuffmanTree::decode_entry`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/struct.HuffmanTree.html#method.decode_entry
+[`HuffmanBuildError::SingleEntryWrongLength`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/enum.BuildError.html#variant.SingleEntryWrongLength
+[`HuffmanBuildError::UnderspecifiedTree`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/enum.BuildError.html#variant.UnderspecifiedTree
+[`HuffmanBuildError::OverspecifiedTree`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/enum.BuildError.html#variant.OverspecifiedTree
+[`HuffmanBuildError::InvalidLength`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/enum.BuildError.html#variant.InvalidLength
+[`HuffmanBuildError::EmptyTree`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/huffman/enum.BuildError.html#variant.EmptyTree
+[`BitReaderLsb`]: https://docs.rs/oxideav-core/latest/oxideav_core/bits/struct.BitReaderLsb.html
 [`oxideav_core::bits::BitReaderLsb`]: https://docs.rs/oxideav-core/latest/oxideav_core/bits/struct.BitReaderLsb.html
 [`oxideav_core::Decoder`]: https://docs.rs/oxideav-core/latest/oxideav_core/trait.Decoder.html
 [`oxideav_core::Encoder`]: https://docs.rs/oxideav-core/latest/oxideav_core/trait.Encoder.html
