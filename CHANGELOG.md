@@ -6,6 +6,30 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I comment-header parser (Vorbis I §5).**
+  `parse_comment_header(&[u8])` decodes a Vorbis I comment-header
+  packet (common header `0x03 "vorbis"` + §5.2.1 body) and returns a
+  `VorbisCommentHeader { vendor: String, comments: Vec<String> }`.
+  The body is read per §5.2.1 (byte-aligned `u32` LE
+  `vendor_length` + UTF-8 vendor + `u32` LE
+  `user_comment_list_length` + per-comment `u32` LE length + UTF-8
+  bytes + 1-bit framing flag). All spec-mandated checks are
+  enforced and surface as `comment::ParseError` variants
+  (`PacketTooShort`, `WrongPacketType`, `BadMagic`,
+  `UnexpectedEndOfPacket` — see §4.2 for the comment-header's
+  "non-fatal" relaxation —, `LengthOverflow`, `InvalidVendorUtf8`,
+  `InvalidCommentUtf8`, `BadFramingFlag`). Helpers
+  `VorbisCommentHeader::key_value_iter` and `split_key_value` parse
+  the §5.2.2 `KEY=value` shape. 22 unit tests cover the
+  `mono-44100-q5-typical` (1-entry encoder tag) and
+  `with-vorbis-comment-tags` (7-entry title/artist/album/date/genre/
+  tracknumber + encoder) fixture shapes, the historical
+  `Xiph.Org libVorbis I 20020717` vendor string, empty vendor + empty
+  comment list, multi-byte UTF-8 in vendor and comment values,
+  duplicate-key entries per §5.2.2, a 64 KiB
+  `METADATA_BLOCK_PICTURE`-sized payload, framing-byte padding per
+  §2.1.8, and every documented `ParseError` failure mode.
+
 * **Vorbis I identification-header parser (Vorbis I §4.2.2).**
   `parse_identification_header(&[u8])` decodes a 30-byte
   identification-header packet and returns a

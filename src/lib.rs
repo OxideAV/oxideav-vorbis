@@ -8,18 +8,22 @@
 //! against the Vorbis I Specification (Xiph.Org, 2020-07-04 revision)
 //! and the corpus traces under `docs/audio/vorbis/`.
 //!
-//! Round 1 lands the identification-header parser (Vorbis I §4.2.2);
-//! see [`identification`] for details. The comment header (§5), the
-//! setup header (§4.2.4), and all audio-packet decode (§4.3) are
-//! still pending and the [`decode_packet`] entry point currently
-//! returns [`Error::NotImplemented`].
+//! Round 1 landed the identification-header parser (Vorbis I §4.2.2);
+//! see [`identification`] for details. Round 2 adds the comment-header
+//! parser (Vorbis I §5); see [`comment`]. The setup header (§4.2.4) and
+//! audio-packet decode (§4.3) are still pending and the [`decode_packet`]
+//! entry point currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod comment;
 pub mod identification;
 
+pub use comment::{
+    parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
+};
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
@@ -32,6 +36,8 @@ pub enum Error {
     NotImplemented,
     /// The identification header (Vorbis I §4.2.2) failed to parse.
     Identification(IdentificationParseError),
+    /// The comment header (Vorbis I §5) failed to parse.
+    Comment(CommentParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -42,6 +48,7 @@ impl core::fmt::Display for Error {
                 "oxideav-vorbis: code path not yet implemented in this round"
             ),
             Error::Identification(e) => write!(f, "{e}"),
+            Error::Comment(e) => write!(f, "{e}"),
         }
     }
 }
@@ -50,6 +57,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Identification(e) => Some(e),
+            Error::Comment(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -58,6 +66,12 @@ impl std::error::Error for Error {
 impl From<IdentificationParseError> for Error {
     fn from(value: IdentificationParseError) -> Self {
         Error::Identification(value)
+    }
+}
+
+impl From<CommentParseError> for Error {
+    fn from(value: CommentParseError) -> Self {
+        Error::Comment(value)
     }
 }
 
