@@ -10,17 +10,23 @@
 //!
 //! Round 1 landed the identification-header parser (Vorbis I §4.2.2);
 //! see [`identification`] for details. Round 2 adds the comment-header
-//! parser (Vorbis I §5); see [`comment`]. The setup header (§4.2.4) and
-//! audio-packet decode (§4.3) are still pending and the [`decode_packet`]
-//! entry point currently returns [`Error::NotImplemented`].
+//! parser (Vorbis I §5); see [`comment`]. Round 3 adds the
+//! codebook-header parser (Vorbis I §3.2.1); see [`codebook`]. The
+//! enclosing setup-header walker (§4.2.4) and the audio-packet decode
+//! (§4.3) are still pending and [`decode_packet`] currently returns
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod codebook;
 pub mod comment;
 pub mod identification;
 
+pub use codebook::{
+    parse_codebook, ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
+};
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
@@ -38,6 +44,8 @@ pub enum Error {
     Identification(IdentificationParseError),
     /// The comment header (Vorbis I §5) failed to parse.
     Comment(CommentParseError),
+    /// A codebook header (Vorbis I §3.2.1) failed to parse.
+    Codebook(CodebookParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -49,6 +57,7 @@ impl core::fmt::Display for Error {
             ),
             Error::Identification(e) => write!(f, "{e}"),
             Error::Comment(e) => write!(f, "{e}"),
+            Error::Codebook(e) => write!(f, "{e}"),
         }
     }
 }
@@ -58,6 +67,7 @@ impl std::error::Error for Error {
         match self {
             Error::Identification(e) => Some(e),
             Error::Comment(e) => Some(e),
+            Error::Codebook(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -72,6 +82,12 @@ impl From<IdentificationParseError> for Error {
 impl From<CommentParseError> for Error {
     fn from(value: CommentParseError) -> Self {
         Error::Comment(value)
+    }
+}
+
+impl From<CodebookParseError> for Error {
+    fn from(value: CodebookParseError) -> Self {
+        Error::Codebook(value)
     }
 }
 
