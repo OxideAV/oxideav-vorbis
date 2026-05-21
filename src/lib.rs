@@ -13,8 +13,11 @@
 //! parser (Vorbis I §5); see [`comment`]. Round 3 adds the
 //! codebook-header parser (Vorbis I §3.2.1); see [`codebook`]. Round 4
 //! adds the canonical Huffman tree builder + entry decoder; see
-//! [`huffman`]. The enclosing setup-header walker (§4.2.4) and the
-//! audio-packet decode (§4.3) are still pending and [`decode_packet`]
+//! [`huffman`]. Round 5 adds the setup-header outer walker covering
+//! codebooks, time-domain placeholders, floor headers and residue
+//! headers (Vorbis I §4.2.4); see [`setup`]. The mapping (§4.3) /
+//! mode (§4.3.1) / framing-bit tail of the setup header and the
+//! audio-packet decode (§4.3.2) are still pending and [`decode_packet`]
 //! currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
@@ -25,6 +28,7 @@ pub mod codebook;
 pub mod comment;
 pub mod huffman;
 pub mod identification;
+pub mod setup;
 
 pub use codebook::{
     parse_codebook, ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
@@ -37,6 +41,11 @@ pub use huffman::{
 };
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
+};
+pub use setup::{
+    parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
+    FloorHeader, FloorKind, ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader,
+    SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
 };
 
 /// Crate-local error type for the in-progress clean-room rebuild.
@@ -57,6 +66,8 @@ pub enum Error {
     /// A Huffman codeword could not be decoded from the packet
     /// bitstream (Vorbis I §3.3).
     HuffmanDecode(HuffmanDecodeError),
+    /// The setup-header walker (Vorbis I §4.2.4) failed to parse.
+    Setup(SetupParseError),
 }
 
 impl core::fmt::Display for Error {
@@ -71,6 +82,7 @@ impl core::fmt::Display for Error {
             Error::Codebook(e) => write!(f, "{e}"),
             Error::HuffmanBuild(e) => write!(f, "{e}"),
             Error::HuffmanDecode(e) => write!(f, "{e}"),
+            Error::Setup(e) => write!(f, "{e}"),
         }
     }
 }
@@ -83,6 +95,7 @@ impl std::error::Error for Error {
             Error::Codebook(e) => Some(e),
             Error::HuffmanBuild(e) => Some(e),
             Error::HuffmanDecode(e) => Some(e),
+            Error::Setup(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -115,6 +128,12 @@ impl From<HuffmanBuildError> for Error {
 impl From<HuffmanDecodeError> for Error {
     fn from(value: HuffmanDecodeError) -> Self {
         Error::HuffmanDecode(value)
+    }
+}
+
+impl From<SetupParseError> for Error {
+    fn from(value: SetupParseError) -> Self {
+        Error::Setup(value)
     }
 }
 

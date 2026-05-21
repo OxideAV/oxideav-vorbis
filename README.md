@@ -1,13 +1,15 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 4.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 5.
 
-## Status — 2026-05-21
+## Status — 2026-05-22
 
-**Round 4 landed: canonical Huffman tree builder + entry decoder
-(Vorbis I §3.2.1).** Round 3 landed the codebook-header parser
-(§3.2.1) on 2026-05-21; round 2 the comment-header parser (§5); round
-1 the identification-header parser (§4.2.2) on 2026-05-20.
+**Round 5 landed: setup-header outer walker (Vorbis I §4.2.4) —
+codebooks + time-domain placeholders + floor headers + residue
+headers.** Round 4 landed the canonical Huffman tree builder + entry
+decoder (§3.2.1); round 3 the codebook-header parser (§3.2.1); round
+2 the comment-header parser (§5); round 1 the identification-header
+parser (§4.2.2) on 2026-05-20.
 
 The crate's prior implementation was retired under the workspace
 clean-room policy because module-level docstrings and inline comments
@@ -100,20 +102,47 @@ comment header.
   (anything outside `1..=32`) surface as
   [`HuffmanBuildError::InvalidLength`], and zero used entries as
   [`HuffmanBuildError::EmptyTree`].
-* 69 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
-  codebook-header parse, and **13 cover §3.2.1 Huffman tree** (spec
-  worked example, concatenated worked-example stream decode, sparse
-  codebook with entry index `0xFF`, single-entry codebook 0-or-1
-  tolerance per errata 20150226, single-entry length≠1 rejection,
-  fully-unused codebook rejection, underspecified / overspecified
-  rejection, invalid-length rejection, truncated-packet EOF
-  surfacing, balanced 16-entry length-4 round-trip, max-length-32
-  entries, and `from_codebook` ↔ `from_lengths` equivalence).
+* [`parse_setup_header`] / [`parse_setup_header_body`] read the
+  round-5 portion of a Vorbis I setup-header packet (§4.2.4):
+  * `vorbis_codebook_count` codebook configurations (delegated to
+    [`parse_codebook`]; §3.2.1).
+  * `vorbis_time_count` 16-bit time-domain transform placeholders —
+    each spec-mandated to equal zero (§4.2.4 step 2; any nonzero value
+    is rejected with `SetupParseError::NonZeroTimePlaceholder`).
+  * `vorbis_floor_count` floor headers. Each carries a 16-bit
+    `floor_type`; type 0 (§6.2.1) and type 1 (§7.2.2) decode their
+    structural fields (no per-packet curve decode), type > 1 is
+    rejected. [`Floor1Header`] exposes `partitions`,
+    `partition_class_list`, `classes` (per-class `dimensions`,
+    `subclasses`, optional `masterbook`, `subclass_books`),
+    `multiplier`, `rangebits`, `x_list`. [`Floor0Header`] exposes
+    `order`, `rate`, `bark_map_size`, `amplitude_bits`,
+    `amplitude_offset`, `book_list`.
+  * `vorbis_residue_count` residue headers (§8.6.1 — common header
+    layout across types 0/1/2). [`ResidueHeader`] exposes
+    `residue_type` (0/1/2; >2 is rejected), `residue_begin`,
+    `residue_end`, `partition_size`, `classifications`, `classbook`,
+    `cascade[classifications]`, and `books[classifications][8]` with
+    `None` entries for cascade-bit-unset stages.
+* The mapping list (§4.3), mode list (§4.3.1), and trailing framing
+  flag of the setup header are still pending; the bit reader is left
+  positioned immediately after the last residue's book list. Round 6
+  will pick up there.
+* 83 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+  codebook-header parse, 13 cover §3.2.1 Huffman tree, and **14 cover
+  §4.2.4 setup-header walker** (minimal one-of-each setup body, full
+  setup packet with 7-byte common header, common-header packet-length
+  / packet-type / magic rejection, nonzero time-placeholder rejection
+  per §4.2.4 step 2, floor-type > 1 rejection per step 2d, residue-type
+  > 2 rejection per step 2c, truncated-packet EOF, floor 1 with
+  `partitions=0` corner case, floor 0 (LSP) setup, two-floor /
+  two-residue stereo shape, multi-stage residue cascade with `bitflag=1`
+  high bits, residue type 0).
 
 ### What does not yet work
 
-* Setup-header outer walker (§4.2.4) — wires multiple codebooks
-  together plus floors / residues / mappings / modes.
+* Setup-header tail (mappings §4.3, modes §4.3.1, framing flag) —
+  round 6.
 * Vector-decode wrapper applying the lookup table to a Huffman entry
   (§3.3 "VQ context": entry → vector via `multiplicands` +
   `minimum_value` / `delta_value` / `sequence_p`). The round-4 walker
@@ -134,7 +163,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 4 were implemented against, and only against:
+Rounds 1 — 5 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -149,7 +178,15 @@ Rounds 1 — 4 were implemented against, and only against:
   the underspecified / overspecified discussion), the §3.2.1 errata
   20150226 "Single entry codebooks" addendum, and §3.3 "Use of the
   codebook abstraction" (decode-time bit-walking semantics + the
-  end-of-packet condition).
+  end-of-packet condition). Round 5 used §4.2.4 "Setup header"
+  (Codebooks / Time domain transforms / Floors / Residues subsections,
+  the "Time domain transforms" must-be-zero rejection, the floor-type
+  > 1 and residue-type > 2 rejections, and the in-spec floor 0 / floor
+  1 / residue branches), §6.2.1 "Floor 0 header decode", §7.2.2 "Floor
+  1 header decode" (steps 1..23), and §8.6.1 "Residue header decode"
+  (the begin/end/partition_size/classifications/classbook fields, the
+  per-classification cascade bitmap with `high_bits = read 5 bits if
+  bitflag`, and the conditional per-stage book reads).
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -157,6 +194,13 @@ Rounds 1 — 4 were implemented against, and only against:
   convention), §9 (trace event vocabulary). Round 3 referenced §3
   (the `CODEBOOK` event shape — `book_idx dimensions entries
   ordered sparse lookup_type value_bits sequence_p` field set).
+  Round 5 referenced §2.4 (`VORBIS_HEADER_SETUP` event shape —
+  `codebook_count`, `time_count`, `floor_count`, `residue_count`,
+  `mapping_count`, `mode_count`, `framing_flag`), §4 (`FLOOR_CONFIG`
+  field shape — `floor_idx`, `type`, plus `partitions`,
+  `multiplier`, `rangebits`, `x_list_count` for type 1), and §5
+  (`RESIDUE_CONFIG` field shape — `residue_idx`, `type`, `begin`,
+  `end`, `partition_size`, `classifications`, `classbook`).
 * `docs/audio/vorbis/fixtures/{mono-44100-q5-typical,with-vorbis-comment-tags}/trace.txt`
   — only as the source for the field-level shape of the test
   fixtures.
@@ -193,6 +237,11 @@ crate that wraps or implements the format).
 [`oxideav_core::bits::BitReaderLsb`]: https://docs.rs/oxideav-core/latest/oxideav_core/bits/struct.BitReaderLsb.html
 [`oxideav_core::Decoder`]: https://docs.rs/oxideav-core/latest/oxideav_core/trait.Decoder.html
 [`oxideav_core::Encoder`]: https://docs.rs/oxideav-core/latest/oxideav_core/trait.Encoder.html
+[`parse_setup_header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/fn.parse_setup_header.html
+[`parse_setup_header_body`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/fn.parse_setup_header_body.html
+[`Floor0Header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.Floor0Header.html
+[`Floor1Header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.Floor1Header.html
+[`ResidueHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.ResidueHeader.html
 
 ## License
 

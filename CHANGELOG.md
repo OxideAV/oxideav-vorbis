@@ -6,6 +6,44 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I setup-header outer walker (Vorbis I §4.2.4).**
+  `parse_setup_header(&[u8])` validates the 7-byte common header
+  (`0x05 "vorbis"` per §4.2.1) and `parse_setup_header_body(&mut
+  BitReaderLsb)` consumes the bit-packed body that follows. The
+  round-5 walker reads the first four sub-lists of the setup header:
+  (1) `vorbis_codebook_count` codebook configurations via
+  `parse_codebook` (§3.2.1); (2) `vorbis_time_count` 16-bit
+  time-domain transform placeholders, each spec-mandated to equal zero
+  (§4.2.4 step 2); (3) `vorbis_floor_count` floor headers, each
+  prefixed by a 16-bit `floor_type` that dispatches to the §6.2.1
+  (LSP, type 0) or §7.2.2 (piecewise-linear, type 1) structural-field
+  reader — no per-packet curve decode; (4) `vorbis_residue_count`
+  residue headers (§8.6.1 common layout: `residue_begin`,
+  `residue_end`, `residue_partition_size`, `residue_classifications`,
+  `residue_classbook`, the per-classification cascade bitmap with the
+  `low_bits / bitflag / high_bits` encoding, and the conditional
+  per-stage book reads). Mappings (§4.3), modes (§4.3.1), and the
+  trailing framing flag are deferred to round 6; the bit reader is
+  left positioned immediately after the last residue's book list.
+  Spec-mandated errors surface as `setup::ParseError` variants
+  (`PacketTooShort`, `WrongPacketType`, `BadMagic`, `Codebook` —
+  wrapping the inner codebook parse error — `NonZeroTimePlaceholder`,
+  `UnsupportedFloorType`, `UnsupportedResidueType`,
+  `UnexpectedEndOfPacket`). Re-exports at the crate root:
+  `parse_setup_header`, `parse_setup_header_body`,
+  `VorbisSetupHeader`, `FloorHeader`, `FloorKind`, `Floor0Header`,
+  `Floor1Header`, `Floor1Class`, `ResidueHeader`, `SetupParseError`,
+  `SETUP_PACKET_TYPE`, `SETUP_PACKET_MAGIC`. 14 new unit tests cover
+  the minimal one-of-each setup body, a full setup packet with the
+  7-byte common header prefix, packet-length / packet-type / magic
+  rejections, nonzero time-placeholder rejection, floor-type > 1
+  rejection, residue-type > 2 rejection, truncated-packet EOF
+  surfaced through `Codebook` wrapping, floor 1 with `partitions = 0`
+  (empty-classes corner case), floor 0 (LSP) setup, two-floor /
+  two-residue stereo shape mirroring trace-doc §2.4, multi-stage
+  residue cascade exercising `bitflag = 1` high bits, and residue
+  type 0 (83 tests total, up from 69).
+
 * **Vorbis I canonical Huffman tree builder + entry decoder (Vorbis I
   §3.2.1).** `HuffmanTree::from_codebook(&VorbisCodebook)` /
   `HuffmanTree::from_lengths(&[u8])` builds a canonical Vorbis decision
