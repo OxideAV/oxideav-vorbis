@@ -6,6 +6,42 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I setup-header mapping + mode + framing-flag parse (Vorbis I
+  §4.2.4 "Mappings" / "Modes").** `parse_setup_header` /
+  `parse_setup_header_body` now walk the entire setup header, not just
+  the codebook/time/floor/residue prefix. Both entry points now take an
+  `audio_channels: u8` parameter (the value carried in the
+  identification header per §4.2.2), required for the
+  `ilog(audio_channels - 1)`-bit magnitude/angle channel reads in the
+  square-polar coupling subblock and for the per-channel `mux[ch]`
+  reads when `submaps > 1`. New types: `MappingHeader { mapping_type,
+  submaps, coupling: Vec<MappingCouplingStep>, mux: Vec<u8>,
+  submap_configs: Vec<MappingSubmap> }`, `MappingCouplingStep
+  { magnitude_channel, angle_channel }`, `MappingSubmap
+  { time_placeholder, floor, residue }`, `ModeHeader { blockflag,
+  windowtype, transformtype, mapping }`. `VorbisSetupHeader` grows
+  three fields: `mappings`, `modes`, `framing_flag`. New
+  `setup::ParseError` variants enforcing the §4.2.4 invariants:
+  `UnsupportedMappingType` (`mapping_type != 0` per step 2b),
+  `BadCouplingChannels` (magnitude == angle, or either >=
+  audio_channels — step 2c.ii), `NonZeroMappingReserved` (2-bit
+  reserved — step 2c.iii), `BadMuxValue` (`mux[ch] >= submaps` —
+  step 2c.iv.B), `BadSubmapFloor` (floor index >= `floor_count` —
+  step 2c.v.C), `BadSubmapResidue` (residue index >= `residue_count` —
+  step 2c.v.E), `NonZeroModeWindowType` / `NonZeroModeTransformType` /
+  `BadModeMapping` (mode-section step 2e), `BadFramingFlag` (trailing
+  flag unset — "Modes" step 3), `ZeroAudioChannels` (caller-side
+  guard — §4.2.2 already guarantees > 0). Re-exports at the crate
+  root: `MappingHeader`, `MappingCouplingStep`, `MappingSubmap`,
+  `ModeHeader`. 14 new unit tests cover the trace-doc §6 / §7 shapes:
+  stereo mapping with one coupling step (magnitude=0, angle=1), 5.1
+  multi-submap mapping with `mux=[0,0,0,0,0,1]` and a per-submap
+  (floor 0, residue 0) / (floor 1, residue 1) split, two
+  one-mode-per-block setups, the §4.2.4 "Modes" `windowtype != 0` /
+  `transformtype != 0` / OOB-`mapping` rejections, the
+  `audio_channels = 0` caller-bug guard, and the unset-framing-flag
+  reject (97 tests total, up from 83).
+
 * **Vorbis I setup-header outer walker (Vorbis I §4.2.4).**
   `parse_setup_header(&[u8])` validates the 7-byte common header
   (`0x05 "vorbis"` per §4.2.1) and `parse_setup_header_body(&mut

@@ -1,15 +1,17 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 5.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 6.
 
 ## Status — 2026-05-22
 
-**Round 5 landed: setup-header outer walker (Vorbis I §4.2.4) —
-codebooks + time-domain placeholders + floor headers + residue
-headers.** Round 4 landed the canonical Huffman tree builder + entry
-decoder (§3.2.1); round 3 the codebook-header parser (§3.2.1); round
-2 the comment-header parser (§5); round 1 the identification-header
-parser (§4.2.2) on 2026-05-20.
+**Round 6 landed: the full setup-header walker now closes — mapping
+configurations (§4.2.4 "Mappings", `mapping_type = 0` only), mode
+configurations (§4.2.4 "Modes"), and the trailing framing flag are
+parsed.** Round 5 landed the setup-header outer walker (codebooks +
+time-domain placeholders + floor headers + residue headers); round 4
+the canonical Huffman tree builder + entry decoder (§3.2.1); round 3
+the codebook-header parser (§3.2.1); round 2 the comment-header parser
+(§5); round 1 the identification-header parser (§4.2.2) on 2026-05-20.
 
 The crate's prior implementation was retired under the workspace
 clean-room policy because module-level docstrings and inline comments
@@ -102,8 +104,11 @@ comment header.
   (anything outside `1..=32`) surface as
   [`HuffmanBuildError::InvalidLength`], and zero used entries as
   [`HuffmanBuildError::EmptyTree`].
-* [`parse_setup_header`] / [`parse_setup_header_body`] read the
-  round-5 portion of a Vorbis I setup-header packet (§4.2.4):
+* [`parse_setup_header`] / [`parse_setup_header_body`] now walk the
+  **entire** Vorbis I setup-header packet (§4.2.4). Both entry points
+  take the stream's `audio_channels` (from the identification header)
+  because the mapping decode reads channel-number widths of
+  `ilog(audio_channels - 1)` bits:
   * `vorbis_codebook_count` codebook configurations (delegated to
     [`parse_codebook`]; §3.2.1).
   * `vorbis_time_count` 16-bit time-domain transform placeholders —
@@ -124,32 +129,47 @@ comment header.
     `residue_end`, `partition_size`, `classifications`, `classbook`,
     `cascade[classifications]`, and `books[classifications][8]` with
     `None` entries for cascade-bit-unset stages.
-* The mapping list (§4.3), mode list (§4.3.1), and trailing framing
-  flag of the setup header are still pending; the bit reader is left
-  positioned immediately after the last residue's book list. Round 6
-  will pick up there.
-* 83 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
-  codebook-header parse, 13 cover §3.2.1 Huffman tree, and **14 cover
-  §4.2.4 setup-header walker** (minimal one-of-each setup body, full
-  setup packet with 7-byte common header, common-header packet-length
-  / packet-type / magic rejection, nonzero time-placeholder rejection
-  per §4.2.4 step 2, floor-type > 1 rejection per step 2d, residue-type
-  > 2 rejection per step 2c, truncated-packet EOF, floor 1 with
-  `partitions=0` corner case, floor 0 (LSP) setup, two-floor /
-  two-residue stereo shape, multi-stage residue cascade with `bitflag=1`
-  high bits, residue type 0).
+  * `vorbis_mapping_count` mapping configurations (§4.2.4 "Mappings",
+    `mapping_type = 0` only — any other type is rejected per step 2b).
+    [`MappingHeader`] exposes `mapping_type`, `submaps` (1 or 4-bit
+    encoded), `coupling` (per-step `(magnitude_channel, angle_channel)`
+    pairs read at `ilog(audio_channels - 1)` bits each, with the spec's
+    "magnitude != angle and both < audio_channels" validation), `mux`
+    (per-channel submap routing; only present when `submaps > 1`), and
+    `submap_configs` (the 8-bit time placeholder + the 8-bit floor /
+    residue indices, both range-checked against the prior counts).
+  * `vorbis_mode_count` mode configurations (§4.2.4 "Modes").
+    [`ModeHeader`] exposes `blockflag`, `windowtype` (forced to 0 per
+    step 2e), `transformtype` (forced to 0 per step 2e), and `mapping`
+    (range-checked against `mapping_count`).
+  * The trailing 1-bit framing flag (§4.2.4 "Modes" step 3) is read
+    and required to be set; the flag value is also surfaced as
+    `VorbisSetupHeader::framing_flag` for downstream inspection.
+* 97 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+  codebook-header parse, 13 cover §3.2.1 Huffman tree, and **28 cover
+  §4.2.4 setup-header walker** — the round-5 set (minimal one-of-each
+  setup body, full packet with common header, packet-length /
+  packet-type / magic rejection, nonzero time-placeholder rejection,
+  floor-type > 1 rejection, residue-type > 2 rejection, truncated
+  packet, floor 1 with `partitions=0`, floor 0 LSP setup, two-floor /
+  two-residue shape, multi-stage residue cascade, residue type 0) plus
+  the **14 new round-6 tests** (stereo coupling mapping, 5.1 multi-submap
+  mapping with `mux=[0,0,0,0,0,1]`, `mapping_type != 0` rejection,
+  coupling-step magnitude==angle rejection, coupling-step OOB magnitude
+  rejection, 2-bit reserved-field rejection, `mux` OOB rejection, submap
+  floor / residue OOB rejections, mode `windowtype != 0` /
+  `transformtype != 0` / OOB-`mapping` rejections, unset framing-flag
+  rejection, `audio_channels = 0` caller-bug guard).
 
 ### What does not yet work
 
-* Setup-header tail (mappings §4.3, modes §4.3.1, framing flag) —
-  round 6.
 * Vector-decode wrapper applying the lookup table to a Huffman entry
   (§3.3 "VQ context": entry → vector via `multiplicands` +
   `minimum_value` / `delta_value` / `sequence_p`). The round-4 walker
-  returns the raw entry index; vector unpacking is the round-5
-  followup.
-* Floors (§6, §7), residues (§8), mappings (§4.3), modes (§4.3.1).
-* Audio-packet decode (§4.3.2): mode / window decode, floor curve,
+  returns the raw entry index; vector unpacking is a followup.
+* Floor curve / residue decode runtime (§7.2.3, §7.2.4, §8.6.2..§8.6.5),
+  mapping submap channel routing at packet time, mode windowing.
+* Audio-packet decode (§4.3): mode / window decode, floor curve,
   residue, channel coupling, inverse MDCT, overlap-add.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
@@ -163,7 +183,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 5 were implemented against, and only against:
+Rounds 1 — 6 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -186,7 +206,19 @@ Rounds 1 — 5 were implemented against, and only against:
   1 header decode" (steps 1..23), and §8.6.1 "Residue header decode"
   (the begin/end/partition_size/classifications/classbook fields, the
   per-classification cascade bitmap with `high_bits = read 5 bits if
-  bitflag`, and the conditional per-stage book reads).
+  bitflag`, and the conditional per-stage book reads). Round 6 used
+  §4.2.4 "Mappings" (steps 1..2 inclusive of the `mapping_type != 0`
+  rejection, the optional submaps and square-polar coupling subblocks,
+  the `ilog(audio_channels - 1)`-bit magnitude/angle channel reads,
+  the "magnitude != angle and both < audio_channels" validation
+  paragraph, the 2-bit reserved field, the `mux[ch]` reads gated on
+  `submaps > 1` with the OOB check, and the per-submap placeholder +
+  floor + residue index reads with their respective OOB checks),
+  §4.2.4 "Modes" (the per-mode blockflag / windowtype / transformtype /
+  mapping reads plus step 2e's `windowtype == 0`, `transformtype == 0`,
+  and `mapping < mapping_count` enforcement), and §4.2.4 "Modes"
+  step 3 (the trailing framing-flag requirement). §9.2.1 `ilog` is
+  reused via [`crate::codebook::ilog`].
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -200,7 +232,17 @@ Rounds 1 — 5 were implemented against, and only against:
   field shape — `floor_idx`, `type`, plus `partitions`,
   `multiplier`, `rangebits`, `x_list_count` for type 1), and §5
   (`RESIDUE_CONFIG` field shape — `residue_idx`, `type`, `begin`,
-  `end`, `partition_size`, `classifications`, `classbook`).
+  `end`, `partition_size`, `classifications`, `classbook`). Round 6
+  referenced §6 (`MAPPING_CONFIG` shape — `mapping_idx`, `type`,
+  `submaps`, `coupling_steps`, `magnitude`, `angle`, `floor`,
+  `residue`; including the §6 narrative confirming "stereo libvorbis
+  output always uses one coupling step `(magnitude=L, angle=R)`,
+  mono streams have `coupling_steps=0` and `submaps=1`, 5.1 streams
+  use `submaps=2` with `mux=[0,0,0,0,0,1]` routing the LFE on its
+  own submap") and §7 (`MODE_CONFIG` shape — `mode_idx`,
+  `blockflag`, `windowtype`, `transformtype`, `mapping`, plus the
+  trace narrative that mode 0 is the short-block mode and mode 1
+  is the long-block mode in every libvorbis stream).
 * `docs/audio/vorbis/fixtures/{mono-44100-q5-typical,with-vorbis-comment-tags}/trace.txt`
   — only as the source for the field-level shape of the test
   fixtures.
@@ -242,6 +284,8 @@ crate that wraps or implements the format).
 [`Floor0Header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.Floor0Header.html
 [`Floor1Header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.Floor1Header.html
 [`ResidueHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.ResidueHeader.html
+[`MappingHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.MappingHeader.html
+[`ModeHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.ModeHeader.html
 
 ## License
 

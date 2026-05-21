@@ -15,10 +15,12 @@
 //! adds the canonical Huffman tree builder + entry decoder; see
 //! [`huffman`]. Round 5 adds the setup-header outer walker covering
 //! codebooks, time-domain placeholders, floor headers and residue
-//! headers (Vorbis I §4.2.4); see [`setup`]. The mapping (§4.3) /
-//! mode (§4.3.1) / framing-bit tail of the setup header and the
-//! audio-packet decode (§4.3.2) are still pending and [`decode_packet`]
-//! currently returns [`Error::NotImplemented`].
+//! headers (Vorbis I §4.2.4); see [`setup`]. Round 6 closes the
+//! setup-header walk: mapping configurations (§4.2.4 "Mappings"),
+//! mode configurations (§4.2.4 "Modes"), and the trailing framing
+//! flag are now parsed. The audio-packet decode (§4.3) is still
+//! pending and [`decode_packet`] currently returns
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -44,8 +46,9 @@ pub use identification::{
 };
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
-    FloorHeader, FloorKind, ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader,
-    SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
+    FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap, ModeHeader,
+    ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader, SETUP_PACKET_MAGIC,
+    SETUP_PACKET_TYPE,
 };
 
 /// Crate-local error type for the in-progress clean-room rebuild.
