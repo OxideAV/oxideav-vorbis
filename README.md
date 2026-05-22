@@ -1,17 +1,25 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 6.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 7.
 
 ## Status — 2026-05-22
 
-**Round 6 landed: the full setup-header walker now closes — mapping
-configurations (§4.2.4 "Mappings", `mapping_type = 0` only), mode
-configurations (§4.2.4 "Modes"), and the trailing framing flag are
-parsed.** Round 5 landed the setup-header outer walker (codebooks +
-time-domain placeholders + floor headers + residue headers); round 4
-the canonical Huffman tree builder + entry decoder (§3.2.1); round 3
-the codebook-header parser (§3.2.1); round 2 the comment-header parser
-(§5); round 1 the identification-header parser (§4.2.2) on 2026-05-20.
+**Round 7 landed: VQ vector unpack (Vorbis I §3.2.1 "VQ lookup table
+vector representation" + §3.3 "Use of the codebook abstraction").**
+[`unpack_vector`] lifts a decoded Huffman entry index into a fixed
+`codebook.dimensions`-element `Vec<f32>` by walking the spec's
+mixed-base permutation (`lookup_type = 1`, lattice) or one-to-one
+slice (`lookup_type = 2`, tessellation) of the codebook's multiplicand
+table, honouring `sequence_p` as a running prefix-sum of the per-element
+`multiplicand × delta + minimum` term. Round 6 landed the rest of the
+setup-header walker — mapping configurations (§4.2.4 "Mappings",
+`mapping_type = 0` only), mode configurations (§4.2.4 "Modes"), and the
+trailing framing flag. Round 5 landed the setup-header outer walker
+(codebooks + time-domain placeholders + floor headers + residue
+headers); round 4 the canonical Huffman tree builder + entry decoder
+(§3.2.1); round 3 the codebook-header parser (§3.2.1); round 2 the
+comment-header parser (§5); round 1 the identification-header parser
+(§4.2.2) on 2026-05-20.
 
 The crate's prior implementation was retired under the workspace
 clean-room policy because module-level docstrings and inline comments
@@ -145,30 +153,50 @@ comment header.
   * The trailing 1-bit framing flag (§4.2.4 "Modes" step 3) is read
     and required to be set; the flag value is also surfaced as
     `VorbisSetupHeader::framing_flag` for downstream inspection.
-* 97 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
-  codebook-header parse, 13 cover §3.2.1 Huffman tree, and **28 cover
-  §4.2.4 setup-header walker** — the round-5 set (minimal one-of-each
-  setup body, full packet with common header, packet-length /
-  packet-type / magic rejection, nonzero time-placeholder rejection,
-  floor-type > 1 rejection, residue-type > 2 rejection, truncated
-  packet, floor 1 with `partitions=0`, floor 0 LSP setup, two-floor /
-  two-residue shape, multi-stage residue cascade, residue type 0) plus
-  the **14 new round-6 tests** (stereo coupling mapping, 5.1 multi-submap
-  mapping with `mux=[0,0,0,0,0,1]`, `mapping_type != 0` rejection,
-  coupling-step magnitude==angle rejection, coupling-step OOB magnitude
-  rejection, 2-bit reserved-field rejection, `mux` OOB rejection, submap
-  floor / residue OOB rejections, mode `windowtype != 0` /
-  `transformtype != 0` / OOB-`mapping` rejections, unset framing-flag
-  rejection, `audio_channels = 0` caller-bug guard).
+* [`unpack_vector`] applies a codebook's `codebook_lookup_type` to a
+  Huffman entry index `lookup_offset` to recover the per-entry VQ
+  vector (Vorbis I §3.2.1 + §3.3). Returns a `Vec<f32>` of length
+  exactly `codebook.dimensions`. Three branches:
+  * `VqLookup::None` → [`VqUnpackError::NoVectorForType0`] (§3.3:
+    "requesting decode using a codebook of lookup type 0 in any
+    context expecting a vector return value … is forbidden").
+  * `VqLookup::Lattice` (lookup type 1) → mixed-base permutation per
+    §3.2.1 "Vector value decode: Lookup type 1" — `multiplicand_offset
+    = (lookup_offset / index_divisor) mod codebook_lookup_values` for
+    each dimension `i`, with `index_divisor` multiplied by
+    `codebook_lookup_values` between iterations.
+  * `VqLookup::Tessellation` (lookup type 2) → direct one-to-one slice
+    per §3.2.1 "Vector value decode: Lookup type 2" —
+    `multiplicand_offset = lookup_offset * codebook_dimensions`,
+    then increment per iteration.
+  * Both honour `sequence_p`: when set, `[last]` carries forward the
+    full prior `value_vector[i]` (post-`min`, post-`delta`,
+    post-`last`), making the output a prefix-sum; when clear, `[last]`
+    stays at `0.0`. Structured `VqUnpackError` variants:
+    `EntryOutOfRange`, `NoVectorForType0`, `ZeroDimensions`,
+    `MultiplicandShapeMismatch`.
+* 113 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+  codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
+  §4.2.4 setup-header walker, and **16 new round-7 tests cover §3.2.1
+  / §3.3 VQ unpack**: type-0 vector rejection, out-of-range
+  `lookup_offset` rejection, zero-dimensions rejection, both shape
+  mismatches (type-1 lattice / type-2 tessellation), four
+  tessellation paths (independent identity, independent with delta /
+  min, cumulative prefix-sum, cumulative-with-min showing `last`
+  carries the post-min full value), three lattice paths (2-D
+  mixed-base, 3-D binary lattice, cumulative 2-D prefix sum), two
+  per-codebook §3.3 round-trips (8×8 tessellation with delta=0.5
+  min=-1.0, 3×3 lattice across all 9 entries), and two sequence-p
+  semantics sanity checks distinguishing the cumulative-vs-independent
+  reading.
 
 ### What does not yet work
 
-* Vector-decode wrapper applying the lookup table to a Huffman entry
-  (§3.3 "VQ context": entry → vector via `multiplicands` +
-  `minimum_value` / `delta_value` / `sequence_p`). The round-4 walker
-  returns the raw entry index; vector unpacking is a followup.
 * Floor curve / residue decode runtime (§7.2.3, §7.2.4, §8.6.2..§8.6.5),
-  mapping submap channel routing at packet time, mode windowing.
+  mapping submap channel routing at packet time, mode windowing. The
+  round-7 `unpack_vector` is the per-entry leaf operation each residue
+  partition stage feeds into; the residue-side cascade (partition
+  classification + per-stage VQ accumulation) is the next step.
 * Audio-packet decode (§4.3): mode / window decode, floor curve,
   residue, channel coupling, inverse MDCT, overlap-add.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
@@ -183,7 +211,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 6 were implemented against, and only against:
+Rounds 1 — 7 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -218,7 +246,22 @@ Rounds 1 — 6 were implemented against, and only against:
   mapping reads plus step 2e's `windowtype == 0`, `transformtype == 0`,
   and `mapping < mapping_count` enforcement), and §4.2.4 "Modes"
   step 3 (the trailing framing-flag requirement). §9.2.1 `ilog` is
-  reused via [`crate::codebook::ilog`].
+  reused via [`crate::codebook::ilog`]. Round 7 used §3.2.1 "VQ
+  lookup table vector representation" introductory paragraph (the
+  eight values consumed by the unpack: `codebook_multiplicands`,
+  `codebook_minimum_value`, `codebook_delta_value`,
+  `codebook_sequence_p`, `codebook_lookup_type`, `codebook_entries`,
+  `codebook_dimensions`, `codebook_lookup_values`), §3.2.1 "Vector
+  value decode: Lookup type 1" (lattice mixed-base permutation
+  pseudocode, steps 1..8), §3.2.1 "Vector value decode: Lookup type
+  2" (tessellation one-to-one pseudocode, steps 1..7), and §3.3
+  "Use of the codebook abstraction" — the explicit prohibition on
+  requesting a VQ value out of a `lookup_type = 0` codebook ("even
+  in a case where a vector of dimension one … is an error condition
+  rendering the packet undecodable"), and the entry-index → VQ
+  vector hand-off after a successful tree walk. §9.2.3
+  `lookup1_values` is reused via [`crate::codebook::lookup1_values`]
+  for the type-1 shape cross-check.
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -286,6 +329,8 @@ crate that wraps or implements the format).
 [`ResidueHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.ResidueHeader.html
 [`MappingHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.MappingHeader.html
 [`ModeHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.ModeHeader.html
+[`unpack_vector`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/vq/fn.unpack_vector.html
+[`VqUnpackError::NoVectorForType0`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/vq/enum.UnpackError.html#variant.NoVectorForType0
 
 ## License
 

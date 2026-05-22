@@ -18,9 +18,11 @@
 //! headers (Vorbis I §4.2.4); see [`setup`]. Round 6 closes the
 //! setup-header walk: mapping configurations (§4.2.4 "Mappings"),
 //! mode configurations (§4.2.4 "Modes"), and the trailing framing
-//! flag are now parsed. The audio-packet decode (§4.3) is still
-//! pending and [`decode_packet`] currently returns
-//! [`Error::NotImplemented`].
+//! flag are now parsed. Round 7 lifts decoded Huffman entries into
+//! VQ vectors per §3.2.1 "VQ lookup table vector representation" +
+//! §3.3 "Use of the codebook abstraction"; see [`vq`]. The
+//! audio-packet decode (§4.3) is still pending and [`decode_packet`]
+//! currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -31,6 +33,7 @@ pub mod comment;
 pub mod huffman;
 pub mod identification;
 pub mod setup;
+pub mod vq;
 
 pub use codebook::{
     parse_codebook, ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
@@ -50,6 +53,7 @@ pub use setup::{
     ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader, SETUP_PACKET_MAGIC,
     SETUP_PACKET_TYPE,
 };
+pub use vq::{unpack_vector, UnpackError as VqUnpackError};
 
 /// Crate-local error type for the in-progress clean-room rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +75,8 @@ pub enum Error {
     HuffmanDecode(HuffmanDecodeError),
     /// The setup-header walker (Vorbis I §4.2.4) failed to parse.
     Setup(SetupParseError),
+    /// A VQ vector unpack (Vorbis I §3.2.1 / §3.3) failed.
+    Vq(VqUnpackError),
 }
 
 impl core::fmt::Display for Error {
@@ -86,6 +92,7 @@ impl core::fmt::Display for Error {
             Error::HuffmanBuild(e) => write!(f, "{e}"),
             Error::HuffmanDecode(e) => write!(f, "{e}"),
             Error::Setup(e) => write!(f, "{e}"),
+            Error::Vq(e) => write!(f, "{e}"),
         }
     }
 }
@@ -99,6 +106,7 @@ impl std::error::Error for Error {
             Error::HuffmanBuild(e) => Some(e),
             Error::HuffmanDecode(e) => Some(e),
             Error::Setup(e) => Some(e),
+            Error::Vq(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -137,6 +145,12 @@ impl From<HuffmanDecodeError> for Error {
 impl From<SetupParseError> for Error {
     fn from(value: SetupParseError) -> Self {
         Error::Setup(value)
+    }
+}
+
+impl From<VqUnpackError> for Error {
+    fn from(value: VqUnpackError) -> Self {
+        Error::Vq(value)
     }
 }
 

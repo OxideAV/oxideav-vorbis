@@ -6,6 +6,35 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I VQ vector unpack (Vorbis I §3.2.1 "VQ lookup table vector
+  representation" + §3.3 "Use of the codebook abstraction").** New
+  module `vq` exporting `unpack_vector(&VorbisCodebook, lookup_offset:
+  u32) -> Result<Vec<f32>, VqUnpackError>`. Implements the §3.2.1
+  "Vector value decode: Lookup type 1" mixed-base permutation
+  (`multiplicand_offset = (lookup_offset / index_divisor) mod
+  codebook_lookup_values`, with `index_divisor` multiplied by
+  `codebook_lookup_values` between iterations) and the §3.2.1 "Vector
+  value decode: Lookup type 2" one-to-one direct slice
+  (`multiplicand_offset = lookup_offset * codebook_dimensions`,
+  incremented per iteration). Both paths honour `codebook_sequence_p`
+  cumulatively: when set, `[last]` carries the full prior
+  `value_vector[i]` (post-`minimum_value`, post-`delta_value`,
+  post-`last`) forward, making the output a prefix-sum; when clear,
+  `[last]` stays at `0.0` and each element is independent. New error
+  enum `VqUnpackError` with variants `EntryOutOfRange`,
+  `NoVectorForType0` (per §3.3 "requesting decode using a codebook of
+  lookup type 0 in any context expecting a vector return value … is
+  forbidden"), `ZeroDimensions`, and `MultiplicandShapeMismatch`. Crate
+  root re-exports `unpack_vector` and `VqUnpackError`; the unified
+  `Error` grows a `Vq(VqUnpackError)` variant with `From` glue. 16 new
+  unit tests cover both lookup-type paths, both `sequence_p` modes,
+  per-codebook §3.3 round-trips (an 8-entry / 8-dim tessellation and a
+  9-entry / 2-dim lattice exhaustively check every entry against
+  hand-computed reference vectors), the type-0 vector-rejection path,
+  out-of-range lookup-offset rejection, zero-dimensions rejection, and
+  multiplicand-shape mismatch detection for both lattice and
+  tessellation. Test count: 113 total (97 → 113).
+
 * **Vorbis I setup-header mapping + mode + framing-flag parse (Vorbis I
   §4.2.4 "Mappings" / "Modes").** `parse_setup_header` /
   `parse_setup_header_body` now walk the entire setup header, not just
