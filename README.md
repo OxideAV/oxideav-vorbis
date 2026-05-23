@@ -1,12 +1,20 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 7.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 8.
 
-## Status — 2026-05-22
+## Status — 2026-05-23
 
-**Round 7 landed: VQ vector unpack (Vorbis I §3.2.1 "VQ lookup table
-vector representation" + §3.3 "Use of the codebook abstraction").**
-[`unpack_vector`] lifts a decoded Huffman entry index into a fixed
+**Round 8 landed: per-packet residue decode (Vorbis I §8.6.2 "packet
+decode" + §8.6.3/§8.6.4/§8.6.5 "format 0/1/2 specifics").**
+[`ResidueDecoder`] turns the residue payload of an audio packet into one
+`Vec<f32>` per channel: it caps the begin/end range to the per-format
+vector size, reads each partition's classification from the classbook in
+scalar context (pass 0), and over passes 0..=7 accumulates the
+stage-`pass` value codebook's VQ vectors into the output — format 0
+interleaved-scatter, format 1 contiguous, format 2 interleave→format-1→
+de-interleave. End-of-packet mid-decode is the §8.6.2 nominal occurrence
+(stop and return work-so-far). Round 7 landed VQ vector unpack
+([`unpack_vector`]), lifting a decoded Huffman entry index into a fixed
 `codebook.dimensions`-element `Vec<f32>` by walking the spec's
 mixed-base permutation (`lookup_type = 1`, lattice) or one-to-one
 slice (`lookup_type = 2`, tessellation) of the codebook's multiplicand
@@ -175,30 +183,63 @@ comment header.
     stays at `0.0`. Structured `VqUnpackError` variants:
     `EntryOutOfRange`, `NoVectorForType0`, `ZeroDimensions`,
     `MultiplicandShapeMismatch`.
-* 113 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+* [`ResidueDecoder`] decodes the per-packet residue payload (Vorbis I
+  §8.6.2 + §8.6.3/§8.6.4/§8.6.5) into one `Vec<f32>` per channel.
+  [`ResidueDecoder::new`] validates the §8.6.1 undecodability clauses
+  (classbook + value-book indices in range, value books carry a value
+  mapping, classbook dimensions nonzero) and pre-builds the classbook +
+  value-book Huffman trees once. [`ResidueDecoder::decode`] runs the
+  §8.6.2 packet decode:
+  * caps `[residue_begin]`/`[residue_end]` to the actual vector size —
+    `blocksize/2` for format 0/1, `blocksize/2 × ch` for format 2 (the
+    interleaved-vector cap of §8.6.2 step 3);
+  * derives `classwords_per_codeword` (= classbook dimensions),
+    `n_to_read`, `partitions_to_read`, returning the zeroed vectors when
+    `n_to_read == 0`;
+  * on pass 0 reads each partition's classification from the classbook
+    in scalar context, unpacking `classwords_per_codeword`
+    classifications per codeword by the descending integer-divide /
+    integer-modulo by `residue_classifications` (§8.6.2 steps 9..12);
+  * over passes 0..=7 looks up each partition's stage-`pass` value book
+    and, if not `unused`, decodes the partition into the output in VQ
+    context, *accumulating* (`+=`) per §8.6.2 step 19 so cascade stages
+    stack;
+  * format 0 (§8.6.3) scatters element `j` to `offset + i + j×step`;
+    format 1 (§8.6.4) appends contiguously; format 2 (§8.6.5) decodes a
+    single interleaved vector of length `ch × blocksize/2` as a format-1
+    decode then de-interleaves `v[i×ch + j] → output[j][i]`, with the
+    all-`do not decode` short-circuit;
+  * treats end-of-packet mid-decode as the §8.6.2 nominal occurrence —
+    decode stops and returns the vectors-so-far instead of erroring.
+  Structured [`ResidueError`] variants (`UnsupportedFormat`,
+  `ClassbookOutOfRange`, `ValueBookOutOfRange`, `ValueBookHasNoLookup`,
+  `ZeroClasswordsPerCodeword`, `Format0PartitionNotDivisible`,
+  `Huffman`, `Vq`).
+* 128 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
   codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
-  §4.2.4 setup-header walker, and **16 new round-7 tests cover §3.2.1
-  / §3.3 VQ unpack**: type-0 vector rejection, out-of-range
-  `lookup_offset` rejection, zero-dimensions rejection, both shape
-  mismatches (type-1 lattice / type-2 tessellation), four
-  tessellation paths (independent identity, independent with delta /
-  min, cumulative prefix-sum, cumulative-with-min showing `last`
-  carries the post-min full value), three lattice paths (2-D
-  mixed-base, 3-D binary lattice, cumulative 2-D prefix sum), two
-  per-codebook §3.3 round-trips (8×8 tessellation with delta=0.5
-  min=-1.0, 3×3 lattice across all 9 entries), and two sequence-p
-  semantics sanity checks distinguishing the cumulative-vs-independent
-  reading.
+  §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, and
+  **15 new round-8 tests cover §8.6 residue decode**: all four §8.6.1
+  construction-validation rejections, the `n_to_read == 0`
+  short-circuit, format-1 mono two-partition decode, `do not decode`
+  zeroing/skip, format-0 interleaved scatter, format-2
+  interleave/de-interleave plus the all-`do not decode` no-op, two
+  end-of-packet nominal-occurrence paths (empty buffer + mid-codeword
+  overrun), the multi-classword descending classification unpack, and
+  cascade-stage accumulation across passes.
 
 ### What does not yet work
 
-* Floor curve / residue decode runtime (§7.2.3, §7.2.4, §8.6.2..§8.6.5),
-  mapping submap channel routing at packet time, mode windowing. The
-  round-7 `unpack_vector` is the per-entry leaf operation each residue
-  partition stage feeds into; the residue-side cascade (partition
-  classification + per-stage VQ accumulation) is the next step.
-* Audio-packet decode (§4.3): mode / window decode, floor curve,
-  residue, channel coupling, inverse MDCT, overlap-add.
+* Floor curve decode runtime (§7.2.3, §7.2.4 for floor 1; §6.2.2,
+  §6.2.3 for floor 0). The per-packet floor amplitude decode + curve
+  synthesis is the next section past the round-8 residue decode.
+* Mapping submap channel routing at packet time (which channels feed
+  which residue, plus square-polar coupling inversion §A.3), mode /
+  window decode, inverse MDCT, and TDAC overlap-add (§4.3, §10).
+* Top-level audio-packet decode (§4.3.2) tying floor + residue + the
+  per-mapping channel plumbing together. `ResidueDecoder` is the residue
+  half of that pipeline; it still needs the floor curve and the
+  per-channel `do not decode` flags computed from the floor's
+  nonzero_flag to be driven by the packet-level decode loop.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
@@ -261,7 +302,26 @@ Rounds 1 — 7 were implemented against, and only against:
   rendering the packet undecodable"), and the entry-index → VQ
   vector hand-off after a successful tree walk. §9.2.3
   `lookup1_values` is reused via [`crate::codebook::lookup1_values`]
-  for the type-1 shape cross-check.
+  for the type-1 shape cross-check. Round 8 used §8.6.2 "packet decode"
+  (the begin/end limiting steps 1..5 including the format-2 `actual_size
+  = actual_size * ch` rule, the `classwords_per_codeword` / `n_to_read`
+  / `partitions_to_read` convenience values, the `n_to_read == 0`
+  early-out, the pass 0..=7 loop, the pass-0 classbook scalar read with
+  the descending modulo/divide classification unpack at steps 9..12, the
+  step 13..20 per-partition VQ decode loop with the `vqbook` "unused"
+  skip, and the "end-of-packet … is to be considered a nominal
+  occurrence" clause), §8.6.3 "format 0 specifics" (`step = n /
+  codebook_dimensions`, the `offset + i + j*step` scatter), §8.6.4
+  "format 1 specifics" (the contiguous `offset + i` append loop), and
+  §8.6.5 "format 2 specifics" (the all-`do not decode` short-circuit,
+  the single `ch*n` interleaved format-1 decode, and the `v[i*ch + j] →
+  output[j][i]` de-interleave). §8.6.1's undecodability clauses ("any
+  codebook number greater than the maximum numbered codebook … renders
+  the stream undecodable" and "all codebooks in array [residue books]
+  are required to have a value mapping") were used for the construction
+  validation. §3.2.1 / §3.3 are reused via [`crate::vq::unpack_vector`]
+  and [`crate::huffman::HuffmanTree`] for the VQ-context partition reads
+  and the classbook scalar reads.
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -331,6 +391,10 @@ crate that wraps or implements the format).
 [`ModeHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.ModeHeader.html
 [`unpack_vector`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/vq/fn.unpack_vector.html
 [`VqUnpackError::NoVectorForType0`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/vq/enum.UnpackError.html#variant.NoVectorForType0
+[`ResidueDecoder`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/struct.ResidueDecoder.html
+[`ResidueDecoder::new`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/struct.ResidueDecoder.html#method.new
+[`ResidueDecoder::decode`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/struct.ResidueDecoder.html#method.decode
+[`ResidueError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/enum.ResidueError.html
 
 ## License
 

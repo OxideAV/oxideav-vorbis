@@ -6,6 +6,42 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I per-packet residue decode (Vorbis I §8.6.2 "packet decode"
+  + §8.6.3/§8.6.4/§8.6.5 "format 0/1/2 specifics").** New module
+  `residue` exporting `ResidueDecoder`. `ResidueDecoder::new(&ResidueHeader,
+  &[VorbisCodebook])` validates the §8.6.1 undecodability clauses
+  (classbook / value-book indices in range, value books carry a value
+  mapping, classbook dimensions nonzero) and pre-builds the classbook +
+  value-book Huffman trees once. `ResidueDecoder::decode(&mut
+  BitReaderLsb, blocksize, &[bool])` runs the §8.6.2 packet decode: it
+  caps `[residue_begin]`/`[residue_end]` to the per-format vector size
+  (`blocksize/2` for format 0/1, `blocksize/2 * ch` for format 2),
+  derives `classwords_per_codeword`/`n_to_read`/`partitions_to_read`,
+  reads the per-partition classifications on pass 0 from the classbook in
+  scalar context (descending integer-divide / integer-modulo unpack),
+  and over passes 0..=7 decodes each partition's stage-`pass` value book
+  in VQ context — *accumulating* (`+=`) into the output. Format 0
+  (§8.6.3) scatters element `j` to `offset + i + j*step`; format 1
+  (§8.6.4) appends contiguously; format 2 (§8.6.5) decodes one
+  interleaved vector of length `ch * blocksize/2` as a format-1 decode
+  then de-interleaves `v[i*ch + j] -> output[j][i]`, with the all-`do
+  not decode` short-circuit. End-of-packet during decode is treated as
+  the §8.6.2 nominal occurrence: decode stops and returns the
+  vectors-so-far rather than erroring. New error enum `ResidueError`
+  (`UnsupportedFormat`, `ClassbookOutOfRange`, `ValueBookOutOfRange`,
+  `ValueBookHasNoLookup`, `ZeroClasswordsPerCodeword`,
+  `Format0PartitionNotDivisible`, `Huffman`, `Vq`). Crate root re-exports
+  `ResidueDecoder` + `ResidueError`; the unified `Error` grows a
+  `Residue(ResidueError)` variant with `From` glue. 15 new unit tests
+  cover all four §8.6.1 construction-validation rejections, the
+  `n_to_read == 0` short-circuit, format-1 mono two-partition decode,
+  `do not decode` zeroing/skip, format-0 interleaved scatter, format-2
+  interleave/de-interleave + the all-`do not decode` no-op, two
+  end-of-packet nominal-occurrence paths (empty buffer + mid-codeword
+  overrun), the multi-classword descending classification unpack, and
+  cascade-stage accumulation across passes. Test count: 128 total (113 →
+  128).
+
 * **Vorbis I VQ vector unpack (Vorbis I §3.2.1 "VQ lookup table vector
   representation" + §3.3 "Use of the codebook abstraction").** New
   module `vq` exporting `unpack_vector(&VorbisCodebook, lookup_offset:

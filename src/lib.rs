@@ -20,9 +20,11 @@
 //! mode configurations (§4.2.4 "Modes"), and the trailing framing
 //! flag are now parsed. Round 7 lifts decoded Huffman entries into
 //! VQ vectors per §3.2.1 "VQ lookup table vector representation" +
-//! §3.3 "Use of the codebook abstraction"; see [`vq`]. The
-//! audio-packet decode (§4.3) is still pending and [`decode_packet`]
-//! currently returns [`Error::NotImplemented`].
+//! §3.3 "Use of the codebook abstraction"; see [`vq`]. Round 8 lands
+//! the per-packet residue decode (§8.6.2 packet decode + §8.6.3/4/5
+//! format 0/1/2 specifics); see [`residue`]. The full audio-packet
+//! decode (§4.3) is still pending and [`decode_packet`] currently
+//! returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -32,6 +34,7 @@ pub mod codebook;
 pub mod comment;
 pub mod huffman;
 pub mod identification;
+pub mod residue;
 pub mod setup;
 pub mod vq;
 
@@ -47,6 +50,7 @@ pub use huffman::{
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
+pub use residue::{ResidueDecoder, ResidueError};
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
     FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap, ModeHeader,
@@ -77,6 +81,8 @@ pub enum Error {
     Setup(SetupParseError),
     /// A VQ vector unpack (Vorbis I §3.2.1 / §3.3) failed.
     Vq(VqUnpackError),
+    /// A residue decode (Vorbis I §8.6) failed to prepare or run.
+    Residue(ResidueError),
 }
 
 impl core::fmt::Display for Error {
@@ -93,6 +99,7 @@ impl core::fmt::Display for Error {
             Error::HuffmanDecode(e) => write!(f, "{e}"),
             Error::Setup(e) => write!(f, "{e}"),
             Error::Vq(e) => write!(f, "{e}"),
+            Error::Residue(e) => write!(f, "{e}"),
         }
     }
 }
@@ -107,6 +114,7 @@ impl std::error::Error for Error {
             Error::HuffmanDecode(e) => Some(e),
             Error::Setup(e) => Some(e),
             Error::Vq(e) => Some(e),
+            Error::Residue(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -151,6 +159,12 @@ impl From<SetupParseError> for Error {
 impl From<VqUnpackError> for Error {
     fn from(value: VqUnpackError) -> Self {
         Error::Vq(value)
+    }
+}
+
+impl From<ResidueError> for Error {
+    fn from(value: ResidueError) -> Self {
+        Error::Residue(value)
     }
 }
 
