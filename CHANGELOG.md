@@ -6,6 +6,49 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I floor type 1 per-packet decode + curve computation (Vorbis
+  I §7.2.3 "packet decode" + §7.2.4 "curve computation").** New module
+  `floor1` exporting `Floor1Decoder`, `FloorCurve`, `Floor1Error`, and
+  the integer geometry helpers `low_neighbor` / `high_neighbor` (§9.2.4 /
+  §9.2.5), `render_point` (§9.2.6) and `render_line` (§9.2.7).
+  `Floor1Decoder::new(&Floor1Header, &[VorbisCodebook])` reconstructs the
+  full `[floor1_X_list]` (prepending the two implicit endpoints `0` and
+  `2^rangebits` that §7.2.2 injects before the per-partition read loop),
+  validates the §7.2.2 undecodability clauses (multiplier in `1..=4`,
+  `[floor1_values]` ≤ 65, x-list uniqueness, master/sub-book indices in
+  range) and pre-builds every referenced codebook's Huffman tree once.
+  `Floor1Decoder::decode(&mut BitReaderLsb, n)` runs the two-stage
+  decode: (1) §7.2.3 packet decode reads the `[nonzero]` flag (returning
+  `FloorCurve::Unused` if clear), the two `ilog([range]-1)`-bit endpoint
+  amplitudes, and per partition the master-book selector (only when
+  `[cbits] > 0`) followed by the per-dimension sub-book scalar
+  amplitudes (a negative/`None` sub-book yields a `0` Y with no bits
+  read), producing `[floor1_Y]`; (2) §7.2.4 step 1 unwraps the positive
+  `[floor1_Y]` differences through iterative `render_point` line
+  prediction into `[floor1_final_Y]` + `[floor1_step2_flag]` (with the
+  suggested `[0, range)` clamp), and step 2 sorts the `(X, final_Y,
+  flag)` triples by ascending X, renders the contiguous integer line
+  segments via `render_line`, and substitutes each integer floor sample
+  through the §10.1 `floor1_inverse_dB_table` (transcribed verbatim as
+  the 256-element `INVERSE_DB_TABLE`) to produce a linear-domain
+  envelope of length `n`. An end-of-packet condition anywhere in §7.2.3
+  is the spec's nominal occurrence: decode returns `FloorCurve::Unused`
+  exactly as if `[nonzero]` had been clear. New error enum `Floor1Error`
+  (`BookOutOfRange`, `BadMultiplier`, `TooManyValues`, `NonUniqueXList`,
+  `Huffman`). Crate root re-exports `Floor1Decoder`, `FloorCurve`,
+  `Floor1Error`, `low_neighbor`, `high_neighbor`, `render_point`,
+  `render_line`; the unified `Error` grows a `Floor1(Floor1Error)`
+  variant with `From` glue. 18 new unit tests cover the §9.2.6/§9.2.7
+  render-point/render-line spec geometry (up/down/flat segments,
+  endpoint-not-written convention), the §9.2.4/§9.2.5 neighbor lookups,
+  all four §7.2.2 construction-validation rejections, a hand-traced full
+  `curve_computation` (x_list `[0,16,4,8]`, Y `[40,20,1,0]` → final_Y
+  `[40,20,34,30]`), a full packet→curve round trip, the master/subclass
+  cascade selector path, the `nonzero` unset path, two end-of-packet
+  nominal-`Unused` paths (mid-amplitude + mid-codeword), the
+  negative-sub-book zero-Y path, and the §10.1 table endpoints. Test
+  count: 146 total (128 → 146).
+
 * **Vorbis I per-packet residue decode (Vorbis I §8.6.2 "packet decode"
   + §8.6.3/§8.6.4/§8.6.5 "format 0/1/2 specifics").** New module
   `residue` exporting `ResidueDecoder`. `ResidueDecoder::new(&ResidueHeader,

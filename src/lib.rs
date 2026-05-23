@@ -22,7 +22,9 @@
 //! VQ vectors per §3.2.1 "VQ lookup table vector representation" +
 //! §3.3 "Use of the codebook abstraction"; see [`vq`]. Round 8 lands
 //! the per-packet residue decode (§8.6.2 packet decode + §8.6.3/4/5
-//! format 0/1/2 specifics); see [`residue`]. The full audio-packet
+//! format 0/1/2 specifics); see [`residue`]. Round 9 lands the floor
+//! type 1 per-packet decode + curve computation (§7.2.3 packet decode +
+//! §7.2.4 curve computation); see [`floor1`]. The full audio-packet
 //! decode (§4.3) is still pending and [`decode_packet`] currently
 //! returns [`Error::NotImplemented`].
 
@@ -32,6 +34,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod codebook;
 pub mod comment;
+pub mod floor1;
 pub mod huffman;
 pub mod identification;
 pub mod residue;
@@ -43,6 +46,9 @@ pub use codebook::{
 };
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
+};
+pub use floor1::{
+    high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
 pub use huffman::{
     BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,
@@ -83,6 +89,8 @@ pub enum Error {
     Vq(VqUnpackError),
     /// A residue decode (Vorbis I §8.6) failed to prepare or run.
     Residue(ResidueError),
+    /// A floor type 1 decode (Vorbis I §7.2) failed to prepare or run.
+    Floor1(Floor1Error),
 }
 
 impl core::fmt::Display for Error {
@@ -100,6 +108,7 @@ impl core::fmt::Display for Error {
             Error::Setup(e) => write!(f, "{e}"),
             Error::Vq(e) => write!(f, "{e}"),
             Error::Residue(e) => write!(f, "{e}"),
+            Error::Floor1(e) => write!(f, "{e}"),
         }
     }
 }
@@ -115,6 +124,7 @@ impl std::error::Error for Error {
             Error::Setup(e) => Some(e),
             Error::Vq(e) => Some(e),
             Error::Residue(e) => Some(e),
+            Error::Floor1(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -165,6 +175,12 @@ impl From<VqUnpackError> for Error {
 impl From<ResidueError> for Error {
     fn from(value: ResidueError) -> Self {
         Error::Residue(value)
+    }
+}
+
+impl From<Floor1Error> for Error {
+    fn from(value: Floor1Error) -> Self {
+        Error::Floor1(value)
     }
 }
 

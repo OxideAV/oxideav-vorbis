@@ -1,8 +1,23 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 8.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 9.
 
-## Status — 2026-05-23
+## Status — 2026-05-24
+
+**Round 9 landed: floor type 1 per-packet decode + curve computation
+(Vorbis I §7.2.3 "packet decode" + §7.2.4 "curve computation").**
+[`Floor1Decoder`] turns the floor payload of an audio packet into a
+linear-domain spectral envelope of length `n` (= `blocksize/2`). It reads
+the `[nonzero]` flag (returning `Unused` if clear), the two
+`ilog([range]-1)`-bit endpoint amplitudes, and per partition the
+master-book selector (only when `[cbits] > 0`) followed by the
+per-dimension sub-book scalar amplitudes, yielding `[floor1_Y]`; then
+unwraps those positive differences through iterative `render_point` line
+prediction (§7.2.4 step 1) and renders the sorted contiguous line
+segments via `render_line` (§7.2.4 step 2) before substituting through
+the §10.1 inverse-dB table. End-of-packet mid-decode is the §7.2.3
+nominal occurrence (return `Unused`). This is the floor half of the
+§4.3.2 audio-packet pipeline that complements round 8's residue half.
 
 **Round 8 landed: per-packet residue decode (Vorbis I §8.6.2 "packet
 decode" + §8.6.3/§8.6.4/§8.6.5 "format 0/1/2 specifics").**
@@ -215,31 +230,61 @@ comment header.
   `ClassbookOutOfRange`, `ValueBookOutOfRange`, `ValueBookHasNoLookup`,
   `ZeroClasswordsPerCodeword`, `Format0PartitionNotDivisible`,
   `Huffman`, `Vq`).
-* 128 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+* [`Floor1Decoder`] decodes the per-packet floor type 1 payload (Vorbis
+  I §7.2.3 + §7.2.4) into a linear-domain spectral envelope.
+  [`Floor1Decoder::new`] reconstructs the full `[floor1_X_list]` —
+  prepending the implicit endpoints `0` and `2^rangebits` — validates the
+  §7.2.2 undecodability clauses (multiplier in `1..=4`, `[floor1_values]`
+  ≤ 65, x-list uniqueness, master/sub-book indices in range) and
+  pre-builds every referenced codebook's Huffman tree once.
+  [`Floor1Decoder::decode`] runs:
+  * §7.2.3 packet decode — reads the `[nonzero]` flag (returning
+    `FloorCurve::Unused` if clear), the two `ilog([range]-1)`-bit
+    endpoint amplitudes, and per partition the master-book selector (only
+    when `[cbits] > 0`) then the per-dimension sub-book scalar
+    amplitudes, with a negative/`None` sub-book forcing a `0` Y with no
+    bits consumed (§7.2.3 step 16/18);
+  * §7.2.4 step 1 — unwraps the positive `[floor1_Y]` differences through
+    iterative `render_point` line prediction into `[floor1_final_Y]` +
+    `[floor1_step2_flag]`, with the suggested `[0, range)` clamp;
+  * §7.2.4 step 2 — sorts the `(X, final_Y, flag)` triples by ascending
+    X, renders the contiguous integer line segments via `render_line`,
+    and substitutes each integer floor sample through the §10.1
+    `floor1_inverse_dB_table` (`INVERSE_DB_TABLE`) for a length-`n`
+    linear envelope;
+  * treats end-of-packet mid-decode as the §7.2.3 nominal occurrence —
+    returns `FloorCurve::Unused` as if `[nonzero]` had been clear.
+  The integer geometry helpers [`low_neighbor`] / [`high_neighbor`]
+  (§9.2.4 / §9.2.5), [`render_point`] (§9.2.6) and [`render_line`]
+  (§9.2.7) are public. Structured [`Floor1Error`] variants
+  (`BookOutOfRange`, `BadMultiplier`, `TooManyValues`, `NonUniqueXList`,
+  `Huffman`).
+* 146 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
   codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
-  §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, and
-  **15 new round-8 tests cover §8.6 residue decode**: all four §8.6.1
-  construction-validation rejections, the `n_to_read == 0`
-  short-circuit, format-1 mono two-partition decode, `do not decode`
-  zeroing/skip, format-0 interleaved scatter, format-2
-  interleave/de-interleave plus the all-`do not decode` no-op, two
-  end-of-packet nominal-occurrence paths (empty buffer + mid-codeword
-  overrun), the multi-classword descending classification unpack, and
-  cascade-stage accumulation across passes.
+  §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, 15 cover
+  §8.6 residue decode, and **18 new round-9 tests cover §7.2 floor 1
+  decode**: the §9.2.6/§9.2.7 render-point/render-line geometry
+  (up/down/flat segments, endpoint-not-written), the §9.2.4/§9.2.5
+  neighbor lookups, all four §7.2.2 construction-validation rejections, a
+  hand-traced full `curve_computation`, a full packet→curve round trip,
+  the master/subclass cascade selector path, the `nonzero` unset path,
+  two end-of-packet nominal-`Unused` paths (mid-amplitude + mid-codeword),
+  the negative-sub-book zero-Y path, and the §10.1 table endpoints.
 
 ### What does not yet work
 
-* Floor curve decode runtime (§7.2.3, §7.2.4 for floor 1; §6.2.2,
-  §6.2.3 for floor 0). The per-packet floor amplitude decode + curve
-  synthesis is the next section past the round-8 residue decode.
+* Floor curve decode runtime for **floor type 0** (§6.2.2, §6.2.3 — LSP
+  representation). libvorbis never produces floor 0, but the codepath
+  exists in the spec; the round-9 work covers floor type 1 only.
 * Mapping submap channel routing at packet time (which channels feed
   which residue, plus square-polar coupling inversion §A.3), mode /
   window decode, inverse MDCT, and TDAC overlap-add (§4.3, §10).
 * Top-level audio-packet decode (§4.3.2) tying floor + residue + the
-  per-mapping channel plumbing together. `ResidueDecoder` is the residue
-  half of that pipeline; it still needs the floor curve and the
-  per-channel `do not decode` flags computed from the floor's
-  nonzero_flag to be driven by the packet-level decode loop.
+  per-mapping channel plumbing together. `Floor1Decoder` is the floor
+  half and `ResidueDecoder` the residue half; the packet-level loop that
+  drives them in channel order — computing each channel's `do not decode`
+  flag from the floor's `nonzero`/`Unused` result and applying §4.3.3
+  nonzero-vector propagation across coupled channels — is still pending.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
@@ -252,7 +297,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 7 were implemented against, and only against:
+Rounds 1 — 9 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -321,7 +366,25 @@ Rounds 1 — 7 were implemented against, and only against:
   are required to have a value mapping") were used for the construction
   validation. §3.2.1 / §3.3 are reused via [`crate::vq::unpack_vector`]
   and [`crate::huffman::HuffmanTree`] for the VQ-context partition reads
-  and the classbook scalar reads.
+  and the classbook scalar reads. Round 9 used §7.2.3 "packet decode"
+  (the `[nonzero]` flag at step 1, the `[range]` table lookup, the two
+  `ilog([range]-1)`-bit endpoint amplitudes at steps 2..3, the
+  per-partition steps 5..19 master-book selector + `cval & csub` /
+  `cval >>= cbits` sub-book cascade + the negative-book zero-Y branch,
+  and the closing "end-of-packet … nominal occurrence → return unused"
+  note), §7.2.4 "curve computation" (step 1 amplitude synthesis with the
+  `render_point` prediction, `highroom`/`lowroom`/`room` wrap arithmetic,
+  the val-vs-room and odd/even branches, the suggested `[0, range)`
+  clamp; step 2 curve synthesis with the ascending-X sort, the
+  `render_line` segment chaining, the `hx < n` tail extension, and the
+  `floor1_inverse_dB_table` substitution), §7.2.1 "model" (the
+  iterative-prediction narrative), §9.2.4 "low neighbor", §9.2.5 "high
+  neighbor", §9.2.6 "render point" (the integer line-solve), §9.2.7
+  "render line" (the Bresenham-style integer line drawing with
+  toward-zero division), and §10.1 "floor1 inverse dB table" (the
+  256-element static table transcribed verbatim). §9.2.1 `ilog` is
+  reused via [`crate::codebook::ilog`]; the scalar codebook reads use
+  [`crate::huffman::HuffmanTree`].
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -395,6 +458,14 @@ crate that wraps or implements the format).
 [`ResidueDecoder::new`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/struct.ResidueDecoder.html#method.new
 [`ResidueDecoder::decode`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/struct.ResidueDecoder.html#method.decode
 [`ResidueError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/residue/enum.ResidueError.html
+[`Floor1Decoder`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/struct.Floor1Decoder.html
+[`Floor1Decoder::new`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/struct.Floor1Decoder.html#method.new
+[`Floor1Decoder::decode`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/struct.Floor1Decoder.html#method.decode
+[`Floor1Error`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/enum.Floor1Error.html
+[`low_neighbor`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.low_neighbor.html
+[`high_neighbor`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.high_neighbor.html
+[`render_point`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.render_point.html
+[`render_line`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.render_line.html
 
 ## License
 
