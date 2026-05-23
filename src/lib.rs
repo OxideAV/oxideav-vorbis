@@ -24,9 +24,11 @@
 //! the per-packet residue decode (§8.6.2 packet decode + §8.6.3/4/5
 //! format 0/1/2 specifics); see [`residue`]. Round 9 lands the floor
 //! type 1 per-packet decode + curve computation (§7.2.3 packet decode +
-//! §7.2.4 curve computation); see [`floor1`]. The full audio-packet
-//! decode (§4.3) is still pending and [`decode_packet`] currently
-//! returns [`Error::NotImplemented`].
+//! §7.2.4 curve computation); see [`floor1`]. Round 10 lands the
+//! floor type 0 per-packet decode + LSP curve computation (§6.2.2
+//! packet decode + §6.2.3 curve computation); see [`floor0`]. The
+//! full audio-packet decode (§4.3) is still pending and
+//! [`decode_packet`] currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -34,6 +36,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod codebook;
 pub mod comment;
+pub mod floor0;
 pub mod floor1;
 pub mod huffman;
 pub mod identification;
@@ -47,6 +50,7 @@ pub use codebook::{
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
+pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
@@ -91,6 +95,8 @@ pub enum Error {
     Residue(ResidueError),
     /// A floor type 1 decode (Vorbis I §7.2) failed to prepare or run.
     Floor1(Floor1Error),
+    /// A floor type 0 decode (Vorbis I §6.2) failed to prepare or run.
+    Floor0(Floor0Error),
 }
 
 impl core::fmt::Display for Error {
@@ -109,6 +115,7 @@ impl core::fmt::Display for Error {
             Error::Vq(e) => write!(f, "{e}"),
             Error::Residue(e) => write!(f, "{e}"),
             Error::Floor1(e) => write!(f, "{e}"),
+            Error::Floor0(e) => write!(f, "{e}"),
         }
     }
 }
@@ -125,6 +132,7 @@ impl std::error::Error for Error {
             Error::Vq(e) => Some(e),
             Error::Residue(e) => Some(e),
             Error::Floor1(e) => Some(e),
+            Error::Floor0(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -181,6 +189,12 @@ impl From<ResidueError> for Error {
 impl From<Floor1Error> for Error {
     fn from(value: Floor1Error) -> Self {
         Error::Floor1(value)
+    }
+}
+
+impl From<Floor0Error> for Error {
+    fn from(value: Floor0Error) -> Self {
+        Error::Floor0(value)
     }
 }
 

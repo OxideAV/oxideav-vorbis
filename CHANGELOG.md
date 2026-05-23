@@ -6,6 +6,60 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I floor type 0 per-packet decode + LSP curve computation
+  (Vorbis I §6.2.2 "packet decode" + §6.2.3 "curve computation").**
+  New module `floor0` exporting `Floor0Decoder`, `Floor0Curve`,
+  `Floor0Error`, and the §6.2.3 post-errata Bark scale helper `bark`.
+  `Floor0Decoder::new(&Floor0Header, &[VorbisCodebook])` validates the
+  §6.2.1 / §6.2.3 undecodability clauses (nonzero `order` /
+  `bark_map_size` / `amplitude_bits`, non-empty `book_list`, every book
+  index in range, every referenced book carries a VQ lookup table per
+  §3.3) and pre-builds each value codebook's Huffman decision tree once.
+  `Floor0Decoder::decode(&mut BitReaderLsb, n)` runs the two-stage
+  decode: (1) §6.2.2 packet decode reads `[amplitude]` in
+  `floor0_amplitude_bits` bits (returning `Floor0Curve::Unused` if
+  zero), then `[booknumber]` in `ilog([floor0_number_of_books])` bits
+  (mapping `booknumber >= floor0_book_list.len()` reserved values to
+  `Unused` per the nominal-occurrence rule), then loops reading VQ
+  vectors from `floor0_book_list[booknumber]` and concatenating them
+  into `[coefficients]` until the vector reaches `floor0_order`
+  elements, with the running `[last]` accumulator added before
+  concatenation (§6.2.2 steps 6..9) and reset to the last scalar of
+  each just-decoded vector (the spec explicitly permits over-reading
+  past `floor0_order`); (2) §6.2.3 curve computation builds a
+  Bark-scale `map[i]` per the post-errata `bark(x) = 13.1·atan(.00074x)
+  + 2.24·atan(.0000000185x²) + .0001x` formula, then synthesises the
+  LSP curve via the order-parity `[p]`/`[q]` product at every
+  `[ω] = π·map[i]/bark_map_size` and applies the
+  `exp(.11512925·(amplitude·offset/((2^bits - 1)·sqrt(p+q)) - offset))`
+  log→linear transform, replicating each synthesis value across all
+  consecutive output bins whose `map[i]` matches the current synthesis
+  bin (§6.2.3 step 8 `[iteration_condition]` chaining). An
+  end-of-packet condition anywhere in §6.2.2 is the spec's nominal
+  occurrence: decode returns `Floor0Curve::Unused`. New error enum
+  `Floor0Error` (`BookOutOfRange`, `EmptyBookList`, `ZeroOrder`,
+  `ZeroBarkMapSize`, `ZeroAmplitudeBits`, `ValueBookHasNoLookup`,
+  `Huffman`). Crate root re-exports `Floor0Decoder`, `Floor0Curve`,
+  `Floor0Error`, and `bark` as `floor0_bark`; the unified `Error`
+  grows a `Floor0(Floor0Error)` variant with `From` glue. 18 new unit
+  tests cover the §6.2.3 post-errata Bark formula at zero plus its
+  monotonicity on the audible range, all six construction-validation
+  rejections, the `amplitude == 0` and EOF-during-amplitude `Unused`
+  paths, an EOF-during-coefficients `Unused` path, a hand-traced packet
+  decode producing the expected `(amplitude, coefficients)` pair with
+  `[last]` accumulating across vectors, a dim-1-book multi-codeword
+  fill exercising the `[last]` carry across every iteration, a curve-
+  computation length-and-finiteness check on a hand-picked LSP set, the
+  `[iteration_condition]` chaining replication assertion, an
+  `amplitude = 0` direct `curve_computation` returning the all-zero
+  length-`n` vector, the reserved-`booknumber` → `Unused` path, and a
+  full packet → `Floor0Curve` end-to-end round trip. Test count: 164
+  total (146 → 164). libvorbis never emits floor 0 (every reference
+  encoder uses floor 1 exclusively) but a conformant Vorbis I decoder
+  must implement the codepath because the spec defines it; this is the
+  missing-piece half of the floor decode pipeline (round 9 covered
+  floor 1).
+
 * **Vorbis I floor type 1 per-packet decode + curve computation (Vorbis
   I §7.2.3 "packet decode" + §7.2.4 "curve computation").** New module
   `floor1` exporting `Floor1Decoder`, `FloorCurve`, `Floor1Error`, and

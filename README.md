@@ -1,8 +1,39 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 9.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 10.
 
 ## Status — 2026-05-24
+
+**Round 10 landed: floor type 0 per-packet decode + LSP curve
+computation (Vorbis I §6.2.2 "packet decode" + §6.2.3 "curve
+computation").** [`Floor0Decoder`] turns the floor payload of an audio
+packet into a linear-domain spectral envelope of length `n` (=
+`blocksize/2`). It reads the `[amplitude]` field (`floor0_amplitude_bits`
+bits, returning `Floor0Curve::Unused` when zero), then the `[booknumber]`
+(`ilog([floor0_number_of_books])` bits), then loops reading VQ vectors
+from `floor0_book_list[booknumber]` and concatenating them into
+`[coefficients]` until the vector reaches at least `floor0_order`
+elements — each new vector has the running `[last]` accumulator added
+before concatenation (§6.2.2 steps 6..10), and `[last]` is reset to the
+last scalar of the just-decoded vector after each iteration. The spec
+explicitly permits the loop to over-read past `floor0_order`; the curve
+synthesis slices to the first `order` coefficients. The curve
+computation builds a Bark-scale frequency map per §6.2.3 (using the
+post-errata `bark(x) = 13.1·atan(.00074x) + 2.24·atan(.0000000185x²) +
+.0001x` formula), then iterates the order-parity-dependent `[p]`/`[q]`
+LSP product through the `exp(.11512925 · …)` log→linear amplitude
+transform at every angle `[ω] = π · map[i] / floor0_bark_map_size`,
+replicating the value across every consecutive output bin whose `map[i]`
+matches the current synthesis bin (the `[iteration_condition]` chaining
+of §6.2.3 step 8). An end-of-packet condition anywhere in §6.2.2 is the
+spec's nominal occurrence: decode returns `Floor0Curve::Unused` exactly
+as if `[amplitude]` had read zero. Reserved-`booknumber` values
+(`booknumber >= floor0_book_list.len()` because the spec stores the
+field in `ilog([floor0_number_of_books])` bits with the high values
+reserved) also map to `Unused`. libvorbis never produces floor 0 but a
+conformant Vorbis I decoder must implement the codepath; this is the
+missing-piece half of the floor decode pipeline (round 9 covered floor
+1).
 
 **Round 9 landed: floor type 1 per-packet decode + curve computation
 (Vorbis I §7.2.3 "packet decode" + §7.2.4 "curve computation").**
@@ -259,23 +290,57 @@ comment header.
   (§9.2.7) are public. Structured [`Floor1Error`] variants
   (`BookOutOfRange`, `BadMultiplier`, `TooManyValues`, `NonUniqueXList`,
   `Huffman`).
-* 146 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+* [`Floor0Decoder`] decodes the per-packet floor type 0 payload (Vorbis
+  I §6.2.2 + §6.2.3) into a linear-domain spectral envelope. The
+  `Floor0Decoder::new` constructor validates the §6.2.1 / §6.2.3
+  undecodability clauses (nonzero `order` / `bark_map_size` /
+  `amplitude_bits`, non-empty `book_list`, every book index in range,
+  every referenced book carries a VQ lookup table per §3.3) and
+  pre-builds each value codebook's Huffman decision tree once.
+  `Floor0Decoder::decode` runs:
+  * §6.2.2 packet decode — reads `[amplitude]` (returning
+    `Floor0Curve::Unused` if zero), reads `[booknumber]` in
+    `ilog([floor0_number_of_books])` bits (mapping
+    `booknumber >= floor0_book_list.len()` to `Unused` per the
+    nominal-occurrence rule on reserved values), then loops decoding VQ
+    vectors from the selected value book — each vector has the running
+    `[last]` accumulator added before concatenation (§6.2.2 steps 6..9)
+    and `[last]` is then reset to the just-decoded vector's tail.
+  * §6.2.3 curve computation — builds a Bark-scale `map[i]` per the
+    post-errata `bark(x) = 13.1·atan(.00074x) + 2.24·atan(.0000000185x²) +
+    .0001x` formula, then synthesises the LSP curve via the order-parity
+    `[p]`/`[q]` product at `[ω] = π·map[i]/bark_map_size` and applies the
+    `exp(.11512925 · …)` log→linear amplitude transform, replicating each
+    synthesis value across all consecutive output bins whose `map[i]`
+    matches the current synthesis bin (§6.2.3 step 8 `[iteration_condition]`
+    chaining).
+  * end-of-packet anywhere in §6.2.2 → `Floor0Curve::Unused`.
+  The Bark-scale formula helper [`bark`] (re-exported at the crate root
+  as `floor0_bark`) is public. Structured [`Floor0Error`] variants
+  (`BookOutOfRange`, `EmptyBookList`, `ZeroOrder`, `ZeroBarkMapSize`,
+  `ZeroAmplitudeBits`, `ValueBookHasNoLookup`, `Huffman`).
+* 164 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
   codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
   §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, 15 cover
-  §8.6 residue decode, and **18 new round-9 tests cover §7.2 floor 1
-  decode**: the §9.2.6/§9.2.7 render-point/render-line geometry
-  (up/down/flat segments, endpoint-not-written), the §9.2.4/§9.2.5
-  neighbor lookups, all four §7.2.2 construction-validation rejections, a
-  hand-traced full `curve_computation`, a full packet→curve round trip,
-  the master/subclass cascade selector path, the `nonzero` unset path,
-  two end-of-packet nominal-`Unused` paths (mid-amplitude + mid-codeword),
-  the negative-sub-book zero-Y path, and the §10.1 table endpoints.
+  §8.6 residue decode, 18 cover §7.2 floor 1 decode, and **18 new
+  round-10 tests cover §6.2 floor 0 decode**: the §6.2.3 post-errata
+  Bark formula at `x = 0` plus its monotonicity on the audible range, all
+  six `Floor0Decoder::new` construction-validation rejections (zero order
+  / bark-map-size / amplitude-bits, empty book list, out-of-range book
+  index, lookup-type-0 value book), the `amplitude == 0` and EOF-during-
+  amplitude `Unused` paths, an EOF-during-coefficients `Unused` path, a
+  hand-traced packet decode producing the expected `(amplitude,
+  coefficients)` pair with `[last]` accumulating across vectors, a
+  dim-1-book multi-codeword fill exercising the `[last]` carry across
+  every iteration, a curve-computation length-and-finiteness check on a
+  hand-picked LSP set, the `[iteration_condition]` chaining replication
+  (consecutive output bins are exactly equal), an `amplitude = 0` direct
+  call to `curve_computation` returning the all-zero length-`n` vector,
+  the reserved-`booknumber` → `Unused` path, and a full
+  packet→`Floor0Curve` end-to-end round trip.
 
 ### What does not yet work
 
-* Floor curve decode runtime for **floor type 0** (§6.2.2, §6.2.3 — LSP
-  representation). libvorbis never produces floor 0, but the codepath
-  exists in the spec; the round-9 work covers floor type 1 only.
 * Mapping submap channel routing at packet time (which channels feed
   which residue, plus square-polar coupling inversion §A.3), mode /
   window decode, inverse MDCT, and TDAC overlap-add (§4.3, §10).
@@ -297,7 +362,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 9 were implemented against, and only against:
+Rounds 1 — 10 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -384,7 +449,35 @@ Rounds 1 — 9 were implemented against, and only against:
   toward-zero division), and §10.1 "floor1 inverse dB table" (the
   256-element static table transcribed verbatim). §9.2.1 `ilog` is
   reused via [`crate::codebook::ilog`]; the scalar codebook reads use
-  [`crate::huffman::HuffmanTree`].
+  [`crate::huffman::HuffmanTree`]. Round 10 used §6.1 "Overview" (the
+  LSP narrative), §6.2.1 "header decode" (the seven structural fields
+  including the closing note that "any element of the array
+  `[floor0_book_list]` that is greater than the maximum codebook number
+  for this bitstream is an error condition that also renders the stream
+  undecodable"), §6.2.2 "packet decode" (step 1 `[amplitude]` =
+  `[floor0_amplitude_bits]` bits, step 2 `amplitude > 0` gating, step 4
+  `[booknumber]` = `ilog([floor0_number_of_books])` bits with the
+  alternative `ilog([floor0_number_of_books] - 1)` storage note
+  explicitly declined in favour of the spec-literal reading, step 5
+  reserved-value → undecodable, steps 6..11 the `[last]` carry / VQ
+  vector concat loop, step 12 done, the "extra values are not used and
+  may be ignored or discarded" over-read clause, the `[amplitude] == 0`
+  ⇒ 'unused' rule, and the closing "end-of-packet condition during
+  decode should be considered a nominal occurrence" note), §6.2.3
+  "curve computation" (the `amplitude == 0` ⇒ all-zero shortcut, the
+  `map[i] = min(bark_map_size - 1, foobar)` computation with
+  `foobar = floor(bark(rate·i/(2n)) · bark_map_size / bark(.5·rate))`,
+  the order-odd `[p]` / `[q]` formulas with the `(1 - cos²ω)` / `0.25`
+  lead factors, the order-even formulas with the `(1 ± cos ω)/2` lead
+  factors, step 4 `[linear_floor_value] = exp(.11512925 · (amplitude ·
+  offset / ((2^bits - 1)·sqrt(p + q)) - offset))`, and steps 5..9 the
+  `[iteration_condition]` chaining that replicates `[linear_floor_value]`
+  across all consecutive output bins whose `map[i]` matches), and the
+  §6.2.3 errata 20150227 "Bark scale computation" parenthesis-
+  misplacement correction `bark(x) = 13.1·atan(.00074x) +
+  2.24·atan(.0000000185x²) + .0001x`. §9.2.1 `ilog` is reused via
+  [`crate::codebook::ilog`]; the VQ-context value-book reads use
+  [`crate::vq::unpack_vector`] and [`crate::huffman::HuffmanTree`].
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -466,6 +559,9 @@ crate that wraps or implements the format).
 [`high_neighbor`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.high_neighbor.html
 [`render_point`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.render_point.html
 [`render_line`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor1/fn.render_line.html
+[`Floor0Decoder`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor0/struct.Floor0Decoder.html
+[`Floor0Error`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor0/enum.Floor0Error.html
+[`bark`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor0/fn.bark.html
 
 ## License
 
