@@ -31,10 +31,12 @@
 //! (§1.3.2 / §4.3.1) and inverse channel coupling (§4.3.5); see
 //! [`synthesis`]. Round 12 lands the two fully-specified, IMDCT-independent
 //! audio-packet driver stages: §4.3.3 nonzero-vector propagate and §4.3.6
-//! floor/residue dot product; see [`packet`]. The full audio-packet decode
-//! (§4.3) is still pending — §4.3.7 inverse MDCT defers its definition to a
-//! barred external reference — and [`decode_packet`] currently returns
-//! [`Error::NotImplemented`].
+//! floor/residue dot product; see [`packet`]. Round 13 adds the §4.3.1
+//! audio-packet prelude reader (`[packet_type]` / `[mode_number]` /
+//! blocksize resolution / window flags); see [`packet::read_packet_header`].
+//! The full audio-packet decode (§4.3) is still pending — §4.3.7 inverse
+//! MDCT defers its definition to a barred external reference — and
+//! [`decode_packet`] currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -68,7 +70,10 @@ pub use huffman::{
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
-pub use packet::{dot_product, dot_product_all, nonzero_propagate, PacketError, VectorKind};
+pub use packet::{
+    dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
+    PacketError, PacketHeaderStage, VectorKind,
+};
 pub use residue::{ResidueDecoder, ResidueError};
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,

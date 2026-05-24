@@ -6,6 +6,42 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I audio-packet §4.3.1 "packet type, mode and window decode".**
+  New `packet::read_packet_header(&mut BitReaderLsb, &VorbisSetupHeader,
+  blocksize_0, blocksize_1) -> Result<AudioPacketHeader, PacketError>` reads
+  the fixed-shape audio-packet prelude: (1) 1-bit `[packet_type]` with the
+  §4.3 "must ignore" reject path for `packet_type != 0`; (2) the
+  `ilog([vorbis_mode_count] - 1)`-bit `[mode_number]` with OOB validation
+  (§9.2.1 `ilog` returns `0` for `mode_count == 1` → zero mode bits, the
+  single-mode degenerate case); (3) blocksize resolution `n = blockflag ?
+  blocksize_1 : blocksize_0` (§4.3.1 step 3); (4) long-block-only
+  `[previous_window_flag]` + `[next_window_flag]` (step 4a.i/ii) — short
+  blocks always reuse the symmetric short shape (step 4b) and do NOT
+  transmit these bits. `AudioPacketHeader::build_window(blocksize_0)`
+  drives the existing `synthesis::vorbis_window` builder with the resolved
+  fields. End-of-packet anywhere in §4.3.1 is fatal (§4.3.1 closing note:
+  "should be considered an error that discards this packet"), surfaced as
+  `PacketError::UnexpectedEndOfPacket { stage: PacketHeaderStage }` with
+  per-sub-step granularity (`PacketType`, `ModeNumber`,
+  `PreviousWindowFlag`, `NextWindowFlag`). Additional `PacketError` variants
+  `NonAudioPacketType { packet_type }`, `BadModeNumber { mode_number,
+  mode_count }`, `EmptyModeList`. Crate root re-exports
+  `read_packet_header`, `AudioPacketHeader`, `PacketHeaderStage`. 16 new
+  unit tests cover: single-mode short block (zero mode bits, 1 bit total),
+  single-mode long block (zero mode bits + 2 window flags), two-mode
+  one-bit `mode_number` short and long paths, three-mode two-bit
+  `mode_number` long path, non-audio packet_type reject, out-of-range
+  mode_number reject, empty-mode-list defensive guard, EOF on packet_type
+  (empty stream), EOF on mode_number (130 modes → 8-bit read past 7
+  remaining bits), EOF on previous_window_flag (65 modes → 7-bit read
+  consumes the byte), EOF on next_window_flag (33 modes → 6-bit read
+  leaves 1 bit), `build_window` short-block matches direct
+  `vorbis_window` call, `build_window` long-block hybrid-left matches +
+  confirms zero lead-in, `WindowError` propagation through
+  `build_window` (non-power-of-two `n`), and the mode-blockflag-driven
+  blocksize selection across mode 0 short / mode 1 long. Test count: 219
+  total (203 → 219).
+
 * **Vorbis I audio-packet driver stages §4.3.3 "nonzero vector propagate"
   and §4.3.6 "dot product".** New module `packet` exporting
   `nonzero_propagate`, `dot_product`, `dot_product_all`, `PacketError`,

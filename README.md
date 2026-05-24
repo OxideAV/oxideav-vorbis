@@ -1,8 +1,34 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 12.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 13.
 
-## Status — 2026-05-24
+## Status — 2026-05-25
+
+**Round 13 landed: the §4.3.1 "packet type, mode and window decode"
+packet-prelude reader — the audio-packet driver's entry point that the
+remaining §4.3 stages feed off.** [`read_packet_header`] takes an LSB-first
+[`BitReaderLsb`] positioned at the first bit of an audio packet, the parsed
+setup header (only `setup.modes` is consulted), and the stream's two
+blocksizes; it reads (1) the 1-bit `[packet_type]` and rejects any
+non-audio packet per the §4.3 "must ignore" rule, (2) the
+`ilog([vorbis_mode_count] - 1)`-bit `[mode_number]` (zero bits when
+`mode_count == 1`, the single-mode degenerate case), (3) resolves the
+per-frame blocksize `[n]` from the selected mode's `blockflag`
+(§4.3.1 step 3), and (4) reads the two long-block-only window flags
+`[previous_window_flag]` / `[next_window_flag]` (step 4a.i/ii) or skips
+them for a short block (step 4b: short blocks always reuse the symmetric
+short shape and do not transmit these bits). The returned
+[`AudioPacketHeader`] carries the resolved `(mode_number, blockflag, n,
+previous_window_flag, next_window_flag)`; [`AudioPacketHeader::build_window`]
+hands them off to the existing [`vorbis_window`] builder for a length-`n`
+Vorbis window. End-of-packet anywhere in §4.3.1 is fatal (§4.3.1 closing
+note: "An end-of-packet condition up to this point should be considered an
+error that discards this packet from the stream"), surfaced as
+[`PacketError::UnexpectedEndOfPacket`] with per-sub-step granularity via
+[`PacketHeaderStage`]. With this round every §4.3.x stage whose definition
+the spec text gives in its own body is implemented; the only remaining
+piece is the §4.3.7 inverse MDCT, still gated on the spec's externally-cited
+reference (T. Sporer / K. Brandenburg / B. Edler).
 
 **Round 12 landed: the two fully-specified, IMDCT-independent stages of
 the §4.3 audio-packet decode driver — §4.3.3 "nonzero vector propagate"
@@ -408,22 +434,51 @@ comment header.
   channels per §4.3.3, and runs [`dot_product`] for the used channels.
   Structured [`PacketError`] variants (`ChannelCountMismatch`,
   `VectorLength` carrying [`VectorKind::Floor`] / [`VectorKind::Residue`]).
-* 203 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+* [`read_packet_header`] reads the §4.3.1 audio-packet prelude from an
+  LSB-first [`BitReaderLsb`] given the stream's parsed
+  [`VorbisSetupHeader`] (only `setup.modes` is consulted) and the two
+  blocksizes (`blocksize_0` / `blocksize_1`) from the identification
+  header (§4.2.2). It validates the 1-bit `[packet_type]` == 0 reject
+  path (§4.3 "must ignore" rule, surfaced as
+  [`PacketError::NonAudioPacketType`]), reads the
+  `ilog([vorbis_mode_count] - 1)`-bit `[mode_number]` with OOB validation
+  (§9.2.1 `ilog`: zero bits when `mode_count == 1`), resolves the
+  per-frame blocksize `[n]` from the selected mode's `blockflag`, and —
+  for long blocks only — reads the two 1-bit window flags
+  `[previous_window_flag]` and `[next_window_flag]` (§4.3.1 step 4a.i/ii;
+  short blocks always reuse the symmetric short shape per step 4b and do
+  not transmit these bits). Returns an [`AudioPacketHeader`] carrying the
+  resolved `(mode_number, blockflag, n, previous_window_flag,
+  next_window_flag)`. [`AudioPacketHeader::build_window`] then drives the
+  existing [`vorbis_window`] builder with the resolved fields. EOF anywhere
+  in §4.3.1 is the spec-mandated fatal path (§4.3.1 closing note),
+  surfaced as [`PacketError::UnexpectedEndOfPacket`] with per-sub-step
+  granularity via [`PacketHeaderStage`] (`PacketType` / `ModeNumber` /
+  `PreviousWindowFlag` / `NextWindowFlag`). Additional `PacketError`
+  variants: [`PacketError::BadModeNumber`] (mode_number ≥ mode_count),
+  [`PacketError::EmptyModeList`] (defensive caller-bug guard for a setup
+  header with zero modes).
+* 219 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
   codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
   §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, 15 cover
   §8.6 residue decode, 18 cover §7.2 floor 1 decode, 18 cover §6.2
   floor 0 decode, 20 cover §1.3.2 / §4.3.1 window generation +
-  §4.3.5 inverse coupling, and **19 new round-12 tests cover §4.3.3
-  nonzero-vector propagate + §4.3.6 dot product**: the no-coupling no-op,
-  magnitude-side pull-in, angle-side pull-in, both-unused-stays-unused,
-  both-used-stays-used, an ascending-order chained cascade `(0,1) →
-  (1,2)` reaching channel 2 through the shared channel 1, a 5.1-style
-  isolated unused channel that survives because no coupling step touches
-  it, the two out-of-range-channel rejections; the bare element-wise
-  `dot_product` happy path, a signed-operand case, and two length-mismatch
-  panic cases; the `dot_product_all` two-used-channel case, the
-  unused-channel zero short-circuit, the all-unused vector case, and the
-  channel-count / short-floor-curve / short-residue-vector error cases.
+  §4.3.5 inverse coupling, 19 cover §4.3.3 nonzero-vector propagate +
+  §4.3.6 dot product, and **16 new round-13 tests cover §4.3.1 packet-prelude
+  reading**: single-mode short-block (zero mode bits, 1 bit total),
+  single-mode long-block (zero mode bits + 2 window flags),
+  two-mode-one-bit-`mode_number` short and long paths, three-mode-two-bit
+  `mode_number` long path, non-audio-packet_type reject, out-of-range
+  `mode_number` reject, empty-mode-list defensive guard, EOF on
+  `packet_type` (empty stream), EOF on `mode_number` (130 modes →
+  ilog(129)=8-bit read past 7 remaining bits), EOF on
+  `previous_window_flag` (65 modes → ilog(64)=7-bit read consumes the
+  byte), EOF on `next_window_flag` (33 modes → ilog(32)=6-bit read +
+  prev-flag leaves 0 bits), `build_window` short-block matches direct
+  `vorbis_window` call, `build_window` long-block hybrid-left matches +
+  confirms zero lead-in, `WindowError` propagation through `build_window`
+  (non-power-of-two `n`), and the mode-blockflag-driven blocksize
+  selection across mode 0 short / mode 1 long.
 
 ### What does not yet work
 
@@ -445,22 +500,26 @@ comment header.
   that the dot-product output cannot feed into without an IMDCT first;
   pending the IMDCT docs gap above.
 * Mapping submap channel routing at packet time (which channels feed
-  which residue / floor via `[vorbis_mapping_mux]`) and the §4.3.1
-  mode-number / window-flag *reading* from the packet (the window
-  *builder* exists but is not yet driven by a per-packet mode read).
-* Top-level audio-packet decode (§4.3.1..§4.3.9) tying floor + residue +
-  window + coupling + dot-product + MDCT + overlap-add together.
-  `Floor1Decoder` / `Floor0Decoder` are the floor half, `ResidueDecoder`
-  the residue half, `vorbis_window` the window, `inverse_couple_all` the
-  decoupling step, `nonzero_propagate` the §4.3.3 propagation, and
-  `dot_product_all` the §4.3.6 dot product. The remaining packet-level
-  loop reads the §4.3.1 mode number + window flags, drives the
-  per-channel floor decode in submap order, packs the `do not decode`
-  flags from each floor's `nonzero`/`Unused` result, runs
-  `nonzero_propagate`, drives the residue decoder, runs
-  `inverse_couple_all`, runs `dot_product_all`, then would IMDCT +
-  overlap-add. Every stage that the spec defines is now implemented as a
-  pure transform; only the IMDCT-blocked stages remain.
+  which residue / floor via `[vorbis_mapping_mux]`) — the §4.3.2 floor
+  iteration over submaps and the §4.3.4 residue iteration's `mux[ch] ==
+  i` test still need to be wired into a top-level packet driver. The
+  §4.3.1 packet-prelude read itself (mode-number + window flags) is now
+  landed (round 13: [`read_packet_header`]).
+* Top-level audio-packet decode (§4.3.2..§4.3.9) tying floor + residue +
+  window + coupling + dot-product + MDCT + overlap-add together. The
+  §4.3.1 prelude reader ([`read_packet_header`]) is the entry point;
+  every other §4.3 stage that the spec defines in its own text is also
+  implemented as a pure transform — `Floor1Decoder` / `Floor0Decoder` for
+  the floor half, `ResidueDecoder` for the residue half, `vorbis_window`
+  for the window (driven by [`AudioPacketHeader::build_window`]),
+  `inverse_couple_all` for the decoupling step, `nonzero_propagate` for
+  §4.3.3, and `dot_product_all` for §4.3.6. The remaining packet-level
+  loop walks the mapping's submap routing to drive the per-channel floor
+  decode, packs the `do not decode` flags from each floor's
+  `nonzero`/`Unused` result, runs `nonzero_propagate`, drives the residue
+  decoder per the §4.3.4 submap iteration, runs `inverse_couple_all`,
+  runs `dot_product_all`, then would IMDCT + overlap-add. Only the
+  IMDCT-blocked stages remain.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
@@ -473,7 +532,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 12 were implemented against, and only against:
+Rounds 1 — 13 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -647,7 +706,25 @@ Rounds 1 — 12 were implemented against, and only against:
   the §4.3.3 propagation driver, and the per-channel `Option<Vec<f32>>`
   representation of floor curves is the natural lift of [`FloorCurve`] /
   [`Floor0Curve`]'s `Unused` / `Curve(Vec<f32>)` distinction (rounds
-  9 / 10).
+  9 / 10). Round 13 used §4.3 introductory text (the "First step of audio
+  packet decode is to read and verify the packet type. A non-audio packet
+  when audio is expected indicates stream corruption or a non-compliant
+  stream. The decoder must ignore the packet and not attempt decoding it
+  to audio" reject rule) and §4.3.1 "packet type, mode and window decode"
+  steps 1..4 plus its closing note: step 1's 1-bit `[packet_type]` with the
+  `== 0` audio check; step 2's `ilog([vorbis_mode_count] - 1)`-bit
+  `[mode_number]`; step 3's blocksize resolution (`n = blockflag ?
+  blocksize_1 : blocksize_0`); step 4a's long-block `[previous_window_flag]`
+  + `[next_window_flag]` reads; step 4b's "if this is a short window, the
+  window is always the same short-window shape" rule that skips the window
+  flags; and the closing note "An end-of-packet condition up to this point
+  should be considered an error that discards this packet from the stream
+  … An end of packet condition past this point is to be considered a
+  possible nominal occurrence" which makes §4.3.1 the only §4.3 stage with
+  fatal EOF semantics. §9.2.1 `ilog` is reused via
+  [`crate::codebook::ilog`]; the resolved window-flag + blockflag + `n`
+  fields feed [`crate::synthesis::vorbis_window`] (round 11) through
+  [`AudioPacketHeader::build_window`].
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -744,8 +821,17 @@ crate that wraps or implements the format).
 [`dot_product`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.dot_product.html
 [`dot_product_all`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.dot_product_all.html
 [`PacketError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketError.html
+[`PacketError::NonAudioPacketType`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketError.html#variant.NonAudioPacketType
+[`PacketError::BadModeNumber`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketError.html#variant.BadModeNumber
+[`PacketError::EmptyModeList`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketError.html#variant.EmptyModeList
+[`PacketError::UnexpectedEndOfPacket`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketError.html#variant.UnexpectedEndOfPacket
+[`PacketHeaderStage`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketHeaderStage.html
 [`VectorKind::Floor`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.VectorKind.html#variant.Floor
 [`VectorKind::Residue`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.VectorKind.html#variant.Residue
+[`read_packet_header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.read_packet_header.html
+[`AudioPacketHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/struct.AudioPacketHeader.html
+[`AudioPacketHeader::build_window`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/struct.AudioPacketHeader.html#method.build_window
+[`VorbisSetupHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.VorbisSetupHeader.html
 
 ## License
 
