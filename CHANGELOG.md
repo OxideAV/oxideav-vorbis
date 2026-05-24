@@ -6,6 +6,32 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I audio-packet driver stages §4.3.3 "nonzero vector propagate"
+  and §4.3.6 "dot product".** New module `packet` exporting
+  `nonzero_propagate`, `dot_product`, `dot_product_all`, `PacketError`,
+  and `VectorKind`. `nonzero_propagate(&mut [bool], &[MappingCouplingStep])`
+  runs the §4.3.3 ascending coupling-step loop that pulls an `'unused'`
+  channel back into the active set when its coupling partner is used,
+  preventing coupling from silently zeroing a half-pair. `dot_product(&[f32],
+  &[f32], &mut [f32])` is the bare §4.3.6 element-wise floor × residue
+  product into a caller-provided spectrum buffer; `dot_product_all(&[Option<Vec<f32>>],
+  &[Vec<f32>], n/2)` is the per-channel driver that emits the all-zero
+  spectrum for an unused channel (per §4.3.3 "that final output vector is
+  all-zero values") and the element-wise product for every used channel.
+  These two stages are the fully-specified, IMDCT-independent halves of
+  the §4.3 audio-packet pipeline; the §4.3.7 inverse MDCT remains pending
+  on a documented docs gap (Vorbis I spec §4.3.7 defers the MDCT
+  definition entirely to external reference `[1]`, T. Sporer / K.
+  Brandenburg / B. Edler, which the workspace clean-room policy bars).
+* 19 new unit tests cover §4.3.3 (no-coupling no-op, magnitude-pulls-in,
+  angle-pulls-in, both-unused-stays-unused, both-used-stays-used, chained
+  ascending cascade, isolated unused channel survives, two
+  out-of-range-channel rejections) and §4.3.6 (element-wise product,
+  signed operands, two length-mismatch panic cases, two-channel
+  per-driver case, unused-channel zero short-circuit, all-unused case,
+  channel-count mismatch, short floor curve rejection, short residue
+  vector rejection).
+
 * **Vorbis I audio-packet synthesis primitives: the Vorbis window
   (§1.3.2 / §4.3.1 "packet type, mode and window decode") and inverse
   channel coupling (§4.3.5 "inverse coupling").** New module `synthesis`

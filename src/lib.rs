@@ -29,8 +29,12 @@
 //! packet decode + §6.2.3 curve computation); see [`floor0`]. Round 11
 //! lands the audio-packet synthesis primitives — the Vorbis window
 //! (§1.3.2 / §4.3.1) and inverse channel coupling (§4.3.5); see
-//! [`synthesis`]. The full audio-packet decode (§4.3) is still pending
-//! and [`decode_packet`] currently returns [`Error::NotImplemented`].
+//! [`synthesis`]. Round 12 lands the two fully-specified, IMDCT-independent
+//! audio-packet driver stages: §4.3.3 nonzero-vector propagate and §4.3.6
+//! floor/residue dot product; see [`packet`]. The full audio-packet decode
+//! (§4.3) is still pending — §4.3.7 inverse MDCT defers its definition to a
+//! barred external reference — and [`decode_packet`] currently returns
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -42,6 +46,7 @@ pub mod floor0;
 pub mod floor1;
 pub mod huffman;
 pub mod identification;
+pub mod packet;
 pub mod residue;
 pub mod setup;
 pub mod synthesis;
@@ -63,6 +68,7 @@ pub use huffman::{
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
+pub use packet::{dot_product, dot_product_all, nonzero_propagate, PacketError, VectorKind};
 pub use residue::{ResidueDecoder, ResidueError};
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
@@ -108,6 +114,9 @@ pub enum Error {
     Window(WindowError),
     /// Inverse channel coupling (Vorbis I §4.3.5) failed.
     Coupling(CouplingError),
+    /// An audio-packet driver stage (Vorbis I §4.3.3 nonzero-vector
+    /// propagate / §4.3.6 dot product) failed.
+    Packet(PacketError),
 }
 
 impl core::fmt::Display for Error {
@@ -129,6 +138,7 @@ impl core::fmt::Display for Error {
             Error::Floor0(e) => write!(f, "{e}"),
             Error::Window(e) => write!(f, "{e}"),
             Error::Coupling(e) => write!(f, "{e}"),
+            Error::Packet(e) => write!(f, "{e}"),
         }
     }
 }
@@ -148,6 +158,7 @@ impl std::error::Error for Error {
             Error::Floor0(e) => Some(e),
             Error::Window(e) => Some(e),
             Error::Coupling(e) => Some(e),
+            Error::Packet(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -222,6 +233,12 @@ impl From<WindowError> for Error {
 impl From<CouplingError> for Error {
     fn from(value: CouplingError) -> Self {
         Error::Coupling(value)
+    }
+}
+
+impl From<PacketError> for Error {
+    fn from(value: PacketError) -> Self {
+        Error::Packet(value)
     }
 }
 

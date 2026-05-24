@@ -1,8 +1,32 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 11.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 12.
 
 ## Status — 2026-05-24
+
+**Round 12 landed: the two fully-specified, IMDCT-independent stages of
+the §4.3 audio-packet decode driver — §4.3.3 "nonzero vector propagate"
+and §4.3.6 "dot product".** [`nonzero_propagate`] runs the §4.3.3
+ascending coupling-step loop over a per-channel `no_residue` flag slice:
+for each `(magnitude_channel, angle_channel)` pair, if *either* member is
+used (`no_residue` false) §4.3.3 forces *both* members used, because
+coupling can mix a zeroed and nonzeroed vector to produce two nonzeroed
+ones. [`dot_product`] computes the §4.3.6 element-wise (Hadamard)
+product of one channel's length-`n/2` floor curve and residue vector
+into a caller-provided spectrum buffer; [`dot_product_all`] is the
+per-channel driver that emits the all-zero spectrum for an unused channel
+(`floors[ch] = None`, per §4.3.3 "that final output vector is all-zero
+values") and the element-wise product for every used channel. These two
+stages sit at §4.3 steps 4 (between residue decode and inverse coupling)
+and 6 (between inverse coupling and the inverse MDCT); they complete every
+§4.3 stage whose definition the Vorbis I spec gives in its own text. The
+remaining §4.3.7 inverse MDCT is a **documented docs gap**: the spec
+defers the MDCT definition entirely to external reference `[1]` (T.
+Sporer, K. Brandenburg, B. Edler, *The use of multirate filter banks for
+coding of high quality digital audio*), which the workspace clean-room
+policy bars. The Vorbis-specific MDCT normalization / sign convention
+that would make a decoder byte-exact against `oggdec` is not stated
+anywhere in `docs/audio/vorbis/`.
 
 **Round 11 landed: audio-packet synthesis primitives — the Vorbis window
 (Vorbis I §1.3.2 / §4.3.1 "packet type, mode and window decode") and
@@ -363,45 +387,80 @@ comment header.
   residue-vector count and rejects a step that names the same channel for
   both magnitude and angle. Structured [`CouplingError`] variants
   (`ChannelOutOfRange`, `SameChannel`).
-* 184 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+* [`nonzero_propagate`] runs the §4.3.3 "nonzero vector propagate" loop in
+  **ascending** coupling-step order: for each `(magnitude_channel,
+  angle_channel)` pair, if either member's `no_residue` flag is `false`
+  (used) it forces *both* members' flags `false`. Ascending vs descending
+  is immaterial here (the loop body only ever clears flags and a cleared
+  flag stays cleared) but the spec text is ascending so we follow it. The
+  driver range-checks each step's channel indices against the
+  `no_residue` slice length. Structured [`PacketError`] variants
+  (`ChannelOutOfRange`, plus the dot-product-driver variants below).
+* [`dot_product`] computes one channel's §4.3.6 element-wise
+  (Hadamard / "dot product" in the spec's terminology) product of a
+  length-`n/2` floor curve and a length-`n/2` residue vector into a
+  caller-supplied length-`n/2` spectrum buffer. Length mismatches panic
+  per the §4.3.6 invariant that every per-channel vector is exactly `n/2`
+  long. [`dot_product_all`] is the per-channel driver: it accepts
+  `floors: &[Option<Vec<f32>>]` where `None` marks a channel whose floor
+  returned `'unused'` (and whose §4.3.3 `no_residue` survived coupling
+  propagation), emits the all-zero spectrum of length `n/2` for those
+  channels per §4.3.3, and runs [`dot_product`] for the used channels.
+  Structured [`PacketError`] variants (`ChannelCountMismatch`,
+  `VectorLength` carrying [`VectorKind::Floor`] / [`VectorKind::Residue`]).
+* 203 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
   codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
   §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, 15 cover
   §8.6 residue decode, 18 cover §7.2 floor 1 decode, 18 cover §6.2
-  floor 0 decode, and **20 new round-11 tests cover §1.3.2 / §4.3.1
-  window generation + §4.3.5 inverse coupling**: the [`slope`]
-  endpoints/midpoint and its symmetry about the ramp centre, both
-  `vorbis_window` validation rejections (non-power-of-two `n`,
-  `blocksize_0 > n`), the plain symmetric short window and its
-  `w[i]² + w[i+n/2]² = 1` overlap-power property, a long block with both
-  neighbours long matching the short shape, the short-previous hybrid
-  ramp with its zero lead-in + plateau, the short-next hybrid ramp with
-  its zero tail, the adjacent long+short window squared-overlap unity
-  reconstruction across the 32-sample overlap, all four [`couple_scalar`]
-  quadrants plus the zero-magnitude else branch, in-place pairwise
-  [`inverse_couple`] with a length-mismatch panic, the
-  [`inverse_couple_all`] single-step stereo case, the descending-order
-  loop (one symmetric and one order-observable variant), the
-  magnitude-below-angle index branch, and the out-of-range / same-channel
-  / empty-coupling driver cases.
+  floor 0 decode, 20 cover §1.3.2 / §4.3.1 window generation +
+  §4.3.5 inverse coupling, and **19 new round-12 tests cover §4.3.3
+  nonzero-vector propagate + §4.3.6 dot product**: the no-coupling no-op,
+  magnitude-side pull-in, angle-side pull-in, both-unused-stays-unused,
+  both-used-stays-used, an ascending-order chained cascade `(0,1) →
+  (1,2)` reaching channel 2 through the shared channel 1, a 5.1-style
+  isolated unused channel that survives because no coupling step touches
+  it, the two out-of-range-channel rejections; the bare element-wise
+  `dot_product` happy path, a signed-operand case, and two length-mismatch
+  panic cases; the `dot_product_all` two-used-channel case, the
+  unused-channel zero short-circuit, the all-unused vector case, and the
+  channel-count / short-floor-curve / short-residue-vector error cases.
 
 ### What does not yet work
 
+* **§4.3.7 inverse MDCT — documented docs gap.** The Vorbis I spec
+  defers the IMDCT definition entirely to external reference `[1]`
+  (T. Sporer, K. Brandenburg, B. Edler, *The use of multirate filter
+  banks for coding of high quality digital audio*), which the workspace
+  clean-room policy bars. The window function and the §4.3.8 overlap-add
+  framing (3/4-vs-1/4 alignment, `(prev_blocksize/4 + cur_blocksize/4)`
+  return-length formula) are fully specified in §1.3.2 / §4.3.1 /
+  §4.3.8 and are already implementable on top of an IMDCT block; but
+  the Vorbis-specific MDCT normalization / sign / cos-argument offset
+  that would make a decoder byte-exact against `oggdec` is not stated
+  anywhere in `docs/audio/vorbis/`. Needs a clean-room trace doc that
+  derives the Vorbis IMDCT integration from the §1.3.2 window property
+  + a captured `MDCT_OUT` corpus, or a spec amendment that inlines the
+  formula.
+* **§4.3.8 overlap-add** is fully specified but is the only §4.3 stage
+  that the dot-product output cannot feed into without an IMDCT first;
+  pending the IMDCT docs gap above.
 * Mapping submap channel routing at packet time (which channels feed
-  which residue / floor via `[vorbis_mapping_mux]`), mode / window-flag
-  *reading* from the packet (the window *builder* now exists but is not
-  yet driven by a per-packet mode-number read), the inverse MDCT itself,
-  and TDAC overlap-add (§4.3.6..§4.3.8, §10). Inverse channel coupling
-  (§4.3.5) is now implemented as [`inverse_couple_all`] but is not yet
-  wired into a packet driver.
+  which residue / floor via `[vorbis_mapping_mux]`) and the §4.3.1
+  mode-number / window-flag *reading* from the packet (the window
+  *builder* exists but is not yet driven by a per-packet mode read).
 * Top-level audio-packet decode (§4.3.1..§4.3.9) tying floor + residue +
-  window + coupling + MDCT + overlap-add together. `Floor1Decoder` /
-  `Floor0Decoder` are the floor half, `ResidueDecoder` the residue half,
-  `vorbis_window` the window, and `inverse_couple_all` the decoupling
-  step; the packet-level loop that drives them in channel/submap order —
-  reading the §4.3.1 mode number + window flags, computing each channel's
-  `do not decode` flag from the floor's `nonzero`/`Unused` result,
-  applying §4.3.3 nonzero-vector propagation across coupled channels, and
-  running the §4.3.6 floor/residue dot product — is still pending.
+  window + coupling + dot-product + MDCT + overlap-add together.
+  `Floor1Decoder` / `Floor0Decoder` are the floor half, `ResidueDecoder`
+  the residue half, `vorbis_window` the window, `inverse_couple_all` the
+  decoupling step, `nonzero_propagate` the §4.3.3 propagation, and
+  `dot_product_all` the §4.3.6 dot product. The remaining packet-level
+  loop reads the §4.3.1 mode number + window flags, drives the
+  per-channel floor decode in submap order, packs the `do not decode`
+  flags from each floor's `nonzero`/`Unused` result, runs
+  `nonzero_propagate`, drives the residue decoder, runs
+  `inverse_couple_all`, runs `dot_product_all`, then would IMDCT +
+  overlap-add. Every stage that the spec defines is now implemented as a
+  pure transform; only the IMDCT-blocked stages remain.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
@@ -414,7 +473,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 11 were implemented against, and only against:
+Rounds 1 — 12 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -560,7 +619,35 @@ Rounds 1 — 11 were implemented against, and only against:
   magnitude/angle vector pairs and the step-3 four-quadrant
   `[new_M]`/`[new_A]` square-polar → Cartesian rule). The
   [`MappingCouplingStep`] `(magnitude_channel, angle_channel)` pairs from
-  §4.2.4 (round 6) feed the inverse-coupling driver.
+  §4.2.4 (round 6) feed the inverse-coupling driver. Round 12 used §4.3
+  "Audio packet decode and synthesis" intro narrative (the per-stage
+  enumeration: floor decode → nonzero-vector propagation → residue decode
+  → inverse coupling → floor/residue dot product → inverse MDCT →
+  overlap/add), §4.3.3 "nonzero vector propagate" (the full
+  for-each-`[i]`-from-`0...[vorbis_mapping_coupling_steps]-1` ascending
+  loop body: "if either `[no_residue]` entry for channel
+  (`[vorbis_mapping_magnitude]` element `[i]`) or channel
+  (`[vorbis_mapping_angle]` element `[i]`) are set to false, then both
+  must be set to false"; plus the §4.3.2 step 6 narrative that establishes
+  the per-channel `[no_residue]` flag from the floor decode's
+  `'unused'`/non-`'unused'` return), and §4.3.6 "dot product" (the
+  per-channel element-wise "multiply each element of the floor curve by
+  each element of that channel's residue vector" rule and its closing
+  sentence "the produced vectors are the length `[n]/2` audio spectrum
+  for each channel" — making explicit that this is element-wise / Hadamard
+  product, not a scalar inner product, despite the spec's "dot product"
+  naming). §4.3.7 "inverse MDCT" was **read and explicitly NOT
+  implemented**: the section defers the MDCT definition entirely to
+  external reference `[1]` ("A detailed description of the MDCT is
+  available in [1]"), which the workspace clean-room policy bars. No
+  external MDCT formula, normalization convention, or reference
+  implementation was consulted; the docs gap is recorded in the "What
+  does not yet work" section above. The [`MappingCouplingStep`]
+  `(magnitude_channel, angle_channel)` pairs from §4.2.4 (round 6) feed
+  the §4.3.3 propagation driver, and the per-channel `Option<Vec<f32>>`
+  representation of floor curves is the natural lift of [`FloorCurve`] /
+  [`Floor0Curve`]'s `Unused` / `Curve(Vec<f32>)` distinction (rounds
+  9 / 10).
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -653,6 +740,12 @@ crate that wraps or implements the format).
 [`couple_scalar`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.couple_scalar.html
 [`CouplingError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/enum.CouplingError.html
 [`MappingCouplingStep`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.MappingCouplingStep.html
+[`nonzero_propagate`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.nonzero_propagate.html
+[`dot_product`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.dot_product.html
+[`dot_product_all`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.dot_product_all.html
+[`PacketError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.PacketError.html
+[`VectorKind::Floor`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.VectorKind.html#variant.Floor
+[`VectorKind::Residue`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/enum.VectorKind.html#variant.Residue
 
 ## License
 
