@@ -1,8 +1,54 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 13.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 14.
 
 ## Status — 2026-05-25
+
+**Round 14 landed: the top-level §4.3 audio-packet driver covering
+§4.3.2 floor decode (per-channel, submap-routed) through §4.3.6 dot
+product, stopping cleanly at the §4.3.7 inverse-MDCT boundary.**
+[`audio::decode_audio_packet_pre_imdct`] takes an LSB-first bit reader
+positioned at an audio packet, the parsed setup header, a per-stream
+[`AudioDecoderState`] decoder cache (built once via
+[`AudioDecoderState::new(setup)`] — every floor and residue decoder
+constructed up front so per-packet decode is allocation-light), the
+stream's `audio_channels`, and the two blocksizes, and runs every §4.3
+stage whose definition the spec gives in its own text:
+
+1. §4.3.1 packet header via the existing [`read_packet_header`].
+2. §4.3.2 floor decode in channel order: for each channel, look up its
+   submap via `mapping.mux[channel]` (or always `0` when the mapping
+   declared `submaps == 1`), pick the submap's floor index, and run the
+   matching [`Floor0Decoder`] / [`Floor1Decoder`] for a length-`n/2`
+   curve. The §4.3.2 step-6 `[no_residue]` flag is set per the floor's
+   `Unused` return; the floor implementations already collapse EOF to
+   `Unused`, matching §4.3.2's nominal-EOF rule.
+3. §4.3.3 nonzero propagate via the existing [`nonzero_propagate`].
+4. §4.3.4 residue decode in submap order: for each submap, gather the
+   channels whose `mux[channel] == submap_idx` (preserving channel
+   order), pack their `no_residue` flags into the `do_not_decode_flag`
+   bundle, dispatch the submap's [`ResidueDecoder::decode`], and scatter
+   the per-channel vectors back into the global per-channel array
+   (§4.3.4 step 7).
+5. §4.3.5 inverse coupling via the existing [`inverse_couple_all`]
+   (descending step order).
+6. §4.3.6 dot product via [`dot_product_all`]: every used channel emits
+   the element-wise floor × residue product; every unused channel emits
+   the all-zero spectrum per §4.3.3's closing note.
+
+The driver returns an [`AudioPacketOutcome::PreImdct { mode_number,
+blockflag, n, previous_window_flag, next_window_flag, spectra }`]
+carrying one length-`n/2` audio spectrum vector per channel, ready for
+the §4.3.7 IMDCT (still pending on a documented docs gap — the spec
+defers the MDCT to external reference `[1]`, barred by the workspace
+clean-room policy). The top-level [`decode_packet`] /
+[`audio::decode_one_packet`] entry points stop at the IMDCT boundary
+and return [`AudioPacketError::ImdctStage`] (`§4.3.7 inverse MDCT is a
+documented docs gap …`) cleanly. The (still-pending) IMDCT-round
+landing is a one-function plug-in: take the `spectra` from `PreImdct`,
+run the IMDCT + window + overlap-add, and replace the `ImdctStage`
+return with the resulting PCM. No callable surface changes beyond
+that.
 
 **Round 13 landed: the §4.3.1 "packet type, mode and window decode"
 packet-prelude reader — the audio-packet driver's entry point that the
@@ -500,26 +546,20 @@ comment header.
   that the dot-product output cannot feed into without an IMDCT first;
   pending the IMDCT docs gap above.
 * Mapping submap channel routing at packet time (which channels feed
-  which residue / floor via `[vorbis_mapping_mux]`) — the §4.3.2 floor
-  iteration over submaps and the §4.3.4 residue iteration's `mux[ch] ==
-  i` test still need to be wired into a top-level packet driver. The
-  §4.3.1 packet-prelude read itself (mode-number + window flags) is now
-  landed (round 13: [`read_packet_header`]).
+  which residue / floor via `[vorbis_mapping_mux]`) — **landed round
+  14**: [`audio::decode_audio_packet_pre_imdct`] walks `mapping.mux[ch]`
+  for the §4.3.2 floor iteration and gathers per-submap channel bundles
+  for the §4.3.4 residue iteration.
 * Top-level audio-packet decode (§4.3.2..§4.3.9) tying floor + residue +
-  window + coupling + dot-product + MDCT + overlap-add together. The
-  §4.3.1 prelude reader ([`read_packet_header`]) is the entry point;
-  every other §4.3 stage that the spec defines in its own text is also
-  implemented as a pure transform — `Floor1Decoder` / `Floor0Decoder` for
-  the floor half, `ResidueDecoder` for the residue half, `vorbis_window`
-  for the window (driven by [`AudioPacketHeader::build_window`]),
-  `inverse_couple_all` for the decoupling step, `nonzero_propagate` for
-  §4.3.3, and `dot_product_all` for §4.3.6. The remaining packet-level
-  loop walks the mapping's submap routing to drive the per-channel floor
-  decode, packs the `do not decode` flags from each floor's
-  `nonzero`/`Unused` result, runs `nonzero_propagate`, drives the residue
-  decoder per the §4.3.4 submap iteration, runs `inverse_couple_all`,
-  runs `dot_product_all`, then would IMDCT + overlap-add. Only the
-  IMDCT-blocked stages remain.
+  window + coupling + dot-product + MDCT + overlap-add together. **Round
+  14 closes every stage up to §4.3.6** via
+  [`audio::decode_audio_packet_pre_imdct`] (returns an
+  [`AudioPacketOutcome::PreImdct`] with per-channel length-`n/2`
+  spectra) and stops at the §4.3.7 IMDCT docs gap; the top-level
+  [`decode_packet`] / [`audio::decode_one_packet`] entry points surface
+  the stop as [`AudioPacketError::ImdctStage`]. Only the IMDCT-blocked
+  stages remain (§4.3.7 itself + the §4.3.8 overlap-add that consumes
+  its output).
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
@@ -528,11 +568,13 @@ comment header.
   as a comment value; FLAC-PICTURE decoding belongs in a higher-level
   consumer.
 * No [`oxideav_core::Decoder`] / [`oxideav_core::Encoder`] is
-  registered yet; `decode_packet` returns `Error::NotImplemented`.
+  registered yet; the top-level [`decode_packet`] drives §4.3.2..§4.3.6
+  and then returns [`AudioPacketError::ImdctStage`] at the IMDCT
+  boundary.
 
 ## Clean-room sources
 
-Rounds 1 — 13 were implemented against, and only against:
+Rounds 1 — 14 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -724,7 +766,21 @@ Rounds 1 — 13 were implemented against, and only against:
   fatal EOF semantics. §9.2.1 `ilog` is reused via
   [`crate::codebook::ilog`]; the resolved window-flag + blockflag + `n`
   fields feed [`crate::synthesis::vorbis_window`] (round 11) through
-  [`AudioPacketHeader::build_window`].
+  [`AudioPacketHeader::build_window`]. Round 14 wired §4.3 itself — the
+  "Audio packet decode and synthesis" outer prose plus §4.3.2 "floor
+  curve decode" (the channel-order iteration, the `submap_number =
+  mux[i]` / `floor_number = vorbis_submap_floor[submap_number]` lookup
+  per step 1/2, the type-0 → §6.2.2 / type-1 → §7.2.3 dispatch per
+  step 3/4, the step-5 "save the needed decoded floor information for
+  later synthesis" hand-off into the §4.3.6 dot-product, the step-6
+  `no_residue` flag toggle, and the closing-note "An end-of-packet
+  condition during floor decode shall result in packet decode zeroing
+  all channel output vectors and skipping to the add/overlap output
+  stage" surfaced as [`AudioPacketOutcome::Zeroed`]); §4.3.4 "residue
+  decode" (the submap-order iteration plus the steps 1..7 channel-gather
+  / `do_not_decode_flag` build / scatter loop); and §4.3.7's "[1]"
+  reference deferral (the documented docs gap, surfaced as
+  [`AudioPacketError::ImdctStage`]).
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /

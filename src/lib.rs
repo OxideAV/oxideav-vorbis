@@ -34,14 +34,20 @@
 //! floor/residue dot product; see [`packet`]. Round 13 adds the §4.3.1
 //! audio-packet prelude reader (`[packet_type]` / `[mode_number]` /
 //! blocksize resolution / window flags); see [`packet::read_packet_header`].
-//! The full audio-packet decode (§4.3) is still pending — §4.3.7 inverse
-//! MDCT defers its definition to a barred external reference — and
-//! [`decode_packet`] currently returns [`Error::NotImplemented`].
+//! Round 14 lands the top-level audio-packet driver covering §4.3.2
+//! through §4.3.6: per-channel floor decode routed through the
+//! mapping's submap table, §4.3.3 nonzero propagate, submap-routed
+//! residue decode, §4.3.5 inverse coupling, and §4.3.6 dot product.
+//! The driver stops cleanly at the §4.3.7 inverse-MDCT boundary; see
+//! [`audio`]. The §4.3.7 IMDCT remains a documented docs gap (the
+//! spec defers it to a barred external reference); [`decode_packet`]
+//! returns [`Error::NotImplemented`] at that boundary.
 
 #![warn(missing_debug_implementations)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod audio;
 pub mod codebook;
 pub mod comment;
 pub mod floor0;
@@ -54,6 +60,10 @@ pub mod setup;
 pub mod synthesis;
 pub mod vq;
 
+pub use audio::{
+    decode_audio_packet_pre_imdct, decode_one_packet, AudioDecoderState, AudioPacketError,
+    AudioPacketOutcome,
+};
 pub use codebook::{
     parse_codebook, ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
 };
@@ -122,6 +132,11 @@ pub enum Error {
     /// An audio-packet driver stage (Vorbis I §4.3.3 nonzero-vector
     /// propagate / §4.3.6 dot product) failed.
     Packet(PacketError),
+    /// The top-level §4.3 audio-packet driver failed at the §4.3.2
+    /// through §4.3.6 stages (mapping/submap routing, floor or residue
+    /// decode failure, inverse coupling, dot product), or stopped at the
+    /// §4.3.7 inverse-MDCT docs-gap boundary.
+    AudioPacket(AudioPacketError),
 }
 
 impl core::fmt::Display for Error {
@@ -144,6 +159,7 @@ impl core::fmt::Display for Error {
             Error::Window(e) => write!(f, "{e}"),
             Error::Coupling(e) => write!(f, "{e}"),
             Error::Packet(e) => write!(f, "{e}"),
+            Error::AudioPacket(e) => write!(f, "{e}"),
         }
     }
 }
@@ -164,6 +180,7 @@ impl std::error::Error for Error {
             Error::Window(e) => Some(e),
             Error::Coupling(e) => Some(e),
             Error::Packet(e) => Some(e),
+            Error::AudioPacket(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -247,10 +264,52 @@ impl From<PacketError> for Error {
     }
 }
 
-/// Placeholder audio-packet decode entry point. The setup header
-/// and audio-packet decode pipeline are not yet wired up; this
-/// function always returns [`Error::NotImplemented`].
-pub fn decode_packet(_packet: &[u8]) -> Result<(), Error> {
+impl From<AudioPacketError> for Error {
+    fn from(value: AudioPacketError) -> Self {
+        Error::AudioPacket(value)
+    }
+}
+
+/// Top-level audio-packet decode entry point. Drives the §4.3.2 through
+/// §4.3.6 pipeline ([`audio::decode_one_packet`]) and stops cleanly at
+/// the §4.3.7 inverse-MDCT boundary, currently a documented docs gap
+/// (the Vorbis I spec defers the MDCT definition entirely to external
+/// reference `[1]`, which the workspace clean-room policy bars).
+///
+/// * `packet` — the audio-packet bitstream payload (Ogg framing
+///   stripped, page-coalesced).
+/// * `setup` — the stream's parsed setup header.
+/// * `state` — the per-stream decoder cache built by
+///   [`AudioDecoderState::new`].
+/// * `audio_channels` / `blocksize_0` / `blocksize_1` — the matching
+///   identification-header fields.
+///
+/// Returns [`Error::AudioPacket(AudioPacketError::ImdctStage)`](AudioPacketError::ImdctStage)
+/// on every successful drive through §4.3.6. Earlier-stage failures
+/// surface as the corresponding [`AudioPacketError`] variant inside
+/// [`Error::AudioPacket`]. The function never returns `Ok(_)` in this
+/// round; the signature is shaped to absorb the IMDCT-round change
+/// without breaking callers.
+pub fn decode_packet(
+    packet: &[u8],
+    setup: &setup::VorbisSetupHeader,
+    state: &AudioDecoderState,
+    audio_channels: u8,
+    blocksize_0: usize,
+    blocksize_1: usize,
+) -> Result<(), Error> {
+    let mut reader = oxideav_core::bits::BitReaderLsb::new(packet);
+    audio::decode_one_packet(
+        &mut reader,
+        setup,
+        state,
+        audio_channels,
+        blocksize_0,
+        blocksize_1,
+    )?;
+    // decode_one_packet always returns Err in this round (Ok is
+    // unreachable until IMDCT lands), so this branch is unreachable.
+    // Kept as the explicit "shape for the future" return.
     Err(Error::NotImplemented)
 }
 

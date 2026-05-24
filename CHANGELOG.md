@@ -6,6 +6,48 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I top-level §4.3 audio-packet driver (§4.3.2 through §4.3.6),
+  stopping cleanly at the §4.3.7 inverse-MDCT boundary.** New module
+  `audio` exporting `decode_audio_packet_pre_imdct`, `decode_one_packet`,
+  `AudioDecoderState`, `AudioPacketOutcome`, `AudioPacketError`. The
+  driver walks every §4.3 stage the spec defines in its own text:
+  §4.3.1 packet header (via `read_packet_header`), §4.3.2 floor decode
+  in channel order with `mapping.mux[ch]` (or implicit submap-0 when
+  `submaps == 1`) routing per channel to its submap's floor, §4.3.3
+  nonzero propagate, §4.3.4 residue decode in submap order with a
+  channels-in-submap gather + `do_not_decode_flag` build + post-decode
+  scatter, §4.3.5 inverse coupling (descending step order), and §4.3.6
+  dot product. Returns `AudioPacketOutcome::PreImdct { mode_number,
+  blockflag, n, previous_window_flag, next_window_flag, spectra }` with
+  one length-`n/2` audio spectrum per channel, ready for the (still
+  pending) §4.3.7 IMDCT. `AudioDecoderState::new(setup)` builds the
+  per-stream cache of `Floor0Decoder` / `Floor1Decoder` / `ResidueDecoder`
+  decoders once up front (so per-packet decode is allocation-light) and
+  surfaces per-floor / per-residue construction errors as
+  `AudioPacketError::Floor0Build { index, source }` /
+  `Floor1Build { index, source }` / `ResidueBuild { index, source }`.
+  Top-level `decode_one_packet` (and the umbrella `decode_packet`)
+  return `AudioPacketError::ImdctStage` cleanly at the IMDCT docs-gap
+  boundary; the variant's `Display` impl spells out the docs-gap
+  reason. Defensive `AudioPacketError::BadModeMapping` /
+  `BadSubmapIndex` / `BadSubmapFloor` / `BadSubmapResidue` /
+  `MuxOutOfRange` variants guard against hand-built or corrupted
+  setup state (the setup parser already range-checks these). 12 new
+  unit tests: cache-build success, Floor1 build error propagation,
+  Residue build error propagation, mono used-floor packet, mono
+  unused-floor short-circuit, stereo-coupled used packet,
+  decode_one_packet IMDCT-stop, ImdctStage Display contains docs-gap
+  text, non-audio header reject, single-submap `submap_for_channel`
+  always 0, multi-submap mux indexing + OOB, and a trivial-classbook
+  Huffman build sanity check. Crate root re-exports
+  `decode_audio_packet_pre_imdct`, `decode_one_packet`,
+  `AudioDecoderState`, `AudioPacketOutcome`, `AudioPacketError`; the
+  umbrella `Error` enum gains `Error::AudioPacket(AudioPacketError)`
+  with `From<AudioPacketError>`. `decode_packet`'s signature now takes
+  `(packet, setup, state, audio_channels, blocksize_0, blocksize_1)`
+  and returns the IMDCT-stop error variant. Test count: 231 total (219
+  → 231).
+
 * **Vorbis I audio-packet §4.3.1 "packet type, mode and window decode".**
   New `packet::read_packet_header(&mut BitReaderLsb, &VorbisSetupHeader,
   blocksize_0, blocksize_1) -> Result<AudioPacketHeader, PacketError>` reads
