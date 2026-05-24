@@ -6,6 +6,38 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I audio-packet synthesis primitives: the Vorbis window
+  (§1.3.2 / §4.3.1 "packet type, mode and window decode") and inverse
+  channel coupling (§4.3.5 "inverse coupling").** New module `synthesis`
+  exporting `vorbis_window`, `slope`, `WindowError`, `couple_scalar`,
+  `inverse_couple`, `inverse_couple_all`, and `CouplingError`.
+  `slope(x, n)` is the bare Vorbis slope function
+  `y = sin(π/2·sin²((x+0.5)/n·π))` (§1.3.2). `vorbis_window(n,
+  blocksize_0, blockflag, previous_window_flag, next_window_flag)`
+  builds the length-`n` window per the §4.3.1 eight-step generation
+  procedure: a zero lead-in, a rising edge using the per-edge `…·π/2`
+  argument over `left_n`, a plateau of ones, a `+π/2`-phase-shifted
+  falling edge over `right_n`, and a zero tail — with the
+  `n/4 ± blocksize_0/4` hybrid ramps selected when a long block laps a
+  short neighbour (`blockflag` set and the matching window flag clear),
+  and the full-half-block ramps otherwise. Short blocks (`blockflag`
+  clear) always get the plain symmetric shape, ignoring the flags
+  (§4.3.1 step 4b). `inverse_couple_all(&mut [Vec<f32>],
+  &[MappingCouplingStep])` runs the §4.3.5 inverse-coupling loop over a
+  residue-vector bundle **in descending coupling-step order**,
+  decoupling each `(magnitude, angle)` pair in place via `couple_scalar`
+  (the four-quadrant square-polar → Cartesian rule of §4.3.5 step 3).
+  New error enums `WindowError` (`NotPowerOfTwo`, `ShortBlockTooLarge`)
+  and `CouplingError` (`ChannelOutOfRange`, `SameChannel`), both wired
+  into the crate `Error` enum via `From`. 20 new tests cover the slope
+  endpoints/symmetry, the short/long/hybrid window shapes with their
+  squared-overlap unity-power reconstruction property, the long+short
+  adjacent-window lapping, the four coupling quadrants plus the
+  zero-magnitude else branch, in-place pairwise decoupling, the
+  descending-order loop observability, the magnitude-below-angle index
+  branch, and the out-of-range / same-channel / empty-list driver
+  cases.
+
 * **Vorbis I floor type 0 per-packet decode + LSP curve computation
   (Vorbis I §6.2.2 "packet decode" + §6.2.3 "curve computation").**
   New module `floor0` exporting `Floor0Decoder`, `Floor0Curve`,

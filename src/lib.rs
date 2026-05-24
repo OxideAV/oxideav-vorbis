@@ -26,9 +26,11 @@
 //! type 1 per-packet decode + curve computation (§7.2.3 packet decode +
 //! §7.2.4 curve computation); see [`floor1`]. Round 10 lands the
 //! floor type 0 per-packet decode + LSP curve computation (§6.2.2
-//! packet decode + §6.2.3 curve computation); see [`floor0`]. The
-//! full audio-packet decode (§4.3) is still pending and
-//! [`decode_packet`] currently returns [`Error::NotImplemented`].
+//! packet decode + §6.2.3 curve computation); see [`floor0`]. Round 11
+//! lands the audio-packet synthesis primitives — the Vorbis window
+//! (§1.3.2 / §4.3.1) and inverse channel coupling (§4.3.5); see
+//! [`synthesis`]. The full audio-packet decode (§4.3) is still pending
+//! and [`decode_packet`] currently returns [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -42,6 +44,7 @@ pub mod huffman;
 pub mod identification;
 pub mod residue;
 pub mod setup;
+pub mod synthesis;
 pub mod vq;
 
 pub use codebook::{
@@ -66,6 +69,10 @@ pub use setup::{
     FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap, ModeHeader,
     ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader, SETUP_PACKET_MAGIC,
     SETUP_PACKET_TYPE,
+};
+pub use synthesis::{
+    couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window, CouplingError,
+    WindowError,
 };
 pub use vq::{unpack_vector, UnpackError as VqUnpackError};
 
@@ -97,6 +104,10 @@ pub enum Error {
     Floor1(Floor1Error),
     /// A floor type 0 decode (Vorbis I §6.2) failed to prepare or run.
     Floor0(Floor0Error),
+    /// A Vorbis window could not be built (Vorbis I §1.3.2 / §4.3.1).
+    Window(WindowError),
+    /// Inverse channel coupling (Vorbis I §4.3.5) failed.
+    Coupling(CouplingError),
 }
 
 impl core::fmt::Display for Error {
@@ -116,6 +127,8 @@ impl core::fmt::Display for Error {
             Error::Residue(e) => write!(f, "{e}"),
             Error::Floor1(e) => write!(f, "{e}"),
             Error::Floor0(e) => write!(f, "{e}"),
+            Error::Window(e) => write!(f, "{e}"),
+            Error::Coupling(e) => write!(f, "{e}"),
         }
     }
 }
@@ -133,6 +146,8 @@ impl std::error::Error for Error {
             Error::Residue(e) => Some(e),
             Error::Floor1(e) => Some(e),
             Error::Floor0(e) => Some(e),
+            Error::Window(e) => Some(e),
+            Error::Coupling(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -195,6 +210,18 @@ impl From<Floor1Error> for Error {
 impl From<Floor0Error> for Error {
     fn from(value: Floor0Error) -> Self {
         Error::Floor0(value)
+    }
+}
+
+impl From<WindowError> for Error {
+    fn from(value: WindowError) -> Self {
+        Error::Window(value)
+    }
+}
+
+impl From<CouplingError> for Error {
+    fn from(value: CouplingError) -> Self {
+        Error::Coupling(value)
     }
 }
 

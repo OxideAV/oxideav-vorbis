@@ -1,8 +1,29 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 10.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 11.
 
 ## Status — 2026-05-24
+
+**Round 11 landed: audio-packet synthesis primitives — the Vorbis window
+(Vorbis I §1.3.2 / §4.3.1 "packet type, mode and window decode") and
+inverse channel coupling (§4.3.5 "inverse coupling").** [`vorbis_window`]
+builds the length-`n` window for one audio frame per the §4.3.1
+eight-step generation procedure: a zero lead-in, a rising edge, a plateau
+of ones, a `+π/2`-phase-shifted falling edge, and a zero tail. Every edge
+uses the Vorbis slope function `y = sin(π/2·sin²((x+0.5)/n·π))` (§1.3.2),
+exposed bare as [`slope`]. A long block (`blockflag` set) reads two flag
+bits and selects the `n/4 ± blocksize_0/4` hybrid ramp on either side
+whose neighbour is short (the matching window flag clear), preserving the
+50%-overlap squared-power reconstruction across dissimilar lapping;
+otherwise the full-half-block ramp is used, and a short block always gets
+the plain symmetric shape (§4.3.1 step 4b). [`inverse_couple_all`] runs
+the §4.3.5 inverse-coupling loop over a per-channel residue-vector bundle
+**in descending coupling-step order**, decoupling each `(magnitude,
+angle)` pair in place via [`couple_scalar`] — the four-quadrant
+square-polar → Cartesian rule of §4.3.5 step 3. These are the pure,
+stateless transforms of the §4.3 pipeline that sit between residue decode
+and the inverse MDCT; the packet-level driver tying floor + residue +
+window + coupling + MDCT together is still pending.
 
 **Round 10 landed: floor type 0 per-packet decode + LSP curve
 computation (Vorbis I §6.2.2 "packet decode" + §6.2.3 "curve
@@ -319,37 +340,68 @@ comment header.
   as `floor0_bark`) is public. Structured [`Floor0Error`] variants
   (`BookOutOfRange`, `EmptyBookList`, `ZeroOrder`, `ZeroBarkMapSize`,
   `ZeroAmplitudeBits`, `ValueBookHasNoLookup`, `Huffman`).
-* 164 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
+* [`vorbis_window`] builds the length-`n` Vorbis window for one audio
+  frame (Vorbis I §1.3.2 / §4.3.1). It validates `n` is a positive power
+  of two and (for long blocks) that `blocksize_0 <= n` is a power of two,
+  computes `window_center = n/2`, then selects each edge's
+  `(start, end, n)` per §4.3.1 steps 2..3 — the `n/4 ± blocksize_0/4`
+  hybrid ramp when `blockflag` is set and the matching neighbour flag is
+  clear, else the full-half-block `0..center` / `center..n` ramp — and
+  fills the zero lead-in (step 4), the rising slope edge (step 5), the
+  ones plateau (step 6), the `+π/2`-shifted falling slope edge (step 7),
+  and the zero tail (step 8). The bare slope `y =
+  sin(π/2·sin²((x+0.5)/n·π))` is exposed as [`slope`]; per-edge fills use
+  the §4.3.1 `…·π/2` quarter-period argument directly. Structured
+  [`WindowError`] variants (`NotPowerOfTwo`, `ShortBlockTooLarge`).
+* [`inverse_couple_all`] runs the §4.3.5 inverse-coupling loop over a
+  slice of per-channel residue vectors, applying every coupling step in
+  **descending** order (`coupling_steps-1 … 0`). Each step decouples its
+  `(magnitude_channel, angle_channel)` pair in place via
+  [`inverse_couple`], which applies the [`couple_scalar`] four-quadrant
+  square-polar → Cartesian rule (§4.3.5 step 3) element by element. The
+  driver range-checks each step's channel indices against the
+  residue-vector count and rejects a step that names the same channel for
+  both magnitude and angle. Structured [`CouplingError`] variants
+  (`ChannelOutOfRange`, `SameChannel`).
+* 184 unit tests in total: 16 cover §4.2.2, 22 cover §5, 18 cover §3
   codebook-header parse, 13 cover §3.2.1 Huffman tree, 28 cover
   §4.2.4 setup-header walker, 16 cover §3.2.1 / §3.3 VQ unpack, 15 cover
-  §8.6 residue decode, 18 cover §7.2 floor 1 decode, and **18 new
-  round-10 tests cover §6.2 floor 0 decode**: the §6.2.3 post-errata
-  Bark formula at `x = 0` plus its monotonicity on the audible range, all
-  six `Floor0Decoder::new` construction-validation rejections (zero order
-  / bark-map-size / amplitude-bits, empty book list, out-of-range book
-  index, lookup-type-0 value book), the `amplitude == 0` and EOF-during-
-  amplitude `Unused` paths, an EOF-during-coefficients `Unused` path, a
-  hand-traced packet decode producing the expected `(amplitude,
-  coefficients)` pair with `[last]` accumulating across vectors, a
-  dim-1-book multi-codeword fill exercising the `[last]` carry across
-  every iteration, a curve-computation length-and-finiteness check on a
-  hand-picked LSP set, the `[iteration_condition]` chaining replication
-  (consecutive output bins are exactly equal), an `amplitude = 0` direct
-  call to `curve_computation` returning the all-zero length-`n` vector,
-  the reserved-`booknumber` → `Unused` path, and a full
-  packet→`Floor0Curve` end-to-end round trip.
+  §8.6 residue decode, 18 cover §7.2 floor 1 decode, 18 cover §6.2
+  floor 0 decode, and **20 new round-11 tests cover §1.3.2 / §4.3.1
+  window generation + §4.3.5 inverse coupling**: the [`slope`]
+  endpoints/midpoint and its symmetry about the ramp centre, both
+  `vorbis_window` validation rejections (non-power-of-two `n`,
+  `blocksize_0 > n`), the plain symmetric short window and its
+  `w[i]² + w[i+n/2]² = 1` overlap-power property, a long block with both
+  neighbours long matching the short shape, the short-previous hybrid
+  ramp with its zero lead-in + plateau, the short-next hybrid ramp with
+  its zero tail, the adjacent long+short window squared-overlap unity
+  reconstruction across the 32-sample overlap, all four [`couple_scalar`]
+  quadrants plus the zero-magnitude else branch, in-place pairwise
+  [`inverse_couple`] with a length-mismatch panic, the
+  [`inverse_couple_all`] single-step stereo case, the descending-order
+  loop (one symmetric and one order-observable variant), the
+  magnitude-below-angle index branch, and the out-of-range / same-channel
+  / empty-coupling driver cases.
 
 ### What does not yet work
 
 * Mapping submap channel routing at packet time (which channels feed
-  which residue, plus square-polar coupling inversion §A.3), mode /
-  window decode, inverse MDCT, and TDAC overlap-add (§4.3, §10).
-* Top-level audio-packet decode (§4.3.2) tying floor + residue + the
-  per-mapping channel plumbing together. `Floor1Decoder` is the floor
-  half and `ResidueDecoder` the residue half; the packet-level loop that
-  drives them in channel order — computing each channel's `do not decode`
-  flag from the floor's `nonzero`/`Unused` result and applying §4.3.3
-  nonzero-vector propagation across coupled channels — is still pending.
+  which residue / floor via `[vorbis_mapping_mux]`), mode / window-flag
+  *reading* from the packet (the window *builder* now exists but is not
+  yet driven by a per-packet mode-number read), the inverse MDCT itself,
+  and TDAC overlap-add (§4.3.6..§4.3.8, §10). Inverse channel coupling
+  (§4.3.5) is now implemented as [`inverse_couple_all`] but is not yet
+  wired into a packet driver.
+* Top-level audio-packet decode (§4.3.1..§4.3.9) tying floor + residue +
+  window + coupling + MDCT + overlap-add together. `Floor1Decoder` /
+  `Floor0Decoder` are the floor half, `ResidueDecoder` the residue half,
+  `vorbis_window` the window, and `inverse_couple_all` the decoupling
+  step; the packet-level loop that drives them in channel/submap order —
+  reading the §4.3.1 mode number + window flags, computing each channel's
+  `do not decode` flag from the floor's `nonzero`/`Unused` result,
+  applying §4.3.3 nonzero-vector propagation across coupled channels, and
+  running the §4.3.6 floor/residue dot product — is still pending.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
@@ -362,7 +414,7 @@ comment header.
 
 ## Clean-room sources
 
-Rounds 1 — 10 were implemented against, and only against:
+Rounds 1 — 11 were implemented against, and only against:
 
 * `docs/audio/vorbis/Vorbis_I_spec.pdf` — Xiph.Org Vorbis I
   Specification, 2020-07-04 revision. Round 1 used §2 Bitpacking
@@ -478,6 +530,37 @@ Rounds 1 — 10 were implemented against, and only against:
   2.24·atan(.0000000185x²) + .0001x`. §9.2.1 `ilog` is reused via
   [`crate::codebook::ilog`]; the VQ-context value-book reads use
   [`crate::vq::unpack_vector`] and [`crate::huffman::HuffmanTree`].
+  Round 11 used §1.3.2 "Decode Procedure" (the decode-step narrative
+  enumerating window-shape decode, the inverse-coupling step, the inverse
+  monolithic MDCT, and the overlap/add stage) and its "Window shape
+  decode (long windows only)" subsection (the slope function `y =
+  sin(.5·π·sin²((x + .5)/n·π))`, the equal-sized and long/short overlap
+  illustrations, and the `previous_window_flag`/`next_window_flag`
+  redundancy paragraph), §4.3 "Audio packet decode and synthesis"
+  (intro + the per-stage narrative: floor decode, residue decode, inverse
+  channel coupling "converting square polar … back to Cartesian", the
+  floor/residue dot product, the inverse MDCT, overlap/add "3/4 point of
+  the previous window aligned with the 1/4 point of the current window",
+  cache-right-hand-data, and the
+  `window_blocksize(prev)/4 + window_blocksize(cur)/4` return-length
+  formula), §4.3.1 "packet type, mode and window decode" (steps 1..4
+  including the long-block `previous_window_flag`/`next_window_flag`
+  reads at step 4a.i/ii, the short-block always-same-shape rule at step
+  4b, and the eight-step window-generation procedure: `window_center =
+  n/2`; the step-2 left-edge `(left_window_start, left_window_end,
+  left_n)` selection between the `n/4 ± blocksize_0/4` hybrid ramp and
+  the `0..window_center`/`n/2` full ramp; the symmetric step-3 right-edge
+  selection between `n*3/4 ± blocksize_0/4` and `window_center..n`; the
+  step-4 zero lead-in; the step-5 rising-edge fill `window([i]) =
+  sin(π/2·sin²(([i]-left_window_start+0.5)/left_n·π/2))`; the step-6
+  ones plateau; the step-7 falling-edge fill with the `… + π/2` phase
+  shift; and the step-8 zero tail; plus the end-of-packet
+  error-vs-nominal-occurrence note), and §4.3.5 "inverse coupling" (the
+  descending `[vorbis_mapping_coupling_steps]-1 … 0` loop over
+  magnitude/angle vector pairs and the step-3 four-quadrant
+  `[new_M]`/`[new_A]` square-polar → Cartesian rule). The
+  [`MappingCouplingStep`] `(magnitude_channel, angle_channel)` pairs from
+  §4.2.4 (round 6) feed the inverse-coupling driver.
 * `docs/audio/vorbis/vorbis-fixtures-and-traces.md` — clean-room
   trace-corpus document. Round 2 referenced §2.2 (`mono-44100-q5-typical`
   and `with-vorbis-comment-tags` `VORBIS_HEADER_COMMENT` /
@@ -562,6 +645,14 @@ crate that wraps or implements the format).
 [`Floor0Decoder`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor0/struct.Floor0Decoder.html
 [`Floor0Error`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor0/enum.Floor0Error.html
 [`bark`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/floor0/fn.bark.html
+[`vorbis_window`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.vorbis_window.html
+[`slope`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.slope.html
+[`WindowError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/enum.WindowError.html
+[`inverse_couple_all`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.inverse_couple_all.html
+[`inverse_couple`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.inverse_couple.html
+[`couple_scalar`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.couple_scalar.html
+[`CouplingError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/enum.CouplingError.html
+[`MappingCouplingStep`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.MappingCouplingStep.html
 
 ## License
 
