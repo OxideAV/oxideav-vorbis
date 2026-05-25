@@ -6,6 +6,50 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.8 overlap-add primitive (Vorbis I §4.3.8 "overlap
+  add").** New module `overlap` exporting `OverlapAdd` (a one-channel
+  stateful overlap-add engine) and `OverlapError`. `OverlapAdd::new`
+  creates a priming state; `OverlapAdd::push_frame(windowed)` consumes
+  the next windowed time-domain frame and returns `Ok(None)` on the
+  first call (the spec's "data is not returned from the first frame"
+  priming step) and `Ok(Some(samples))` on every subsequent call,
+  emitting the §4.3.8 return range of
+  `previous_window_blocksize / 4 + current_window_blocksize / 4`
+  samples spanning the previous-window center (`windowsize / 2`) to
+  the current-window center (`windowsize / 2 - 1`, inclusive). The
+  3/4-vs-1/4 alignment geometry (`cur_global_start = prev_n * 3 / 4 -
+  cur_n / 4`) is reproduced from §4.3.8 verbatim, with signed-isize
+  arithmetic so the short→long case (where the current frame begins
+  BEFORE the previous-window center) is handled exactly as the spec
+  text "much of the returned range does not actually overlap"
+  describes. Per-frame state is the previous-frame right half
+  (length `prev_n / 2`), so memory is proportional to block size
+  rather than full frame. `OverlapAdd::reset` returns to priming;
+  `OverlapAdd::finish` drains the stored tail for stream-end finishing
+  (the symmetric counterpart of the first-frame priming). Helper
+  accessors `is_priming`, `stored_tail_len`, and `next_output_len`
+  expose the §4.3.8 return-length formula without requiring a push.
+  New error enum `OverlapError` (`NotPowerOfTwo`, `FrameTooSmall`)
+  guards against malformed frame lengths (defensive — §4.2.2 already
+  pins `blocksize >= 64`); `From<OverlapError> for WindowError` maps
+  into the umbrella window-error type. Crate root re-exports
+  `OverlapAdd`, `OverlapError`; the unified `Error` grows an
+  `Overlap(OverlapError)` variant with `From` glue. 20 new unit tests
+  cover both error paths, the priming → output → reset cycle,
+  `next_output_len` against the spec formula, the equal-sized case
+  (one-half block return, fully overlapped), the long→short and
+  short→long mixed-size cases (return-length formulas + which range
+  carries each frame's contribution), the §1.3.2 squared-window
+  perfect-reconstruction property (`w[i]² + w[i + n/2]² == 1`),
+  a three-frame chained sequence, the finish/priming corner cases,
+  and the spec's "from element windowsize/2 of previous to element
+  windowsize/2 - 1 of current" return-range indexing invariant.
+  Test count: 251 total (231 → 251). With this round every §4.3.x
+  stage the Vorbis I spec body defines in its own text is implemented
+  as a standalone primitive; the only remaining gap is the §4.3.7
+  inverse MDCT itself, still gated on the spec's externally-cited
+  reference `[1]`.
+
 * **Vorbis I top-level §4.3 audio-packet driver (§4.3.2 through §4.3.6),
   stopping cleanly at the §4.3.7 inverse-MDCT boundary.** New module
   `audio` exporting `decode_audio_packet_pre_imdct`, `decode_one_packet`,

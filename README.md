@@ -1,8 +1,37 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 14.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 15.
 
 ## Status — 2026-05-25
+
+**Round 15 landed: the §4.3.8 overlap-add primitive as a standalone,
+IMDCT-independent math module.** A new [`overlap`] module exposes
+[`OverlapAdd`] — a one-channel stateful overlap-add engine driven by
+[`OverlapAdd::push_frame(windowed_frame)`]. It consumes the windowed
+time-domain frame (the §4.3.7 IMDCT output multiplied by the §1.3.2 /
+§4.3.1 Vorbis window) and returns the finished PCM samples for the
+previous → current frame transition per §4.3.8: `prev_n / 4 +
+cur_n / 4` samples spanning the previous-window center
+(`windowsize / 2`) to the current-window center (`windowsize / 2 - 1`,
+inclusive). The 3/4-vs-1/4 alignment geometry is reproduced from
+§4.3.8 verbatim; the spec's first-frame priming step (no output) is
+modelled as `Ok(None)` on the first [`push_frame`] call. All four
+mixed-size combinations (long→long, long→short, short→long,
+short→short) are exercised against the §4.3.8 spec text, including
+the spec's note that a short→long boundary lets the current frame
+begin BEFORE the previous-frame center (negative offset, handled
+with signed arithmetic). The squared-window perfect-reconstruction
+property of §1.3.2 (`w[i]² + w[i + n/2]² == 1`) is verified
+end-to-end: pushing the same windowed unit-signal through two
+consecutive frames returns constant `1.0` across the entire overlap
+region. With this round, every §4.3.x stage the Vorbis I spec body
+defines in its own text is now implemented as a standalone primitive;
+the only remaining gap is the §4.3.7 inverse MDCT itself, still
+gated on the spec's externally-cited reference `[1]`. When the IMDCT
+round lands, the audio-packet driver glue is: per channel, run IMDCT
+on the `PreImdct` spectrum, multiply by the §4.3.1 window, hand the
+result to that channel's [`OverlapAdd`] instance, and emit whatever
+PCM it returns.
 
 **Round 14 landed: the top-level §4.3 audio-packet driver covering
 §4.3.2 floor decode (per-channel, submap-routed) through §4.3.6 dot
@@ -542,9 +571,13 @@ comment header.
   derives the Vorbis IMDCT integration from the §1.3.2 window property
   + a captured `MDCT_OUT` corpus, or a spec amendment that inlines the
   formula.
-* **§4.3.8 overlap-add** is fully specified but is the only §4.3 stage
-  that the dot-product output cannot feed into without an IMDCT first;
-  pending the IMDCT docs gap above.
+* **§4.3.8 overlap-add — landed round 15.** [`OverlapAdd`] is the
+  IMDCT-independent standalone primitive: feed it any windowed
+  time-domain frame (the §4.3.7 output) and it returns the §4.3.8
+  finished PCM range, holding the right-hand tail for the next call
+  in `prev_n / 2` samples of internal state. The IMDCT integration is
+  the last remaining wire to run; the overlap-add geometry is no
+  longer a blocker.
 * Mapping submap channel routing at packet time (which channels feed
   which residue / floor via `[vorbis_mapping_mux]`) — **landed round
   14**: [`audio::decode_audio_packet_pre_imdct`] walks `mapping.mux[ch]`

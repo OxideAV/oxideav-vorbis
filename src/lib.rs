@@ -41,7 +41,10 @@
 //! The driver stops cleanly at the §4.3.7 inverse-MDCT boundary; see
 //! [`audio`]. The §4.3.7 IMDCT remains a documented docs gap (the
 //! spec defers it to a barred external reference); [`decode_packet`]
-//! returns [`Error::NotImplemented`] at that boundary.
+//! returns [`Error::NotImplemented`] at that boundary. Round 15 lands
+//! the §4.3.8 overlap-add primitive as a standalone, IMDCT-independent
+//! math module ready to consume any windowed time-domain frame
+//! (the §4.3.7 output once the IMDCT round lands); see [`overlap`].
 
 #![warn(missing_debug_implementations)]
 
@@ -54,6 +57,7 @@ pub mod floor0;
 pub mod floor1;
 pub mod huffman;
 pub mod identification;
+pub mod overlap;
 pub mod packet;
 pub mod residue;
 pub mod setup;
@@ -80,6 +84,7 @@ pub use huffman::{
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
+pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
     PacketError, PacketHeaderStage, VectorKind,
@@ -132,6 +137,9 @@ pub enum Error {
     /// An audio-packet driver stage (Vorbis I §4.3.3 nonzero-vector
     /// propagate / §4.3.6 dot product) failed.
     Packet(PacketError),
+    /// The §4.3.8 overlap-add primitive rejected a frame as malformed
+    /// (length not a positive power of two, or below the spec minimum).
+    Overlap(OverlapError),
     /// The top-level §4.3 audio-packet driver failed at the §4.3.2
     /// through §4.3.6 stages (mapping/submap routing, floor or residue
     /// decode failure, inverse coupling, dot product), or stopped at the
@@ -159,6 +167,7 @@ impl core::fmt::Display for Error {
             Error::Window(e) => write!(f, "{e}"),
             Error::Coupling(e) => write!(f, "{e}"),
             Error::Packet(e) => write!(f, "{e}"),
+            Error::Overlap(e) => write!(f, "{e}"),
             Error::AudioPacket(e) => write!(f, "{e}"),
         }
     }
@@ -180,6 +189,7 @@ impl std::error::Error for Error {
             Error::Window(e) => Some(e),
             Error::Coupling(e) => Some(e),
             Error::Packet(e) => Some(e),
+            Error::Overlap(e) => Some(e),
             Error::AudioPacket(e) => Some(e),
             Error::NotImplemented => None,
         }
@@ -261,6 +271,12 @@ impl From<CouplingError> for Error {
 impl From<PacketError> for Error {
     fn from(value: PacketError) -> Self {
         Error::Packet(value)
+    }
+}
+
+impl From<OverlapError> for Error {
+    fn from(value: OverlapError) -> Self {
+        Error::Overlap(value)
     }
 }
 
