@@ -6,6 +6,44 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.7 inverse MDCT — direct cosine-summation kernel.**
+  New module `imdct` exporting `imdct_naive(spectrum, output, scale)`,
+  `imdct_naive_vec(spectrum, scale)`, and the `ImdctError` enum
+  (`SpectrumNotPowerOfTwo`, `OutputLenMismatch`). The kernel implements
+  the bare cosine summation
+  `x[n] = sum_k X[k] · cos[ (π/N) · (2n + 1 + N/2) · (2k + 1) / 2 ]`
+  from `docs/audio/vorbis/imdct-cross-reference.md` — the OxideAV
+  clean-room companion that closes Vorbis I §4.3.7's deferral to
+  external reference `[1]` by observing that the IMDCT mathematical
+  kernel is restated in three other adjacent in-repo specs (ATSC A/52
+  §7.9.4, ISO/IEC 14496-3 §4.6.x, IETF RFC 6716 §4.3.7). The
+  implementation is the O(N²) direct form, deliberately chosen as the
+  *reference* implementation that is provably correct by inspection
+  against the cosine summation; an FFT-decomposed fast path can land in
+  a later round and validate against this kernel's output. Working
+  precision is `f64` accumulators with `f32` output to match the
+  spectral pipeline. The `scale` argument is a pure output multiplier
+  — the Vorbis-specific normalization scalar that maps the bare
+  kernel to oggdec-bit-equivalent PCM is deliberately **not** pinned
+  in this round (see Followups). Crate root re-exports `imdct_naive`,
+  `imdct_naive_vec`, `ImdctError`; the unified `Error` grows an
+  `Imdct(ImdctError)` variant with `From` glue. 12 new unit tests
+  cover the error paths (empty / non-power-of-two spectrum, mismatched
+  output length, vec-wrapper rejection), mathematical properties
+  derivable directly from the cosine summation (zero input → zero
+  output; linearity in the spectrum; left-half anti-symmetry
+  `x[i] + x[N/2 - 1 - i] = 0`; right-half symmetry
+  `x[N/2 + i] = x[N - 1 - i]` — the two TDAC half-rules that overlap-add
+  cancellation builds on), the `scale` argument's linearity property,
+  two hand-computed N = 4 fixtures (impulse on DC bin, impulse on
+  k = 1 bin — these pin the exact cosine arguments and would catch
+  any off-by-one in the `(2n + 1 + N/2) · (2k + 1) / 2` form), and the
+  `Display` strings. Test count: 263 total (251 → 263). The top-level
+  `decode_packet` still returns at the §4.3.7 boundary because wiring
+  the IMDCT into the per-packet driver needs the normalization factor
+  to be pinned first — a future-round task once fixture traces extend
+  through the post-IMDCT trace point.
+
 * **Vorbis I §4.3.8 overlap-add primitive (Vorbis I §4.3.8 "overlap
   add").** New module `overlap` exporting `OverlapAdd` (a one-channel
   stateful overlap-add engine) and `OverlapError`. `OverlapAdd::new`

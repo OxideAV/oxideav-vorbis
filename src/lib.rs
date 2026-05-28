@@ -39,12 +39,18 @@
 //! mapping's submap table, §4.3.3 nonzero propagate, submap-routed
 //! residue decode, §4.3.5 inverse coupling, and §4.3.6 dot product.
 //! The driver stops cleanly at the §4.3.7 inverse-MDCT boundary; see
-//! [`audio`]. The §4.3.7 IMDCT remains a documented docs gap (the
-//! spec defers it to a barred external reference); [`decode_packet`]
-//! returns [`Error::NotImplemented`] at that boundary. Round 15 lands
-//! the §4.3.8 overlap-add primitive as a standalone, IMDCT-independent
-//! math module ready to consume any windowed time-domain frame
-//! (the §4.3.7 output once the IMDCT round lands); see [`overlap`].
+//! [`audio`]. The top-level [`decode_packet`] still returns at the
+//! §4.3.7 boundary because wiring the IMDCT into the per-packet
+//! driver depends on pinning the Vorbis-specific normalization
+//! factor (see [`imdct`] doc) — a follow-up round once the fixture
+//! traces under `docs/audio/vorbis/fixtures/` extend through the
+//! post-IMDCT trace point. Round 15 lands the §4.3.8 overlap-add
+//! primitive as a standalone, IMDCT-independent math module ready to
+//! consume any windowed time-domain frame; see [`overlap`].
+//! Round 16 lands the §4.3.7 inverse-MDCT cosine-summation kernel as
+//! a standalone primitive — the direct O(N²) reference form derived
+//! from the in-repo clean-room cross-reference document
+//! `docs/audio/vorbis/imdct-cross-reference.md`; see [`imdct`].
 
 #![warn(missing_debug_implementations)]
 
@@ -57,6 +63,7 @@ pub mod floor0;
 pub mod floor1;
 pub mod huffman;
 pub mod identification;
+pub mod imdct;
 pub mod overlap;
 pub mod packet;
 pub mod residue;
@@ -84,6 +91,7 @@ pub use huffman::{
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
+pub use imdct::{imdct_naive, imdct_naive_vec, ImdctError};
 pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
@@ -140,6 +148,10 @@ pub enum Error {
     /// The §4.3.8 overlap-add primitive rejected a frame as malformed
     /// (length not a positive power of two, or below the spec minimum).
     Overlap(OverlapError),
+    /// The §4.3.7 inverse-MDCT cosine-summation kernel rejected its
+    /// input — either an invalid spectrum length, or a mismatched
+    /// output buffer length.
+    Imdct(ImdctError),
     /// The top-level §4.3 audio-packet driver failed at the §4.3.2
     /// through §4.3.6 stages (mapping/submap routing, floor or residue
     /// decode failure, inverse coupling, dot product), or stopped at the
@@ -168,6 +180,7 @@ impl core::fmt::Display for Error {
             Error::Coupling(e) => write!(f, "{e}"),
             Error::Packet(e) => write!(f, "{e}"),
             Error::Overlap(e) => write!(f, "{e}"),
+            Error::Imdct(e) => write!(f, "{e}"),
             Error::AudioPacket(e) => write!(f, "{e}"),
         }
     }
@@ -190,6 +203,7 @@ impl std::error::Error for Error {
             Error::Coupling(e) => Some(e),
             Error::Packet(e) => Some(e),
             Error::Overlap(e) => Some(e),
+            Error::Imdct(e) => Some(e),
             Error::AudioPacket(e) => Some(e),
             Error::NotImplemented => None,
         }
@@ -277,6 +291,12 @@ impl From<PacketError> for Error {
 impl From<OverlapError> for Error {
     fn from(value: OverlapError) -> Self {
         Error::Overlap(value)
+    }
+}
+
+impl From<ImdctError> for Error {
+    fn from(value: ImdctError) -> Self {
+        Error::Imdct(value)
     }
 }
 

@@ -1,6 +1,48 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 15.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 16.
+
+## Status — 2026-05-29
+
+**Round 16 landed: the §4.3.7 inverse-MDCT direct cosine-summation kernel
+as a standalone math primitive.** New module [`imdct`] exposes
+[`imdct_naive(spectrum, output, scale)`] and its allocating
+[`imdct_naive_vec(spectrum, scale)`] convenience wrapper. The kernel
+implements the bare cosine summation
+`x[n] = sum_k X[k] · cos[ (π/N) · (2n + 1 + N/2) · (2k + 1) / 2 ]`
+verbatim from the OxideAV clean-room companion document
+`docs/audio/vorbis/imdct-cross-reference.md`. That document closes the
+Vorbis I §4.3.7 spec-deferral to external reference `[1]`
+(Sporer/Brandenburg/Edler, barred by workspace policy) by observing
+that the IMDCT mathematical kernel is **also** restated in three
+adjacent in-repo specs (ATSC A/52 §7.9.4, ISO/IEC 14496-3 §4.6.x,
+IETF RFC 6716 §4.3.7) and giving the canonical formula. The
+implementation is the O(N²) direct form, chosen as the *reference*
+implementation that is provably correct by inspection against the
+cosine summation; a future round can land an FFT-decomposed fast path
+and validate byte-for-byte against this kernel. Working precision is
+`f64` accumulators with `f32` output to match the spectral pipeline.
+12 new unit tests cover the error paths, the mathematical properties
+derivable directly from the cosine summation (zero input → zero
+output; linearity; left-half anti-symmetry `x[i] = -x[N/2 - 1 - i]`;
+right-half symmetry `x[N/2 + i] = x[N - 1 - i]` — the two TDAC
+half-rules), the `scale` argument's linearity property, and two
+hand-computed N = 4 fixtures (impulse on DC bin / impulse on k = 1)
+that pin the exact cosine arguments against any off-by-one in the
+`(2n + 1 + N/2) · (2k + 1) / 2` form. The Vorbis-specific
+normalization scalar that would make the kernel output
+oggdec-bit-equivalent is **deliberately not pinned in this round** —
+`imdct-cross-reference.md` notes it "falls out of matching the
+fixture traces," and the staged fixtures under
+`docs/audio/vorbis/fixtures/<case>/trace.txt` do not yet log
+post-IMDCT samples. The `scale` argument is a `f32` multiplier the
+caller can plug a tentative factor into; a follow-up round pins its
+value when those traces extend. The top-level [`decode_packet`]
+still stops at the §4.3.7 boundary for the same reason. Test count:
+263 total (251 → 263). With this round, every §4.3.x stage the
+Vorbis I spec body or the clean-room IMDCT cross-reference defines
+exists as a standalone primitive; the remaining work is the
+fixture-derived normalization and the per-packet driver glue.
 
 ## Status — 2026-05-25
 
