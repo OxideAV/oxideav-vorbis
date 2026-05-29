@@ -4,6 +4,29 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.8...v0.0.9) - 2026-05-29
+
+### Other
+
+- wire §4.3.7 IMDCT + §4.3.6 window into per-packet driver (round 17)
+- add §4.3.7 inverse-MDCT cosine-summation kernel (Vorbis I)
+- add §4.3.8 overlap-add primitive (Vorbis I)
+- round 14: top-level §4.3 audio-packet driver (§4.3.2 through §4.3.6)
+- add §4.3.1 audio-packet prelude reader (Vorbis I)
+- add §4.3.3 nonzero-vector propagate + §4.3.6 dot product (Vorbis I)
+- add Vorbis window + inverse channel coupling (Vorbis I §1.3.2/§4.3.1 + §4.3.5)
+- per-packet decode + LSP curve computation (Vorbis I §6.2.2 + §6.2.3)
+- per-packet decode + curve computation (Vorbis I §7.2.3 + §7.2.4)
+- add §8.6.2 packet decode + §8.6.3/4/5 format 0/1/2 (round 8)
+- add §3.2.1 / §3.3 VQ vector unpack (round 7)
+- add §4.2.4 mapping + mode + framing-flag parse (round 6)
+- add §4.2.4 setup-header outer walker — codebooks/time/floors/residues (round 5)
+- add §3.2.1 canonical Huffman tree builder + entry decoder (round 4)
+- add §3.2.1 codebook-header parser (round 3)
+- round 2: comment-header parser (Vorbis I §5)
+- round 1: identification-header parser (Vorbis I §4.2.2)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Vorbis I §4.3.7 IMDCT + §4.3.6 windowing wired into the per-packet
