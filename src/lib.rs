@@ -50,7 +50,15 @@
 //! Round 16 lands the §4.3.7 inverse-MDCT cosine-summation kernel as
 //! a standalone primitive — the direct O(N²) reference form derived
 //! from the in-repo clean-room cross-reference document
-//! `docs/audio/vorbis/imdct-cross-reference.md`; see [`imdct`].
+//! `docs/audio/vorbis/imdct-cross-reference.md`; see [`imdct`]. Round 17
+//! wires the §4.3.7 IMDCT and §4.3.6 windowing into the per-packet
+//! driver: [`decode_audio_packet_windowed`] and the convenience
+//! [`decode_one_packet_windowed`] entry point return per-channel
+//! length-`n` windowed time-domain frames ready to feed into per-channel
+//! [`overlap::OverlapAdd::push_frame`] instances. Only the Vorbis-specific
+//! IMDCT normalization scalar (a deferred-fixture concern) is still
+//! pinned via an explicit `imdct_scale: f32` knob; the full §4.3
+//! pipeline-up-to-overlap-add is now reachable from a parsed packet.
 
 #![warn(missing_debug_implementations)]
 
@@ -72,8 +80,9 @@ pub mod synthesis;
 pub mod vq;
 
 pub use audio::{
-    decode_audio_packet_pre_imdct, decode_one_packet, AudioDecoderState, AudioPacketError,
-    AudioPacketOutcome,
+    apply_imdct_and_window, decode_audio_packet_pre_imdct, decode_audio_packet_windowed,
+    decode_one_packet, decode_one_packet_windowed, AudioDecoderState, AudioPacketError,
+    AudioPacketOutcome, WindowedPacketOutcome,
 };
 pub use codebook::{
     parse_codebook, ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,

@@ -6,6 +6,47 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.7 IMDCT + §4.3.6 windowing wired into the per-packet
+  driver (round 17).** New entry points `decode_audio_packet_windowed`
+  (drives §4.3.2..§4.3.6 via `decode_audio_packet_pre_imdct`, runs the
+  §4.3.7 `imdct::imdct_naive` cosine-summation kernel per channel, and
+  element-wise multiplies by the §4.3.6 / §1.3.2 Vorbis window built
+  once per packet via `AudioPacketHeader::build_window`) and the
+  convenience `decode_one_packet_windowed` that returns per-channel
+  length-`n` windowed time-domain frames ready to feed straight into
+  per-channel `crate::overlap::OverlapAdd::push_frame` instances. New
+  pure transform `apply_imdct_and_window(outcome, blocksize_0,
+  imdct_scale)` for callers that already hold a parsed
+  `AudioPacketOutcome` (e.g. from a buffered decode) and only need the
+  §4.3.7-then-§4.3.6 stage. New outcome enum `WindowedPacketOutcome`
+  with two variants (`Windowed` for a normal frame, `ZeroedWindowed`
+  for the §4.3.2 short-circuit) plus `header()` and `frames()`
+  accessors. The `imdct_scale: f32` argument is the deferred-
+  normalization knob — the Vorbis-specific IMDCT normalization scalar
+  the cross-reference notes "falls out of matching the fixture traces"
+  is still pinned to caller-supplied; passing `1.0` returns the bare
+  un-normalized kernel output × window. Two new error variants on
+  `AudioPacketError`: `Window(WindowError)` for a window-builder
+  rejection and `Imdct(ImdctError)` for an IMDCT-kernel rejection;
+  both surface verbatim with `§4.3.6` / `§4.3.7` prefixes in their
+  `Display`. The legacy `decode_one_packet` entry point still returns
+  `AudioPacketError::ImdctStage` so callers depending on the pre-IMDCT
+  stop remain unbroken. 11 new tests cover: windowed driver on the
+  trivial mono packet (one length-`n` frame per channel; geometry
+  pinned), `apply_imdct_and_window` round-trip on a hand-built outcome
+  with a long-block window (lead-in / tail regions are exactly zero by
+  window-edge construction), the §4.3.2 short-circuit (`ZeroedWindowed`
+  returns per-channel all-zero length-`n` frames), the `imdct_scale`
+  linearity property (scaling by α scales every output sample by α),
+  the IMDCT-then-window composition matching the direct
+  `imdct_naive_vec` × `vorbis_window` path bit-for-bit, end-to-end
+  integration with `OverlapAdd::push_frame` (first call primes,
+  second emits the §4.3.8 finished-PCM range), legacy
+  `decode_one_packet` ImdctStage preservation, `decode_one_packet_windowed`
+  parity with `decode_audio_packet_windowed`, `header()` / `frames()`
+  accessor checks, and `AudioPacketError::Window` / `Imdct` Display
+  strings. Test count: 274 total (263 → 274).
+
 * **Vorbis I §4.3.7 inverse MDCT — direct cosine-summation kernel.**
   New module `imdct` exporting `imdct_naive(spectrum, output, scale)`,
   `imdct_naive_vec(spectrum, scale)`, and the `ImdctError` enum

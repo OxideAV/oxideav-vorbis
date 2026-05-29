@@ -55,11 +55,41 @@
 //! keyed by setup-header index so the driver constructs them only on
 //! the first packet (or eagerly via [`AudioDecoderState::new`]).
 //!
+//! # §4.3.7 inverse-MDCT + §4.3.6 window wiring (round 17)
+//!
+//! As of round 17 the driver also exposes a "windowed time-domain frame"
+//! entry point: [`decode_audio_packet_windowed`]. After the §4.3.2..§4.3.6
+//! pipeline completes (the [`decode_audio_packet_pre_imdct`] body), each
+//! per-channel length-`n/2` audio-spectrum vector is run through the
+//! [`crate::imdct::imdct_naive`] direct cosine-summation kernel and the
+//! resulting length-`n` time-domain frame is multiplied element-wise by
+//! the §4.3.6 / §1.3.2 Vorbis window built once per packet via
+//! [`AudioPacketHeader::build_window`]. The result is a length-`n`
+//! windowed time-domain frame per channel, ready to feed straight into
+//! the §4.3.8 [`crate::overlap::OverlapAdd`] primitive.
+//!
+//! The §4.3.7 IMDCT cross-reference document
+//! (`docs/audio/vorbis/imdct-cross-reference.md`) closes the spec's
+//! deferral to external reference `[1]` by observing that the IMDCT
+//! kernel is generic DSP restated in three adjacent in-repo specs (ATSC
+//! A/52 §7.9.4, ISO/IEC 14496-3 §4.6.x, IETF RFC 6716 §4.3.7) and giving
+//! the canonical formula that [`crate::imdct`] implements. The only
+//! Vorbis-specific piece still deferred is the **normalization scalar**
+//! — the cross-reference notes the scalar "falls out of matching the
+//! fixture traces," and the staged traces under
+//! `docs/audio/vorbis/fixtures/<case>/trace.txt` do not yet log
+//! post-IMDCT samples. [`decode_audio_packet_windowed`] takes an explicit
+//! `imdct_scale: f32` parameter that callers plug a tentative value into;
+//! a follow-up round pins it once the traces extend.
+//!
 //! # What this driver does NOT do
 //!
-//! * **Inverse MDCT (§4.3.7).** Documented docs gap.
-//! * **Overlap-add (§4.3.8).** Fully specified in the spec, but cannot
-//!   feed from the dot-product output without an IMDCT first.
+//! * **Inverse MDCT normalization scalar (§4.3.7).** Documented docs gap;
+//!   `imdct_scale: f32` is the deferred-normalization knob.
+//! * **Overlap-add (§4.3.8).** Fully specified in the spec; this driver
+//!   stops at the windowed-frame boundary so the caller can keep one
+//!   [`crate::overlap::OverlapAdd`] instance per channel without the
+//!   driver having to thread per-stream state.
 //! * **Channel-order rearrangement (§4.3.9).** A presentation concern
 //!   for the consumer; the driver returns per-channel vectors in
 //!   bitstream order.
@@ -68,12 +98,13 @@
 
 use crate::floor0::{Floor0Curve, Floor0Decoder, Floor0Error};
 use crate::floor1::{Floor1Decoder, Floor1Error, FloorCurve};
+use crate::imdct::{imdct_naive, ImdctError};
 use crate::packet::{
     dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader, PacketError,
 };
 use crate::residue::{ResidueDecoder, ResidueError};
 use crate::setup::{FloorHeader, FloorKind, MappingHeader, VorbisSetupHeader};
-use crate::synthesis::{inverse_couple_all, CouplingError};
+use crate::synthesis::{inverse_couple_all, CouplingError, WindowError};
 use oxideav_core::bits::BitReaderLsb;
 
 /// Per-stream cache of every floor and residue decoder a stream may use,
@@ -229,6 +260,107 @@ pub enum AudioPacketOutcome {
         /// generally allocate the buffer themselves.
         channels: usize,
     },
+}
+
+/// The outcome of running the §4.3.2..§4.3.6 driver, plus §4.3.7 IMDCT,
+/// plus §4.3.6 window multiplication. Produced by
+/// [`decode_audio_packet_windowed`].
+///
+/// The variant boundary mirrors [`AudioPacketOutcome`]: a normal frame
+/// (`Windowed`) holds the per-channel length-`n` windowed time-domain
+/// frames, ready to feed straight into the §4.3.8 overlap-add primitive;
+/// the §4.3.2 short-circuit (`ZeroedWindowed`) emits per-channel all-zero
+/// length-`n` frames (the IMDCT of zero is zero by linearity, times any
+/// window is still zero).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowedPacketOutcome {
+    /// The driver completed §4.3.2..§4.3.6 normally, ran the §4.3.7 IMDCT
+    /// per channel, and multiplied each length-`n` time-domain frame by
+    /// the §4.3.6 / §1.3.2 Vorbis window. One windowed frame per channel,
+    /// in bitstream channel order, each length `n`.
+    Windowed {
+        /// `[mode_number]` selected by §4.3.1.
+        mode_number: u32,
+        /// `[vorbis_mode_blockflag]` of the selected mode.
+        blockflag: bool,
+        /// `[n]` — the per-frame blocksize resolved from `blockflag`.
+        n: usize,
+        /// `[previous_window_flag]` (long-block-only; placeholder
+        /// `false` for short blocks).
+        previous_window_flag: bool,
+        /// `[next_window_flag]` (long-block-only; placeholder `false`
+        /// for short blocks).
+        next_window_flag: bool,
+        /// One length-`n` windowed time-domain frame per channel, in
+        /// bitstream channel order. Each is `imdct(spectrum) ⊙ window`
+        /// — element-wise multiplication of the §4.3.7 IMDCT output by
+        /// the §4.3.6 / §1.3.2 window, scaled by the caller-supplied
+        /// `imdct_scale` factor. Hand each one to a per-channel
+        /// [`crate::overlap::OverlapAdd::push_frame`].
+        frames: Vec<Vec<f32>>,
+    },
+    /// §4.3.2's closing note fired (see [`AudioPacketOutcome::Zeroed`]).
+    /// The IMDCT of an all-zero spectrum is the all-zero frame, times
+    /// any window is still all-zero — so this variant returns ready-to-
+    /// overlap-add zero frames directly. Geometry is preserved so the
+    /// caller's per-channel overlap-add state still advances correctly.
+    ZeroedWindowed {
+        /// `[mode_number]` selected by §4.3.1.
+        mode_number: u32,
+        /// `[vorbis_mode_blockflag]` of the selected mode.
+        blockflag: bool,
+        /// `[n]` — the per-frame blocksize resolved from `blockflag`.
+        n: usize,
+        /// `[previous_window_flag]` (long-block-only; placeholder).
+        previous_window_flag: bool,
+        /// `[next_window_flag]` (long-block-only; placeholder).
+        next_window_flag: bool,
+        /// One length-`n` all-zero windowed frame per channel.
+        frames: Vec<Vec<f32>>,
+    },
+}
+
+impl WindowedPacketOutcome {
+    /// Convenience accessor: the resolved §4.3.1 header for either variant.
+    #[must_use]
+    pub fn header(&self) -> AudioPacketHeader {
+        match *self {
+            WindowedPacketOutcome::Windowed {
+                mode_number,
+                blockflag,
+                n,
+                previous_window_flag,
+                next_window_flag,
+                ..
+            }
+            | WindowedPacketOutcome::ZeroedWindowed {
+                mode_number,
+                blockflag,
+                n,
+                previous_window_flag,
+                next_window_flag,
+                ..
+            } => AudioPacketHeader {
+                mode_number,
+                blockflag,
+                n,
+                previous_window_flag,
+                next_window_flag,
+            },
+        }
+    }
+
+    /// Borrow the per-channel windowed-frame slice held by either variant.
+    /// The `Windowed` variant returns the §4.3.7-then-§4.3.6 output;
+    /// `ZeroedWindowed` returns the all-zero frames; both have one entry
+    /// per channel and each entry is length `n`.
+    #[must_use]
+    pub fn frames(&self) -> &[Vec<f32>] {
+        match self {
+            WindowedPacketOutcome::Windowed { frames, .. }
+            | WindowedPacketOutcome::ZeroedWindowed { frames, .. } => frames,
+        }
+    }
 }
 
 impl AudioPacketOutcome {
@@ -452,8 +584,9 @@ pub fn decode_audio_packet_pre_imdct(
 ///
 /// Runs the §4.3.2..§4.3.6 driver via [`decode_audio_packet_pre_imdct`]
 /// and then stops at the §4.3.7 inverse-MDCT boundary, returning
-/// [`AudioPacketError::ImdctStage`] cleanly. This is the entry point a
-/// future round will replace once the IMDCT docs gap is closed.
+/// [`AudioPacketError::ImdctStage`] cleanly. This is the legacy entry
+/// point preserved for callers that want the pre-IMDCT stop; the new
+/// IMDCT-wired entry point is [`decode_one_packet_windowed`].
 ///
 /// The §4.3.2-mandated "zero every output vector" short-circuit is
 /// surfaced via [`AudioPacketError::ImdctStage`] just like the normal
@@ -465,8 +598,8 @@ pub fn decode_audio_packet_pre_imdct(
 /// Returns [`AudioPacketError::ImdctStage`] on every successful drive
 /// (the §4.3.7 boundary stop). Any earlier-stage failure is surfaced as
 /// the corresponding [`AudioPacketError`] variant. The function never
-/// returns `Ok(_)` in this round; it is shaped that way so the public
-/// signature does not need to change when the IMDCT round lands.
+/// returns `Ok(_)`; it is shaped that way so the public signature does
+/// not need to change.
 pub fn decode_one_packet(
     reader: &mut BitReaderLsb<'_>,
     setup: &VorbisSetupHeader,
@@ -483,10 +616,212 @@ pub fn decode_one_packet(
         blocksize_0,
         blocksize_1,
     )?;
-    // §4.3.7 inverse MDCT — DOCS-GAP'd: the spec defers the MDCT
-    // definition entirely to external reference [1], which the
-    // workspace clean-room policy bars. We stop cleanly here.
+    // §4.3.7 inverse MDCT normalization — DOCS-GAP'd: the spec defers
+    // the MDCT definition entirely to external reference [1], which the
+    // workspace clean-room policy bars. The kernel + window + overlap-add
+    // are all wired (see `decode_one_packet_windowed`); only the
+    // fixture-derived normalization scalar is still deferred. This
+    // legacy entry point preserves the pre-IMDCT stop for callers that
+    // depend on it.
     Err(AudioPacketError::ImdctStage)
+}
+
+/// Run the full §4.3.2..§4.3.7-then-§4.3.6-window pipeline over one
+/// audio packet and return per-channel **windowed time-domain frames**.
+///
+/// This is the IMDCT-wired sibling of [`decode_audio_packet_pre_imdct`]:
+/// it runs the §4.3.2..§4.3.6 pipeline to produce per-channel
+/// audio-spectrum vectors, then per channel runs the §4.3.7
+/// [`crate::imdct::imdct_naive`] direct cosine-summation kernel on the
+/// length-`n/2` spectrum to obtain the length-`n` time-domain frame,
+/// then element-wise multiplies by the §4.3.6 / §1.3.2 Vorbis window
+/// built once per packet via
+/// [`AudioPacketHeader::build_window`]. The result is the input the
+/// §4.3.8 [`crate::overlap::OverlapAdd::push_frame`] primitive expects
+/// — one per-channel windowed frame ready to feed straight in.
+///
+/// * `reader` — an LSB-first bit reader positioned at the first bit of
+///   the audio packet (RFC-3533-stripped, Ogg-page-coalesced payload).
+/// * `setup` — the stream's parsed setup header.
+/// * `state` — the per-stream decoder cache built by
+///   [`AudioDecoderState::new`].
+/// * `audio_channels` — the stream's `[audio_channels]` from the
+///   identification header.
+/// * `blocksize_0` / `blocksize_1` — the two blocksizes from the
+///   identification header (§4.2.2).
+/// * `imdct_scale` — the deferred-normalization knob. The Vorbis IMDCT
+///   cross-reference document
+///   (`docs/audio/vorbis/imdct-cross-reference.md` §"Vorbis-specific
+///   parameters" item 5) notes the Vorbis-specific normalization scalar
+///   "falls out of matching the fixture traces"; the staged traces
+///   under `docs/audio/vorbis/fixtures/` do not yet log post-IMDCT
+///   samples, so this scalar is **deliberately deferred** to a follow-up
+///   round once those traces extend. Callers pass `1.0` for the bare
+///   un-normalized kernel, or any tentative scaling they want to
+///   experiment with. By linearity of [`crate::imdct::imdct_naive`] this
+///   parameter is a pure output multiplier: scaling it by `α` scales
+///   every returned sample by `α`.
+///
+/// # Errors
+///
+/// * Every error path the §4.3.2..§4.3.6 stage emits surfaces verbatim
+///   from [`decode_audio_packet_pre_imdct`].
+/// * [`AudioPacketError::Window`] for a [`WindowError`] from the §4.3.6
+///   / §1.3.2 window builder (e.g. `blocksize_0 > blocksize_1` on a long
+///   block — already caught by the identification-header parser, but
+///   checked defensively here).
+/// * [`AudioPacketError::Imdct`] for an [`ImdctError`] from the §4.3.7
+///   kernel. The §4.3.6 dot-product already returns a length-`n/2`
+///   spectrum per channel and `n` is power-of-two-validated by the
+///   identification header, so this should not arise in practice; the
+///   variant exists for defensive surfacing.
+pub fn decode_audio_packet_windowed(
+    reader: &mut BitReaderLsb<'_>,
+    setup: &VorbisSetupHeader,
+    state: &AudioDecoderState,
+    audio_channels: u8,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    imdct_scale: f32,
+) -> Result<WindowedPacketOutcome, AudioPacketError> {
+    let pre = decode_audio_packet_pre_imdct(
+        reader,
+        setup,
+        state,
+        audio_channels,
+        blocksize_0,
+        blocksize_1,
+    )?;
+    apply_imdct_and_window(pre, blocksize_0, imdct_scale)
+}
+
+/// IMDCT + §4.3.6 window post-processing of an [`AudioPacketOutcome`].
+///
+/// Separated from [`decode_audio_packet_windowed`] so callers that
+/// already hold a pre-IMDCT outcome (e.g. from a buffered decode) can
+/// run the §4.3.7 stage without re-driving §4.3.2..§4.3.6 from the bit
+/// stream. The transformation is pure (no bit-reader state).
+///
+/// # Errors
+///
+/// See [`decode_audio_packet_windowed`].
+pub fn apply_imdct_and_window(
+    outcome: AudioPacketOutcome,
+    blocksize_0: usize,
+    imdct_scale: f32,
+) -> Result<WindowedPacketOutcome, AudioPacketError> {
+    match outcome {
+        AudioPacketOutcome::PreImdct {
+            mode_number,
+            blockflag,
+            n,
+            previous_window_flag,
+            next_window_flag,
+            spectra,
+        } => {
+            let header = AudioPacketHeader {
+                mode_number,
+                blockflag,
+                n,
+                previous_window_flag,
+                next_window_flag,
+            };
+            // §4.3.6 / §1.3.2 window — one build per packet, reused for
+            // every channel. The window length matches the packet's `n`.
+            let window = header
+                .build_window(blocksize_0)
+                .map_err(AudioPacketError::Window)?;
+            // Defensive: the window builder validates `n` already, but
+            // pin the length match against the IMDCT output to make any
+            // future window-builder change loud.
+            if window.len() != n {
+                return Err(AudioPacketError::Window(WindowError::NotPowerOfTwo { n }));
+            }
+
+            // §4.3.7 per channel: IMDCT(spectrum) → length-`n` frame,
+            // then element-wise multiply by `window`.
+            let mut frames: Vec<Vec<f32>> = Vec::with_capacity(spectra.len());
+            for spectrum in &spectra {
+                let mut time_frame = vec![0.0f32; n];
+                imdct_naive(spectrum, &mut time_frame, imdct_scale)
+                    .map_err(AudioPacketError::Imdct)?;
+                // §4.3.6 windowing: every IMDCT output sample times the
+                // matching window sample. The window is `0` at the
+                // lead-in and tail, so this also zeroes the
+                // overlap-out-of-bounds regions automatically.
+                for (sample, &w) in time_frame.iter_mut().zip(window.iter()) {
+                    *sample *= w;
+                }
+                frames.push(time_frame);
+            }
+
+            Ok(WindowedPacketOutcome::Windowed {
+                mode_number,
+                blockflag,
+                n,
+                previous_window_flag,
+                next_window_flag,
+                frames,
+            })
+        }
+        AudioPacketOutcome::Zeroed {
+            mode_number,
+            blockflag,
+            n,
+            previous_window_flag,
+            next_window_flag,
+            channels,
+        } => {
+            // The IMDCT of the all-zero spectrum is the all-zero frame
+            // (`imdct::tests::zero_input_gives_zero_output`), and the
+            // §4.3.6 window times zero is still zero. We can skip the
+            // window build entirely here and emit the canonical zero
+            // frames at the right geometry.
+            let frames = vec![vec![0.0f32; n]; channels];
+            Ok(WindowedPacketOutcome::ZeroedWindowed {
+                mode_number,
+                blockflag,
+                n,
+                previous_window_flag,
+                next_window_flag,
+                frames,
+            })
+        }
+    }
+}
+
+/// IMDCT-wired top-level packet driver: returns one length-`n` windowed
+/// time-domain frame per channel, ready to feed into per-channel
+/// [`crate::overlap::OverlapAdd::push_frame`] instances.
+///
+/// Convenience wrapper around [`decode_audio_packet_windowed`] that
+/// extracts the per-channel frames directly. The header geometry is
+/// recoverable from the returned [`WindowedPacketOutcome`] via
+/// [`WindowedPacketOutcome::header`] when needed; this entry point is
+/// for the common case where the caller already pairs the per-packet
+/// header with the frames stream-side.
+///
+/// # Errors
+///
+/// See [`decode_audio_packet_windowed`].
+pub fn decode_one_packet_windowed(
+    reader: &mut BitReaderLsb<'_>,
+    setup: &VorbisSetupHeader,
+    state: &AudioDecoderState,
+    audio_channels: u8,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    imdct_scale: f32,
+) -> Result<WindowedPacketOutcome, AudioPacketError> {
+    decode_audio_packet_windowed(
+        reader,
+        setup,
+        state,
+        audio_channels,
+        blocksize_0,
+        blocksize_1,
+        imdct_scale,
+    )
 }
 
 /// Resolve the submap a channel belongs to (`mux[ch]` if the mapping
@@ -596,17 +931,26 @@ pub enum AudioPacketError {
         /// The length of `mapping.mux`.
         mux_len: usize,
     },
-    /// **§4.3.7 inverse MDCT is a documented docs gap.** The Vorbis I
-    /// spec defers the MDCT definition entirely to external reference
-    /// `[1]` (T. Sporer, K. Brandenburg, B. Edler, *The use of multirate
-    /// filter banks for coding of high quality digital audio*), which
-    /// the workspace clean-room policy bars. The driver stops cleanly
-    /// at this boundary and returns this variant. The §4.3.2..§4.3.6
-    /// stages all ran successfully when this is returned; the
-    /// per-channel pre-IMDCT spectra (or the §4.3.2 zero-output
-    /// short-circuit) are available via
-    /// [`decode_audio_packet_pre_imdct`].
+    /// **§4.3.7 inverse MDCT is a documented docs gap.** The legacy
+    /// [`decode_one_packet`] entry point stops cleanly at this boundary
+    /// and returns this variant. The §4.3.2..§4.3.6 stages all ran
+    /// successfully when this is returned; the per-channel pre-IMDCT
+    /// spectra are available via [`decode_audio_packet_pre_imdct`]; the
+    /// per-channel windowed time-domain frames are available via
+    /// [`decode_audio_packet_windowed`] (with the deferred-normalization
+    /// scalar passed as `imdct_scale`).
     ImdctStage,
+    /// The §4.3.6 / §1.3.2 Vorbis window builder rejected the requested
+    /// geometry — defensive: the identification header already validates
+    /// `blocksize_0` / `blocksize_1` as powers of two, so this only
+    /// arises from a hand-built setup.
+    Window(WindowError),
+    /// The §4.3.7 inverse-MDCT kernel rejected the spectrum or output
+    /// length — defensive: the §4.3.6 dot-product always returns a
+    /// length-`n/2` spectrum per channel, and `n` is power-of-two
+    /// validated, so this only arises from a hand-built outcome passed
+    /// to [`apply_imdct_and_window`].
+    Imdct(ImdctError),
 }
 
 impl core::fmt::Display for AudioPacketError {
@@ -678,6 +1022,12 @@ impl core::fmt::Display for AudioPacketError {
                  (Vorbis I spec defers to external reference [1] — barred by \
                   workspace clean-room policy)"
             ),
+            AudioPacketError::Window(e) => {
+                write!(f, "vorbis audio packet: §4.3.6 window builder: {e}")
+            }
+            AudioPacketError::Imdct(e) => {
+                write!(f, "vorbis audio packet: §4.3.7 inverse MDCT: {e}")
+            }
         }
     }
 }
@@ -691,6 +1041,8 @@ impl std::error::Error for AudioPacketError {
             AudioPacketError::Floor0Build { source, .. } => Some(source),
             AudioPacketError::Floor1Build { source, .. } => Some(source),
             AudioPacketError::ResidueBuild { source, .. } => Some(source),
+            AudioPacketError::Window(e) => Some(e),
+            AudioPacketError::Imdct(e) => Some(e),
             AudioPacketError::BadModeMapping { .. }
             | AudioPacketError::BadSubmapIndex { .. }
             | AudioPacketError::BadSubmapFloor { .. }
@@ -1132,5 +1484,355 @@ mod tests {
     fn trivial_classbook_huffman_tree_builds() {
         let cb = scalar_classbook();
         let _tree = HuffmanTree::from_codebook(&cb).expect("trivial classbook builds");
+    }
+
+    // ---- Round 17: §4.3.7 IMDCT + §4.3.6 window wiring ----
+
+    /// The IMDCT-wired entry point returns one length-`n` windowed frame
+    /// per channel on a normal used-channel packet. Because the trivial
+    /// setup decodes every spectrum to all-zero (floor-curve × zero
+    /// residue = 0), every windowed frame is also all-zero — IMDCT of
+    /// zero is zero by linearity, then any window times zero is zero.
+    /// The geometry (channel count, frame length = n) is the test
+    /// surface.
+    #[test]
+    fn windowed_driver_mono_used_packet_emits_one_frame() {
+        let setup = mono_setup();
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let bytes = write_used_packet();
+        let mut r = BitReaderLsb::new(&bytes);
+        let outcome =
+            decode_audio_packet_windowed(&mut r, &setup, &state, 1, 64, 1024, 1.0).unwrap();
+        match outcome {
+            WindowedPacketOutcome::Windowed {
+                blockflag,
+                n,
+                frames,
+                ..
+            } => {
+                assert!(!blockflag);
+                assert_eq!(n, 64);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), 64); // length n, not n/2.
+                for &s in &frames[0] {
+                    assert_eq!(s, 0.0);
+                }
+            }
+            other => panic!("expected Windowed, got {:?}", other),
+        }
+    }
+
+    /// Apply IMDCT + window to a hand-built PreImdct outcome with a
+    /// non-zero spectrum (one bin only) and verify:
+    /// * one frame per channel, each length `n`,
+    /// * the lead-in / tail regions (window == 0) are exactly zero,
+    /// * the plateau region (window == 1) carries the bare IMDCT output.
+    ///
+    /// This exercises the IMDCT + window composition without depending
+    /// on the synthetic-packet bit-stream encoding.
+    #[test]
+    fn apply_imdct_and_window_carries_one_bin_into_plateau() {
+        // Short block: n = 64 → window has no lead-in/tail (the plain
+        // symmetric short shape spans the full length and is everywhere
+        // > 0). Use a long block instead so we have a clear plateau
+        // surrounded by zero edges.
+        //
+        // Long block n = 1024 with previous_window_flag = false,
+        // next_window_flag = false → hybrid ramps with `blocksize_0/2`
+        // ramp length on each side. Lead-in = `n/4 - blocksize_0/4`
+        // samples of zero before the rising edge starts.
+        let blocksize_0 = 64;
+        let n = 1024;
+        let lead_in = n / 4 - blocksize_0 / 4; // = 240 samples of zero
+        let half_n = n / 2;
+        let spectrum: Vec<f32> = (0..half_n).map(|i| (i as f32 + 1.0) * 0.001).collect();
+        let outcome = AudioPacketOutcome::PreImdct {
+            mode_number: 0,
+            blockflag: true,
+            n,
+            previous_window_flag: false,
+            next_window_flag: false,
+            spectra: vec![spectrum],
+        };
+        let windowed = apply_imdct_and_window(outcome, blocksize_0, 1.0).unwrap();
+        match windowed {
+            WindowedPacketOutcome::Windowed {
+                frames,
+                n: out_n,
+                blockflag,
+                ..
+            } => {
+                assert_eq!(out_n, n);
+                assert!(blockflag);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), n);
+                // The lead-in region is everywhere zero in the window;
+                // the windowed frame inherits that exactness.
+                for (i, &sample) in frames[0].iter().enumerate().take(lead_in) {
+                    assert_eq!(sample, 0.0, "lead-in sample {i} non-zero in windowed frame");
+                }
+                // The mirrored tail region is also everywhere zero.
+                let tail_start = n - lead_in;
+                for (i, &sample) in frames[0].iter().enumerate().take(n).skip(tail_start) {
+                    assert_eq!(sample, 0.0, "tail sample {i} non-zero in windowed frame");
+                }
+            }
+            other => panic!("expected Windowed, got {:?}", other),
+        }
+    }
+
+    /// The §4.3.2 short-circuit `Zeroed` produces per-channel all-zero
+    /// length-`n` windowed frames via [`apply_imdct_and_window`].
+    #[test]
+    fn apply_imdct_and_window_zeroed_short_circuit() {
+        let outcome = AudioPacketOutcome::Zeroed {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: false,
+            channels: 2,
+        };
+        let windowed = apply_imdct_and_window(outcome, 64, 1.0).unwrap();
+        match windowed {
+            WindowedPacketOutcome::ZeroedWindowed { frames, n, .. } => {
+                assert_eq!(n, 64);
+                assert_eq!(frames.len(), 2);
+                for ch in &frames {
+                    assert_eq!(ch.len(), 64);
+                    for &s in ch {
+                        assert_eq!(s, 0.0);
+                    }
+                }
+            }
+            other => panic!("expected ZeroedWindowed, got {:?}", other),
+        }
+    }
+
+    /// `imdct_scale` is a pure output multiplier (inherits from
+    /// `imdct::tests::scale_is_pure_output_multiplier`); scaling by `α`
+    /// scales every returned sample by `α`. Test via the public
+    /// [`apply_imdct_and_window`] entry point against a non-zero
+    /// spectrum.
+    #[test]
+    fn apply_imdct_and_window_scale_is_linear() {
+        let n = 64;
+        let half_n = n / 2;
+        let spectrum: Vec<f32> = (0..half_n).map(|i| ((i + 1) as f32 * 0.07).sin()).collect();
+        let make = |_scale: f32| AudioPacketOutcome::PreImdct {
+            mode_number: 0,
+            blockflag: false,
+            n,
+            previous_window_flag: false,
+            next_window_flag: false,
+            spectra: vec![spectrum.clone()],
+        };
+        let one = apply_imdct_and_window(make(1.0), 64, 1.0).unwrap();
+        let two_point_five = apply_imdct_and_window(make(1.0), 64, 2.5).unwrap();
+        let frames_one = match &one {
+            WindowedPacketOutcome::Windowed { frames, .. } => frames,
+            _ => panic!("expected Windowed"),
+        };
+        let frames_alpha = match &two_point_five {
+            WindowedPacketOutcome::Windowed { frames, .. } => frames,
+            _ => panic!("expected Windowed"),
+        };
+        for i in 0..n {
+            let expected = frames_one[0][i] * 2.5;
+            let diff = (frames_alpha[0][i] - expected).abs();
+            let tol = (expected.abs() * 1.0e-4).max(1.0e-5);
+            assert!(
+                diff < tol,
+                "idx {i}: scaled {} != expected {} (diff {})",
+                frames_alpha[0][i],
+                expected,
+                diff,
+            );
+        }
+    }
+
+    /// The composition `imdct then window` matches running each
+    /// primitive directly: pin this against the standalone
+    /// [`crate::imdct::imdct_naive_vec`] + the standalone
+    /// [`crate::synthesis::vorbis_window`]. Guards against an off-by-one
+    /// or accidental window reuse in the audio driver.
+    #[test]
+    fn apply_imdct_and_window_matches_direct_composition() {
+        let n = 64;
+        let half_n = n / 2;
+        let blocksize_0 = 64;
+        let spectrum: Vec<f32> = (0..half_n).map(|i| ((i + 1) as f32 * 0.13).cos()).collect();
+        let outcome = AudioPacketOutcome::PreImdct {
+            mode_number: 0,
+            blockflag: false,
+            n,
+            previous_window_flag: false,
+            next_window_flag: false,
+            spectra: vec![spectrum.clone()],
+        };
+        let windowed = apply_imdct_and_window(outcome, blocksize_0, 1.0).unwrap();
+        let frames = match &windowed {
+            WindowedPacketOutcome::Windowed { frames, .. } => frames,
+            _ => panic!("expected Windowed"),
+        };
+
+        // Direct path: bare IMDCT + element-wise window mul.
+        let direct_time = crate::imdct::imdct_naive_vec(&spectrum, 1.0).unwrap();
+        let window = crate::synthesis::vorbis_window(n, blocksize_0, false, false, false).unwrap();
+        let direct_windowed: Vec<f32> = direct_time
+            .iter()
+            .zip(&window)
+            .map(|(&t, &w)| t * w)
+            .collect();
+
+        for i in 0..n {
+            let diff = (frames[0][i] - direct_windowed[i]).abs();
+            assert!(
+                diff < 1.0e-6,
+                "idx {i}: driver {} != direct {} (diff {})",
+                frames[0][i],
+                direct_windowed[i],
+                diff,
+            );
+        }
+    }
+
+    /// Output of [`decode_audio_packet_windowed`] feeds straight into
+    /// [`crate::overlap::OverlapAdd::push_frame`] — pin the integration
+    /// end-to-end on the synthetic mono packet. The first call primes
+    /// (returns `Ok(None)`); the second call returns
+    /// `Ok(Some(samples))` with the §4.3.8 finished-PCM geometry.
+    #[test]
+    fn windowed_driver_feeds_overlap_add() {
+        let setup = mono_setup();
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let bytes = write_used_packet();
+        let mut overlap = crate::overlap::OverlapAdd::new();
+
+        // Packet 1 — should prime overlap-add and return None.
+        let mut r1 = BitReaderLsb::new(&bytes);
+        let outcome1 =
+            decode_audio_packet_windowed(&mut r1, &setup, &state, 1, 64, 1024, 1.0).unwrap();
+        let frame1 = &outcome1.frames()[0];
+        assert_eq!(frame1.len(), 64);
+        let result1 = overlap.push_frame(frame1).unwrap();
+        assert!(result1.is_none(), "first frame must prime overlap-add");
+
+        // Packet 2 — should emit prev_n/4 + cur_n/4 = 32 finished samples.
+        let mut r2 = BitReaderLsb::new(&bytes);
+        let outcome2 =
+            decode_audio_packet_windowed(&mut r2, &setup, &state, 1, 64, 1024, 1.0).unwrap();
+        let frame2 = &outcome2.frames()[0];
+        let result2 = overlap.push_frame(frame2).unwrap();
+        let pcm = result2.expect("second frame should emit PCM");
+        assert_eq!(pcm.len(), 64 / 4 + 64 / 4); // 32 samples
+                                                // Trivial setup → spectrum is 0 → IMDCT is 0 → windowed is 0 →
+                                                // overlap-add of zero + zero is zero.
+        for &s in &pcm {
+            assert_eq!(s, 0.0);
+        }
+    }
+
+    /// The legacy [`decode_one_packet`] entry point still surfaces
+    /// `ImdctStage` so callers depending on the pre-IMDCT stop are not
+    /// broken by round 17. The new wiring is the additive
+    /// [`decode_one_packet_windowed`] entry point.
+    #[test]
+    fn legacy_decode_one_packet_still_stops_at_imdct_boundary() {
+        let setup = mono_setup();
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let bytes = write_used_packet();
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(
+            decode_one_packet(&mut r, &setup, &state, 1, 64, 1024),
+            Err(AudioPacketError::ImdctStage),
+        );
+    }
+
+    /// The new [`decode_one_packet_windowed`] entry point is a thin
+    /// wrapper around [`decode_audio_packet_windowed`]; behaviour parity
+    /// is the documented invariant.
+    #[test]
+    fn decode_one_packet_windowed_matches_decode_audio_packet_windowed() {
+        let setup = mono_setup();
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let bytes = write_used_packet();
+        let mut r_a = BitReaderLsb::new(&bytes);
+        let mut r_b = BitReaderLsb::new(&bytes);
+        let a = decode_audio_packet_windowed(&mut r_a, &setup, &state, 1, 64, 1024, 1.0).unwrap();
+        let b = decode_one_packet_windowed(&mut r_b, &setup, &state, 1, 64, 1024, 1.0).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// The convenience accessor [`WindowedPacketOutcome::header`] returns
+    /// the same fields for either variant.
+    #[test]
+    fn windowed_packet_outcome_header_accessor() {
+        let outcome = WindowedPacketOutcome::Windowed {
+            mode_number: 3,
+            blockflag: true,
+            n: 2048,
+            previous_window_flag: true,
+            next_window_flag: false,
+            frames: Vec::new(),
+        };
+        let h = outcome.header();
+        assert_eq!(h.mode_number, 3);
+        assert!(h.blockflag);
+        assert_eq!(h.n, 2048);
+        assert!(h.previous_window_flag);
+        assert!(!h.next_window_flag);
+
+        let zeroed = WindowedPacketOutcome::ZeroedWindowed {
+            mode_number: 1,
+            blockflag: false,
+            n: 256,
+            previous_window_flag: false,
+            next_window_flag: true,
+            frames: Vec::new(),
+        };
+        let hz = zeroed.header();
+        assert_eq!(hz.mode_number, 1);
+        assert!(!hz.blockflag);
+        assert_eq!(hz.n, 256);
+        assert!(!hz.previous_window_flag);
+        assert!(hz.next_window_flag);
+    }
+
+    /// The `frames()` accessor borrows the per-channel slice from
+    /// either variant identically.
+    #[test]
+    fn windowed_packet_outcome_frames_accessor() {
+        let frames_w = vec![vec![1.0, 2.0, 3.0, 4.0]];
+        let outcome = WindowedPacketOutcome::Windowed {
+            mode_number: 0,
+            blockflag: false,
+            n: 4,
+            previous_window_flag: false,
+            next_window_flag: false,
+            frames: frames_w.clone(),
+        };
+        assert_eq!(outcome.frames(), &frames_w[..]);
+
+        let frames_z = vec![vec![0.0; 4], vec![0.0; 4]];
+        let zeroed = WindowedPacketOutcome::ZeroedWindowed {
+            mode_number: 0,
+            blockflag: false,
+            n: 4,
+            previous_window_flag: false,
+            next_window_flag: false,
+            frames: frames_z.clone(),
+        };
+        assert_eq!(zeroed.frames(), &frames_z[..]);
+    }
+
+    /// The error display strings for the new Window + Imdct variants
+    /// include the §4.3 section that owns the failure.
+    #[test]
+    fn audio_packet_error_window_and_imdct_display() {
+        let we = AudioPacketError::Window(WindowError::NotPowerOfTwo { n: 31 });
+        assert!(we.to_string().contains("§4.3.6"), "{we}");
+        let ie = AudioPacketError::Imdct(ImdctError::SpectrumNotPowerOfTwo { spectrum_len: 31 });
+        assert!(ie.to_string().contains("§4.3.7"), "{ie}");
     }
 }

@@ -1,6 +1,64 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 16.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 17.
+
+## Status — 2026-05-29 (round 17)
+
+**Round 17 landed: §4.3.7 IMDCT + §4.3.6 window wired into the per-packet
+driver.** New entry point [`decode_audio_packet_windowed`] drives
+§4.3.2..§4.3.6 via the existing [`decode_audio_packet_pre_imdct`], runs
+the §4.3.7 [`imdct::imdct_naive`] cosine-summation kernel on each
+channel's length-`n/2` spectrum to obtain the length-`n` time-domain
+frame, then element-wise multiplies by the §4.3.6 / §1.3.2 Vorbis
+window built once per packet via [`AudioPacketHeader::build_window`].
+The result is one length-`n` windowed time-domain frame per channel —
+exactly the input the §4.3.8 [`overlap::OverlapAdd::push_frame`]
+primitive expects. The convenience [`decode_one_packet_windowed`] is
+the same call shaped for "drop in to the streaming pipeline." New pure
+transform [`apply_imdct_and_window(outcome, blocksize_0, imdct_scale)`]
+lifts §4.3.7-then-§4.3.6 over an already-parsed
+[`AudioPacketOutcome`] for callers that hold one (e.g. from a buffered
+decode). New outcome enum [`WindowedPacketOutcome`] holds either
+`Windowed { frames, … }` for a normal packet or `ZeroedWindowed { frames,
+… }` for the §4.3.2 short-circuit (IMDCT of zero is zero × any window is
+still zero); both expose `header()` and `frames()` accessors.
+
+The `imdct_scale: f32` parameter on every new entry point is the
+**deferred-normalization knob** the IMDCT cross-reference document
+(`docs/audio/vorbis/imdct-cross-reference.md` §"Vorbis-specific
+parameters" item 5) names — the Vorbis-specific normalization scalar
+that maps the bare kernel to oggdec-bit-equivalent PCM. The
+cross-reference notes the scalar "falls out of matching the fixture
+traces," and the staged fixture traces under
+`docs/audio/vorbis/fixtures/<case>/trace.txt` do not yet log post-IMDCT
+samples; the scalar is therefore still pinned to caller-supplied. By
+linearity of the IMDCT kernel `imdct_scale` is a pure output multiplier:
+scaling it by α scales every returned sample by α, so a future round
+can land the fixture-derived value as a constant without changing call
+sites.
+
+11 new tests cover the windowed driver on the trivial mono synthetic
+packet (one length-`n` frame per channel; geometry pinned), the pure
+[`apply_imdct_and_window`] transform on a hand-built outcome with a
+long-block window (lead-in / tail regions exactly zero by window-edge
+construction), the §4.3.2 short-circuit (`ZeroedWindowed` returns
+per-channel all-zero length-`n` frames), the `imdct_scale` linearity
+property, the IMDCT-then-window composition matching the direct
+`imdct_naive_vec` × `vorbis_window` path bit-for-bit, end-to-end
+integration with `OverlapAdd::push_frame` (first call primes the
+overlap-add state, second emits the §4.3.8 finished-PCM range), legacy
+[`decode_one_packet`] preservation of the `ImdctStage` stop,
+[`decode_one_packet_windowed`] parity with
+[`decode_audio_packet_windowed`], accessor returns, and the new
+[`AudioPacketError::Window`] / [`AudioPacketError::Imdct`] Display
+strings. Two new error variants land on [`AudioPacketError`]
+(`Window(WindowError)` / `Imdct(ImdctError)`); both surface verbatim
+with §4.3.6 / §4.3.7 prefixes. Legacy [`decode_one_packet`] is
+preserved unchanged so callers depending on the pre-IMDCT stop are not
+broken. Test count: **274 total (263 → 274)**. With this round the
+entire §4.3 pipeline from a parsed audio-packet bitstream to PCM is
+reachable in code: only the fixture-derived `imdct_scale` constant
+remains as a documented docs gap.
 
 ## Status — 2026-05-29
 
@@ -599,27 +657,30 @@ comment header.
 
 ### What does not yet work
 
-* **§4.3.7 inverse MDCT — documented docs gap.** The Vorbis I spec
-  defers the IMDCT definition entirely to external reference `[1]`
-  (T. Sporer, K. Brandenburg, B. Edler, *The use of multirate filter
-  banks for coding of high quality digital audio*), which the workspace
-  clean-room policy bars. The window function and the §4.3.8 overlap-add
-  framing (3/4-vs-1/4 alignment, `(prev_blocksize/4 + cur_blocksize/4)`
-  return-length formula) are fully specified in §1.3.2 / §4.3.1 /
-  §4.3.8 and are already implementable on top of an IMDCT block; but
-  the Vorbis-specific MDCT normalization / sign / cos-argument offset
-  that would make a decoder byte-exact against `oggdec` is not stated
-  anywhere in `docs/audio/vorbis/`. Needs a clean-room trace doc that
-  derives the Vorbis IMDCT integration from the §1.3.2 window property
-  + a captured `MDCT_OUT` corpus, or a spec amendment that inlines the
-  formula.
-* **§4.3.8 overlap-add — landed round 15.** [`OverlapAdd`] is the
-  IMDCT-independent standalone primitive: feed it any windowed
-  time-domain frame (the §4.3.7 output) and it returns the §4.3.8
-  finished PCM range, holding the right-hand tail for the next call
-  in `prev_n / 2` samples of internal state. The IMDCT integration is
-  the last remaining wire to run; the overlap-add geometry is no
-  longer a blocker.
+* **§4.3.7 IMDCT normalization scalar — documented docs gap.** The
+  Vorbis-specific IMDCT normalization scalar that maps the bare cosine-
+  summation kernel to oggdec-bit-equivalent PCM is the only piece of
+  the §4.3 pipeline still pinned to a deferred-fixture knob. As of
+  round 17 the §4.3.7 kernel itself and the §4.3.6 window
+  multiplication are both wired into the per-packet driver via
+  [`decode_audio_packet_windowed`] and [`apply_imdct_and_window`]; the
+  Vorbis-specific normalization constant is exposed as an
+  `imdct_scale: f32` argument that defaults to caller-supplied. The
+  IMDCT cross-reference document
+  (`docs/audio/vorbis/imdct-cross-reference.md` §"Vorbis-specific
+  parameters" item 5) notes the constant "falls out of matching the
+  fixture traces" — pinning it requires the staged fixture traces under
+  `docs/audio/vorbis/fixtures/<case>/trace.txt` to extend through the
+  post-IMDCT trace point. Until then a caller passing `1.0` gets the
+  bare un-normalized kernel output × window; passing the
+  fixture-derived constant once it exists is a one-line site change.
+* **§4.3.8 overlap-add — landed round 15, integrated round 17.**
+  [`OverlapAdd`] is the IMDCT-independent standalone primitive. The
+  round-17 [`decode_audio_packet_windowed`] / [`apply_imdct_and_window`]
+  entry points now produce exactly the windowed time-domain frames
+  this primitive expects, so a per-channel
+  [`OverlapAdd::push_frame(frame)`] call chain takes the round-17
+  output the rest of the way to PCM.
 * Mapping submap channel routing at packet time (which channels feed
   which residue / floor via `[vorbis_mapping_mux]`) — **landed round
   14**: [`audio::decode_audio_packet_pre_imdct`] walks `mapping.mux[ch]`
@@ -627,14 +688,18 @@ comment header.
   for the §4.3.4 residue iteration.
 * Top-level audio-packet decode (§4.3.2..§4.3.9) tying floor + residue +
   window + coupling + dot-product + MDCT + overlap-add together. **Round
-  14 closes every stage up to §4.3.6** via
-  [`audio::decode_audio_packet_pre_imdct`] (returns an
-  [`AudioPacketOutcome::PreImdct`] with per-channel length-`n/2`
-  spectra) and stops at the §4.3.7 IMDCT docs gap; the top-level
-  [`decode_packet`] / [`audio::decode_one_packet`] entry points surface
-  the stop as [`AudioPacketError::ImdctStage`]. Only the IMDCT-blocked
-  stages remain (§4.3.7 itself + the §4.3.8 overlap-add that consumes
-  its output).
+  14 closed every stage up to §4.3.6** via
+  [`audio::decode_audio_packet_pre_imdct`] (per-channel length-`n/2`
+  pre-IMDCT spectra). **Round 17 closes §4.3.7 + §4.3.6 windowing** via
+  [`audio::decode_audio_packet_windowed`] / [`decode_one_packet_windowed`]
+  / [`apply_imdct_and_window`] (per-channel length-`n` windowed
+  time-domain frames). §4.3.8 [`OverlapAdd::push_frame`] consumes each
+  windowed frame and emits PCM. §4.3.9 channel-order rearrangement is a
+  presentation concern handled above the codec. The legacy
+  [`decode_packet`] / [`audio::decode_one_packet`] entry points are
+  preserved with the §4.3.7 boundary stop (`AudioPacketError::ImdctStage`)
+  for callers that depend on it. Only the fixture-derived
+  `imdct_scale` constant (deferred-normalization knob) remains.
 * Ogg framing (RFC 3533 + Vorbis I §A) — the parsers are currently
   bring-your-own-packet. Consuming an Ogg-encapsulated stream needs
   to be wired up via `oxideav-ogg`.
