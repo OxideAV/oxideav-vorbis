@@ -1,6 +1,52 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 17.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 18.
+
+## Status — 2026-05-29 (round 18)
+
+**Round 18 landed: multi-channel streaming PCM driver.** New module
+[`streaming`] exposes [`StreamingDecoder`] — a per-stream state machine
+holding one [`overlap::OverlapAdd`] instance per channel — that stitches
+the round-17 [`decode_audio_packet_windowed`] per-packet driver to the
+§4.3.8 overlap-add primitive across consecutive packets. The decoder is
+constructed from the identification-header fields (`audio_channels` /
+`blocksize_0` / `blocksize_1`) plus the deferred `imdct_scale`, then
+driven one packet at a time via
+[`StreamingDecoder::push_packet`]`(reader, setup, state)` (or
+[`StreamingDecoder::push_windowed`]`(outcome)` for callers that already
+hold a [`WindowedPacketOutcome`]). The first packet primes every
+per-channel overlap-add state (§4.3.8 priming step) and returns
+[`StreamingFrame::Primed`]; from the second packet on the engine emits
+[`StreamingFrame::Pcm`] holding `prev_n / 4 + cur_n / 4` finished PCM
+samples per channel (bitstream channel order — §4.3.9 rearrangement is
+a presentation concern handled above this module).
+[`StreamingDecoder::reset`] returns every per-channel state to priming
+(e.g. after a seek); [`StreamingDecoder::finish`] drains the last
+frame's right-half tail (`n / 2` samples per channel) for callers
+flushing a finite encoded clip. New error type [`StreamingError`] with
+three variants (`Packet` / `Overlap { channel, source }` /
+`ChannelCountMismatch { expected, got }`) surfaces the underlying
+failures; the umbrella [`Error::Streaming`] variant + `From` impl wire
+them up at the crate root.
+
+14 new unit tests cover construction accessors, the §4.3.8 priming step
+on a long block, the `prev_n / 4 + cur_n / 4` spec-formula return length
+for equal-sized and mixed-sized block transitions, two-channel routing
+with a per-channel ratio invariant on synthetic ramps, the defensive
+`ChannelCountMismatch` check, the `ZeroedWindowed` packet propagating
+cleanly through priming and emitting the previous-frame plateau on a
+zeroed-after-normal transition, `reset()` returning to priming, the
+`finish()` per-channel tail drain (or `None` on an unprimed engine),
+the per-packet failure surface via `StreamingError::Packet`, and the
+two non-trivial `Display` strings. Test count: **288 total
+(274 → 288)**. With this round the entire §4.3 pipeline from a parsed
+audio-packet bitstream to PCM is reachable end-to-end as a single
+[`StreamingDecoder::push_packet`] call per packet — the last
+composition step the round-17 wiring named. Only the Vorbis-specific
+IMDCT normalization scalar `imdct_scale` is still caller-supplied; the
+staged fixture traces under `docs/audio/vorbis/fixtures/<case>/trace.txt`
+do not yet log post-IMDCT samples, so pinning that constant remains a
+documented docs gap.
 
 ## Status — 2026-05-29 (round 17)
 

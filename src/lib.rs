@@ -59,6 +59,12 @@
 //! IMDCT normalization scalar (a deferred-fixture concern) is still
 //! pinned via an explicit `imdct_scale: f32` knob; the full §4.3
 //! pipeline-up-to-overlap-add is now reachable from a parsed packet.
+//! Round 18 lands the multi-channel streaming PCM driver:
+//! [`StreamingDecoder`] holds one [`overlap::OverlapAdd`] instance per
+//! channel and stitches consecutive per-packet windowed outcomes into
+//! finished PCM samples (§4.3.8 across packets), closing the last
+//! composition step from a parsed audio-packet bitstream to per-channel
+//! PCM; see [`streaming`].
 
 #![warn(missing_debug_implementations)]
 
@@ -76,6 +82,7 @@ pub mod overlap;
 pub mod packet;
 pub mod residue;
 pub mod setup;
+pub mod streaming;
 pub mod synthesis;
 pub mod vq;
 
@@ -113,6 +120,7 @@ pub use setup::{
     ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader, SETUP_PACKET_MAGIC,
     SETUP_PACKET_TYPE,
 };
+pub use streaming::{StreamingDecoder, StreamingError, StreamingFrame};
 pub use synthesis::{
     couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window, CouplingError,
     WindowError,
@@ -166,6 +174,11 @@ pub enum Error {
     /// decode failure, inverse coupling, dot product), or stopped at the
     /// §4.3.7 inverse-MDCT docs-gap boundary.
     AudioPacket(AudioPacketError),
+    /// The multi-channel streaming driver
+    /// ([`crate::streaming::StreamingDecoder`]) failed at either the
+    /// per-packet stage, the per-channel §4.3.8 overlap-add stage, or
+    /// the defensive channel-count mismatch check.
+    Streaming(StreamingError),
 }
 
 impl core::fmt::Display for Error {
@@ -191,6 +204,7 @@ impl core::fmt::Display for Error {
             Error::Overlap(e) => write!(f, "{e}"),
             Error::Imdct(e) => write!(f, "{e}"),
             Error::AudioPacket(e) => write!(f, "{e}"),
+            Error::Streaming(e) => write!(f, "{e}"),
         }
     }
 }
@@ -214,6 +228,7 @@ impl std::error::Error for Error {
             Error::Overlap(e) => Some(e),
             Error::Imdct(e) => Some(e),
             Error::AudioPacket(e) => Some(e),
+            Error::Streaming(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -312,6 +327,12 @@ impl From<ImdctError> for Error {
 impl From<AudioPacketError> for Error {
     fn from(value: AudioPacketError) -> Self {
         Error::AudioPacket(value)
+    }
+}
+
+impl From<StreamingError> for Error {
+    fn from(value: StreamingError) -> Self {
+        Error::Streaming(value)
     }
 }
 

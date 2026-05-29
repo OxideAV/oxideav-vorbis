@@ -29,6 +29,46 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I multi-channel streaming PCM driver (round 18).** New module
+  `streaming` exposes `StreamingDecoder` — a per-stream state machine
+  holding one `crate::overlap::OverlapAdd` instance per channel — that
+  stitches the round-17 `decode_audio_packet_windowed` per-packet driver
+  to the §4.3.8 overlap-add primitive across consecutive packets. The
+  decoder is constructed from the identification-header fields
+  (`audio_channels` / `blocksize_0` / `blocksize_1`) plus the deferred
+  `imdct_scale`, then driven one packet at a time via
+  `push_packet(reader, setup, state)` (or `push_windowed(outcome)` for
+  callers that already hold a `WindowedPacketOutcome`). The first packet
+  primes every per-channel overlap-add state (§4.3.8 priming step) and
+  returns `StreamingFrame::Primed`; from the second packet on the
+  engine emits `StreamingFrame::Pcm { mode_number, blockflag, n,
+  per_channel_pcm }` carrying the `prev_n / 4 + cur_n / 4` finished PCM
+  samples per channel (in bitstream channel order — §4.3.9
+  rearrangement is left to the consumer). `reset()` returns every
+  per-channel state to priming (e.g. after a seek); `finish()` drains
+  the last frame's right-half tail (`n / 2` samples per channel) for
+  callers flushing a finite encoded clip. New error type
+  `StreamingError` with three variants (`Packet(AudioPacketError)` /
+  `Overlap { channel, source: OverlapError }` / `ChannelCountMismatch
+  { expected, got }`) wires the underlying failures up; umbrella
+  `Error::Streaming(StreamingError)` + `From<StreamingError> for Error`
+  surface them at the top level. 14 new unit tests cover the
+  construction accessors, the §4.3.8 priming step, the spec-formula
+  return length (`prev_n / 4 + cur_n / 4`) for equal-sized and
+  mixed-sized block transitions, multi-channel routing with a
+  channel-ratio invariant on synthetic per-channel ramps, the
+  `ChannelCountMismatch` defensive check, the `ZeroedWindowed` packet
+  propagation (preserves geometry through priming, emits per-channel
+  zero PCM with the previous-frame plateau preserved on a zeroed-after-
+  normal transition), `reset()` returning to priming, `finish()`
+  emitting per-channel right-half tails (or `None` on an unprimed
+  engine), and the `StreamingError::Display` strings for both the
+  channel-count-mismatch variant and the per-channel overlap-add
+  failure. Per-packet driver failures surface verbatim via
+  `StreamingError::Packet`. With this round the entire §4.3 pipeline
+  from a parsed audio-packet bitstream to PCM is reachable end-to-end
+  as a single `StreamingDecoder::push_packet` call per packet — the
+  last composition step the round-17 wiring named.
 * **Vorbis I §4.3.7 IMDCT + §4.3.6 windowing wired into the per-packet
   driver (round 17).** New entry points `decode_audio_packet_windowed`
   (drives §4.3.2..§4.3.6 via `decode_audio_packet_pre_imdct`, runs the
