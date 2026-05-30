@@ -4,6 +4,13 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.9...v0.0.10) - 2026-05-30
+
+### Other
+
+- §4.2.1/§4.3.1 classifier + unified header dispatcher (round 19)
+- add multi-channel §4.3.8 PCM driver (round 18)
+
 ### Added
 
 * **Vorbis I §4.2.1 / §4.3.1 packet-kind classifier + unified header
