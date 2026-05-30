@@ -4,6 +4,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Vorbis I §4.2.1 / §4.3.1 packet-kind classifier + unified header
+  dispatcher (round 19).** New module `packet_kind` exposes
+  `classify_packet`, a cheap byte-0 / six-byte-magic inspection that
+  resolves a raw Vorbis packet payload to one of the four `PacketKind`
+  variants (`Identification` / `Comment` / `Setup` / `Audio`) without
+  parsing the body; header packets are recognised by the §4.2.1 common
+  header (`0x01` / `0x03` / `0x05` followed by ASCII `"vorbis"`),
+  audio packets by the §4.3.1 step-1 `[packet_type]` bit (LSB of byte 0
+  == 0). The companion `parse_header_packet` dispatcher classifies and
+  then delegates to `parse_identification_header` /
+  `parse_comment_header` / `parse_setup_header`, returning the parsed
+  result in a `HeaderPacket` sum with `identification()` / `comment()` /
+  `setup()` borrow accessors. New error types `ClassifyError` (empty,
+  unknown-odd, too-short-for-magic, bad-magic) and
+  `HeaderDispatchError` (classify + expected-header-got-audio +
+  sub-parser pass-through) are wired into the umbrella
+  `Error::Classify` / `Error::HeaderDispatch` variants. 24 new unit
+  tests bring the total to **312 (288 → 312)**.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.8...v0.0.9) - 2026-05-29
 
 ### Other

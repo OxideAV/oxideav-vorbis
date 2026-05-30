@@ -65,6 +65,14 @@
 //! finished PCM samples (§4.3.8 across packets), closing the last
 //! composition step from a parsed audio-packet bitstream to per-channel
 //! PCM; see [`streaming`].
+//! Round 19 adds the §4.2.1 / §4.3.1 packet-kind classifier and the
+//! unified header-packet dispatcher: [`classify_packet`] resolves a
+//! raw packet payload to one of the four [`PacketKind`] variants
+//! (`Identification` / `Comment` / `Setup` / `Audio`) by inspecting
+//! the §4.2.1 common-header prelude or, for audio packets, the
+//! §4.3.1 step-1 `[packet_type]` bit; [`parse_header_packet`] then
+//! delegates to the matching per-header sub-parser and returns the
+//! parsed result in a [`HeaderPacket`] sum. See [`packet_kind`].
 
 #![warn(missing_debug_implementations)]
 
@@ -80,6 +88,7 @@ pub mod identification;
 pub mod imdct;
 pub mod overlap;
 pub mod packet;
+pub mod packet_kind;
 pub mod residue;
 pub mod setup;
 pub mod streaming;
@@ -112,6 +121,10 @@ pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
     PacketError, PacketHeaderStage, VectorKind,
+};
+pub use packet_kind::{
+    classify_packet, parse_header_packet, ClassifyError, HeaderDispatchError, HeaderPacket,
+    PacketKind,
 };
 pub use residue::{ResidueDecoder, ResidueError};
 pub use setup::{
@@ -179,6 +192,15 @@ pub enum Error {
     /// per-packet stage, the per-channel §4.3.8 overlap-add stage, or
     /// the defensive channel-count mismatch check.
     Streaming(StreamingError),
+    /// The §4.2.1 / §4.3.1 packet-kind classifier
+    /// ([`crate::packet_kind::classify_packet`]) failed to identify
+    /// a packet from its byte-0 / magic prelude.
+    Classify(ClassifyError),
+    /// The unified header-packet dispatcher
+    /// ([`crate::packet_kind::parse_header_packet`]) failed at the
+    /// classification step, on an unexpected audio packet, or in one
+    /// of the three header sub-parsers.
+    HeaderDispatch(HeaderDispatchError),
 }
 
 impl core::fmt::Display for Error {
@@ -205,6 +227,8 @@ impl core::fmt::Display for Error {
             Error::Imdct(e) => write!(f, "{e}"),
             Error::AudioPacket(e) => write!(f, "{e}"),
             Error::Streaming(e) => write!(f, "{e}"),
+            Error::Classify(e) => write!(f, "{e}"),
+            Error::HeaderDispatch(e) => write!(f, "{e}"),
         }
     }
 }
@@ -229,6 +253,8 @@ impl std::error::Error for Error {
             Error::Imdct(e) => Some(e),
             Error::AudioPacket(e) => Some(e),
             Error::Streaming(e) => Some(e),
+            Error::Classify(e) => Some(e),
+            Error::HeaderDispatch(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -333,6 +359,18 @@ impl From<AudioPacketError> for Error {
 impl From<StreamingError> for Error {
     fn from(value: StreamingError) -> Self {
         Error::Streaming(value)
+    }
+}
+
+impl From<ClassifyError> for Error {
+    fn from(value: ClassifyError) -> Self {
+        Error::Classify(value)
+    }
+}
+
+impl From<HeaderDispatchError> for Error {
+    fn from(value: HeaderDispatchError) -> Self {
+        Error::HeaderDispatch(value)
     }
 }
 

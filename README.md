@@ -1,6 +1,41 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 18.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 19.
+
+## Status — 2026-05-30 (round 19)
+
+**Round 19 landed: §4.2.1 / §4.3.1 packet-kind classifier + unified
+header-packet dispatcher.** New module [`packet_kind`] exposes
+[`classify_packet`] — a cheap byte-0 / six-byte-magic inspection that
+resolves a raw Vorbis packet payload to one of the four
+[`PacketKind`] variants (`Identification` / `Comment` / `Setup` /
+`Audio`) without parsing the body. Header packets are recognised by
+the §4.2.1 common-header prelude (`0x01` / `0x03` / `0x05` followed by
+the ASCII string `"vorbis"`); audio packets are recognised by the
+§4.3.1 step-1 `[packet_type]` bit (LSB of byte 0 == 0). The companion
+[`parse_header_packet`] dispatcher classifies and then delegates to
+the matching per-header sub-parser, returning the result in a
+[`HeaderPacket`] sum whose `identification()` / `comment()` /
+`setup()` accessors borrow the parsed body. Error types
+[`ClassifyError`] (four byte-0 / magic-level rejection cases) and
+[`HeaderDispatchError`] (classification failure plus the three
+sub-parser failures plus the "expected header, got audio" defensive
+variant) are wired into the umbrella `Error::Classify` /
+`Error::HeaderDispatch` variants for ergonomic propagation. 24 new
+unit tests cover empty / single-byte / every-even-first-byte audio
+classification, the three header packet-type happy paths, every
+odd-but-unknown packet-type rejection, the too-short-for-magic case
+for every header packet-type at every truncated length, the bad-magic
+rejection (uppercase "VORBIS"), the [`PacketKind`] helper methods
+(`is_header` / `is_audio` / `packet_type_byte` / `Display`), the
+[`parse_header_packet`] happy paths on a hand-built 30-byte
+identification packet and a comment packet, the
+"expected-header-got-audio" defensive variant, the empty / bad-magic
+classify-error surfacing through the dispatcher, the per-sub-parser
+body-error surfacing (`UnsupportedVorbisVersion` for identification,
+short-vendor-length for comment), the `From<ClassifyError>` lift, the
+two non-trivial `Display` strings, and the [`std::error::Error::source`]
+chain. Test count: **312 total (288 → 312)**.
 
 ## Status — 2026-05-29 (round 18)
 
