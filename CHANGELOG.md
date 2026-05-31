@@ -4,6 +4,51 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Vorbis I header-packet WRITE primitives — first encoder-side
+  functions (round 20, umbrella round 195).** New module `encoder`
+  exposes `write_identification_header` and `write_comment_header`.
+  Each is the byte-exact inverse of its round-1 / round-2 parser
+  counterpart and honours the bit-exact roundtrip property
+  `parse_(...)_header(&write_(...)_header(&x)?)? == x` for every
+  legal input. Both functions validate the same §4.2.2 / §5.2.1
+  invariants their parser counterparts enforce on input
+  (`vorbis_version == 0`, nonzero channels and sample rate, blocksize
+  exponents in 6..=13, `blocksize_0 <= blocksize_1`,
+  `u32`-representable vendor / comment lengths and count) and refuse
+  the call with a structured `WriteError` (eight variants:
+  `UnsupportedVorbisVersion`, `ZeroChannels`, `ZeroSampleRate`,
+  `IllegalBlocksize`, `BlocksizesOutOfOrder`, `CommentTooLong`,
+  `VendorTooLong`, `TooManyComments`) rather than emit a malformed
+  packet. Layout sources: `docs/audio/vorbis/Vorbis_I_spec.pdf`
+  §4.2.1 (common header), §4.2.2 (identification layout), §5.2.1 /
+  §5.2.3 (comment encoding), §2.1.4 (LSB-first packing collapsing to
+  little-endian byte order for octet-aligned fields), §2.1.8 (framing
+  byte's seven high bits are zero padding). 31 new unit tests cover
+  byte-shape pinning for `mono-44100-q5-typical` and the 63-byte
+  one-comment packet shape, bit-exact roundtrip on five canonical
+  identification fixtures (mono-44100 q5, 5.1-channel 48000 q5,
+  negative bitrate hints, equal-blocksize spec-minimum 64-sample,
+  spec-maximum 8192-sample, 255-channel upper edge), an exhaustive
+  sweep of every legal `(blocksize_0_exp, blocksize_1_exp)` pair (36
+  combinations) confirming the byte-28 nibble pack roundtrips,
+  bit-exact roundtrip on seven canonical comment fixtures (typical
+  one-comment, seven-comment `with-vorbis-comment-tags` shape, empty
+  vendor + zero comments, empty vendor + one comment, multi-byte
+  UTF-8 vendor, multi-byte UTF-8 in comments, duplicate keys, 32 KiB
+  long payload), comment-ordering preservation, the closed-form
+  `7 + 4 + V + 4 + sum(4 + C_i) + 1` byte-length formula across four
+  shapes, every `WriteError` rejection variant, the
+  `WriteError::Display` non-emptiness smoke test for all eight
+  variants, the `std::error::Error::source` leaf check, and the
+  `exponent_of_power_of_two` helper on every legal exponent and on
+  six non-power-of-two cases. The umbrella `Error` enum grows an
+  `Error::Write(WriteError)` variant with `From<WriteError> for Error`
+  glue. Test count: **343 total (312 → 343)**. Audio-packet WRITE
+  and codebook / floor / residue / mapping / mode WRITE primitives
+  are explicit followups for subsequent rounds.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.9...v0.0.10) - 2026-05-30
 
 ### Other

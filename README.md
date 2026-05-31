@@ -1,6 +1,44 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 19.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 20.
+
+## Status — 2026-05-31 (round 20, umbrella round 195)
+
+**Round 20 landed: the first concrete encoder-side primitive — a pair
+of header-packet WRITE functions.** New module [`encoder`] exposes
+[`write_identification_header`] and [`write_comment_header`]. Each is
+the byte-exact inverse of the round-1 / round-2 parser
+([`parse_identification_header`] / [`parse_comment_header`]) and
+honours the bit-exact roundtrip property
+`parse_(...)_header(&write_(...)_header(&x)?)? == x` for every legal
+input. Both functions validate the same §4.2.2 / §5.2.1 invariants
+their parser counterparts enforce on input (vorbis_version == 0,
+nonzero channels and sample rate, blocksize exponents in 6..=13,
+`blocksize_0 <= blocksize_1`, `u32`-representable vendor/comment
+lengths and counts) and refuse the call with a structured
+[`WriteError`] rather than emit a malformed packet. The packet bytes
+are pinned with explicit byte-shape assertions (byte 28 nibble pack +
+byte 29 framing flag for identification; `u32` LE length prefixes +
+raw UTF-8 + framing byte for comment), so the encoded packet matches
+the §4.2.1 / §4.2.2 / §5.2.1 / §5.2.3 layout independently of the
+parser-roundtrip path. 31 new unit tests cover the spec-fixture
+shapes from `docs/audio/vorbis/vorbis-fixtures-and-traces.md` §2.1 /
+§2.2 (`mono-44100-q5-typical`, `5.1-channel-48000-q5`,
+`with-vorbis-comment-tags`), every `(blocksize_0_exp, blocksize_1_exp)`
+pair with `bs0 <= bs1` (36 combinations) sweep-tested through a single
+test, max-channel-count (255) edge, signed bitrate-hint roundtrip,
+spec-min / spec-max blocksizes, empty vendor + zero comments, empty
+vendor + one comment, multi-byte UTF-8 in both vendor and comments,
+duplicate-key comment ordering preservation, a 32 KiB comment-payload
+allocation path, the closed-form byte-length formula
+`7 + 4 + V + 4 + sum(4 + C_i) + 1`, every `WriteError` rejection variant,
+the `WriteError::Display` non-emptiness smoke test, and the
+`exponent_of_power_of_two` helper. Test count: **343 total
+(312 → 343)**. The umbrella [`Error`] gains an `Error::Write(WriteError)`
+variant with the matching `From` glue. With this round the crate's
+public surface grows its first WRITE-side functions; audio-packet
+WRITE, codebook WRITE, and floor / residue / mapping / mode WRITE
+primitives remain explicit followups for subsequent rounds.
 
 ## Status — 2026-05-30 (round 19)
 

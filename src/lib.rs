@@ -73,6 +73,20 @@
 //! §4.3.1 step-1 `[packet_type]` bit; [`parse_header_packet`] then
 //! delegates to the matching per-header sub-parser and returns the
 //! parsed result in a [`HeaderPacket`] sum. See [`packet_kind`].
+//!
+//! Round 20 (umbrella round 195) lands the first concrete encoder-
+//! side primitive: a pair of header-packet WRITE functions. See
+//! [`encoder`]. [`write_identification_header`] serialises a
+//! [`VorbisIdentificationHeader`] to the fixed 30-byte §4.2.2 packet
+//! shape, and [`write_comment_header`] serialises a
+//! [`VorbisCommentHeader`] to the variable-length §5.2.1 packet
+//! shape. Both functions validate the same spec-mandated invariants
+//! their corresponding parsers enforce on input, so the bit-exact
+//! roundtrip property
+//! `parse_(...)_header(&write_(...)_header(&x)?)? == x` is
+//! guaranteed for every legal input. Audio-packet WRITE and codebook
+//! / floor / residue / mapping / mode WRITE primitives are explicit
+//! followups.
 
 #![warn(missing_debug_implementations)]
 
@@ -81,6 +95,7 @@ use oxideav_core::RuntimeContext;
 pub mod audio;
 pub mod codebook;
 pub mod comment;
+pub mod encoder;
 pub mod floor0;
 pub mod floor1;
 pub mod huffman;
@@ -106,6 +121,7 @@ pub use codebook::{
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
+pub use encoder::{write_comment_header, write_identification_header, WriteError};
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
@@ -201,6 +217,13 @@ pub enum Error {
     /// classification step, on an unexpected audio packet, or in one
     /// of the three header sub-parsers.
     HeaderDispatch(HeaderDispatchError),
+    /// A header-packet writer
+    /// ([`crate::encoder::write_identification_header`] or
+    /// [`crate::encoder::write_comment_header`]) rejected its input
+    /// because the supplied struct fails one of the §4.2.2 / §5.2.1
+    /// invariants the encoder is contracted to refuse rather than
+    /// emit a malformed packet.
+    Write(WriteError),
 }
 
 impl core::fmt::Display for Error {
@@ -229,6 +252,7 @@ impl core::fmt::Display for Error {
             Error::Streaming(e) => write!(f, "{e}"),
             Error::Classify(e) => write!(f, "{e}"),
             Error::HeaderDispatch(e) => write!(f, "{e}"),
+            Error::Write(e) => write!(f, "{e}"),
         }
     }
 }
@@ -255,6 +279,7 @@ impl std::error::Error for Error {
             Error::Streaming(e) => Some(e),
             Error::Classify(e) => Some(e),
             Error::HeaderDispatch(e) => Some(e),
+            Error::Write(e) => Some(e),
             Error::NotImplemented => None,
         }
     }
@@ -371,6 +396,12 @@ impl From<ClassifyError> for Error {
 impl From<HeaderDispatchError> for Error {
     fn from(value: HeaderDispatchError) -> Self {
         Error::HeaderDispatch(value)
+    }
+}
+
+impl From<WriteError> for Error {
+    fn from(value: WriteError) -> Self {
+        Error::Write(value)
     }
 }
 
