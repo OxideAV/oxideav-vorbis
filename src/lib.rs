@@ -84,9 +84,26 @@
 //! their corresponding parsers enforce on input, so the bit-exact
 //! roundtrip property
 //! `parse_(...)_header(&write_(...)_header(&x)?)? == x` is
-//! guaranteed for every legal input. Audio-packet WRITE and codebook
-//! / floor / residue / mapping / mode WRITE primitives are explicit
-//! followups.
+//! guaranteed for every legal input.
+//!
+//! Round 21 (umbrella round 201) lands the first nested-block writer:
+//! [`write_codebook`] serialises a [`VorbisCodebook`] to the §3.2.1
+//! codebook-header bitstream shape, plus the encoder-side §9.2.2
+//! companion [`float32_pack`] that inverts the existing
+//! [`float32_unpack`]. The writer picks the densest legal length
+//! encoding (ordered / dense unordered / sparse unordered) per the
+//! codebook's content and validates every §3.2.1 invariant
+//! (`entries > 0`, length table well-sized, used lengths in `1..=32`,
+//! `value_bits ∈ 1..=16`, multiplicand fits its field, ordered
+//! requires no unused entries + non-decreasing lengths, lookup-type-1
+//! count matches `lookup1_values()`, lookup-type-2 count matches
+//! `entries × dimensions`, packed-float representability). The
+//! round-trip property
+//! `parse_codebook(&mut BitReaderLsb::new(&write_codebook(&book)?))? == book`
+//! holds for every legal input across all three length encodings and
+//! all three lookup types. Audio-packet WRITE and floor / residue /
+//! mapping / mode WRITE primitives plus the setup-header splice are
+//! explicit followups.
 
 #![warn(missing_debug_implementations)]
 
@@ -116,12 +133,16 @@ pub use audio::{
     AudioPacketOutcome, WindowedPacketOutcome,
 };
 pub use codebook::{
-    parse_codebook, ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
+    float32_pack, float32_unpack, ilog, lookup1_values, parse_codebook,
+    ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
 };
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
-pub use encoder::{write_comment_header, write_identification_header, WriteError};
+pub use encoder::{
+    write_codebook, write_comment_header, write_identification_header, WriteCodebookError,
+    WriteError,
+};
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
@@ -157,7 +178,7 @@ pub use synthesis::{
 pub use vq::{unpack_vector, UnpackError as VqUnpackError};
 
 /// Crate-local error type for the in-progress clean-room rebuild.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     /// A code path is reachable in the public surface but its
     /// implementation has not yet landed in any round.

@@ -6,6 +6,63 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §3.2.1 codebook WRITE primitive + §9.2.2 `float32_pack`
+  encoder-side companion (round 21, umbrella round 201).** New public
+  function `encoder::write_codebook` serialises a `VorbisCodebook`
+  (the round-3 parser's output type) to the §3.2.1 codebook-header
+  bitstream shape. The writer picks the densest legal length
+  encoding from the codebook's content per the auto policy:
+  any `UNUSED_ENTRY` sentinel forces sparse unordered, otherwise
+  non-decreasing lengths choose ordered, otherwise dense unordered.
+  The bit-exact roundtrip property
+  `parse_codebook(&mut BitReaderLsb::new(&write_codebook(&book)?))?
+  == book` holds for every legal input across all three length
+  encodings and all three lookup types (None / Lattice / Tessellation).
+  `WriteCodebookError` enumerates eleven §3.2.1 / §9.2.2 invariant
+  violations (`ZeroEntries`, `LengthTableMismatch`,
+  `IllegalCodewordLength`, `IllegalValueBits`, `MultiplicandOverflow`,
+  `LatticeMultiplicandCountMismatch`,
+  `TessellationMultiplicandCountMismatch`,
+  `UnrepresentableLookupFloat`, `OrderedHasUnusedEntries`,
+  `OrderedNotMonotonic`, `LookupCountOverflow`); each refuses the
+  call without emitting any bits rather than serialise a packet the
+  parser would reject. The `codebook` module gains the §9.2.2 encoder
+  companion `float32_pack(f32) -> Option<u32>` that inverts the
+  existing `float32_unpack`: zero packs to the canonical all-zero
+  container, non-finite inputs are rejected, mantissa is canonicalised
+  by stripping trailing zero bits, and the function returns `None` for
+  values whose 21-bit mantissa or 10-bit biased exponent would
+  overflow. The umbrella `WriteError` enum grows a
+  `WriteError::Codebook(WriteCodebookError)` variant with the matching
+  `From` glue; the `codebook` module now re-exports `float32_pack`,
+  `float32_unpack`, `ilog`, and `lookup1_values` so the encoder side
+  can reach them without a private path. 35 new tests cover the
+  §9.2.2 pack helper (zero, ±1, sign bit, non-finite rejection,
+  spread of canonical roundtrip values, unrepresentable-decimal
+  rejection, mantissa-overflow rejection, repack idempotence),
+  bit-exact roundtrip on nine codebook shapes (dense unordered §3.2.1
+  worked example, sparse with unused entries, ordered monotonic,
+  lookup-type-2 tessellation, lookup-type-1 lattice, non-trivial
+  floats in the lookup table, `value_bits = 16` edge, single-entry
+  edge, trace-doc §3 fixture shape), three picker pinning tests
+  (sparse forced by unused, monotonic forced to ordered, non-monotonic
+  forced to dense unordered), the byte-shape sync-pattern-first
+  invariant, every `WriteCodebookError` rejection variant
+  (`ZeroEntries`, `LengthTableMismatch`, `IllegalCodewordLength`,
+  `IllegalValueBits` at both ends, `MultiplicandOverflow`,
+  `TessellationMultiplicandCountMismatch`,
+  `LatticeMultiplicandCountMismatch`, `UnrepresentableLookupFloat` on
+  both `minimum_value` and `delta_value`), two bit-length
+  hand-computed formula checks (dense + sparse), and the
+  `WriteError::Codebook` `From` glue with `source()` chaining. The
+  module-level lib.rs `Error` enum loses its `Eq` bound (now
+  `Clone + PartialEq` only) because
+  `WriteCodebookError::UnrepresentableLookupFloat` carries an `f32`;
+  no public-API consumers within the crate or downstream depend on
+  `Eq` for this type. Test count: **378 total (343 → 378, +35)**.
+  Audio-packet WRITE and floor / residue / mapping / mode WRITE
+  primitives plus the setup-header splice are explicit followups.
+
 * **Vorbis I header-packet WRITE primitives — first encoder-side
   functions (round 20, umbrella round 195).** New module `encoder`
   exposes `write_identification_header` and `write_comment_header`.

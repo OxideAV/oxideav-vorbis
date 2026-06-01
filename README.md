@@ -1,6 +1,45 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 20.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 21.
+
+## Status — 2026-06-01 (round 21, umbrella round 201)
+
+**Round 21 landed: the §3.2.1 codebook WRITE primitive plus the §9.2.2
+encoder-side `float32_pack` companion.** New public function
+[`encoder::write_codebook`] serialises a [`VorbisCodebook`] (the
+round-3 parser's output type) to the §3.2.1 codebook-header bitstream
+shape, picking the densest legal length encoding from the codebook's
+content (any `UNUSED_ENTRY` ⇒ sparse unordered; otherwise
+non-decreasing lengths ⇒ ordered; otherwise dense unordered). The
+bit-exact roundtrip property
+`parse_codebook(&mut BitReaderLsb::new(&write_codebook(&book)?))? == book`
+holds for every legal input across all three length encodings and all
+three lookup types (`VqLookup::None` / `Lattice` / `Tessellation`). A
+new [`WriteCodebookError`] enumerates eleven §3.2.1 / §9.2.2 invariant
+violations and the writer refuses the call rather than emit a packet
+the parser would reject. The [`codebook`] module gains
+[`float32_pack`] — encoder-side inverse of the existing
+[`float32_unpack`] — and re-exports `float32_unpack`, `ilog`,
+`lookup1_values` so the encoder module can reach them. The umbrella
+[`WriteError`] grows a `WriteError::Codebook(WriteCodebookError)`
+variant; the module-level `Error` enum drops its `Eq` bound (still
+`Clone + PartialEq`) because the new error carries an `f32`. 35 new
+tests bring the in-module suite to **378 (343 → 378)**: §9.2.2 pack
+helper coverage (zero / ±1 / sign / non-finite rejection / canonical
+roundtrip / unrepresentable-decimal rejection / mantissa-overflow
+rejection / repack idempotence), bit-exact roundtrip on nine
+codebook shapes (the §3.2.1 worked-example `[2, 4, 4, 4, 4, 2, 3, 3]`,
+sparse with unused entries, ordered monotonic, lookup-type-2
+tessellation, lookup-type-1 lattice, non-trivial lookup floats,
+`value_bits = 16` edge, single-entry edge, the trace-doc §3
+fixture-style 8-dim/8-entry sparse-with-lookup-type-2 shape), three
+encoding-picker pinning tests, the sync-pattern-first byte-shape
+check, every `WriteCodebookError` rejection variant, two
+hand-computed bit-length formulas (dense + sparse), and the
+`WriteError::Codebook` `From` + `source()` chain. Audio-packet WRITE
+and floor / residue / mapping / mode WRITE primitives plus the
+setup-header splice (which `write_codebook_into_writer` is already
+shaped to support) are explicit followups.
 
 ## Status — 2026-05-31 (round 20, umbrella round 195)
 

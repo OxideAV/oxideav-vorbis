@@ -266,6 +266,101 @@ pub fn float32_unpack(x: u32) -> f32 {
     (signed as f32) * (2.0f32).powi(exponent - 788)
 }
 
+/// Encoder-side companion to [`float32_unpack`]: pack a finite host
+/// `f32` into the Vorbis I §9.2.2 32-bit container.
+///
+/// §9.2.2 only defines the unpack direction; this helper is the
+/// arithmetic inverse, packing a finite `f32` as
+/// `(sign, mantissa, exponent)` such that
+/// `float32_unpack(float32_pack(x)) == x` for every finite `x`
+/// whose magnitude fits in the §9.2.2 range. The container has:
+///
+/// * 21-bit unsigned mantissa (`0..=0x1f_ffff`),
+/// * 10-bit unsigned biased exponent (`0..=0x3ff`), bias 788,
+/// * 1-bit sign in the MSB.
+///
+/// Special cases:
+///
+/// * `x == 0.0` (positive or negative zero) → returns `0` (the
+///   canonical zero representation; §9.2.2 produces `0.0` for
+///   container value `0`).
+/// * Non-finite inputs (NaN / ±∞) → `None`. §9.2.2 has no
+///   representation for these.
+/// * `|x|` smaller than the smallest representable magnitude
+///   (`1 * 2^-788`) → `None`. The container has no subnormal range
+///   beyond `mantissa = 1, exponent = 0`.
+/// * `|x|` larger than the largest representable magnitude
+///   (`0x1f_ffff * 2^(1023 - 788)`) → `None`.
+///
+/// Round-trip equality `float32_unpack(float32_pack(x).unwrap()) == x`
+/// holds only for `x` already expressible as an integer mantissa
+/// `m ∈ -2_097_151..=2_097_151` times a power of two — which is
+/// exactly the set of values §9.2.2 can carry. Lossy-input quantizing
+/// is the encoder's job, not this primitive's.
+#[must_use]
+pub fn float32_pack(x: f32) -> Option<u32> {
+    if x == 0.0 {
+        // Both ±0 collapse to the canonical zero container; §9.2.2 of
+        // the unpack reproduces 0.0 from a fully-zero u32.
+        return Some(0);
+    }
+    if !x.is_finite() {
+        return None;
+    }
+    // Decompose |x| into IEEE-754 mantissa + exponent, then re-scale
+    // to fit the §9.2.2 21-bit unsigned mantissa container.
+    let sign_bit: u32 = if x.is_sign_negative() { 0x8000_0000 } else { 0 };
+    let abs = x.abs();
+
+    // f32 bit layout: 1 sign + 8 exp (bias 127) + 23 mantissa.
+    let bits = abs.to_bits();
+    let ieee_exp = ((bits >> 23) & 0xff) as i32;
+    let ieee_mant = bits & 0x007f_ffff;
+
+    // Reconstruct (mantissa, unbiased_exp) such that
+    // abs == mantissa * 2^unbiased_exp with mantissa as the smallest
+    // integer that exactly represents the value.
+    //
+    // Normal IEEE: value = (1 + ieee_mant * 2^-23) * 2^(ieee_exp - 127)
+    //                    = (2^23 + ieee_mant) * 2^(ieee_exp - 127 - 23)
+    // Subnormal (ieee_exp == 0): value = ieee_mant * 2^(1 - 127 - 23)
+    //                                  = ieee_mant * 2^-149
+    let (mut int_mant, mut unbiased_exp): (u32, i32) = if ieee_exp == 0 {
+        // Subnormal — including denormalised inputs.
+        if ieee_mant == 0 {
+            // Handled by the `x == 0.0` early-return above.
+            unreachable!("zero already handled");
+        }
+        (ieee_mant, -149)
+    } else {
+        // Normal — re-attach the implicit leading 1.
+        (ieee_mant | (1 << 23), ieee_exp - 127 - 23)
+    };
+
+    // Strip trailing zero bits of the mantissa to get the canonical
+    // (smallest integer mantissa, matching exponent) representation —
+    // §9.2.2 has no preferred normalisation, but the smallest mantissa
+    // gives us the most headroom against the 21-bit field.
+    while int_mant != 0 && (int_mant & 1) == 0 {
+        int_mant >>= 1;
+        unbiased_exp += 1;
+    }
+
+    // §9.2.2: value = mantissa * 2^(stored_exponent - 788), so
+    // stored_exponent = unbiased_exp + 788.
+    let stored_exp = unbiased_exp + 788;
+    if !(0..=1023).contains(&stored_exp) {
+        return None;
+    }
+
+    // §9.2.2 21-bit mantissa container limit.
+    if int_mant > 0x001f_ffff {
+        return None;
+    }
+
+    Some(sign_bit | ((stored_exp as u32) << 21) | int_mant)
+}
+
 /// `lookup1_values(entries, dimensions)` per Vorbis I §9.2.3: the
 /// greatest integer `n` such that `n.pow(dimensions) <= entries`.
 ///
@@ -512,6 +607,139 @@ mod tests {
     fn float32_unpack_unit() {
         let x: u32 = (788u32 << 21) | 1;
         assert_eq!(float32_unpack(x), 1.0);
+    }
+
+    // ---- §9.2.2 float32_pack (encoder-side companion) ----
+
+    /// Zero (both signs) packs to the canonical all-zero container,
+    /// and the container's unpack reproduces `0.0`.
+    #[test]
+    fn float32_pack_zero() {
+        assert_eq!(float32_pack(0.0), Some(0));
+        assert_eq!(float32_pack(-0.0), Some(0));
+        assert_eq!(float32_unpack(0), 0.0);
+    }
+
+    /// `float32_pack(1.0)` produces the canonical unit container —
+    /// mantissa = 1, stored_exponent = 788 — matching the
+    /// `float32_unpack_unit` test on the parser side.
+    #[test]
+    fn float32_pack_one() {
+        let packed = float32_pack(1.0).expect("must pack");
+        assert_eq!(packed, (788u32 << 21) | 1);
+        assert_eq!(float32_unpack(packed), 1.0);
+    }
+
+    /// Negative inputs set the §9.2.2 sign bit.
+    #[test]
+    fn float32_pack_negative_one() {
+        let packed = float32_pack(-1.0).expect("must pack");
+        assert_eq!(packed, 0x8000_0000 | (788u32 << 21) | 1);
+        assert_eq!(float32_unpack(packed), -1.0);
+    }
+
+    /// Non-finite inputs are rejected — §9.2.2 has no NaN / ±∞.
+    #[test]
+    fn float32_pack_rejects_non_finite() {
+        assert_eq!(float32_pack(f32::NAN), None);
+        assert_eq!(float32_pack(f32::INFINITY), None);
+        assert_eq!(float32_pack(f32::NEG_INFINITY), None);
+    }
+
+    /// Roundtrip a representative spread of finite values that all fit
+    /// in the §9.2.2 mantissa+exponent envelope: powers of two on both
+    /// sides of 1.0, small integer mantissas at varying exponents, and
+    /// the signed unit. Every one must satisfy
+    /// `unpack(pack(x)) == x` bit-for-bit.
+    ///
+    /// Inputs are restricted to values exactly representable as
+    /// `mantissa * 2^k` with `|mantissa| <= 0x1f_ffff` — the §9.2.2
+    /// container's representable set. Decimal literals like `1.0e-6`
+    /// are deliberately excluded because their nearest `f32` already
+    /// exceeds 21 mantissa bits and so can't round-trip through the
+    /// container.
+    #[test]
+    fn float32_pack_unpack_roundtrips_canonical_values() {
+        let cases: [f32; 13] = [
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            2.0,
+            -2.0,
+            1024.0,
+            1.0 / 1024.0,
+            3.0,
+            -3.0,
+            7.0 * 0.125, // 0.875 — mantissa 7, exponent -3
+            1048576.0,   // 2^20, exactly representable
+            1234567.0,   // 21-bit odd mantissa
+        ];
+        for x in cases {
+            let packed = float32_pack(x).unwrap_or_else(|| panic!("pack failed for {x}"));
+            let round = float32_unpack(packed);
+            assert_eq!(round, x, "roundtrip failed for {x}: packed=0x{packed:08x}");
+        }
+    }
+
+    /// Inputs whose exact `f32` value requires more than 21 mantissa
+    /// bits cannot fit in the §9.2.2 container. Confirm the
+    /// representative case — decimal constants like `1.0e-6` whose
+    /// nearest `f32` has a full 24-bit mantissa — is rejected with
+    /// `None` (not silently quantised).
+    #[test]
+    fn float32_pack_rejects_unrepresentable_decimals() {
+        // 1.0e-6_f32 = 0x358637bd, mantissa-with-implicit-1 = 0x86_37bd
+        // after normalisation = 0x10c_6f7a >> trailing zeros → still
+        // 22+ bits — exceeds the 21-bit field.
+        assert_eq!(float32_pack(1.0e-6_f32), None);
+    }
+
+    /// A value whose integer mantissa exceeds the §9.2.2 21-bit field
+    /// (`> 0x1f_ffff`) cannot be represented. We expect rejection
+    /// rather than silent precision loss. `0x20_0000 = 2_097_152` is
+    /// one above the field cap and is exactly representable in `f32`.
+    #[test]
+    fn float32_pack_rejects_mantissa_over_21_bits() {
+        // Integer mantissa exactly one above the cap: 2_097_152.
+        let too_big = 2_097_152.0_f32;
+        // But this normalises to mantissa=1, exponent=21 after the
+        // canonical-form pass — which IS representable. Test the
+        // genuine overflow case instead: 2_097_151 * (any odd small
+        // multiplier that doesn't reduce). 3 * 2_097_151 / 2 won't be
+        // an exact f32; use 2_097_151 itself with a non-trivial odd
+        // sub-bit pattern: 2_097_151 is 0x1fffff, exactly fits.
+        // For genuine overflow, we need a value that can't normalise
+        // down to ≤21 bits — but every f32 has at most 24 mantissa
+        // bits, so any odd value > 0x1f_ffff cannot reduce. Pick
+        // 0x1f_ffff * 2 + 1 = 0x3f_ffff = 4_194_303, exactly f32.
+        let unreducible = 4_194_303.0_f32; // 0x3f_ffff, 22 bits, odd
+        assert_eq!(float32_pack(unreducible), None);
+        // The "too big but even" case normalises, so it IS packable.
+        let packed = float32_pack(too_big).expect("even values normalise");
+        assert_eq!(float32_unpack(packed), too_big);
+    }
+
+    /// Sweep every legal packed container `(sign, exponent, mantissa)`
+    /// shape at coarse granularity, packing the unpacked value and
+    /// confirming the round-trip lands on the *same* packed bits — the
+    /// canonical-mantissa pass is deterministic.
+    #[test]
+    fn float32_pack_unpack_pack_idempotent_for_canonical_containers() {
+        // Sweep mantissa across odd 21-bit values (so the canonical
+        // form is the input itself), at three representative
+        // exponents (small positive, unit, small negative).
+        for stored_exp in [770u32, 788, 800] {
+            for mant in [1u32, 3, 7, 0x1f_ffff] {
+                let packed = (stored_exp << 21) | mant;
+                let unpacked = float32_unpack(packed);
+                let repacked = float32_pack(unpacked).expect("must repack");
+                assert_eq!(
+                    repacked, packed,
+                    "exp={stored_exp} mant=0x{mant:06x} did not round-trip"
+                );
+            }
+        }
     }
 
     // ---- §9.2.3 lookup1_values ----
