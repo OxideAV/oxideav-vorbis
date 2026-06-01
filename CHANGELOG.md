@@ -6,6 +6,46 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §7.2.2 floor type 1 header WRITE primitive (round 22,
+  umbrella round 206).** New public function
+  `encoder::write_floor1_header` serialises a
+  `crate::setup::Floor1Header` to the §7.2.2 floor-type-1 header bit
+  pattern. The function is the bit-exact inverse of the round-9 floor 1
+  parser: the property
+  `parse_floor1_header(&mut BitReaderLsb::new(&write_floor1_header(&h)?))? == h`
+  holds for every legal `Floor1Header`. The crate-private
+  `write_floor1_header_into_writer` companion is shaped to splice the
+  floor 1 body into the surrounding setup-header writer (still a
+  followup), matching the `write_codebook_into_writer` splice point
+  established in round 21. A new `WriteFloor1Error` enum enumerates
+  thirteen §7.2.2 invariant violations (`PartitionsOverflow`,
+  `PartitionClassListMismatch`, `PartitionClassValueOverflow`,
+  `ClassCountMismatch`, `IllegalClassDimensions`,
+  `SubclassesOverflow`, `MasterbookPresenceMismatch`,
+  `SubclassBookCountMismatch`, `SubclassBookOverflow`,
+  `IllegalMultiplier`, `RangebitsOverflow`, `XListLengthMismatch`,
+  `XListValueOverflow`); each refuses the call without emitting any
+  bits rather than serialise a header the parser would reject. The
+  umbrella `WriteError` enum grows a `WriteError::Floor1(WriteFloor1Error)`
+  variant with the matching `From` glue and `source()` chain; the
+  module-level `Error` enum's `Write` docstring is updated to mention
+  the new §7.2.2 invariant gate. 31 new tests cover the byte-shape of
+  the minimal §7.2.2 fixture (32-bit packet built explicitly through
+  `BitWriterLsb` step-by-step to pin the exact bytes), the closed-form
+  bit-length formula on a non-trivial two-class shape with masterbooks
+  (108 bits → 14 bytes), nine bit-exact roundtrip fixtures (minimal,
+  zero-partitions corner, multiple-partitions-same-class,
+  multiple-classes, max-subclasses=3 with full eight-slot
+  subclass-book table, subclass-book at the `Some(254)` upper edge,
+  rangebits=0 corner with all-zero x_list, rangebits=15 at the upper
+  edge, partitions=31 max-5-bit-field, and the max-class-index=15
+  max-4-bit-field shape), every `WriteFloor1Error` rejection variant
+  (each of the thirteen), the `WriteFloor1Error::Display` non-emptiness
+  smoke test across every variant, and the `WriteError::Floor1`
+  `From` + `source()` chain. Test count: **409 total (378 → 409, +31)**.
+  Floor 0 WRITE, residue WRITE, mapping / mode WRITE, audio-packet
+  WRITE, and the setup-header splice are explicit followups.
+
 * **Vorbis I §3.2.1 codebook WRITE primitive + §9.2.2 `float32_pack`
   encoder-side companion (round 21, umbrella round 201).** New public
   function `encoder::write_codebook` serialises a `VorbisCodebook`

@@ -78,6 +78,7 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
+use crate::setup::Floor1Header;
 
 /// Errors that may arise while writing a Vorbis I header packet.
 ///
@@ -122,6 +123,9 @@ pub enum WriteError {
     /// A nested codebook (§3.2.1) failed one of the writer-side
     /// invariants checked by [`write_codebook`].
     Codebook(WriteCodebookError),
+    /// A nested floor type 1 header (§7.2.2) failed one of the
+    /// writer-side invariants checked by [`write_floor1_header`].
+    Floor1(WriteFloor1Error),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -292,6 +296,213 @@ impl fmt::Display for WriteCodebookError {
 
 impl std::error::Error for WriteCodebookError {}
 
+/// Errors that may arise while writing a Vorbis I floor type 1 header
+/// (§7.2.2) via [`write_floor1_header`].
+///
+/// Each variant flags a §7.2.2 invariant the caller-supplied
+/// [`Floor1Header`] does not satisfy. The writer refuses the call
+/// without emitting any bits, preserving the bit-exact roundtrip
+/// guarantee
+/// `parse_floor1_header(&mut BitReaderLsb::new(&write_floor1_header(&h)?))? == h`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFloor1Error {
+    /// `partitions` exceeds the 5-bit `floor1_partitions` field's
+    /// representable range (`0..=31`).
+    PartitionsOverflow(u8),
+    /// `partition_class_list.len()` does not match the declared
+    /// `partitions` count. §7.2.2 step 3 emits exactly one 4-bit class
+    /// index per partition.
+    PartitionClassListMismatch {
+        /// The declared `partitions` count.
+        partitions: u8,
+        /// The actual length of `partition_class_list`.
+        list_len: usize,
+    },
+    /// A `partition_class_list[i]` value exceeds the 4-bit
+    /// `floor1_partition_class_list[i]` field's representable range
+    /// (`0..=15`).
+    PartitionClassValueOverflow {
+        /// The partition index in `0 .. partitions`.
+        index: u8,
+        /// The rejected class-list value.
+        value: u8,
+    },
+    /// `classes.len()` is inconsistent with the largest value in
+    /// `partition_class_list`. §7.2.2 step 6 requires exactly
+    /// `maximum_class + 1` class entries (and zero entries when
+    /// `partitions == 0`).
+    ClassCountMismatch {
+        /// The expected class count = `max(partition_class_list) + 1`,
+        /// or `0` when `partition_class_list` is empty.
+        expected: usize,
+        /// The actual length of `classes`.
+        actual: usize,
+    },
+    /// A class's `dimensions` field was outside `1..=8`. §7.2.2 step 7
+    /// encodes `class_dimensions[i]` as `read 3 bits + 1`, so the legal
+    /// range is `1..=8`.
+    IllegalClassDimensions {
+        /// Class index.
+        class: usize,
+        /// The rejected `dimensions` value.
+        dimensions: u8,
+    },
+    /// A class's `subclasses` field exceeded the 2-bit
+    /// `floor1_class_subclasses[i]` field's representable range
+    /// (`0..=3`).
+    SubclassesOverflow {
+        /// Class index.
+        class: usize,
+        /// The rejected `subclasses` value.
+        subclasses: u8,
+    },
+    /// A class's `masterbook` slot was inconsistent with its
+    /// `subclasses` count. §7.2.2 step 9 only reads the masterbook
+    /// field when `subclasses > 0`; a class with `subclasses == 0`
+    /// must have `masterbook == None`, and a class with `subclasses
+    /// > 0` must have `masterbook == Some(_)`.
+    MasterbookPresenceMismatch {
+        /// Class index.
+        class: usize,
+        /// The class's `subclasses` count.
+        subclasses: u8,
+        /// `true` if `masterbook` was present, `false` otherwise.
+        present: bool,
+    },
+    /// A class's `subclass_books` length did not match `1 << subclasses`.
+    /// §7.2.2 step 11 emits exactly `2^subclasses` per-subclass codebook
+    /// slots.
+    SubclassBookCountMismatch {
+        /// Class index.
+        class: usize,
+        /// Expected length (`1 << subclasses`).
+        expected: usize,
+        /// Actual length.
+        actual: usize,
+    },
+    /// A subclass-book entry's `Some(v)` value exceeded the largest
+    /// `v` that fits in §7.2.2 step 12's "read 8 bits - 1" container.
+    /// The raw byte must fit in 8 bits, so the highest representable
+    /// `Some(v)` is `v == 254` (raw `255`); values `>= 255` cannot be
+    /// emitted.
+    SubclassBookOverflow {
+        /// Class index.
+        class: usize,
+        /// Subclass slot index.
+        subclass: usize,
+        /// The rejected book index.
+        book: u8,
+    },
+    /// `multiplier` was outside `1..=4`. §7.2.2 step 13 encodes
+    /// `floor1_multiplier` as `read 2 bits + 1`, so the legal range is
+    /// `1..=4`.
+    IllegalMultiplier(u8),
+    /// `rangebits` exceeded the 4-bit `floor1_rangebits` field's
+    /// representable range (`0..=15`).
+    RangebitsOverflow(u8),
+    /// `x_list.len()` did not match the `sum_over_partitions(
+    /// classes[partition_class_list[i]].dimensions)` total §7.2.2
+    /// step 18 requires.
+    XListLengthMismatch {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        actual: usize,
+    },
+    /// An `x_list[i]` value did not fit in the `rangebits`-bit field.
+    /// §7.2.2 step 21 emits each x-coordinate as a `rangebits`-bit
+    /// unsigned integer; a value with bits set beyond `rangebits` would
+    /// be truncated on emit.
+    XListValueOverflow {
+        /// The x-list index.
+        index: usize,
+        /// The rejected value.
+        value: u32,
+        /// The declared `rangebits` field width.
+        rangebits: u8,
+    },
+}
+
+impl fmt::Display for WriteFloor1Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteFloor1Error::PartitionsOverflow(n) => write!(
+                f,
+                "vorbis floor1 header (write): partitions={n} > 31 (§7.2.2 step 1 is a 5-bit field)"
+            ),
+            WriteFloor1Error::PartitionClassListMismatch {
+                partitions,
+                list_len,
+            } => write!(
+                f,
+                "vorbis floor1 header (write): partition_class_list.len()={list_len} != partitions={partitions} (§7.2.2 step 3)"
+            ),
+            WriteFloor1Error::PartitionClassValueOverflow { index, value } => write!(
+                f,
+                "vorbis floor1 header (write): partition_class_list[{index}]={value} > 15 (§7.2.2 step 4 is a 4-bit field)"
+            ),
+            WriteFloor1Error::ClassCountMismatch { expected, actual } => write!(
+                f,
+                "vorbis floor1 header (write): classes.len()={actual} != max(partition_class_list)+1={expected} (§7.2.2 step 6)"
+            ),
+            WriteFloor1Error::IllegalClassDimensions { class, dimensions } => write!(
+                f,
+                "vorbis floor1 header (write): classes[{class}].dimensions={dimensions} outside legal 1..=8 (§7.2.2 step 7)"
+            ),
+            WriteFloor1Error::SubclassesOverflow { class, subclasses } => write!(
+                f,
+                "vorbis floor1 header (write): classes[{class}].subclasses={subclasses} > 3 (§7.2.2 step 8 is a 2-bit field)"
+            ),
+            WriteFloor1Error::MasterbookPresenceMismatch {
+                class,
+                subclasses,
+                present,
+            } => write!(
+                f,
+                "vorbis floor1 header (write): classes[{class}] masterbook present={present} but subclasses={subclasses} (§7.2.2 step 9: present iff subclasses > 0)"
+            ),
+            WriteFloor1Error::SubclassBookCountMismatch {
+                class,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "vorbis floor1 header (write): classes[{class}].subclass_books.len()={actual} != 1<<subclasses={expected} (§7.2.2 step 11)"
+            ),
+            WriteFloor1Error::SubclassBookOverflow {
+                class,
+                subclass,
+                book,
+            } => write!(
+                f,
+                "vorbis floor1 header (write): classes[{class}].subclass_books[{subclass}]=Some({book}) cannot be expressed in §7.2.2 step 12's 'read 8 bits - 1' container (max Some(254))"
+            ),
+            WriteFloor1Error::IllegalMultiplier(m) => write!(
+                f,
+                "vorbis floor1 header (write): multiplier={m} outside legal 1..=4 (§7.2.2 step 13)"
+            ),
+            WriteFloor1Error::RangebitsOverflow(r) => write!(
+                f,
+                "vorbis floor1 header (write): rangebits={r} > 15 (§7.2.2 step 14 is a 4-bit field)"
+            ),
+            WriteFloor1Error::XListLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis floor1 header (write): x_list.len()={actual} != sum(class.dimensions over partitions)={expected} (§7.2.2 step 18)"
+            ),
+            WriteFloor1Error::XListValueOverflow {
+                index,
+                value,
+                rangebits,
+            } => write!(
+                f,
+                "vorbis floor1 header (write): x_list[{index}]={value} does not fit in {rangebits}-bit field (§7.2.2 step 21)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteFloor1Error {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -331,6 +542,7 @@ impl fmt::Display for WriteError {
                 "vorbis comment header (write): {n} comments; >u32::MAX cannot be expressed in the §5.2.1 user_comment_list_length prefix"
             ),
             WriteError::Codebook(e) => write!(f, "{e}"),
+            WriteError::Floor1(e) => write!(f, "{e}"),
         }
     }
 }
@@ -339,6 +551,7 @@ impl std::error::Error for WriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WriteError::Codebook(e) => Some(e),
+            WriteError::Floor1(e) => Some(e),
             _ => None,
         }
     }
@@ -347,6 +560,12 @@ impl std::error::Error for WriteError {
 impl From<WriteCodebookError> for WriteError {
     fn from(value: WriteCodebookError) -> Self {
         WriteError::Codebook(value)
+    }
+}
+
+impl From<WriteFloor1Error> for WriteError {
+    fn from(value: WriteFloor1Error) -> Self {
+        WriteError::Floor1(value)
     }
 }
 
@@ -847,11 +1066,220 @@ fn write_lookup_block(
     Ok(())
 }
 
+/// Serialises a [`Floor1Header`] to the Vorbis I §7.2.2 floor-type-1
+/// header bit pattern.
+///
+/// This is the inverse of the §7.2.2 parser invoked by the setup-header
+/// walker. The 16-bit `floor_type = 1` selector that the setup-header
+/// walker writes ahead of the per-floor body is **not** emitted here —
+/// the floor-type tag belongs to the outer setup-header layout, and the
+/// nested writer is the body-only function whose output the
+/// [`Floor1Header::partitions`]-onwards parser ([`crate::setup::parse_setup_header_body`]
+/// at floor-type dispatch) consumes.
+///
+/// Layout (per §7.2.2):
+///
+/// 1. `floor1_partitions` — 5 bits.
+/// 2. For `i in 0 .. partitions`: `floor1_partition_class_list[i]` —
+///    4 bits.
+/// 3. For `i in 0 ..= maximum_class` (or none when `partitions == 0`),
+///    per-class: `class_dimensions[i] - 1` (3 bits), `class_subclasses[i]`
+///    (2 bits); when `subclasses > 0`, `class_masterbooks[i]` (8 bits);
+///    then for `j in 0 .. 2^class_subclasses[i]`,
+///    `subclass_books[i][j] + 1` (8 bits, with `None` mapped to raw `0`).
+/// 4. `floor1_multiplier - 1` — 2 bits.
+/// 5. `floor1_rangebits` — 4 bits.
+/// 6. For each partition's `class.dimensions` x-list values: each as a
+///    `rangebits`-bit unsigned integer.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte may carry up to 7 bits of zero padding to byte-align the
+/// slice; the parser stops after the last x-list bit per §7.2.2 step 21.
+///
+/// Returns [`WriteFloor1Error`] without emitting any bits if the
+/// supplied header violates a §7.2.2 invariant.
+pub fn write_floor1_header(header: &Floor1Header) -> Result<Vec<u8>, WriteFloor1Error> {
+    let mut writer = BitWriterLsb::with_capacity(16);
+    write_floor1_header_into_writer(header, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a floor 1 header into a larger
+/// bit-packed stream (the setup-header writer will use this in a
+/// later round, just as [`write_codebook_into_writer`] is exposed for
+/// the codebook side).
+///
+/// Writes the header's bits into `writer` at its current bit
+/// position. On error, the writer has had no bits appended (we
+/// validate before emitting).
+pub(crate) fn write_floor1_header_into_writer(
+    header: &Floor1Header,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteFloor1Error> {
+    // ---- §7.2.2 invariant gate. ----
+    // Fail-closed: refuse to emit a single bit if any field cannot be
+    // serialised back to a packet the parser would accept.
+
+    // step 1: partitions fits in a 5-bit field (0..=31).
+    if header.partitions > 31 {
+        return Err(WriteFloor1Error::PartitionsOverflow(header.partitions));
+    }
+    // step 3: partition_class_list length matches partitions.
+    if header.partition_class_list.len() != header.partitions as usize {
+        return Err(WriteFloor1Error::PartitionClassListMismatch {
+            partitions: header.partitions,
+            list_len: header.partition_class_list.len(),
+        });
+    }
+    // step 4: each partition_class_list value fits in a 4-bit field.
+    for (i, &v) in header.partition_class_list.iter().enumerate() {
+        if v > 15 {
+            return Err(WriteFloor1Error::PartitionClassValueOverflow {
+                index: i as u8,
+                value: v,
+            });
+        }
+    }
+    // step 6: classes.len() == max(partition_class_list) + 1, or 0
+    // when partition_class_list is empty (partitions == 0).
+    let expected_class_count = header
+        .partition_class_list
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0);
+    if header.classes.len() != expected_class_count {
+        return Err(WriteFloor1Error::ClassCountMismatch {
+            expected: expected_class_count,
+            actual: header.classes.len(),
+        });
+    }
+    // steps 7..12: per-class invariants.
+    for (class_idx, class) in header.classes.iter().enumerate() {
+        if !(1..=8).contains(&class.dimensions) {
+            return Err(WriteFloor1Error::IllegalClassDimensions {
+                class: class_idx,
+                dimensions: class.dimensions,
+            });
+        }
+        if class.subclasses > 3 {
+            return Err(WriteFloor1Error::SubclassesOverflow {
+                class: class_idx,
+                subclasses: class.subclasses,
+            });
+        }
+        let present = class.masterbook.is_some();
+        let required = class.subclasses > 0;
+        if present != required {
+            return Err(WriteFloor1Error::MasterbookPresenceMismatch {
+                class: class_idx,
+                subclasses: class.subclasses,
+                present,
+            });
+        }
+        let expected_book_count = 1usize << class.subclasses;
+        if class.subclass_books.len() != expected_book_count {
+            return Err(WriteFloor1Error::SubclassBookCountMismatch {
+                class: class_idx,
+                expected: expected_book_count,
+                actual: class.subclass_books.len(),
+            });
+        }
+        for (j, &slot) in class.subclass_books.iter().enumerate() {
+            if let Some(book) = slot {
+                // step 12: raw = book + 1 must fit in 8 bits, so the
+                // highest representable Some(_) is Some(254).
+                if book == u8::MAX {
+                    return Err(WriteFloor1Error::SubclassBookOverflow {
+                        class: class_idx,
+                        subclass: j,
+                        book,
+                    });
+                }
+            }
+        }
+    }
+    // step 13: multiplier in 1..=4.
+    if !(1..=4).contains(&header.multiplier) {
+        return Err(WriteFloor1Error::IllegalMultiplier(header.multiplier));
+    }
+    // step 14: rangebits fits in a 4-bit field.
+    if header.rangebits > 15 {
+        return Err(WriteFloor1Error::RangebitsOverflow(header.rangebits));
+    }
+    // step 18: x_list length matches the sum-over-partitions formula.
+    let expected_x_len: usize = header
+        .partition_class_list
+        .iter()
+        .map(|&pc| header.classes[pc as usize].dimensions as usize)
+        .sum();
+    if header.x_list.len() != expected_x_len {
+        return Err(WriteFloor1Error::XListLengthMismatch {
+            expected: expected_x_len,
+            actual: header.x_list.len(),
+        });
+    }
+    // step 21: every x_list element fits in rangebits bits.
+    // - rangebits == 0 → only 0 fits.
+    // - 0 < rangebits < 32 → cap = (1 << rangebits) - 1.
+    // - rangebits == 32 is unreachable here (rangebits is at most 15
+    //   per the 4-bit field width checked above).
+    for (i, &v) in header.x_list.iter().enumerate() {
+        let cap: u32 = if header.rangebits == 0 {
+            0
+        } else {
+            (1u32 << header.rangebits) - 1
+        };
+        if v > cap {
+            return Err(WriteFloor1Error::XListValueOverflow {
+                index: i,
+                value: v,
+                rangebits: header.rangebits,
+            });
+        }
+    }
+
+    // ---- §7.2.2 emit. ----
+    // step 1.
+    writer.write_u32(header.partitions as u32, 5);
+    // step 3.
+    for &pc in &header.partition_class_list {
+        writer.write_u32(pc as u32, 4);
+    }
+    // steps 6..12.
+    for class in &header.classes {
+        writer.write_u32((class.dimensions - 1) as u32, 3);
+        writer.write_u32(class.subclasses as u32, 2);
+        if class.subclasses > 0 {
+            // masterbook presence guaranteed by the gate above.
+            writer.write_u32(class.masterbook.expect("validated") as u32, 8);
+        }
+        for slot in &class.subclass_books {
+            let raw: u32 = match slot {
+                Some(b) => (*b as u32) + 1,
+                None => 0,
+            };
+            writer.write_u32(raw, 8);
+        }
+    }
+    // step 13.
+    writer.write_u32((header.multiplier - 1) as u32, 2);
+    // step 14.
+    writer.write_u32(header.rangebits as u32, 4);
+    // step 18..21.
+    for &v in &header.x_list {
+        writer.write_u32(v, header.rangebits as u32);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::comment::parse_comment_header;
     use crate::identification::parse_identification_header;
+    use crate::setup::Floor1Class;
 
     // ----------------------------------------------------------------
     // Identification header — byte-shape pinning.
@@ -1906,5 +2334,730 @@ mod tests {
         // Source chain points to the inner error.
         use std::error::Error as StdError;
         assert!(StdError::source(&inner).is_some());
+    }
+
+    // ----------------------------------------------------------------
+    // Floor 1 header writer (§7.2.2) — fixture builders.
+    // ----------------------------------------------------------------
+
+    /// The §7.2.2 floor 1 header parser is `pub(crate)` (it is reached
+    /// via the setup-header walker); call into the bytes by replaying
+    /// the parser's published flow through a `BitReaderLsb`. To keep
+    /// the encoder's test module independent of the setup-header
+    /// outer walker we reach into the parser directly via the same
+    /// `BitReaderLsb` plumbing the parser uses internally.
+    fn parse_floor1_via_setup_body(bytes: &[u8]) -> Floor1Header {
+        // The §7.2.2 parser is a `fn parse_floor1_header(reader)` in
+        // `setup`. We wrap that path by running the setup-header
+        // walker against a synthetic body that carries exactly one
+        // floor-type-1 header and nothing else.
+        // The setup walker, however, demands the surrounding
+        // codebook/time/floor-count/residue/mapping/mode/framing
+        // scaffolding. The cleaner clean-room reflection is: invoke
+        // a tiny local parser duplicating the public §7.2.2 step list,
+        // using only the bit-reader primitives. Anything else would
+        // need to consume the setup-header walker's plumbing.
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(bytes);
+        local_parse_floor1_for_tests(&mut reader)
+    }
+
+    /// Mirror of `setup::parse_floor1_header` — clean-room reproduction
+    /// from the §7.2.2 step list, used only to exercise the writer's
+    /// bit-exact roundtrip property without coupling the encoder test
+    /// suite to the setup-header outer walker.
+    ///
+    /// Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §7.2.2.
+    fn local_parse_floor1_for_tests(
+        reader: &mut oxideav_core::bits::BitReaderLsb<'_>,
+    ) -> Floor1Header {
+        let partitions = reader.read_u32(5).unwrap() as u8;
+        let mut partition_class_list = Vec::with_capacity(partitions as usize);
+        for _ in 0..partitions {
+            partition_class_list.push(reader.read_u32(4).unwrap() as u8);
+        }
+        let maximum_class = partition_class_list.iter().copied().max();
+        let classes = if let Some(maximum_class) = maximum_class {
+            let class_count = (maximum_class as usize) + 1;
+            let mut classes = Vec::with_capacity(class_count);
+            for _ in 0..class_count {
+                let dimensions = (reader.read_u32(3).unwrap() as u8) + 1;
+                let subclasses = reader.read_u32(2).unwrap() as u8;
+                let masterbook = if subclasses > 0 {
+                    Some(reader.read_u32(8).unwrap() as u8)
+                } else {
+                    None
+                };
+                let subclass_book_count: usize = 1usize << subclasses;
+                let mut subclass_books = Vec::with_capacity(subclass_book_count);
+                for _ in 0..subclass_book_count {
+                    let raw = reader.read_u32(8).unwrap() as i32 - 1;
+                    subclass_books.push(if raw < 0 { None } else { Some(raw as u8) });
+                }
+                classes.push(Floor1Class {
+                    dimensions,
+                    subclasses,
+                    masterbook,
+                    subclass_books,
+                });
+            }
+            classes
+        } else {
+            Vec::new()
+        };
+        let multiplier = (reader.read_u32(2).unwrap() as u8) + 1;
+        let rangebits = reader.read_u32(4).unwrap() as u8;
+        let mut x_list: Vec<u32> = Vec::new();
+        for &current_class in &partition_class_list {
+            let cdim = classes[current_class as usize].dimensions;
+            for _ in 0..cdim {
+                x_list.push(reader.read_u32(rangebits as u32).unwrap());
+            }
+        }
+        Floor1Header {
+            partitions,
+            partition_class_list,
+            classes,
+            multiplier,
+            rangebits,
+            x_list,
+        }
+    }
+
+    /// The "minimal" floor 1 from the setup-header test suite:
+    /// `partitions=1`, one class with dimensions=1, subclasses=0,
+    /// multiplier=1, rangebits=4, x_list=[5].
+    fn minimal_floor1() -> Floor1Header {
+        Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 1,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 1,
+            rangebits: 4,
+            x_list: vec![5],
+        }
+    }
+
+    fn floor1_roundtrips(header: &Floor1Header) {
+        let bytes = write_floor1_header(header).expect("write must succeed");
+        let parsed = parse_floor1_via_setup_body(&bytes);
+        assert_eq!(&parsed, header, "floor1 roundtrip equality");
+    }
+
+    // ----------------------------------------------------------------
+    // Floor 1 header writer — byte-shape pinning.
+    // ----------------------------------------------------------------
+
+    /// Pin the exact bit layout of the minimal floor 1 fixture. This
+    /// mirrors the byte sequence that `setup::tests::minimal_floor1`
+    /// emits (excluding the outer `floor_type=1` 16-bit selector,
+    /// which is the setup walker's responsibility).
+    #[test]
+    fn floor1_byte_shape_minimal() {
+        let bytes = write_floor1_header(&minimal_floor1()).expect("must build");
+        // Bits emitted (LSB-first per §2.1.4):
+        //   partitions=1         -> 5 bits  -> 0b00001
+        //   class_list[0]=0      -> 4 bits  -> 0b0000
+        //   class 0: dim-1=0     -> 3 bits  -> 0b000
+        //   class 0: subclass=0  -> 2 bits  -> 0b00
+        //   subclass_books[0]=Some(0): raw=1 -> 8 bits -> 0b00000001
+        //   multiplier-1=0       -> 2 bits  -> 0b00
+        //   rangebits=4          -> 4 bits  -> 0b0100
+        //   x_list[0]=5          -> 4 bits  -> 0b0101
+        //   Total = 5+4+3+2+8+2+4+4 = 32 bits = 4 bytes.
+        assert_eq!(bytes.len(), 4);
+        // Build the same stream through BitWriterLsb step-by-step to
+        // pin the exact bytes.
+        let mut expected = BitWriterLsb::with_capacity(4);
+        expected.write_u32(1, 5); // partitions
+        expected.write_u32(0, 4); // partition_class_list[0]
+        expected.write_u32(0, 3); // class[0].dimensions - 1
+        expected.write_u32(0, 2); // class[0].subclasses
+        expected.write_u32(1, 8); // subclass_books[0][0] raw = 0 + 1
+        expected.write_u32(0, 2); // multiplier - 1
+        expected.write_u32(4, 4); // rangebits
+        expected.write_u32(5, 4); // x_list[0]
+        assert_eq!(bytes, expected.finish());
+    }
+
+    /// Round 22 closed-form bit-length formula. Verifies the writer
+    /// emits exactly the spec-mandated number of bits for a fixed
+    /// shape with non-zero `subclasses` (which adds the masterbook).
+    #[test]
+    fn floor1_bit_length_formula_with_masterbook() {
+        // partitions = 2 → 5 bits
+        // class_list[0..2] = [0, 1] → 2 × 4 = 8 bits
+        // 2 classes:
+        //   class 0: dim=2, subclasses=1 → 3 + 2 = 5 bits
+        //            masterbook (subclasses > 0) → 8 bits
+        //            2 subclass slots × 8 = 16 bits
+        //   class 1: dim=1, subclasses=2 → 3 + 2 = 5 bits
+        //            masterbook → 8 bits
+        //            4 subclass slots × 8 = 32 bits
+        // multiplier - 1 → 2 bits
+        // rangebits → 4 bits
+        // x_list: sum(dim over partitions) = 2 + 1 = 3, × rangebits=5 → 15 bits
+        // Total = 5 + 8 + 5 + 8 + 16 + 5 + 8 + 32 + 2 + 4 + 15 = 108 bits
+        // = 14 bytes (ceil 108/8).
+        let header = Floor1Header {
+            partitions: 2,
+            partition_class_list: vec![0, 1],
+            classes: vec![
+                Floor1Class {
+                    dimensions: 2,
+                    subclasses: 1,
+                    masterbook: Some(3),
+                    subclass_books: vec![None, Some(0)],
+                },
+                Floor1Class {
+                    dimensions: 1,
+                    subclasses: 2,
+                    masterbook: Some(7),
+                    subclass_books: vec![None, Some(0), Some(1), Some(2)],
+                },
+            ],
+            multiplier: 2,
+            rangebits: 5,
+            x_list: vec![1, 2, 3],
+        };
+        let bytes = write_floor1_header(&header).expect("must build");
+        let total_bits = 5 + 8 + 5 + 8 + 16 + 5 + 8 + 32 + 2 + 4 + 15;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+        // Roundtrip too.
+        floor1_roundtrips(&header);
+    }
+
+    // ----------------------------------------------------------------
+    // Floor 1 header writer — bit-exact roundtrip.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn floor1_roundtrips_minimal() {
+        floor1_roundtrips(&minimal_floor1());
+    }
+
+    #[test]
+    fn floor1_roundtrips_zero_partitions() {
+        // §7.2.2 step 5 corner case: partitions = 0 means
+        // partition_class_list is empty, maximum_class is undefined,
+        // and the class loop iterates zero times. The roundtrip must
+        // still hold.
+        floor1_roundtrips(&Floor1Header {
+            partitions: 0,
+            partition_class_list: vec![],
+            classes: vec![],
+            multiplier: 1,
+            rangebits: 4,
+            x_list: vec![],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_multiple_partitions_same_class() {
+        floor1_roundtrips(&Floor1Header {
+            partitions: 4,
+            partition_class_list: vec![0, 0, 0, 0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(1)],
+            }],
+            multiplier: 2,
+            rangebits: 5,
+            x_list: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_multiple_classes() {
+        floor1_roundtrips(&Floor1Header {
+            partitions: 3,
+            partition_class_list: vec![0, 1, 2],
+            classes: vec![
+                Floor1Class {
+                    dimensions: 1,
+                    subclasses: 0,
+                    masterbook: None,
+                    subclass_books: vec![Some(0)],
+                },
+                Floor1Class {
+                    dimensions: 2,
+                    subclasses: 1,
+                    masterbook: Some(3),
+                    subclass_books: vec![Some(0), Some(1)],
+                },
+                Floor1Class {
+                    dimensions: 4,
+                    subclasses: 2,
+                    masterbook: Some(7),
+                    subclass_books: vec![None, Some(0), Some(1), Some(2)],
+                },
+            ],
+            multiplier: 3,
+            rangebits: 6,
+            x_list: vec![1, 2, 3, 4, 5, 6, 7],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_max_subclasses() {
+        // subclasses = 3 → 2^3 = 8 subclass slots, with masterbook.
+        floor1_roundtrips(&Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 8,
+                subclasses: 3,
+                masterbook: Some(5),
+                subclass_books: vec![
+                    None,
+                    Some(0),
+                    Some(1),
+                    None,
+                    Some(2),
+                    Some(3),
+                    None,
+                    Some(4),
+                ],
+            }],
+            multiplier: 4,
+            rangebits: 8,
+            x_list: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_subclass_book_at_upper_edge() {
+        // book = 254 is the largest representable Some(_): raw = 255
+        // is the highest 8-bit value.
+        floor1_roundtrips(&Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 1,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(254), None],
+            }],
+            multiplier: 1,
+            rangebits: 4,
+            x_list: vec![15],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_rangebits_zero() {
+        // rangebits = 0 → every x_list element must be 0; the parser
+        // reads 0 bits per element (a no-op). This pins the corner.
+        floor1_roundtrips(&Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 3,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 1,
+            rangebits: 0,
+            x_list: vec![0, 0, 0],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_rangebits_at_upper_edge() {
+        // rangebits = 15, x_list values near the cap.
+        floor1_roundtrips(&Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 4,
+            rangebits: 15,
+            x_list: vec![0, 0x7fff],
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_max_partitions() {
+        // partitions = 31 is the largest 5-bit value.
+        let pcl = vec![0u8; 31];
+        let x_list: Vec<u32> = (0..31).collect();
+        floor1_roundtrips(&Floor1Header {
+            partitions: 31,
+            partition_class_list: pcl,
+            classes: vec![Floor1Class {
+                dimensions: 1,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 1,
+            rangebits: 5,
+            x_list,
+        });
+    }
+
+    #[test]
+    fn floor1_roundtrips_max_class_index() {
+        // partition_class_list references class index 15 (the largest
+        // 4-bit value), forcing classes.len() = 16.
+        let mut classes = Vec::with_capacity(16);
+        for i in 0..16 {
+            classes.push(Floor1Class {
+                dimensions: ((i % 8) + 1) as u8,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            });
+        }
+        floor1_roundtrips(&Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![15],
+            classes,
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // Floor 1 header writer — rejection variants.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn floor1_rejects_partitions_overflow() {
+        let mut h = minimal_floor1();
+        h.partitions = 32;
+        // Mismatched lengths are normally a separate error; force the
+        // list length to match the rejected partitions count so the
+        // overflow check fires first.
+        h.partition_class_list = vec![0; 32];
+        h.x_list = vec![0; 32];
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::PartitionsOverflow(32)
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_partition_class_list_mismatch() {
+        let mut h = minimal_floor1();
+        h.partition_class_list = vec![0, 0]; // declared partitions = 1
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::PartitionClassListMismatch {
+                partitions: 1,
+                list_len: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_partition_class_value_overflow() {
+        let mut h = minimal_floor1();
+        h.partition_class_list = vec![16]; // 4-bit field caps at 15
+                                           // Resize classes to satisfy the count check should this rule
+                                           // ever be reordered; but the value-overflow gate must fire
+                                           // first in any case.
+        let mut classes = Vec::with_capacity(17);
+        for _ in 0..17 {
+            classes.push(Floor1Class {
+                dimensions: 1,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            });
+        }
+        h.classes = classes;
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::PartitionClassValueOverflow {
+                index: 0,
+                value: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_class_count_mismatch() {
+        let mut h = minimal_floor1();
+        h.classes = vec![]; // partitions=1, max(pcl)=0 → expected 1
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::ClassCountMismatch {
+                expected: 1,
+                actual: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_illegal_class_dimensions_zero() {
+        let mut h = minimal_floor1();
+        h.classes[0].dimensions = 0;
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::IllegalClassDimensions {
+                class: 0,
+                dimensions: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_illegal_class_dimensions_too_large() {
+        let mut h = minimal_floor1();
+        h.classes[0].dimensions = 9;
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::IllegalClassDimensions {
+                class: 0,
+                dimensions: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_subclasses_overflow() {
+        let mut h = minimal_floor1();
+        h.classes[0].subclasses = 4; // 2-bit field caps at 3
+                                     // Pad subclass_books to the matching length so the test
+                                     // catches the subclasses check, not the book-count check.
+        h.classes[0].subclass_books = vec![Some(0); 16];
+        h.classes[0].masterbook = Some(0);
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::SubclassesOverflow {
+                class: 0,
+                subclasses: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_masterbook_present_with_zero_subclasses() {
+        let mut h = minimal_floor1();
+        h.classes[0].masterbook = Some(0); // but subclasses == 0
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::MasterbookPresenceMismatch {
+                class: 0,
+                subclasses: 0,
+                present: true,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_masterbook_missing_with_nonzero_subclasses() {
+        let mut h = minimal_floor1();
+        h.classes[0].subclasses = 1;
+        h.classes[0].masterbook = None;
+        h.classes[0].subclass_books = vec![None, None];
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::MasterbookPresenceMismatch {
+                class: 0,
+                subclasses: 1,
+                present: false,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_subclass_book_count_mismatch() {
+        let mut h = minimal_floor1();
+        h.classes[0].subclasses = 1;
+        h.classes[0].masterbook = Some(0);
+        h.classes[0].subclass_books = vec![Some(0)]; // expected 2
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::SubclassBookCountMismatch {
+                class: 0,
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_subclass_book_overflow() {
+        let mut h = minimal_floor1();
+        h.classes[0].subclass_books = vec![Some(u8::MAX)];
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::SubclassBookOverflow {
+                class: 0,
+                subclass: 0,
+                book: u8::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_illegal_multiplier_zero() {
+        let mut h = minimal_floor1();
+        h.multiplier = 0;
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::IllegalMultiplier(0)
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_illegal_multiplier_too_large() {
+        let mut h = minimal_floor1();
+        h.multiplier = 5;
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::IllegalMultiplier(5)
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_rangebits_overflow() {
+        let mut h = minimal_floor1();
+        h.rangebits = 16; // 4-bit field caps at 15
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::RangebitsOverflow(16)
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_x_list_length_mismatch() {
+        let mut h = minimal_floor1();
+        h.x_list = vec![0, 1]; // expected 1 (1 partition × dim 1)
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::XListLengthMismatch {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_x_list_value_overflow_rangebits_nonzero() {
+        let mut h = minimal_floor1();
+        h.rangebits = 4; // cap = 15
+        h.x_list = vec![16];
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::XListValueOverflow {
+                index: 0,
+                value: 16,
+                rangebits: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn floor1_rejects_x_list_value_overflow_rangebits_zero() {
+        let mut h = minimal_floor1();
+        h.rangebits = 0; // cap = 0
+        h.x_list = vec![1];
+        assert_eq!(
+            write_floor1_header(&h).unwrap_err(),
+            WriteFloor1Error::XListValueOverflow {
+                index: 0,
+                value: 1,
+                rangebits: 0,
+            }
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Floor 1 header — Display + WriteError glue.
+    // ----------------------------------------------------------------
+
+    /// Every `WriteFloor1Error` variant has a non-empty `Display`
+    /// rendering so error messages propagated through the umbrella
+    /// `Error::Write` are always informative.
+    #[test]
+    fn floor1_display_non_empty_for_every_variant() {
+        let cases = [
+            WriteFloor1Error::PartitionsOverflow(32),
+            WriteFloor1Error::PartitionClassListMismatch {
+                partitions: 1,
+                list_len: 0,
+            },
+            WriteFloor1Error::PartitionClassValueOverflow {
+                index: 0,
+                value: 16,
+            },
+            WriteFloor1Error::ClassCountMismatch {
+                expected: 1,
+                actual: 0,
+            },
+            WriteFloor1Error::IllegalClassDimensions {
+                class: 0,
+                dimensions: 0,
+            },
+            WriteFloor1Error::SubclassesOverflow {
+                class: 0,
+                subclasses: 4,
+            },
+            WriteFloor1Error::MasterbookPresenceMismatch {
+                class: 0,
+                subclasses: 1,
+                present: false,
+            },
+            WriteFloor1Error::SubclassBookCountMismatch {
+                class: 0,
+                expected: 2,
+                actual: 1,
+            },
+            WriteFloor1Error::SubclassBookOverflow {
+                class: 0,
+                subclass: 0,
+                book: u8::MAX,
+            },
+            WriteFloor1Error::IllegalMultiplier(0),
+            WriteFloor1Error::RangebitsOverflow(16),
+            WriteFloor1Error::XListLengthMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            WriteFloor1Error::XListValueOverflow {
+                index: 0,
+                value: 16,
+                rangebits: 4,
+            },
+        ];
+        for case in &cases {
+            let s = format!("{case}");
+            assert!(!s.is_empty(), "Display empty for {case:?}");
+            assert!(
+                s.contains("floor1"),
+                "Display for {case:?} must mention the §7.2.2 floor1 context"
+            );
+        }
+    }
+
+    /// Floor 1 write errors surface as `WriteError::Floor1` via the
+    /// `From` impl, preserving the variant for caller inspection and
+    /// the source chain.
+    #[test]
+    fn write_error_floor1_glue() {
+        let inner: WriteError = WriteFloor1Error::PartitionsOverflow(32).into();
+        assert_eq!(
+            inner,
+            WriteError::Floor1(WriteFloor1Error::PartitionsOverflow(32))
+        );
+        use std::error::Error as StdError;
+        let src = StdError::source(&inner).expect("source chain should reach Floor1");
+        // The chained Display must non-trivially echo the floor1 tag.
+        assert!(format!("{src}").contains("floor1"));
     }
 }

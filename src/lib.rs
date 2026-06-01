@@ -104,6 +104,22 @@
 //! all three lookup types. Audio-packet WRITE and floor / residue /
 //! mapping / mode WRITE primitives plus the setup-header splice are
 //! explicit followups.
+//!
+//! Round 22 (umbrella round 206) lands the next nested-block writer:
+//! [`write_floor1_header`] serialises a
+//! [`crate::setup::Floor1Header`] to the §7.2.2 floor-type-1
+//! header bitstream shape. Every §7.2.2 structural invariant is
+//! validated before any bits are emitted; the writer fails closed
+//! with a structured [`WriteFloor1Error`] (thirteen variants covering
+//! partitions / class-list / class-count / dimensions / subclasses /
+//! masterbook presence / subclass-book count / subclass-book overflow
+//! / multiplier / rangebits / x-list length / x-list value-overflow
+//! invariants). The bit-exact roundtrip property
+//! `parse_floor1_header(&mut BitReaderLsb::new(&write_floor1_header(&h)?))? == h`
+//! holds for every legal input. The umbrella [`WriteError`] grows a
+//! [`WriteError::Floor1`] variant with the matching `From` glue.
+//! Floor 0 WRITE, residue WRITE, mapping / mode WRITE, audio-packet
+//! WRITE, and the setup-header splice remain explicit followups.
 
 #![warn(missing_debug_implementations)]
 
@@ -140,8 +156,8 @@ pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
 pub use encoder::{
-    write_codebook, write_comment_header, write_identification_header, WriteCodebookError,
-    WriteError,
+    write_codebook, write_comment_header, write_floor1_header, write_identification_header,
+    WriteCodebookError, WriteError, WriteFloor1Error,
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
@@ -238,12 +254,14 @@ pub enum Error {
     /// classification step, on an unexpected audio packet, or in one
     /// of the three header sub-parsers.
     HeaderDispatch(HeaderDispatchError),
-    /// A header-packet writer
-    /// ([`crate::encoder::write_identification_header`] or
-    /// [`crate::encoder::write_comment_header`]) rejected its input
-    /// because the supplied struct fails one of the §4.2.2 / §5.2.1
-    /// invariants the encoder is contracted to refuse rather than
-    /// emit a malformed packet.
+    /// A header-packet or nested-block writer
+    /// ([`crate::encoder::write_identification_header`],
+    /// [`crate::encoder::write_comment_header`],
+    /// [`crate::encoder::write_codebook`], or
+    /// [`crate::encoder::write_floor1_header`]) rejected its input
+    /// because the supplied struct fails one of the §4.2.2 / §5.2.1 /
+    /// §3.2.1 / §7.2.2 invariants the encoder is contracted to refuse
+    /// rather than emit a malformed packet.
     Write(WriteError),
 }
 

@@ -1,6 +1,48 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 21.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 22.
+
+## Status — 2026-06-02 (round 22, umbrella round 206)
+
+**Round 22 landed: the §7.2.2 floor type 1 WRITE primitive.** New
+public function [`encoder::write_floor1_header`] serialises a
+[`crate::setup::Floor1Header`] to the §7.2.2 floor-type-1 header
+bit pattern. This is the third nested-block writer (after
+[`write_codebook`] in round 21 and the header-packet pair in round
+20), and the first per-floor encoder primitive. The function is the
+bit-exact inverse of the round-9 floor 1 parser: the property
+`parse_floor1_header(&mut BitReaderLsb::new(&write_floor1_header(&h)?))? == h`
+holds for every legal [`Floor1Header`]. The crate-private
+`write_floor1_header_into_writer` companion is shaped to splice the
+floor 1 body into the surrounding setup-header writer (still a
+followup), matching the existing `write_codebook_into_writer`
+splice point. A new [`WriteFloor1Error`] enumerates thirteen
+§7.2.2 invariant violations (`PartitionsOverflow`,
+`PartitionClassListMismatch`, `PartitionClassValueOverflow`,
+`ClassCountMismatch`, `IllegalClassDimensions`,
+`SubclassesOverflow`, `MasterbookPresenceMismatch`,
+`SubclassBookCountMismatch`, `SubclassBookOverflow`,
+`IllegalMultiplier`, `RangebitsOverflow`, `XListLengthMismatch`,
+`XListValueOverflow`) — the writer refuses each rather than emit a
+header the parser would reject. The umbrella [`WriteError`] grows a
+[`WriteError::Floor1`] variant with the matching `From` glue and
+`source()` chain. 31 new unit tests bring the in-module suite to
+**409 (378 → 409)**: byte-shape pinning for the minimal §7.2.2
+fixture (32-bit packet, exactly the layout the setup-header test
+suite emits), the closed-form bit-length formula on a non-trivial
+two-class shape with masterbooks (108 bits → 14 bytes), nine
+bit-exact roundtrip fixtures (minimal, zero-partitions corner,
+multiple-partitions-same-class, multiple-classes, max-subclasses=3
+with full eight-slot subclass-book table, subclass-book at the
+Some(254) upper edge, rangebits=0 corner with all-zero x_list,
+rangebits=15 at the upper edge, partitions=31 max-5-bit-field, and
+the max-class-index=15 max-4-bit-field shape), every
+`WriteFloor1Error` rejection variant (each of the thirteen),
+the `WriteFloor1Error::Display` non-emptiness smoke test across
+every variant, and the `WriteError::Floor1` `From` + `source()`
+chain. Floor 0 WRITE, residue WRITE, mapping / mode WRITE,
+audio-packet WRITE, and the setup-header splice are explicit
+followups.
 
 ## Status — 2026-06-01 (round 21, umbrella round 201)
 
