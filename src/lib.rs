@@ -157,8 +157,8 @@ pub use comment::{
 };
 pub use encoder::{
     write_codebook, write_comment_header, write_floor0_header, write_floor1_header,
-    write_identification_header, write_residue_header, WriteCodebookError, WriteError,
-    WriteFloor0Error, WriteFloor1Error, WriteResidueError,
+    write_identification_header, write_mapping_header, write_residue_header, WriteCodebookError,
+    WriteError, WriteFloor0Error, WriteFloor1Error, WriteMappingError, WriteResidueError,
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
@@ -260,11 +260,13 @@ pub enum Error {
     /// [`crate::encoder::write_comment_header`],
     /// [`crate::encoder::write_codebook`],
     /// [`crate::encoder::write_floor1_header`],
-    /// [`crate::encoder::write_floor0_header`], or
-    /// [`crate::encoder::write_residue_header`]) rejected its input
+    /// [`crate::encoder::write_floor0_header`],
+    /// [`crate::encoder::write_residue_header`], or
+    /// [`crate::encoder::write_mapping_header`]) rejected its input
     /// because the supplied struct fails one of the §4.2.2 / §5.2.1 /
-    /// §3.2.1 / §6.2.1 / §7.2.2 / §8.6.1 invariants the encoder is
-    /// contracted to refuse rather than emit a malformed packet.
+    /// §3.2.1 / §6.2.1 / §7.2.2 / §8.6.1 / §4.2.4 invariants the
+    /// encoder is contracted to refuse rather than emit a malformed
+    /// packet.
     Write(WriteError),
 }
 

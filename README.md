@@ -1,6 +1,78 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 24.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 25.
+
+## Status — 2026-06-03 (round 25, umbrella round 223)
+
+**Round 25 landed: the §4.2.4 mapping header WRITE primitive.** New
+public function [`encoder::write_mapping_header`] serialises a
+[`crate::setup::MappingHeader`] (the round-5 parser's output type) to
+the §4.2.4 "Mappings" bit pattern. This is the fifth nested-block
+writer (after [`write_codebook`] in round 21, [`write_floor1_header`]
+in round 22, [`write_floor0_header`] in round 23, and
+[`write_residue_header`] in round 24) and the first mapping-side
+encoder primitive. The bit-exact roundtrip property
+`local_parse_mapping_for_tests(&mut BitReaderLsb::new(&write_mapping_header(&h, ch, fc, rc)?), mapping_type, ch) == h`
+holds for every legal [`MappingHeader`] across the parser's context
+tuple `(audio_channels, floor_count, residue_count)`. The
+crate-private [`write_mapping_header_into_writer`] companion is shaped
+to splice the mapping body into the surrounding setup-header writer
+(still a followup), matching the existing
+`write_codebook_into_writer` / `write_floor1_header_into_writer` /
+`write_floor0_header_into_writer` /
+`write_residue_header_into_writer` splice points. A new
+[`WriteMappingError`] enumerates eleven §4.2.4 invariant violations
+(`UnsupportedMappingType`, `ZeroAudioChannels`, `SubmapsOutOfRange`,
+`CouplingStepsOverflow`, `BadCouplingChannels`,
+`CouplingChannelOverflow`, `MuxLengthMismatch`, `BadMuxValue`,
+`SubmapCountMismatch`, `BadSubmapFloor`, `BadSubmapResidue`) — the
+writer refuses each rather than emit a header the parser would
+reject. The umbrella [`WriteError`] grows a [`WriteError::Mapping`]
+variant with the matching `From` glue and `source()` chain.
+
+The encoder reverses §4.2.4 step 2c.i and step 2c.ii exactly: when
+`submaps == 1` the writer picks the densest encoding
+(`submaps_flag = 0`, no 4-bit body) and when `coupling.is_empty()` it
+picks `square_polar_flag = 0` (no 8-bit step count or per-step
+body). The §4.2.4 step 2c.ii.A per-coupling-step channel-number field
+width is sourced from [`codebook::ilog`]`(audio_channels - 1)` — the
+same §9.2.1 helper the round-5 parser consults — so a future ilog
+refactor would propagate to both sides simultaneously. The §4.2.4
+step 2c.iv per-channel `mux[ch]` loop is elided when
+`submaps == 1` and the writer enforces `mux.is_empty()` for that
+branch, refusing any stale field that would otherwise sit in the
+struct.
+
+38 new unit tests bring the in-module suite to **490 (452 → 490)**:
+byte-shape pinning for the minimal-mono §4.2.4 fixture (28-bit
+packet, exactly the layout the mono mapping in
+[`crate::audio::tests::mapping_mono_no_coupling`] emits) and for the
+stereo-coupled fixture (38-bit packet), the closed-form bit-length
+formula on a multi-submap multi-channel shape with coupling (112 bits
+= 14 bytes), eleven bit-exact roundtrip fixtures (minimal-mono /
+stereo-coupled / stereo no-coupling / 5.1-channel with three coupling
+steps and two submaps / submaps at the 16 upper edge with 16
+channels / coupling_steps at the 256 upper edge / submap indices at
+the 255 upper edge with 256 floor/residue counts / time_placeholder
+sweep across all 256 values / 8-channel coupling-width / 3-channel
+coupling-width / 255-channel coupling-width at the 8-bit ilog upper
+edge / 4-channel 2-submap mux-cycle), three encoding-picker pinning
+tests (densest-submaps-flag / flagged-encoding-when-submaps-above-one
+/ densest-square-polar-flag-when-no-coupling), every
+`WriteMappingError` rejection variant (including the
+coupling-magnitude-equals-angle case, magnitude/angle out of range,
+coupling-on-mono-audio at field-width zero, mux length mismatch for
+both the `submaps > 1` and `submaps == 1` branches, mux value at the
+upper edge of submaps, submap-count mismatch, submap floor / residue
+out of range), the `WriteMappingError::Display` non-emptiness smoke
+test across all 13 enumerated cases (covering both
+`CouplingChannelOverflow` `is_magnitude` directions and both
+`MuxLengthMismatch` `submaps > 1` and `submaps == 1` branches), the
+`WriteError::Mapping` `From` + `source()` chain, and the two
+splice-point tests (appends-after-existing-bits + emits-no-bits-
+on-error). Mode WRITE, audio-packet WRITE, and the setup-header
+splice that stitches all six nested-block writers together remain
+explicit followups.
 
 ## Status — 2026-06-03 (round 24, umbrella round 218)
 

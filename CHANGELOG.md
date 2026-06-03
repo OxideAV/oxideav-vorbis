@@ -6,6 +6,60 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.2.4 mapping header WRITE primitive (round 25,
+  umbrella round 223).** New public function
+  `encoder::write_mapping_header` serialises a
+  `crate::setup::MappingHeader` to the §4.2.4 "Mappings" bit pattern.
+  The function is the bit-exact inverse of the round-5 mapping header
+  parser (`setup::parse_mapping_header`): the property
+  `parse_mapping_header_via_local_helper(&write_mapping_header(&h, ch, fc, rc)?, mapping_type, ch) == h`
+  holds for every legal `MappingHeader` against the parser's context
+  tuple `(audio_channels, floor_count, residue_count)`. The
+  crate-private `write_mapping_header_into_writer` companion mirrors
+  the splice-point shape established by `write_codebook_into_writer`,
+  `write_floor1_header_into_writer`, `write_floor0_header_into_writer`,
+  and `write_residue_header_into_writer`, allowing the still-pending
+  setup-header writer to slot the mapping body into the surrounding
+  bit-packed stream. A new `WriteMappingError` enum enumerates eleven
+  §4.2.4 invariant violations (`UnsupportedMappingType`,
+  `ZeroAudioChannels`, `SubmapsOutOfRange`, `CouplingStepsOverflow`,
+  `BadCouplingChannels`, `CouplingChannelOverflow`,
+  `MuxLengthMismatch`, `BadMuxValue`, `SubmapCountMismatch`,
+  `BadSubmapFloor`, `BadSubmapResidue`); each refuses the call without
+  emitting any bits rather than serialise a header the parser would
+  reject. The umbrella `WriteError` enum grows a
+  `WriteError::Mapping(WriteMappingError)` variant with the matching
+  `From` glue and `source()` chain. The encoder reverses §4.2.4
+  step 2c.i and step 2c.ii exactly: when `submaps == 1` the writer
+  picks the densest encoding (`submaps_flag = 0`, no 4-bit body) and
+  when `coupling.is_empty()` it picks `square_polar_flag = 0` (no
+  8-bit step count or per-step body). Thirty-eight new tests pin the
+  byte shape on the minimal-mono fixture (28-bit packet) and the
+  stereo-coupled fixture (38-bit packet), the closed-form bit-length
+  formula on a multi-submap multi-channel case (112 bits = 14 bytes),
+  eleven roundtrip fixtures (minimal-mono / stereo-coupled / stereo
+  no-coupling / 5.1-channel with three coupling steps and two submaps
+  / submaps at the 16 upper edge with 16 channels / coupling_steps at
+  the 256 upper edge / submap indices at the 255 upper edge with 256
+  floor/residue counts / time_placeholder sweep across all 256 values
+  / 8-channel coupling-width / 3-channel coupling-width / 255-channel
+  coupling-width at the 8-bit ilog upper edge / 4-channel 2-submap
+  mux-cycle), three encoding-picker pinning tests
+  (submaps_flag = 0 when submaps == 1, submaps_flag = 1 with body =
+  submaps - 1 when above one, square_polar_flag = 0 when coupling is
+  empty), every `WriteMappingError` rejection variant (including
+  coupling-magnitude-equals-angle, magnitude/angle out of range,
+  coupling on mono audio at field-width zero, mux length mismatch for
+  both submaps > 1 and submaps == 1, mux value at upper edge of
+  submaps, submap-count mismatch, submap floor / residue out of
+  range), the `WriteMappingError::Display` non-emptiness smoke test
+  across all 13 enumerated cases, the `WriteError::Mapping` `From` +
+  `source()` chain, and two splice-point tests
+  (appends-after-existing-bits + emits-no-bits-on-error). Test count:
+  **490 total (452 → 490)**. Mode WRITE, audio-packet WRITE, and the
+  setup-header splice that stitches all six nested-block writers
+  together remain explicit followups.
+
 * **Vorbis I §8.6.1 residue header WRITE primitive (round 24,
   umbrella round 218).** New public function
   `encoder::write_residue_header` serialises a

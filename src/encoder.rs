@@ -1,4 +1,4 @@
-//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218).
+//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218 + 223).
 //!
 //! This module collects the encoder-side functions that mirror the
 //! parser surface in [`crate::identification`], [`crate::comment`],
@@ -29,6 +29,14 @@
 //!   types (0, 1, 2); the outer 16-bit `residue_type` selector is the
 //!   setup walker's responsibility, mirroring the floor 0 / floor 1
 //!   convention. Round 218.
+//! * [`write_mapping_header`] — serialises a [`MappingHeader`] to the
+//!   §4.2.4 "Mappings" bit pattern. The outer 16-bit `mapping_type`
+//!   selector (always 0 for Vorbis I) is also the setup walker's
+//!   responsibility, mirroring the floor / residue convention. The
+//!   writer takes the same context tuple
+//!   `(audio_channels, floor_count, residue_count)` the parser took, so
+//!   the per-field invariant gate can match the parser's
+//!   range-check semantics exactly. Round 223.
 //!
 //! Both functions validate the same spec-mandated invariants that the
 //! corresponding parser enforces on input, so a typo in the caller's
@@ -79,8 +87,9 @@
 //! * `docs/audio/vorbis/Vorbis_I_spec.pdf` §2.1.8 "end-of-packet
 //!   alignment" (the framing-byte's seven high bits are zero padding).
 //!
-//! Audio-packet encode and floor / residue / mapping / mode WRITE
-//! primitives are explicit followups for subsequent rounds.
+//! Audio-packet encode and mode WRITE primitives are explicit followups
+//! for subsequent rounds, along with the setup-header splice that
+//! stitches all the nested-block writers together.
 
 use core::fmt;
 
@@ -89,7 +98,7 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
-use crate::setup::{Floor0Header, Floor1Header, ResidueHeader};
+use crate::setup::{Floor0Header, Floor1Header, MappingHeader, ResidueHeader};
 
 /// Errors that may arise while writing a Vorbis I header packet.
 ///
@@ -143,6 +152,9 @@ pub enum WriteError {
     /// A nested residue header (§8.6.1) failed one of the writer-side
     /// invariants checked by [`write_residue_header`].
     Residue(WriteResidueError),
+    /// A nested mapping header (§4.2.4 "Mappings") failed one of the
+    /// writer-side invariants checked by [`write_mapping_header`].
+    Mapping(WriteMappingError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -683,6 +695,216 @@ impl fmt::Display for WriteResidueError {
 
 impl std::error::Error for WriteResidueError {}
 
+/// Errors that may arise while writing a Vorbis I mapping header
+/// (§4.2.4 "Mappings") via [`write_mapping_header`].
+///
+/// Each variant flags a §4.2.4 invariant the caller-supplied
+/// [`MappingHeader`] does not satisfy. The writer refuses the call
+/// without emitting any bits, preserving the bit-exact roundtrip
+/// guarantee
+/// `parse_mapping_header(&write_mapping_header(&h, ch, fc, rc)?, ...)? == h`
+/// against the parser's context tuple `(audio_channels, floor_count,
+/// residue_count)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteMappingError {
+    /// `mapping_type` was a value other than `0`. Vorbis I §4.2.4
+    /// step 2b only defines `mapping_type = 0`; the setup walker
+    /// rejects any other value on input. Even though the §4.2.4
+    /// "Mappings" body itself does not serialise `mapping_type` (the
+    /// 16-bit selector is the setup walker's responsibility, mirroring
+    /// the floor / residue convention), the writer refuses the call so
+    /// a stale field cannot quietly persist.
+    UnsupportedMappingType(u16),
+    /// `audio_channels` was `0`. §4.2.4 reads per-channel `mux[ch]`
+    /// values and the parser's outer entry guarantees `> 0` from the
+    /// §4.2.2 identification header. The writer mirrors the gate
+    /// defensively rather than silently emit a zero-channel mapping.
+    ZeroAudioChannels,
+    /// `submaps` was outside `1..=16`. §4.2.4 step 2c.i encodes
+    /// `vorbis_mapping_submaps - 1` in a 4-bit field guarded by an
+    /// optional `submaps_flag`; when the flag is unset, `submaps`
+    /// defaults to `1`. The legal range is therefore `1..=16` and
+    /// every other value is refused.
+    SubmapsOutOfRange(u8),
+    /// `coupling.len()` exceeded the largest count representable by
+    /// §4.2.4 step 2c.ii's `read 8 bits + 1` field (`256`).
+    CouplingStepsOverflow(usize),
+    /// A coupling step's `magnitude_channel` or `angle_channel` did
+    /// not satisfy the §4.2.4 step 2c.ii "magnitude != angle, both
+    /// < audio_channels" invariant. The parser also enforces this gate
+    /// on input.
+    BadCouplingChannels {
+        /// Index of the offending step in `coupling`.
+        step_index: usize,
+        /// The rejected `magnitude_channel` value.
+        magnitude_channel: u8,
+        /// The rejected `angle_channel` value.
+        angle_channel: u8,
+        /// The §4.2.2 `audio_channels` field the writer was called
+        /// with, used to upper-bound the channel indices.
+        audio_channels: u8,
+    },
+    /// A coupling-channel index did not fit in the
+    /// `ilog(audio_channels - 1)`-bit field §4.2.4 step 2c.ii.A emits.
+    /// When `audio_channels == 1` the field width is `0` and only the
+    /// value `0` is representable, which immediately also fails the
+    /// `magnitude != angle` invariant — so this variant captures the
+    /// general "value would be truncated on emit" case for
+    /// `audio_channels >= 2`.
+    CouplingChannelOverflow {
+        /// Index of the offending step in `coupling`.
+        step_index: usize,
+        /// `true` if the rejected value was the step's
+        /// `magnitude_channel`, `false` if `angle_channel`.
+        is_magnitude: bool,
+        /// The rejected channel-index value.
+        value: u8,
+        /// The §4.2.4 step 2c.ii.A field width in bits.
+        field_bits: u32,
+    },
+    /// `mux.len()` did not match the §4.2.4 step 2c.iv layout. When
+    /// `submaps > 1` the layout reads one 4-bit `mux[ch]` value per
+    /// channel, so `mux.len() == audio_channels` is required; when
+    /// `submaps == 1` the loop is elided and `mux.is_empty()` is
+    /// required.
+    MuxLengthMismatch {
+        /// The declared `submaps` field on the header.
+        submaps: u8,
+        /// The §4.2.2 `audio_channels` field the writer was called
+        /// with.
+        audio_channels: u8,
+        /// The actual length of `mux`.
+        actual: usize,
+    },
+    /// A `mux[ch]` value was `>= submaps`. §4.2.4 step 2c.iv encodes
+    /// each `mux[ch]` as a 4-bit index into the per-submap config
+    /// list; the parser rejects any value that would walk off the end.
+    BadMuxValue {
+        /// Channel index in `0 .. audio_channels`.
+        channel_index: usize,
+        /// The rejected `mux[ch]` value.
+        mux: u8,
+        /// The declared `submaps` field on the header.
+        submaps: u8,
+    },
+    /// `submap_configs.len()` did not equal the declared `submaps`
+    /// count. §4.2.4 step 2c.v emits exactly one per-submap config
+    /// triple per declared submap.
+    SubmapCountMismatch {
+        /// The declared `submaps` field on the header.
+        submaps: u8,
+        /// The actual length of `submap_configs`.
+        actual: usize,
+    },
+    /// A submap's `floor` index was `>= floor_count`. §4.2.4 step
+    /// 2c.v.B encodes the field as a raw 8-bit unsigned integer; the
+    /// parser checks the value against the setup header's
+    /// `floors.len()` and rejects any out-of-range value.
+    BadSubmapFloor {
+        /// Submap index in `0 .. submaps`.
+        submap_index: usize,
+        /// The rejected `floor` value.
+        floor: u8,
+        /// The setup header's `floors.len()` the writer was called
+        /// with.
+        floor_count: usize,
+    },
+    /// A submap's `residue` index was `>= residue_count`. §4.2.4 step
+    /// 2c.v.C encodes the field as a raw 8-bit unsigned integer; the
+    /// parser checks the value against the setup header's
+    /// `residues.len()` and rejects any out-of-range value.
+    BadSubmapResidue {
+        /// Submap index in `0 .. submaps`.
+        submap_index: usize,
+        /// The rejected `residue` value.
+        residue: u8,
+        /// The setup header's `residues.len()` the writer was called
+        /// with.
+        residue_count: usize,
+    },
+}
+
+impl fmt::Display for WriteMappingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteMappingError::UnsupportedMappingType(t) => write!(
+                f,
+                "vorbis mapping header (write): mapping_type={t} != 0 (§4.2.4 step 2b)"
+            ),
+            WriteMappingError::ZeroAudioChannels => write!(
+                f,
+                "vorbis mapping header (write): audio_channels=0 (§4.2.2 + §4.2.4)"
+            ),
+            WriteMappingError::SubmapsOutOfRange(v) => write!(
+                f,
+                "vorbis mapping header (write): submaps={v} outside legal 1..=16 (§4.2.4 step 2c.i)"
+            ),
+            WriteMappingError::CouplingStepsOverflow(n) => write!(
+                f,
+                "vorbis mapping header (write): coupling.len()={n} > 256 (§4.2.4 step 2c.ii is `read 8 bits + 1`)"
+            ),
+            WriteMappingError::BadCouplingChannels {
+                step_index,
+                magnitude_channel,
+                angle_channel,
+                audio_channels,
+            } => write!(
+                f,
+                "vorbis mapping header (write): coupling[{step_index}] magnitude={magnitude_channel}, angle={angle_channel}, audio_channels={audio_channels} (§4.2.4 step 2c.ii requires magnitude != angle, both < audio_channels)"
+            ),
+            WriteMappingError::CouplingChannelOverflow {
+                step_index,
+                is_magnitude,
+                value,
+                field_bits,
+            } => write!(
+                f,
+                "vorbis mapping header (write): coupling[{step_index}].{field}={value} does not fit in the {field_bits}-bit ilog(audio_channels - 1) field (§4.2.4 step 2c.ii.A)",
+                field = if *is_magnitude { "magnitude_channel" } else { "angle_channel" }
+            ),
+            WriteMappingError::MuxLengthMismatch {
+                submaps,
+                audio_channels,
+                actual,
+            } => write!(
+                f,
+                "vorbis mapping header (write): mux.len()={actual} does not match §4.2.4 step 2c.iv layout (submaps={submaps}, audio_channels={audio_channels}: required mux.len() = {required})",
+                required = if *submaps > 1 { *audio_channels as usize } else { 0 }
+            ),
+            WriteMappingError::BadMuxValue {
+                channel_index,
+                mux,
+                submaps,
+            } => write!(
+                f,
+                "vorbis mapping header (write): mux[{channel_index}]={mux} >= submaps={submaps} (§4.2.4 step 2c.iv)"
+            ),
+            WriteMappingError::SubmapCountMismatch { submaps, actual } => write!(
+                f,
+                "vorbis mapping header (write): submap_configs.len()={actual} != submaps={submaps} (§4.2.4 step 2c.v)"
+            ),
+            WriteMappingError::BadSubmapFloor {
+                submap_index,
+                floor,
+                floor_count,
+            } => write!(
+                f,
+                "vorbis mapping header (write): submap_configs[{submap_index}].floor={floor} >= floor_count={floor_count} (§4.2.4 step 2c.v.B)"
+            ),
+            WriteMappingError::BadSubmapResidue {
+                submap_index,
+                residue,
+                residue_count,
+            } => write!(
+                f,
+                "vorbis mapping header (write): submap_configs[{submap_index}].residue={residue} >= residue_count={residue_count} (§4.2.4 step 2c.v.C)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteMappingError {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -725,6 +947,7 @@ impl fmt::Display for WriteError {
             WriteError::Floor1(e) => write!(f, "{e}"),
             WriteError::Floor0(e) => write!(f, "{e}"),
             WriteError::Residue(e) => write!(f, "{e}"),
+            WriteError::Mapping(e) => write!(f, "{e}"),
         }
     }
 }
@@ -736,6 +959,7 @@ impl std::error::Error for WriteError {
             WriteError::Floor1(e) => Some(e),
             WriteError::Floor0(e) => Some(e),
             WriteError::Residue(e) => Some(e),
+            WriteError::Mapping(e) => Some(e),
             _ => None,
         }
     }
@@ -762,6 +986,12 @@ impl From<WriteFloor0Error> for WriteError {
 impl From<WriteResidueError> for WriteError {
     fn from(value: WriteResidueError) -> Self {
         WriteError::Residue(value)
+    }
+}
+
+impl From<WriteMappingError> for WriteError {
+    fn from(value: WriteMappingError) -> Self {
+        WriteError::Mapping(value)
     }
 }
 
@@ -1731,12 +1961,274 @@ pub(crate) fn write_residue_header_into_writer(
     Ok(())
 }
 
+/// Serialises a [`MappingHeader`] to the §4.2.4 "Mappings" bit pattern.
+///
+/// §4.2.4 fields (each value is unsigned, written LSB-first into the
+/// bit stream per §2.1.4):
+///
+/// | Step    | Field                                  | Width                          | Notes                                                            |
+/// | ------- | -------------------------------------- | -----------------------------: | ---------------------------------------------------------------- |
+/// | 2c.i    | `submaps_flag`                         |                            1 b | Emitted as `1` iff `submaps > 1`.                                |
+/// | 2c.i    | `vorbis_mapping_submaps - 1`           |                            4 b | Elided when `submaps_flag = 0`.                                  |
+/// | 2c.ii   | `square_polar_flag`                    |                            1 b | Emitted as `1` iff `!coupling.is_empty()`.                       |
+/// | 2c.ii   | `vorbis_mapping_coupling_steps - 1`    |                            8 b | Elided when `square_polar_flag = 0`.                             |
+/// | 2c.ii.A | `magnitude_channel[step]`              | `ilog(audio_channels - 1)` b   | Width is `0` when `audio_channels == 1`.                         |
+/// | 2c.ii.A | `angle_channel[step]`                  | `ilog(audio_channels - 1)` b   | Width is `0` when `audio_channels == 1`.                         |
+/// | 2c.iii  | reserved (`0`)                         |                            2 b | Always emitted as `0`.                                           |
+/// | 2c.iv   | `mux[ch]`                              |                            4 b | Loop emitted only when `submaps > 1`.                            |
+/// | 2c.v.A  | `submap_time_placeholder[j]`           |                            8 b | Verbatim 8-bit blob (the spec instructs the decoder to discard). |
+/// | 2c.v.B  | `submap_floor[j]`                      |                            8 b | Index into the setup header's `floors` list.                     |
+/// | 2c.v.C  | `submap_residue[j]`                    |                            8 b | Index into the setup header's `residues` list.                   |
+///
+/// The header is emitted **without** the outer 16-bit `mapping_type`
+/// selector (always `0` for Vorbis I); that bit pattern is the
+/// responsibility of the §4.2.4 setup-header walker. The `mapping_type`
+/// field on the input struct is still validated (must equal `0`) so a
+/// stale value cannot quietly persist.
+///
+/// **Context tuple.** The writer takes
+/// `(audio_channels, floor_count, residue_count)` for the same reason
+/// the parser does: §4.2.4 ties the field-width and value-range checks
+/// to the §4.2.2 channel count and the surrounding setup header's
+/// per-list sizes. Passing the same triple the round-5 parser was
+/// called with reproduces every parser-side invariant exactly.
+///
+/// **Encoding choices** — the parser permits multiple bit patterns
+/// that round-trip to the same struct; the writer picks the densest:
+///
+/// * `submaps == 1` ⇒ `submaps_flag = 0` (the 4-bit length is elided).
+/// * `submaps > 1`  ⇒ `submaps_flag = 1, value = submaps - 1`.
+/// * `coupling.is_empty()` ⇒ `square_polar_flag = 0` (the 8-bit count
+///   plus coupling-step loop are elided).
+/// * `!coupling.is_empty()` ⇒ `square_polar_flag = 1,
+///   value = coupling.len() - 1`.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte may carry up to 7 bits of zero padding to byte-align the
+/// slice; the parser stops after the last submap-residue byte
+/// (a whole-byte boundary if `submaps == 1`).
+///
+/// Returns [`WriteMappingError`] without emitting any bits if the
+/// supplied header violates a §4.2.4 invariant.
+///
+/// ## Spec source
+///
+/// `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.2.4 "Mappings" (step 2a
+/// through step 2c.v.C — the per-mapping bit layout), §9.2.1 (the
+/// `ilog` helper used for the coupling-channel field width), and
+/// §2.1.4 (LSB-first packing).
+pub fn write_mapping_header(
+    header: &MappingHeader,
+    audio_channels: u8,
+    floor_count: usize,
+    residue_count: usize,
+) -> Result<Vec<u8>, WriteMappingError> {
+    let mut writer = BitWriterLsb::with_capacity(16);
+    write_mapping_header_into_writer(
+        header,
+        audio_channels,
+        floor_count,
+        residue_count,
+        &mut writer,
+    )?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a mapping header into a larger
+/// bit-packed stream. The setup-header writer will use this in a
+/// later round, mirroring
+/// [`write_floor0_header_into_writer`] /
+/// [`write_floor1_header_into_writer`] /
+/// [`write_residue_header_into_writer`] /
+/// [`write_codebook_into_writer`].
+///
+/// Writes the header's bits into `writer` at its current bit
+/// position. On error, the writer has had no bits appended (we
+/// validate before emitting).
+pub(crate) fn write_mapping_header_into_writer(
+    header: &MappingHeader,
+    audio_channels: u8,
+    floor_count: usize,
+    residue_count: usize,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteMappingError> {
+    // ---- §4.2.4 invariant gate. ----
+    // Fail-closed: refuse to emit a single bit if any field cannot be
+    // serialised back to a packet the parser would accept.
+
+    // step 2b: only mapping_type = 0 is defined in Vorbis I.
+    if header.mapping_type != 0 {
+        return Err(WriteMappingError::UnsupportedMappingType(
+            header.mapping_type,
+        ));
+    }
+    // Defensive: §4.2.2 already guarantees audio_channels > 0 for any
+    // accepted identification header.
+    if audio_channels == 0 {
+        return Err(WriteMappingError::ZeroAudioChannels);
+    }
+    // step 2c.i: submaps in 1..=16 (encoded as `read 4 bits + 1`,
+    // guarded by an optional flag for the submaps == 1 default).
+    if header.submaps == 0 || header.submaps > 16 {
+        return Err(WriteMappingError::SubmapsOutOfRange(header.submaps));
+    }
+    // step 2c.ii: coupling-step count fits in `read 8 bits + 1` (so
+    // 1..=256 when the square-polar flag is set).
+    if header.coupling.len() > 256 {
+        return Err(WriteMappingError::CouplingStepsOverflow(
+            header.coupling.len(),
+        ));
+    }
+    // step 2c.ii.A: per-step magnitude / angle channel-number checks
+    // (parser rejects: magnitude == angle, OR either >= audio_channels).
+    // Additionally, the field width is `ilog(audio_channels - 1)` bits;
+    // any value whose top bit lies above that width cannot be emitted
+    // without truncation. For audio_channels == 1, the field is 0 bits
+    // wide and only the value 0 is representable — every coupling step
+    // would then immediately fail the BadCouplingChannels gate (since
+    // magnitude == angle == 0).
+    let channel_bits = ilog((audio_channels as u32).saturating_sub(1));
+    for (step_index, step) in header.coupling.iter().enumerate() {
+        if step.magnitude_channel == step.angle_channel
+            || step.magnitude_channel >= audio_channels
+            || step.angle_channel >= audio_channels
+        {
+            return Err(WriteMappingError::BadCouplingChannels {
+                step_index,
+                magnitude_channel: step.magnitude_channel,
+                angle_channel: step.angle_channel,
+                audio_channels,
+            });
+        }
+        // The above bound (`< audio_channels`) is strictly tighter than
+        // the field-width bound for the legal range, since
+        // `audio_channels - 1 <= (1 << channel_bits) - 1` by definition
+        // of `ilog`. But we double-check for defence-in-depth: a future
+        // ilog refactor that returned a wider value than needed would
+        // leave the field-bits check redundant but not incorrect, and a
+        // narrower one would surface here before any bit is emitted.
+        if channel_bits < 32 {
+            let cap: u32 = if channel_bits == 0 {
+                0
+            } else {
+                (1u32 << channel_bits) - 1
+            };
+            if step.magnitude_channel as u32 > cap {
+                return Err(WriteMappingError::CouplingChannelOverflow {
+                    step_index,
+                    is_magnitude: true,
+                    value: step.magnitude_channel,
+                    field_bits: channel_bits,
+                });
+            }
+            if step.angle_channel as u32 > cap {
+                return Err(WriteMappingError::CouplingChannelOverflow {
+                    step_index,
+                    is_magnitude: false,
+                    value: step.angle_channel,
+                    field_bits: channel_bits,
+                });
+            }
+        }
+    }
+    // step 2c.iv: mux vector length depends on submaps.
+    let required_mux_len = if header.submaps > 1 {
+        audio_channels as usize
+    } else {
+        0
+    };
+    if header.mux.len() != required_mux_len {
+        return Err(WriteMappingError::MuxLengthMismatch {
+            submaps: header.submaps,
+            audio_channels,
+            actual: header.mux.len(),
+        });
+    }
+    // step 2c.iv (per-channel value bound). Only reachable when
+    // submaps > 1; for submaps == 1 the loop above forced
+    // mux.is_empty() so this check is vacuous.
+    for (channel_index, &mux) in header.mux.iter().enumerate() {
+        if mux >= header.submaps {
+            return Err(WriteMappingError::BadMuxValue {
+                channel_index,
+                mux,
+                submaps: header.submaps,
+            });
+        }
+    }
+    // step 2c.v: per-submap config triples.
+    if header.submap_configs.len() != header.submaps as usize {
+        return Err(WriteMappingError::SubmapCountMismatch {
+            submaps: header.submaps,
+            actual: header.submap_configs.len(),
+        });
+    }
+    for (submap_index, cfg) in header.submap_configs.iter().enumerate() {
+        if (cfg.floor as usize) >= floor_count {
+            return Err(WriteMappingError::BadSubmapFloor {
+                submap_index,
+                floor: cfg.floor,
+                floor_count,
+            });
+        }
+        if (cfg.residue as usize) >= residue_count {
+            return Err(WriteMappingError::BadSubmapResidue {
+                submap_index,
+                residue: cfg.residue,
+                residue_count,
+            });
+        }
+    }
+    // Note: `time_placeholder` is a raw u8 the parser is instructed by
+    // the spec to "read and discard"; its 8-bit field width accepts
+    // every u8 value, so no further bound check is required.
+
+    // ---- §4.2.4 emit. ----
+    // step 2c.i: submaps_flag + optional `read 4 bits + 1` body. The
+    // densest encoding picks flag=0 when submaps == 1.
+    if header.submaps > 1 {
+        writer.write_u32(1, 1);
+        writer.write_u32((header.submaps - 1) as u32, 4);
+    } else {
+        writer.write_u32(0, 1);
+    }
+    // step 2c.ii: square_polar_flag + optional coupling-step body.
+    if !header.coupling.is_empty() {
+        writer.write_u32(1, 1);
+        // `coupling.len() - 1` fits in 8 bits because the gate above
+        // refused len > 256, and the empty case is handled by the
+        // outer if. So len is in 1..=256 → len-1 is in 0..=255.
+        writer.write_u32((header.coupling.len() - 1) as u32, 8);
+        for step in &header.coupling {
+            writer.write_u32(step.magnitude_channel as u32, channel_bits);
+            writer.write_u32(step.angle_channel as u32, channel_bits);
+        }
+    } else {
+        writer.write_u32(0, 1);
+    }
+    // step 2c.iii: 2-bit reserved, always 0.
+    writer.write_u32(0, 2);
+    // step 2c.iv: per-channel mux[ch] only when submaps > 1.
+    if header.submaps > 1 {
+        for &mux in &header.mux {
+            writer.write_u32(mux as u32, 4);
+        }
+    }
+    // step 2c.v: per-submap (time_placeholder, floor, residue) triples.
+    for cfg in &header.submap_configs {
+        writer.write_u32(cfg.time_placeholder as u32, 8);
+        writer.write_u32(cfg.floor as u32, 8);
+        writer.write_u32(cfg.residue as u32, 8);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::comment::parse_comment_header;
     use crate::identification::parse_identification_header;
-    use crate::setup::Floor1Class;
+    use crate::setup::{Floor1Class, MappingCouplingStep, MappingSubmap};
 
     // ----------------------------------------------------------------
     // Identification header — byte-shape pinning.
@@ -4448,6 +4940,1046 @@ mod tests {
         assert_eq!(err, WriteResidueError::UnsupportedResidueType(7));
 
         // bit_position unchanged: the gate ran before any write call.
+        assert_eq!(w.bit_position(), before);
+    }
+
+    // ----------------------------------------------------------------
+    // Mapping header writer — local parser + roundtrip helpers.
+    // ----------------------------------------------------------------
+
+    /// Test-only inline mapping-header parser. Mirrors `parse_mapping_header`
+    /// in `src/setup.rs` (which is private), inlined here so the writer's
+    /// bit-exact roundtrip can be exercised without coupling the encoder
+    /// test suite to the setup-header outer walker. Performs only the
+    /// reads — invariant checking is the production parser's job and is
+    /// exercised at the setup-walker level elsewhere.
+    ///
+    /// Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.2.4
+    /// "Mappings" step 2c.
+    fn local_parse_mapping_for_tests(
+        reader: &mut oxideav_core::bits::BitReaderLsb<'_>,
+        mapping_type: u16,
+        audio_channels: u8,
+    ) -> MappingHeader {
+        let submaps_flag = reader.read_bit().unwrap();
+        let submaps = if submaps_flag {
+            (reader.read_u32(4).unwrap() as u8) + 1
+        } else {
+            1
+        };
+        let square_polar_flag = reader.read_bit().unwrap();
+        let coupling = if square_polar_flag {
+            let n = (reader.read_u32(8).unwrap() as usize) + 1;
+            let channel_bits = ilog((audio_channels as u32).saturating_sub(1));
+            let mut steps = Vec::with_capacity(n);
+            for _ in 0..n {
+                let mag = reader.read_u32(channel_bits).unwrap() as u8;
+                let ang = reader.read_u32(channel_bits).unwrap() as u8;
+                steps.push(MappingCouplingStep {
+                    magnitude_channel: mag,
+                    angle_channel: ang,
+                });
+            }
+            steps
+        } else {
+            Vec::new()
+        };
+        // step 2c.iii reserved 2 bits.
+        let _ = reader.read_u32(2).unwrap();
+        let mux = if submaps > 1 {
+            let mut m = Vec::with_capacity(audio_channels as usize);
+            for _ in 0..audio_channels {
+                m.push(reader.read_u32(4).unwrap() as u8);
+            }
+            m
+        } else {
+            Vec::new()
+        };
+        let mut submap_configs = Vec::with_capacity(submaps as usize);
+        for _ in 0..submaps {
+            let time_placeholder = reader.read_u32(8).unwrap() as u8;
+            let floor = reader.read_u32(8).unwrap() as u8;
+            let residue = reader.read_u32(8).unwrap() as u8;
+            submap_configs.push(MappingSubmap {
+                time_placeholder,
+                floor,
+                residue,
+            });
+        }
+        MappingHeader {
+            mapping_type,
+            submaps,
+            coupling,
+            mux,
+            submap_configs,
+        }
+    }
+
+    /// The minimal mono mapping: submaps=1, no coupling, single submap
+    /// pointing at floor 0 / residue 0. Mirrors the §4.2.4 layout for a
+    /// `mono-44100-q5-typical` fixture's mapping section.
+    fn minimal_mono_mapping() -> MappingHeader {
+        MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        }
+    }
+
+    /// Two-channel coupled stereo mapping: submaps=1, single coupling
+    /// step (magnitude=0, angle=1), single submap. Mirrors the
+    /// §4.2.4 layout for the typical libvorbis stereo packet.
+    fn stereo_coupled_mapping() -> MappingHeader {
+        MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        }
+    }
+
+    fn mapping_roundtrips(
+        header: &MappingHeader,
+        audio_channels: u8,
+        floor_count: usize,
+        residue_count: usize,
+    ) {
+        let bytes = write_mapping_header(header, audio_channels, floor_count, residue_count)
+            .expect("write must succeed");
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let parsed =
+            local_parse_mapping_for_tests(&mut reader, header.mapping_type, audio_channels);
+        assert_eq!(&parsed, header, "mapping roundtrip equality");
+    }
+
+    // ----------------------------------------------------------------
+    // Mapping header writer — byte-shape pinning.
+    // ----------------------------------------------------------------
+
+    /// Pin the exact bit layout of the minimal mono mapping. Reproduces
+    /// a hand-rolled bit stream against the writer output so the §4.2.4
+    /// field order + widths are locked, not merely "roundtrips through
+    /// the local parser."
+    #[test]
+    fn mapping_byte_shape_minimal_mono() {
+        let bytes = write_mapping_header(&minimal_mono_mapping(), 1, 1, 1).expect("must build");
+        // Bits emitted (LSB-first per §2.1.4):
+        //   submaps_flag           = 0  →  1 bit
+        //   square_polar_flag      = 0  →  1 bit
+        //   reserved               = 0  →  2 bits
+        //   submap_configs[0]:
+        //     time_placeholder = 0      →  8 bits
+        //     floor            = 0      →  8 bits
+        //     residue          = 0      →  8 bits
+        // Total = 1 + 1 + 2 + 24 = 28 bits → 4 bytes.
+        let total_bits = 1 + 1 + 2 + 24;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+        let mut expected = BitWriterLsb::with_capacity(16);
+        expected.write_u32(0, 1); // submaps_flag
+        expected.write_u32(0, 1); // square_polar_flag
+        expected.write_u32(0, 2); // reserved
+        expected.write_u32(0, 8); // submap[0].time_placeholder
+        expected.write_u32(0, 8); // submap[0].floor
+        expected.write_u32(0, 8); // submap[0].residue
+        assert_eq!(bytes, expected.finish());
+    }
+
+    /// Pin the exact bit layout of the stereo-coupled mapping (the
+    /// classic libvorbis stereo body).
+    #[test]
+    fn mapping_byte_shape_stereo_coupled() {
+        let bytes = write_mapping_header(&stereo_coupled_mapping(), 2, 1, 1).expect("must build");
+        // channel_bits = ilog(audio_channels - 1) = ilog(1) = 1.
+        // Bits emitted (LSB-first per §2.1.4):
+        //   submaps_flag           = 0  →  1 bit
+        //   square_polar_flag      = 1  →  1 bit
+        //   coupling_steps - 1     = 0  →  8 bits
+        //   coupling[0].mag        = 0  →  1 bit
+        //   coupling[0].ang        = 1  →  1 bit
+        //   reserved               = 0  →  2 bits
+        //   submap_configs[0]:
+        //     time_placeholder = 0      →  8 bits
+        //     floor            = 0      →  8 bits
+        //     residue          = 0      →  8 bits
+        // Total = 1+1+8+1+1+2+24 = 38 bits → 5 bytes.
+        let total_bits = 1 + 1 + 8 + 1 + 1 + 2 + 24;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+        let mut expected = BitWriterLsb::with_capacity(16);
+        expected.write_u32(0, 1); // submaps_flag
+        expected.write_u32(1, 1); // square_polar_flag
+        expected.write_u32(0, 8); // coupling_steps - 1
+        expected.write_u32(0, 1); // coupling[0].magnitude_channel
+        expected.write_u32(1, 1); // coupling[0].angle_channel
+        expected.write_u32(0, 2); // reserved
+        expected.write_u32(0, 8); // submap[0].time_placeholder
+        expected.write_u32(0, 8); // submap[0].floor
+        expected.write_u32(0, 8); // submap[0].residue
+        assert_eq!(bytes, expected.finish());
+    }
+
+    /// Closed-form bit-length formula for the minimal mono case.
+    /// Independently catches a regression that shifts the byte
+    /// count by a single bit somewhere.
+    #[test]
+    fn mapping_bit_length_minimal_mono() {
+        let bytes = write_mapping_header(&minimal_mono_mapping(), 1, 1, 1).expect("must build");
+        // 1 (submaps_flag) + 1 (square_polar_flag) + 2 (reserved)
+        // + 0 (no coupling body) + 0 (mux loop elided)
+        // + 1 * 24 (one submap config) = 28 bits.
+        assert_eq!(bytes.len(), 28usize.div_ceil(8));
+    }
+
+    /// Closed-form bit-length formula for a multi-submap multi-channel
+    /// case with coupling. submaps=3 (flag=1, +4 bits), audio_channels=4
+    /// (channel_bits=ilog(3)=2), coupling_steps=2 (flag=1, +8 bits, plus
+    /// 2 * 2 * 2 bits), reserved=2, mux=4*4=16 bits, submap_configs=3 *
+    /// 24 bits = 72 bits. Total = 1+4+1+8+8+2+16+72 = 112 bits = 14 bytes.
+    #[test]
+    fn mapping_bit_length_multi_submap_with_coupling() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 3,
+            coupling: vec![
+                MappingCouplingStep {
+                    magnitude_channel: 0,
+                    angle_channel: 1,
+                },
+                MappingCouplingStep {
+                    magnitude_channel: 2,
+                    angle_channel: 3,
+                },
+            ],
+            mux: vec![0, 0, 1, 2],
+            submap_configs: vec![
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+            ],
+        };
+        let bytes = write_mapping_header(&h, 4, 1, 1).expect("must build");
+        // 1 + 4 (submaps_flag + body)
+        // + 1 + 8 + 2*(2+2) (square_polar_flag + body + 2 steps * 2*channel_bits)
+        // + 2 (reserved)
+        // + 4 * 4 (mux: per-channel 4 bits)
+        // + 3 * 24 (three submap configs)
+        // = 5 + 17 + 2 + 16 + 72 = 112 bits = 14 bytes.
+        assert_eq!(bytes.len(), 112usize.div_ceil(8));
+    }
+
+    // ----------------------------------------------------------------
+    // Mapping header writer — bit-exact roundtrip fixtures.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn mapping_roundtrips_minimal_mono() {
+        mapping_roundtrips(&minimal_mono_mapping(), 1, 1, 1);
+    }
+
+    #[test]
+    fn mapping_roundtrips_stereo_coupled() {
+        mapping_roundtrips(&stereo_coupled_mapping(), 2, 1, 1);
+    }
+
+    /// Two-channel, no coupling, single submap.
+    #[test]
+    fn mapping_roundtrips_stereo_no_coupling() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        mapping_roundtrips(&h, 2, 1, 1);
+    }
+
+    /// 5.1-channel (6-channel) layout with multiple submaps + multiple
+    /// coupling steps. Pinning the §4.2.4 multi-channel path that
+    /// exists in the wild.
+    #[test]
+    fn mapping_roundtrips_five_one_channel() {
+        // 6 channels: channel_bits = ilog(5) = 3.
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: vec![
+                MappingCouplingStep {
+                    magnitude_channel: 0,
+                    angle_channel: 1,
+                },
+                MappingCouplingStep {
+                    magnitude_channel: 2,
+                    angle_channel: 3,
+                },
+                MappingCouplingStep {
+                    magnitude_channel: 4,
+                    angle_channel: 5,
+                },
+            ],
+            mux: vec![0, 0, 0, 0, 1, 1],
+            submap_configs: vec![
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+            ],
+        };
+        mapping_roundtrips(&h, 6, 1, 1);
+    }
+
+    /// Maximum legal submaps (16) — encoded as submaps_flag=1, body=15.
+    #[test]
+    fn mapping_roundtrips_submaps_at_upper_edge() {
+        let configs: Vec<MappingSubmap> = (0..16)
+            .map(|i| MappingSubmap {
+                time_placeholder: i as u8,
+                floor: 0,
+                residue: 0,
+            })
+            .collect();
+        // 16 submaps means mux[ch] in 0..16, fits in 4 bits.
+        let mux: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 16,
+            coupling: Vec::new(),
+            mux,
+            submap_configs: configs,
+        };
+        // Need 16 channels so each mux value < 16; channel_bits =
+        // ilog(15) = 4 — no coupling, so that field width is unused.
+        mapping_roundtrips(&h, 16, 1, 1);
+    }
+
+    /// Maximum legal coupling steps (256) — encoded as the 8-bit body
+    /// at its 0xFF upper edge. Uses 2-channel audio (channel_bits=1) so
+    /// every step alternates (mag, ang) = (0, 1).
+    #[test]
+    fn mapping_roundtrips_coupling_steps_at_upper_edge() {
+        let coupling: Vec<MappingCouplingStep> = (0..256)
+            .map(|_| MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            })
+            .collect();
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling,
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        mapping_roundtrips(&h, 2, 1, 1);
+    }
+
+    /// time_placeholder, floor, residue values across the entire 8-bit
+    /// field. floor=255 and residue=255 are legal when floor_count /
+    /// residue_count are 256.
+    #[test]
+    fn mapping_roundtrips_submap_indices_at_upper_edge() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 255,
+                floor: 255,
+                residue: 255,
+            }],
+        };
+        mapping_roundtrips(&h, 1, 256, 256);
+    }
+
+    /// `time_placeholder` is a raw 8-bit blob — exercise every value.
+    /// A single submap suffices.
+    #[test]
+    fn mapping_roundtrips_time_placeholder_sweep() {
+        for tp in 0u8..=255 {
+            let h = MappingHeader {
+                mapping_type: 0,
+                submaps: 1,
+                coupling: Vec::new(),
+                mux: Vec::new(),
+                submap_configs: vec![MappingSubmap {
+                    time_placeholder: tp,
+                    floor: 0,
+                    residue: 0,
+                }],
+            };
+            mapping_roundtrips(&h, 1, 1, 1);
+        }
+    }
+
+    /// 8-channel layout — channel_bits = ilog(7) = 3. Pin that the
+    /// 3-bit width handles every legal magnitude/angle pair.
+    #[test]
+    fn mapping_roundtrips_eight_channel_coupling_width() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![
+                MappingCouplingStep {
+                    magnitude_channel: 0,
+                    angle_channel: 7,
+                },
+                MappingCouplingStep {
+                    magnitude_channel: 3,
+                    angle_channel: 4,
+                },
+            ],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        mapping_roundtrips(&h, 8, 1, 1);
+    }
+
+    /// 3-channel layout — channel_bits = ilog(2) = 2. Legal max
+    /// magnitude/angle channels are in 0..3.
+    #[test]
+    fn mapping_roundtrips_three_channel() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 1,
+                angle_channel: 2,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 7,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        mapping_roundtrips(&h, 3, 1, 1);
+    }
+
+    /// 255-channel layout exercises the channel_bits = ilog(254) = 8
+    /// upper edge of the coupling-channel field width.
+    #[test]
+    fn mapping_roundtrips_max_channel_width() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 254,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        mapping_roundtrips(&h, 255, 1, 1);
+    }
+
+    /// Submap config triples at the legal 4-bit boundary for mux:
+    /// submaps=2 with mux values {0, 1, 0, 1} cycling.
+    #[test]
+    fn mapping_roundtrips_four_channel_two_submap_mux_cycle() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            mux: vec![0, 1, 0, 1],
+            submap_configs: vec![
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+            ],
+        };
+        mapping_roundtrips(&h, 4, 1, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // Mapping header writer — encoding-picker pinning.
+    // ----------------------------------------------------------------
+
+    /// submaps == 1 picks the densest encoding: submaps_flag = 0 with
+    /// no 4-bit body. The minimal-mono fixture's first bit must be 0.
+    #[test]
+    fn mapping_picks_dense_submaps_flag_when_submaps_is_one() {
+        let bytes = write_mapping_header(&minimal_mono_mapping(), 1, 1, 1).expect("must build");
+        // Byte 0 LSB is submaps_flag.
+        assert_eq!(bytes[0] & 0b1, 0);
+    }
+
+    /// submaps > 1 emits flag=1, body=submaps-1 in 4 bits.
+    #[test]
+    fn mapping_picks_flagged_encoding_when_submaps_above_one() {
+        let h = MappingHeader {
+            mapping_type: 0,
+            submaps: 4,
+            coupling: Vec::new(),
+            mux: vec![0, 1, 2, 3],
+            submap_configs: vec![
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+            ],
+        };
+        let bytes = write_mapping_header(&h, 4, 1, 1).expect("must build");
+        // Byte 0 LSB is submaps_flag (must be 1).
+        assert_eq!(bytes[0] & 0b1, 1);
+        // Bits 1..=4 are submaps - 1 = 3. After LSB-first packing the
+        // 4-bit field occupies bits 1..=4 of byte 0.
+        assert_eq!((bytes[0] >> 1) & 0b1111, 3);
+    }
+
+    /// `coupling.is_empty()` picks the densest encoding: square_polar_flag
+    /// = 0 with no 8-bit body.
+    #[test]
+    fn mapping_picks_dense_square_polar_flag_when_no_coupling() {
+        // submaps=1 (so bit 0 = 0) followed by square_polar_flag at bit
+        // 1.
+        let bytes = write_mapping_header(&minimal_mono_mapping(), 1, 1, 1).expect("must build");
+        assert_eq!((bytes[0] >> 1) & 0b1, 0);
+    }
+
+    // ----------------------------------------------------------------
+    // Mapping header writer — rejection paths.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn mapping_rejects_nonzero_mapping_type() {
+        let mut bad = minimal_mono_mapping();
+        bad.mapping_type = 1;
+        let err = write_mapping_header(&bad, 1, 1, 1).expect_err("must reject mapping_type != 0");
+        assert_eq!(err, WriteMappingError::UnsupportedMappingType(1));
+    }
+
+    #[test]
+    fn mapping_rejects_zero_audio_channels() {
+        let err = write_mapping_header(&minimal_mono_mapping(), 0, 1, 1)
+            .expect_err("must reject audio_channels = 0");
+        assert_eq!(err, WriteMappingError::ZeroAudioChannels);
+    }
+
+    #[test]
+    fn mapping_rejects_zero_submaps() {
+        let mut bad = minimal_mono_mapping();
+        bad.submaps = 0;
+        bad.submap_configs.clear();
+        let err = write_mapping_header(&bad, 1, 1, 1).expect_err("must reject submaps = 0");
+        assert_eq!(err, WriteMappingError::SubmapsOutOfRange(0));
+    }
+
+    #[test]
+    fn mapping_rejects_submaps_above_sixteen() {
+        let mut bad = minimal_mono_mapping();
+        bad.submaps = 17;
+        bad.submap_configs = (0..17)
+            .map(|_| MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            })
+            .collect();
+        // 16 channels so mux would fit in 4 bits if we were past the gate.
+        bad.mux = (0..16).map(|i| (i % 17) as u8).collect();
+        let err = write_mapping_header(&bad, 16, 1, 1).expect_err("must reject submaps = 17");
+        assert_eq!(err, WriteMappingError::SubmapsOutOfRange(17));
+    }
+
+    #[test]
+    fn mapping_rejects_coupling_steps_overflow() {
+        let coupling: Vec<MappingCouplingStep> = (0..257)
+            .map(|_| MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            })
+            .collect();
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling,
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        let err = write_mapping_header(&bad, 2, 1, 1).expect_err("must reject 257 coupling steps");
+        assert_eq!(err, WriteMappingError::CouplingStepsOverflow(257));
+    }
+
+    #[test]
+    fn mapping_rejects_coupling_magnitude_equal_angle() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 1,
+                angle_channel: 1,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        let err = write_mapping_header(&bad, 2, 1, 1).expect_err("must reject magnitude == angle");
+        assert_eq!(
+            err,
+            WriteMappingError::BadCouplingChannels {
+                step_index: 0,
+                magnitude_channel: 1,
+                angle_channel: 1,
+                audio_channels: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_coupling_magnitude_out_of_range() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 2,
+                angle_channel: 1,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        let err = write_mapping_header(&bad, 2, 1, 1)
+            .expect_err("must reject magnitude >= audio_channels");
+        assert_eq!(
+            err,
+            WriteMappingError::BadCouplingChannels {
+                step_index: 0,
+                magnitude_channel: 2,
+                angle_channel: 1,
+                audio_channels: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_coupling_angle_out_of_range() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 2,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        let err =
+            write_mapping_header(&bad, 2, 1, 1).expect_err("must reject angle >= audio_channels");
+        assert_eq!(
+            err,
+            WriteMappingError::BadCouplingChannels {
+                step_index: 0,
+                magnitude_channel: 0,
+                angle_channel: 2,
+                audio_channels: 2,
+            }
+        );
+    }
+
+    /// audio_channels == 1 with at least one coupling step:
+    /// channel_bits = 0, so magnitude/angle can only be 0 — which then
+    /// fails the magnitude != angle check. The writer must refuse with
+    /// the BadCouplingChannels variant before any bits are emitted.
+    #[test]
+    fn mapping_rejects_coupling_on_mono_audio() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 0,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        let err =
+            write_mapping_header(&bad, 1, 1, 1).expect_err("must reject coupling on mono audio");
+        assert_eq!(
+            err,
+            WriteMappingError::BadCouplingChannels {
+                step_index: 0,
+                magnitude_channel: 0,
+                angle_channel: 0,
+                audio_channels: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_mux_length_mismatch_when_submaps_above_one() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            mux: vec![0], // wrong length: should be 4
+            submap_configs: vec![
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+            ],
+        };
+        let err = write_mapping_header(&bad, 4, 1, 1).expect_err("must reject mux length mismatch");
+        assert_eq!(
+            err,
+            WriteMappingError::MuxLengthMismatch {
+                submaps: 2,
+                audio_channels: 4,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_mux_length_mismatch_when_submaps_is_one() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: vec![0, 0], // wrong: must be empty when submaps == 1
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        let err = write_mapping_header(&bad, 2, 1, 1)
+            .expect_err("must reject nonempty mux when submaps == 1");
+        assert_eq!(
+            err,
+            WriteMappingError::MuxLengthMismatch {
+                submaps: 1,
+                audio_channels: 2,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_mux_value_out_of_range() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            mux: vec![0, 2], // mux[1] = 2 >= submaps = 2
+            submap_configs: vec![
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+                MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                },
+            ],
+        };
+        let err = write_mapping_header(&bad, 2, 1, 1).expect_err("must reject mux[ch] >= submaps");
+        assert_eq!(
+            err,
+            WriteMappingError::BadMuxValue {
+                channel_index: 1,
+                mux: 2,
+                submaps: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_submap_count_mismatch() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            mux: vec![0, 0],
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }], // wrong: should be 2 entries
+        };
+        let err = write_mapping_header(&bad, 2, 1, 1)
+            .expect_err("must reject submap_configs count != submaps");
+        assert_eq!(
+            err,
+            WriteMappingError::SubmapCountMismatch {
+                submaps: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_submap_floor_out_of_range() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 3,
+                residue: 0,
+            }],
+        };
+        // floor_count = 2, so floor=3 is out of range.
+        let err = write_mapping_header(&bad, 1, 2, 1)
+            .expect_err("must reject submap floor >= floor_count");
+        assert_eq!(
+            err,
+            WriteMappingError::BadSubmapFloor {
+                submap_index: 0,
+                floor: 3,
+                floor_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_rejects_submap_residue_out_of_range() {
+        let bad = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 2,
+            }],
+        };
+        // residue_count = 2, so residue=2 is out of range.
+        let err = write_mapping_header(&bad, 1, 1, 2)
+            .expect_err("must reject submap residue >= residue_count");
+        assert_eq!(
+            err,
+            WriteMappingError::BadSubmapResidue {
+                submap_index: 0,
+                residue: 2,
+                residue_count: 2,
+            }
+        );
+    }
+
+    /// Display strings are non-empty for every WriteMappingError variant
+    /// — smoke test against silent template-string regressions.
+    #[test]
+    fn mapping_error_display_non_empty() {
+        let cases = vec![
+            WriteMappingError::UnsupportedMappingType(1),
+            WriteMappingError::ZeroAudioChannels,
+            WriteMappingError::SubmapsOutOfRange(17),
+            WriteMappingError::CouplingStepsOverflow(257),
+            WriteMappingError::BadCouplingChannels {
+                step_index: 0,
+                magnitude_channel: 1,
+                angle_channel: 1,
+                audio_channels: 2,
+            },
+            WriteMappingError::CouplingChannelOverflow {
+                step_index: 0,
+                is_magnitude: true,
+                value: 7,
+                field_bits: 2,
+            },
+            WriteMappingError::CouplingChannelOverflow {
+                step_index: 1,
+                is_magnitude: false,
+                value: 4,
+                field_bits: 2,
+            },
+            WriteMappingError::MuxLengthMismatch {
+                submaps: 2,
+                audio_channels: 4,
+                actual: 1,
+            },
+            WriteMappingError::MuxLengthMismatch {
+                submaps: 1,
+                audio_channels: 4,
+                actual: 1,
+            },
+            WriteMappingError::BadMuxValue {
+                channel_index: 1,
+                mux: 2,
+                submaps: 2,
+            },
+            WriteMappingError::SubmapCountMismatch {
+                submaps: 2,
+                actual: 1,
+            },
+            WriteMappingError::BadSubmapFloor {
+                submap_index: 0,
+                floor: 3,
+                floor_count: 2,
+            },
+            WriteMappingError::BadSubmapResidue {
+                submap_index: 0,
+                residue: 2,
+                residue_count: 2,
+            },
+        ];
+        for c in cases {
+            let s = format!("{c}");
+            assert!(!s.is_empty(), "Display must be non-empty for {c:?}");
+        }
+    }
+
+    /// `WriteError::Mapping` wraps a `WriteMappingError` via the `From`
+    /// glue and surfaces the source on `std::error::Error::source()`.
+    #[test]
+    fn mapping_write_error_from_and_source() {
+        let inner = WriteMappingError::SubmapsOutOfRange(0);
+        let outer: WriteError = inner.clone().into();
+        assert!(matches!(&outer, WriteError::Mapping(ref e) if e == &inner));
+        let source = std::error::Error::source(&outer).expect("must surface inner");
+        assert_eq!(format!("{source}"), format!("{inner}"));
+    }
+
+    // ----------------------------------------------------------------
+    // Mapping header writer — splice (`_into_writer`) tests.
+    // ----------------------------------------------------------------
+
+    /// The `_into_writer` companion appends bits to the existing
+    /// writer state without resetting it. Mirrors the residue / floor
+    /// splice-point test pattern.
+    #[test]
+    fn mapping_into_writer_splice_appends_after_existing_bits() {
+        let mut w = BitWriterLsb::with_capacity(16);
+        w.write_u32(0b1010_1010, 8); // 8-bit prefix
+        let before = w.bit_position();
+
+        write_mapping_header_into_writer(&minimal_mono_mapping(), 1, 1, 1, &mut w)
+            .expect("must build");
+        let after = w.bit_position();
+        // 28 bits were appended.
+        assert_eq!(after - before, 28);
+
+        // The standalone writer's output, prepended with the 8-bit
+        // prefix, must equal the spliced writer's finished output.
+        let standalone =
+            write_mapping_header(&minimal_mono_mapping(), 1, 1, 1).expect("must build");
+        let mut expected = BitWriterLsb::with_capacity(16);
+        expected.write_u32(0b1010_1010, 8);
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(&standalone);
+        // 28 bits live in 4 bytes; copy them through.
+        for _ in 0..28 {
+            expected.write_bit(reader.read_bit().unwrap());
+        }
+        assert_eq!(w.finish(), expected.finish());
+    }
+
+    /// If the gate rejects the header, the splice writer's bit cursor
+    /// is unchanged — no bits are appended. Pinning the "validate
+    /// before emit" contract.
+    #[test]
+    fn mapping_into_writer_splice_emits_no_bits_on_error() {
+        let mut w = BitWriterLsb::with_capacity(16);
+        w.write_u32(0b101, 3);
+        let before = w.bit_position();
+
+        let mut bad = minimal_mono_mapping();
+        bad.mapping_type = 7;
+
+        let err = write_mapping_header_into_writer(&bad, 1, 1, 1, &mut w)
+            .expect_err("must reject unsupported mapping_type");
+        assert_eq!(err, WriteMappingError::UnsupportedMappingType(7));
+
         assert_eq!(w.bit_position(), before);
     }
 }
