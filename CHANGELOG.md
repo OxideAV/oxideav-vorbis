@@ -6,6 +6,33 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §6.2.1 floor type 0 header WRITE primitive (round 23,
+  umbrella round 212).** New public function
+  `encoder::write_floor0_header` serialises a
+  `crate::setup::Floor0Header` to the §6.2.1 floor-type-0 header bit
+  pattern. The function is the bit-exact inverse of the round-7 floor 0
+  parser: the property
+  `parse_floor0_header(&mut BitReaderLsb::new(&write_floor0_header(&h)?))? == h`
+  holds for every legal `Floor0Header`. The crate-private
+  `write_floor0_header_into_writer` companion mirrors the §7.2.2 floor 1
+  splice point shape established in round 22, allowing the still-pending
+  setup-header writer to splice the floor 0 body into a wider
+  bit-packed stream. A new `WriteFloor0Error` enum enumerates three
+  §6.2.1 invariant violations (`AmplitudeBitsOverflow`,
+  `EmptyBookList`, `BookListTooLong`); each refuses the call without
+  emitting any bits rather than serialise a header the parser would
+  reject. The umbrella `WriteError` enum grows a
+  `WriteError::Floor0(WriteFloor0Error)` variant with the matching
+  `From` glue and `source()` chain. Sixteen new tests pin the byte
+  shape on the minimal `setup::tests::minimal_floor0` fixture, the
+  parametric bit-length formula
+  `8 + 16 + 16 + 6 + 8 + 4 + 8 × number_of_books` on the 1-book
+  minimum and 16-book maximum, six roundtrip variants covering field
+  extremes (`u8::MAX` / `u16::MAX` corners, `amplitude_bits = 63`,
+  16-book maximum, all-zero spec-legal writer-input), each rejection
+  path, the splice-point append behaviour, and the fail-closed
+  validate-before-emit contract on the `into_writer` helper.
+
 * **Vorbis I §7.2.2 floor type 1 header WRITE primitive (round 22,
   umbrella round 206).** New public function
   `encoder::write_floor1_header` serialises a

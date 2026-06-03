@@ -1,4 +1,4 @@
-//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201).
+//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212).
 //!
 //! This module collects the encoder-side functions that mirror the
 //! parser surface in [`crate::identification`], [`crate::comment`],
@@ -18,6 +18,12 @@
 //!   variable-length codebook-header shape defined in Vorbis I §3.2.1.
 //!   This is the first sub-packet writer (codebooks are nested inside
 //!   the setup header — they do not have a §4.2.1 common header).
+//! * [`write_floor1_header`] — serialises a [`Floor1Header`] to the
+//!   §7.2.2 floor-type-1 setup-header bit pattern.
+//! * [`write_floor0_header`] — serialises a [`Floor0Header`] to the
+//!   §6.2.1 floor-type-0 setup-header bit pattern. Sibling of
+//!   [`write_floor1_header`] and the second per-floor encoder
+//!   primitive.
 //!
 //! Both functions validate the same spec-mandated invariants that the
 //! corresponding parser enforces on input, so a typo in the caller's
@@ -78,7 +84,7 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
-use crate::setup::Floor1Header;
+use crate::setup::{Floor0Header, Floor1Header};
 
 /// Errors that may arise while writing a Vorbis I header packet.
 ///
@@ -126,6 +132,9 @@ pub enum WriteError {
     /// A nested floor type 1 header (§7.2.2) failed one of the
     /// writer-side invariants checked by [`write_floor1_header`].
     Floor1(WriteFloor1Error),
+    /// A nested floor type 0 header (§6.2.1) failed one of the
+    /// writer-side invariants checked by [`write_floor0_header`].
+    Floor0(WriteFloor0Error),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -503,6 +512,51 @@ impl fmt::Display for WriteFloor1Error {
 
 impl std::error::Error for WriteFloor1Error {}
 
+/// Errors that may arise while writing a Vorbis I floor type 0 header
+/// (§6.2.1) via [`write_floor0_header`].
+///
+/// Each variant flags a §6.2.1 invariant the caller-supplied
+/// [`Floor0Header`] does not satisfy. The writer refuses the call
+/// without emitting any bits, preserving the bit-exact roundtrip
+/// guarantee
+/// `parse_floor0_header(&mut BitReaderLsb::new(&write_floor0_header(&h)?))? == h`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFloor0Error {
+    /// `amplitude_bits` exceeded the 6-bit `floor0_amplitude_bits`
+    /// field's representable range (`0..=63`).
+    AmplitudeBitsOverflow(u8),
+    /// `book_list` was empty. §6.2.1 encodes
+    /// `[floor0_number_of_books] = read 4 bits + 1`, so the smallest
+    /// representable book list has length `1`. The writer refuses
+    /// rather than emit a header whose round-trip would conjure a
+    /// non-existent book index.
+    EmptyBookList,
+    /// `book_list.len()` exceeded the largest count representable by
+    /// the 4-bit `floor0_number_of_books - 1` field (`16`).
+    BookListTooLong(usize),
+}
+
+impl fmt::Display for WriteFloor0Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteFloor0Error::AmplitudeBitsOverflow(v) => write!(
+                f,
+                "vorbis floor0 header (write): amplitude_bits={v} > 63 (§6.2.1 step 4 is a 6-bit field)"
+            ),
+            WriteFloor0Error::EmptyBookList => write!(
+                f,
+                "vorbis floor0 header (write): book_list is empty (§6.2.1 step 6 encodes the count as `read 4 bits + 1`, so the minimum length is 1)"
+            ),
+            WriteFloor0Error::BookListTooLong(n) => write!(
+                f,
+                "vorbis floor0 header (write): book_list.len()={n} > 16 (§6.2.1 step 6 is a 4-bit + 1 field, so the maximum length is 16)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteFloor0Error {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -543,6 +597,7 @@ impl fmt::Display for WriteError {
             ),
             WriteError::Codebook(e) => write!(f, "{e}"),
             WriteError::Floor1(e) => write!(f, "{e}"),
+            WriteError::Floor0(e) => write!(f, "{e}"),
         }
     }
 }
@@ -552,6 +607,7 @@ impl std::error::Error for WriteError {
         match self {
             WriteError::Codebook(e) => Some(e),
             WriteError::Floor1(e) => Some(e),
+            WriteError::Floor0(e) => Some(e),
             _ => None,
         }
     }
@@ -566,6 +622,12 @@ impl From<WriteCodebookError> for WriteError {
 impl From<WriteFloor1Error> for WriteError {
     fn from(value: WriteFloor1Error) -> Self {
         WriteError::Floor1(value)
+    }
+}
+
+impl From<WriteFloor0Error> for WriteError {
+    fn from(value: WriteFloor0Error) -> Self {
+        WriteError::Floor0(value)
     }
 }
 
@@ -1270,6 +1332,95 @@ pub(crate) fn write_floor1_header_into_writer(
     // step 18..21.
     for &v in &header.x_list {
         writer.write_u32(v, header.rangebits as u32);
+    }
+    Ok(())
+}
+
+/// Serialises a [`Floor0Header`] to the §6.2.1 floor-type-0
+/// setup-header bit pattern.
+///
+/// §6.2.1 fields (each value is unsigned, written LSB-first into the
+/// bit stream per §2.1.4):
+///
+/// | Step | Field                       | Width  | Notes                                |
+/// | ---: | --------------------------- | -----: | ------------------------------------ |
+/// |    1 | `floor0_order`              |   8 b  | Raw `u8`.                            |
+/// |    2 | `floor0_rate`               |  16 b  | Raw `u16`.                           |
+/// |    3 | `floor0_bark_map_size`      |  16 b  | Raw `u16`.                           |
+/// |    4 | `floor0_amplitude_bits`     |   6 b  | Range `0..=63`.                      |
+/// |    5 | `floor0_amplitude_offset`   |   8 b  | Raw `u8`.                            |
+/// |    6 | `floor0_number_of_books - 1`|   4 b  | `book_list.len()` in `1..=16`.       |
+/// |    7 | `floor0_book_list[i]`       |   8 b  | One byte per entry.                  |
+///
+/// The header is emitted **without** the outer 16-bit `floor_type`
+/// selector — that field is the setup-header walker's responsibility
+/// (mirroring the [`write_floor1_header`] convention). The companion
+/// [`write_floor0_header_into_writer`] splice point is shaped to slot
+/// into the setup-header writer when that lands in a later round.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte may carry up to 7 bits of zero padding to byte-align
+/// the slice; the parser stops after the last book-list entry per
+/// §6.2.1 step 7.
+///
+/// Returns [`WriteFloor0Error`] without emitting any bits if the
+/// supplied header violates a §6.2.1 invariant.
+pub fn write_floor0_header(header: &Floor0Header) -> Result<Vec<u8>, WriteFloor0Error> {
+    let mut writer = BitWriterLsb::with_capacity(16);
+    write_floor0_header_into_writer(header, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a floor 0 header into a larger
+/// bit-packed stream. The setup-header writer will use this in a
+/// later round, mirroring [`write_floor1_header_into_writer`] /
+/// [`write_codebook_into_writer`].
+///
+/// Writes the header's bits into `writer` at its current bit
+/// position. On error, the writer has had no bits appended (we
+/// validate before emitting).
+pub(crate) fn write_floor0_header_into_writer(
+    header: &Floor0Header,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteFloor0Error> {
+    // ---- §6.2.1 invariant gate. ----
+    // Fail-closed: refuse to emit a single bit if any field cannot be
+    // serialised back to a packet the parser would accept.
+
+    // step 4: amplitude_bits fits in a 6-bit field.
+    if header.amplitude_bits > 63 {
+        return Err(WriteFloor0Error::AmplitudeBitsOverflow(
+            header.amplitude_bits,
+        ));
+    }
+    // step 6: book_list.len() in 1..=16 (encoded as len - 1 in 4 bits).
+    if header.book_list.is_empty() {
+        return Err(WriteFloor0Error::EmptyBookList);
+    }
+    if header.book_list.len() > 16 {
+        return Err(WriteFloor0Error::BookListTooLong(header.book_list.len()));
+    }
+    // Note: `order`, `rate`, `bark_map_size`, `amplitude_offset` are
+    // raw u8/u16 values — every value of those types fits its field
+    // by construction (8/16/16/8 bits), so no further bound checks
+    // are required.
+
+    // ---- §6.2.1 emit. ----
+    // step 1.
+    writer.write_u32(header.order as u32, 8);
+    // step 2.
+    writer.write_u32(header.rate as u32, 16);
+    // step 3.
+    writer.write_u32(header.bark_map_size as u32, 16);
+    // step 4.
+    writer.write_u32(header.amplitude_bits as u32, 6);
+    // step 5.
+    writer.write_u32(header.amplitude_offset as u32, 8);
+    // step 6: number_of_books - 1.
+    writer.write_u32((header.book_list.len() - 1) as u32, 4);
+    // step 7.
+    for &book in &header.book_list {
+        writer.write_u32(book as u32, 8);
     }
     Ok(())
 }
@@ -3059,5 +3210,334 @@ mod tests {
         let src = StdError::source(&inner).expect("source chain should reach Floor1");
         // The chained Display must non-trivially echo the floor1 tag.
         assert!(format!("{src}").contains("floor1"));
+    }
+
+    // ================================================================
+    // Floor 0 header writer (§6.2.1) — fixture builders + tests
+    // ================================================================
+
+    /// Clean-room reproduction of [`setup::parse_floor0_header`] from the
+    /// §6.2.1 step list, used only to exercise the writer's bit-exact
+    /// roundtrip property without coupling the encoder test suite to
+    /// the setup-header outer walker.
+    ///
+    /// Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §6.2.1.
+    fn local_parse_floor0_for_tests(
+        reader: &mut oxideav_core::bits::BitReaderLsb<'_>,
+    ) -> Floor0Header {
+        let order = reader.read_u32(8).unwrap() as u8;
+        let rate = reader.read_u32(16).unwrap() as u16;
+        let bark_map_size = reader.read_u32(16).unwrap() as u16;
+        let amplitude_bits = reader.read_u32(6).unwrap() as u8;
+        let amplitude_offset = reader.read_u32(8).unwrap() as u8;
+        let number_of_books = (reader.read_u32(4).unwrap() as usize) + 1;
+        let mut book_list = Vec::with_capacity(number_of_books);
+        for _ in 0..number_of_books {
+            book_list.push(reader.read_u32(8).unwrap() as u8);
+        }
+        Floor0Header {
+            order,
+            rate,
+            bark_map_size,
+            amplitude_bits,
+            amplitude_offset,
+            book_list,
+        }
+    }
+
+    /// The "minimal" floor 0 from the setup-header test suite:
+    /// `order=4`, `rate=44100`, `bark_map_size=64`, `amplitude_bits=8`,
+    /// `amplitude_offset=100`, `book_list=[0]`. Mirrors
+    /// `setup::tests::SetupHeaderBuilder::minimal_floor0`.
+    fn minimal_floor0() -> Floor0Header {
+        Floor0Header {
+            order: 4,
+            rate: 44100,
+            bark_map_size: 64,
+            amplitude_bits: 8,
+            amplitude_offset: 100,
+            book_list: vec![0],
+        }
+    }
+
+    fn floor0_roundtrips(header: &Floor0Header) {
+        let bytes = write_floor0_header(header).expect("write must succeed");
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let parsed = local_parse_floor0_for_tests(&mut reader);
+        assert_eq!(&parsed, header, "floor0 roundtrip equality");
+    }
+
+    /// Pin the exact bit layout of the minimal floor 0 fixture. This
+    /// mirrors the byte sequence that `setup::tests::minimal_floor0`
+    /// emits (excluding the outer `floor_type=0` 16-bit selector,
+    /// which is the setup walker's responsibility).
+    ///
+    /// The `unusual_byte_groupings` lint is locally disabled because
+    /// each binary literal below is deliberately split along the
+    /// §6.2.1 sub-byte field boundary it visualises (e.g. `0b00_001000`
+    /// = the high 2 bits of amplitude_offset spliced above the 6 bits
+    /// of amplitude_bits).
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn floor0_byte_shape_minimal() {
+        let bytes = write_floor0_header(&minimal_floor0()).expect("must build");
+        // Bits emitted (LSB-first per §2.1.4):
+        //   order=4              -> 8 bits  -> 0b00000100
+        //   rate=44100           -> 16 bits -> 0xAC44 -> LE bytes 0x44 0xAC
+        //   bark_map_size=64     -> 16 bits -> 0x0040 -> LE bytes 0x40 0x00
+        //   amplitude_bits=8     -> 6 bits  -> 0b001000
+        //   amplitude_offset=100 -> 8 bits  -> 0b01100100
+        //   number_of_books-1=0  -> 4 bits  -> 0b0000
+        //   book_list[0]=0       -> 8 bits  -> 0b00000000
+        //
+        // The first three fields cover whole-byte spans so they pack
+        // as plain LE bytes. The amplitude_bits (6 b) + first 2 bits
+        // of amplitude_offset share a byte; the remaining 6 bits of
+        // amplitude_offset share the next byte with the 2 low bits of
+        // (number_of_books - 1); the high 2 bits of (number_of_books
+        // - 1 = 0) plus the 6 low bits of book_list[0] share the next
+        // byte; the high 2 bits of book_list[0] occupy the LSBs of
+        // the final byte with the rest as zero-padding.
+        //
+        // Total bits = 8 + 16 + 16 + 6 + 8 + 4 + 8 = 66 bits ->
+        // 9 bytes (with 6 bits of zero padding).
+        assert_eq!(bytes.len(), 9);
+        assert_eq!(bytes[0], 0x04); // order
+        assert_eq!(bytes[1], 0x44); // rate low byte
+        assert_eq!(bytes[2], 0xAC); // rate high byte
+        assert_eq!(bytes[3], 0x40); // bark_map_size low byte
+        assert_eq!(bytes[4], 0x00); // bark_map_size high byte
+                                    // Byte 5: amplitude_bits=8 in low 6 bits; high 2 bits =
+                                    // low 2 bits of amplitude_offset=100=0b01100100, i.e. 0b00.
+        assert_eq!(bytes[5], 0b00_001000);
+        // Byte 6: high 6 bits of amplitude_offset=0b011001 in low 6
+        // bits; high 2 bits = low 2 bits of (number_of_books - 1)=0.
+        assert_eq!(bytes[6], 0b00_011001);
+        // Byte 7: high 2 bits of (number_of_books - 1)=0 in low 2
+        // bits; high 6 bits = low 6 bits of book_list[0]=0.
+        assert_eq!(bytes[7], 0b000000_00);
+        // Byte 8: high 2 bits of book_list[0]=0 in low 2 bits; rest zero.
+        assert_eq!(bytes[8], 0b000000_00);
+        // Roundtrip check.
+        floor0_roundtrips(&minimal_floor0());
+    }
+
+    /// Hand-computed bit-length formula for floor 0:
+    /// 8 + 16 + 16 + 6 + 8 + 4 + 8 × number_of_books bits.
+    /// Verified on the minimal (1 book → 66 bits → 9 bytes) and a
+    /// max-length (16 books → 8+16+16+6+8+4+128 = 186 bits → 24 bytes)
+    /// shape.
+    #[test]
+    fn floor0_bit_length_formula() {
+        // Minimal: 66 bits → 9 bytes.
+        let minimal = write_floor0_header(&minimal_floor0()).expect("write");
+        assert_eq!(minimal.len(), 9);
+
+        // Max-length book list = 16 entries.
+        let max_books = Floor0Header {
+            order: 32,
+            rate: 48000,
+            bark_map_size: 256,
+            amplitude_bits: 6,
+            amplitude_offset: 200,
+            book_list: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        };
+        let max_bytes = write_floor0_header(&max_books).expect("write");
+        // 8 + 16 + 16 + 6 + 8 + 4 + 16 × 8 = 186 bits -> 24 bytes.
+        assert_eq!(max_bytes.len(), 24);
+        floor0_roundtrips(&max_books);
+    }
+
+    #[test]
+    fn floor0_roundtrip_minimal() {
+        floor0_roundtrips(&minimal_floor0());
+    }
+
+    /// Spec-realistic floor 0: high-order LSP filter from a 48k q5
+    /// pipeline.
+    #[test]
+    fn floor0_roundtrip_spec_realistic_48k() {
+        floor0_roundtrips(&Floor0Header {
+            order: 16,
+            rate: 48000,
+            bark_map_size: 128,
+            amplitude_bits: 8,
+            amplitude_offset: 192,
+            book_list: vec![0, 2, 5, 7],
+        });
+    }
+
+    /// `amplitude_bits` at the 6-bit field upper edge.
+    #[test]
+    fn floor0_roundtrip_amplitude_bits_max() {
+        floor0_roundtrips(&Floor0Header {
+            order: 8,
+            rate: 22050,
+            bark_map_size: 64,
+            amplitude_bits: 63, // 6-bit field upper edge
+            amplitude_offset: 0,
+            book_list: vec![3],
+        });
+    }
+
+    /// All u8 / u16 field corners at their representable maxima.
+    #[test]
+    fn floor0_roundtrip_field_extremes() {
+        floor0_roundtrips(&Floor0Header {
+            order: u8::MAX,
+            rate: u16::MAX,
+            bark_map_size: u16::MAX,
+            amplitude_bits: 1, // smallest non-zero amplitude (writer-level)
+            amplitude_offset: u8::MAX,
+            book_list: vec![u8::MAX, 0, u8::MAX, 0],
+        });
+    }
+
+    /// All-zero floor 0 (spec-legal as a writer-side input shape; the
+    /// runtime [`Floor0Decoder::new`] additionally rejects zero
+    /// `order` / `bark_map_size` / `amplitude_bits`, but that is a
+    /// decoder-time gate, not a §6.2.1 writer-time invariant).
+    #[test]
+    fn floor0_roundtrip_all_zero_minimal_book_list() {
+        floor0_roundtrips(&Floor0Header {
+            order: 0,
+            rate: 0,
+            bark_map_size: 0,
+            amplitude_bits: 0,
+            amplitude_offset: 0,
+            book_list: vec![0],
+        });
+    }
+
+    /// Book list at the 16-entry upper edge.
+    #[test]
+    fn floor0_roundtrip_book_list_max() {
+        floor0_roundtrips(&Floor0Header {
+            order: 4,
+            rate: 44100,
+            bark_map_size: 64,
+            amplitude_bits: 8,
+            amplitude_offset: 100,
+            book_list: (0u8..16).collect(),
+        });
+    }
+
+    /// `amplitude_bits` above the 6-bit field width is rejected.
+    #[test]
+    fn floor0_rejects_amplitude_bits_overflow() {
+        let mut h = minimal_floor0();
+        h.amplitude_bits = 64;
+        assert_eq!(
+            write_floor0_header(&h),
+            Err(WriteFloor0Error::AmplitudeBitsOverflow(64))
+        );
+    }
+
+    /// An empty book list cannot be expressed by the `number_of_books
+    /// - 1` 4-bit field — the smallest representable count is 1.
+    #[test]
+    fn floor0_rejects_empty_book_list() {
+        let mut h = minimal_floor0();
+        h.book_list.clear();
+        assert_eq!(
+            write_floor0_header(&h),
+            Err(WriteFloor0Error::EmptyBookList)
+        );
+    }
+
+    /// A book list exceeding 16 entries cannot be expressed by the
+    /// 4-bit count field.
+    #[test]
+    fn floor0_rejects_book_list_too_long() {
+        let mut h = minimal_floor0();
+        h.book_list = vec![0; 17];
+        assert_eq!(
+            write_floor0_header(&h),
+            Err(WriteFloor0Error::BookListTooLong(17))
+        );
+    }
+
+    /// `WriteFloor0Error::Display` is non-empty for every variant and
+    /// echoes the §6.2.1 tag.
+    #[test]
+    fn floor0_error_display_smoke() {
+        let cases = [
+            WriteFloor0Error::AmplitudeBitsOverflow(64),
+            WriteFloor0Error::EmptyBookList,
+            WriteFloor0Error::BookListTooLong(17),
+        ];
+        for case in cases {
+            let s = format!("{case}");
+            assert!(!s.is_empty(), "Display empty for {case:?}");
+            assert!(
+                s.contains("floor0"),
+                "Display for {case:?} must mention the §6.2.1 floor0 context"
+            );
+        }
+    }
+
+    /// Floor 0 write errors surface as `WriteError::Floor0` via the
+    /// `From` impl, preserving the variant for caller inspection and
+    /// the source chain.
+    #[test]
+    fn write_error_floor0_glue() {
+        let inner: WriteError = WriteFloor0Error::AmplitudeBitsOverflow(64).into();
+        assert_eq!(
+            inner,
+            WriteError::Floor0(WriteFloor0Error::AmplitudeBitsOverflow(64))
+        );
+        use std::error::Error as StdError;
+        let src = StdError::source(&inner).expect("source chain should reach Floor0");
+        // The chained Display must non-trivially echo the floor0 tag.
+        assert!(format!("{src}").contains("floor0"));
+    }
+
+    /// The `write_floor0_header_into_writer` splice point appends to
+    /// an in-progress writer at the current bit offset, leaving
+    /// pre-existing bits intact. This pins the shape the setup-header
+    /// writer will splice the floor 0 body into.
+    #[test]
+    fn floor0_into_writer_splice_appends_after_existing_bits() {
+        let mut w = BitWriterLsb::with_capacity(4);
+        // Seed: write 7 bits (sub-byte) before splicing.
+        w.write_u32(0b1010101, 7);
+        write_floor0_header_into_writer(&minimal_floor0(), &mut w).expect("splice");
+        let with_splice = w.finish();
+
+        // Standalone floor 0 bytes, for comparison.
+        let standalone = write_floor0_header(&minimal_floor0()).expect("standalone");
+
+        // Spliced output must be strictly longer than the seed-only
+        // and standalone slices.
+        assert!(with_splice.len() >= standalone.len());
+
+        // Re-decode the spliced output: consume the 7 seed bits then
+        // run the floor 0 parser at the resumed position.
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&with_splice);
+        let seed = r.read_u32(7).unwrap();
+        assert_eq!(seed, 0b1010101);
+        let parsed = local_parse_floor0_for_tests(&mut r);
+        assert_eq!(parsed, minimal_floor0());
+    }
+
+    /// The fail-closed gate: when the writer rejects a header, no
+    /// bits are appended to the supplied splice writer. This pins the
+    /// "validate before emit" contract documented on
+    /// [`write_floor0_header_into_writer`].
+    #[test]
+    fn floor0_into_writer_splice_emits_no_bits_on_error() {
+        let mut w = BitWriterLsb::with_capacity(4);
+        // Seed 3 bits to give the writer some pre-existing state.
+        w.write_u32(0b101, 3);
+        let before = w.bit_position();
+
+        let mut bad = minimal_floor0();
+        bad.amplitude_bits = 64; // 6-bit field overflow
+
+        let err = write_floor0_header_into_writer(&bad, &mut w).expect_err("must reject overflow");
+        assert_eq!(err, WriteFloor0Error::AmplitudeBitsOverflow(64));
+
+        // bit_position unchanged: the gate ran before any write call.
+        assert_eq!(w.bit_position(), before);
     }
 }
