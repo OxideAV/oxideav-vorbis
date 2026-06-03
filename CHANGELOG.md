@@ -6,6 +6,57 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.2.4 mode header WRITE primitive (round 26,
+  umbrella round 228).** New public function
+  `encoder::write_mode_header` serialises a `crate::setup::ModeHeader`
+  to the §4.2.4 "Modes" body bit pattern. The function is the
+  bit-exact inverse of the round-5 mode parser
+  (`setup::parse_mode_header`): given the same context value the
+  parser is supplied with — `mapping_count` (the length of the
+  mapping list earlier in the setup body) — the round-trip property
+  `local_parse_mode_for_tests(&mut BitReaderLsb::new(&write_mode_header(&h, mapping_count)?), mapping_count) == h`
+  holds for every legal `ModeHeader`. The §4.2.4 "Modes" body is a
+  single fixed-width 41-bit record: 1 bit `blockflag`, 16 bit
+  `windowtype` (must be 0 per §4.2.4 step 2e), 16 bit `transformtype`
+  (must be 0 per §4.2.4 step 2e), 8 bit `mapping` (range-checked
+  against `mapping_count`). The body is emitted **without** the
+  surrounding `vorbis_mode_count - 1` 6-bit count field and
+  **without** the trailing 1-bit framing flag (both are the
+  setup-header walker's responsibility). The crate-private
+  `write_mode_header_into_writer` companion mirrors the splice
+  point shape established by `write_codebook_into_writer`,
+  `write_floor1_header_into_writer`,
+  `write_floor0_header_into_writer`,
+  `write_residue_header_into_writer`, and
+  `write_mapping_header_into_writer`, allowing the still-pending
+  setup-header writer to slot the mode body into a wider
+  bit-packed stream. A new `WriteModeError` enum enumerates three
+  §4.2.4 step-2e invariant violations (`NonZeroWindowType`,
+  `NonZeroTransformType`, `BadMapping`); each refuses the call
+  without emitting any bits rather than serialise a header the
+  parser would reject. The umbrella `WriteError` enum grows a
+  `WriteError::Mode(WriteModeError)` variant with the matching
+  `From` glue and `source()` chain. 15 new tests pin the byte
+  shape on the short-block fixture (41-bit body, 6 bytes), the
+  long-block fixture at `mapping = 1` (re-decoded to confirm both
+  LSB-first packing and the bit positions of the four fields),
+  the constant-41-bit-body length check across five `mapping_count`
+  sweep values (`{1, 2, 7, 32, 255}`), three bit-exact roundtrip
+  fixtures (short-block minimal, long-block at mapping index 1,
+  `mapping = 255` against `mapping_count = 256` at the 8-bit upper
+  edge), every `WriteModeError` rejection variant
+  (`NonZeroWindowType(1)`, `NonZeroTransformType(2)`, plus two
+  `BadMapping` shapes: `mapping == mapping_count` boundary and
+  `mapping = 200` against `mapping_count = 4`), the
+  `WriteError::Mode(_)` `From` + `source()` chain, the umbrella
+  Display forwarding through to the inner enum, and three splice-point
+  tests (appends-after-existing-bits across a sub-byte 11-bit seed,
+  emits-no-bits on `NonZeroWindowType`, emits-no-bits on the
+  `mapping == mapping_count` boundary). The §4.2.4 setup-header
+  splice that stitches all six nested-block writers (plus the
+  leading `audio_channels` glue and the trailing framing bit) and
+  the audio-packet WRITE primitives remain explicit followups.
+
 * **Vorbis I §4.2.4 mapping header WRITE primitive (round 25,
   umbrella round 223).** New public function
   `encoder::write_mapping_header` serialises a

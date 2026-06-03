@@ -1,6 +1,63 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 25.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 26.
+
+## Status — 2026-06-04 (round 26, umbrella round 228)
+
+**Round 26 landed: the §4.2.4 mode header WRITE primitive.** New
+public function [`encoder::write_mode_header`] serialises a
+[`crate::setup::ModeHeader`] (the round-5 parser's output type) to
+the §4.2.4 "Modes" body bit pattern. This is the sixth nested-block
+writer (after [`write_codebook`] in round 21, [`write_floor1_header`]
+in round 22, [`write_floor0_header`] in round 23,
+[`write_residue_header`] in round 24, and [`write_mapping_header`]
+in round 25) and the second mapping-side encoder primitive. Given
+the context value the parser is supplied with — `mapping_count`,
+i.e. the number of mapping entries the setup walker has accumulated
+so far — the bit-exact roundtrip property
+`local_parse_mode_for_tests(&mut BitReaderLsb::new(&write_mode_header(&h, mapping_count)?), mapping_count) == h`
+holds for every legal [`ModeHeader`]. The crate-private
+[`write_mode_header_into_writer`] companion is shaped to splice the
+mode body into the surrounding setup-header writer (still a
+followup), matching the existing `write_codebook_into_writer` /
+`write_floor1_header_into_writer` / `write_floor0_header_into_writer` /
+`write_residue_header_into_writer` / `write_mapping_header_into_writer`
+splice points. A new [`WriteModeError`] enumerates three §4.2.4
+step-2e invariant violations (`NonZeroWindowType`,
+`NonZeroTransformType`, `BadMapping`) — the writer refuses each
+rather than emit a header the parser would reject. The umbrella
+[`WriteError`] grows a [`WriteError::Mode`] variant with the matching
+`From` glue and `source()` chain.
+
+The §4.2.4 "Modes" body is a single fixed-width 41-bit record:
+1 bit `blockflag`, 16 bit `windowtype` (must be 0), 16 bit
+`transformtype` (must be 0), 8 bit `mapping` (range-checked against
+`mapping_count`). Unlike the mapping body there is no
+context-dependent field width or optional sub-block; the writer
+emits the same 41 bits regardless of `mapping_count`, byte-aligning
+to 6 bytes via 7 trailing zero bits per §2.1.8.
+
+15 new unit tests bring the in-module suite to **503 (488 → 503)**:
+byte-shape pinning for the short-block fixture (41-bit body, 6
+bytes), byte-shape pinning for the long-block fixture at
+`mapping = 1` (re-decode confirms both LSB-first packing and the
+bit positions of the four fields), the constant-41-bit-body length
+check across five `mapping_count` sweep values
+(`{1, 2, 7, 32, 255}`), three bit-exact roundtrip fixtures
+(short-block minimal, long-block at mapping index 1, full
+8-bit upper edge `mapping = 255` against `mapping_count = 256`),
+every `WriteModeError` rejection variant
+(`NonZeroWindowType(1)`, `NonZeroTransformType(2)`, plus two
+`BadMapping` shapes: `mapping == mapping_count` boundary and
+`mapping = 200` against `mapping_count = 4`), the
+`WriteError::Mode(_)` `From` + `source()` chain, the umbrella
+Display forwarding through to the inner enum, and three splice-point
+tests (appends-after-existing-bits across a sub-byte 11-bit seed,
+emits-no-bits on `NonZeroWindowType`, emits-no-bits on the
+`mapping == mapping_count` boundary). The §4.2.4 setup-header
+splice that stitches all six nested-block writers together (plus
+the leading `audio_channels` glue and the trailing framing bit) and
+the audio-packet WRITE primitives remain explicit followups.
 
 ## Status — 2026-06-03 (round 25, umbrella round 223)
 

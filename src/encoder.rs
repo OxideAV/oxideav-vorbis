@@ -1,4 +1,4 @@
-//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218).
+//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218 + 228).
 //!
 //! This module collects the encoder-side functions that mirror the
 //! parser surface in [`crate::identification`], [`crate::comment`],
@@ -29,6 +29,12 @@
 //!   types (0, 1, 2); the outer 16-bit `residue_type` selector is the
 //!   setup walker's responsibility, mirroring the floor 0 / floor 1
 //!   convention. Round 218.
+//! * [`write_mode_header`] — serialises a [`ModeHeader`] to the
+//!   §4.2.4 "Modes" body bit pattern. Fixed-width 41-bit body
+//!   (1-bit `blockflag`, 16-bit `windowtype`, 16-bit `transformtype`,
+//!   8-bit `mapping`). The writer is the byte-exact inverse of the
+//!   round-5 mode parser and refuses any header whose `mapping`
+//!   index falls outside the supplied `mapping_count`. Round 228.
 //!
 //! Both functions validate the same spec-mandated invariants that the
 //! corresponding parser enforces on input, so a typo in the caller's
@@ -79,8 +85,10 @@
 //! * `docs/audio/vorbis/Vorbis_I_spec.pdf` §2.1.8 "end-of-packet
 //!   alignment" (the framing-byte's seven high bits are zero padding).
 //!
-//! Audio-packet encode and floor / residue / mapping / mode WRITE
-//! primitives are explicit followups for subsequent rounds.
+//! Audio-packet encode and the wrapping setup-header WRITE primitive
+//! (which splices codebook / floor / residue / mapping / mode bodies
+//! into a single §4.2.4 packet) are explicit followups for subsequent
+//! rounds.
 
 use core::fmt;
 
@@ -89,7 +97,7 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
-use crate::setup::{Floor0Header, Floor1Header, MappingHeader, ResidueHeader};
+use crate::setup::{Floor0Header, Floor1Header, MappingHeader, ModeHeader, ResidueHeader};
 
 /// Errors that may arise while writing a Vorbis I header packet.
 ///
@@ -146,6 +154,9 @@ pub enum WriteError {
     /// A nested mapping configuration (§4.2.4 "Mappings") failed one
     /// of the writer-side invariants checked by [`write_mapping_header`].
     Mapping(WriteMappingError),
+    /// A nested mode configuration (§4.2.4 "Modes") failed one of the
+    /// writer-side invariants checked by [`write_mode_header`].
+    Mode(WriteModeError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -871,6 +882,65 @@ impl fmt::Display for WriteMappingError {
 
 impl std::error::Error for WriteMappingError {}
 
+/// Errors that may arise while writing a Vorbis I mode configuration
+/// (§4.2.4 "Modes") via [`write_mode_header`].
+///
+/// Each variant flags an invariant the caller-supplied [`ModeHeader`]
+/// does not satisfy with respect to either the mode body itself
+/// (§4.2.4 step 2e) or the surrounding context (`mapping_count`) the
+/// round-5 parser is fed. The writer refuses the call without
+/// emitting any bits, preserving the bit-exact roundtrip guarantee
+/// against [`crate::setup::ModeHeader`]-shaped input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteModeError {
+    /// `windowtype` was nonzero. §4.2.4 step 2e specifies "zero is
+    /// the only legal value in Vorbis I for [vorbis_mode_windowtype]";
+    /// the round-5 parser rejects any other value with
+    /// `ParseError::NonZeroModeWindowType`.
+    NonZeroWindowType(u16),
+    /// `transformtype` was nonzero. §4.2.4 step 2e specifies "zero is
+    /// the only legal value in Vorbis I for
+    /// [vorbis_mode_transformtype]"; the round-5 parser rejects any
+    /// other value with `ParseError::NonZeroModeTransformType`.
+    NonZeroTransformType(u16),
+    /// `mapping` (the value stored in [`ModeHeader::mapping`]) was
+    /// `>= mapping_count`, i.e. it would dereference past the end of
+    /// the setup header's mapping table. §4.2.4 step 2e specifies
+    /// "vorbis_mode_mapping must not be greater than the highest
+    /// number mapping in use"; the round-5 parser mirrors that as
+    /// `ParseError::BadModeMapping`.
+    BadMapping {
+        /// The illegal `mapping` value.
+        mapping: u8,
+        /// Context-supplied `mapping_count`.
+        mapping_count: usize,
+    },
+}
+
+impl fmt::Display for WriteModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteModeError::NonZeroWindowType(v) => write!(
+                f,
+                "vorbis mode header (write): windowtype={v} != 0 (Vorbis I §4.2.4 step 2e: zero is the only legal value)"
+            ),
+            WriteModeError::NonZeroTransformType(v) => write!(
+                f,
+                "vorbis mode header (write): transformtype={v} != 0 (Vorbis I §4.2.4 step 2e: zero is the only legal value)"
+            ),
+            WriteModeError::BadMapping {
+                mapping,
+                mapping_count,
+            } => write!(
+                f,
+                "vorbis mode header (write): mapping={mapping} >= mapping_count={mapping_count} (§4.2.4 step 2e)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteModeError {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -914,6 +984,7 @@ impl fmt::Display for WriteError {
             WriteError::Floor0(e) => write!(f, "{e}"),
             WriteError::Residue(e) => write!(f, "{e}"),
             WriteError::Mapping(e) => write!(f, "{e}"),
+            WriteError::Mode(e) => write!(f, "{e}"),
         }
     }
 }
@@ -926,6 +997,7 @@ impl std::error::Error for WriteError {
             WriteError::Floor0(e) => Some(e),
             WriteError::Residue(e) => Some(e),
             WriteError::Mapping(e) => Some(e),
+            WriteError::Mode(e) => Some(e),
             _ => None,
         }
     }
@@ -958,6 +1030,12 @@ impl From<WriteResidueError> for WriteError {
 impl From<WriteMappingError> for WriteError {
     fn from(value: WriteMappingError) -> Self {
         WriteError::Mapping(value)
+    }
+}
+
+impl From<WriteModeError> for WriteError {
+    fn from(value: WriteModeError) -> Self {
+        WriteError::Mode(value)
     }
 }
 
@@ -2205,6 +2283,119 @@ pub(crate) fn write_mapping_header_into_writer(
         writer.write_u32(submap.floor as u32, 8);
         writer.write_u32(submap.residue as u32, 8);
     }
+
+    Ok(())
+}
+
+/// Serialises a [`ModeHeader`] to the §4.2.4 "Modes" body bit pattern.
+///
+/// The §4.2.4 mode body is a single fixed-width 41-bit record:
+///
+/// | Step | Field             | Width | Notes                                                 |
+/// | ---: | ----------------- | ----: | ----------------------------------------------------- |
+/// |   2a | `blockflag`       |   1 b | `false` selects `blocksize_0`, `true` selects `blocksize_1`. |
+/// |   2b | `windowtype`      |  16 b | Vorbis I §4.2.4 step 2e: only `0` is legal.          |
+/// |   2c | `transformtype`   |  16 b | Vorbis I §4.2.4 step 2e: only `0` is legal.          |
+/// |   2d | `mapping`         |   8 b | Range-checked against `mapping_count`.               |
+///
+/// The 41-bit body is emitted **without** the surrounding
+/// `vorbis_mode_count - 1` 6-bit count field and **without** the
+/// trailing 1-bit framing flag (both are the setup-header walker's
+/// responsibility). The companion [`write_mode_header_into_writer`]
+/// splice point is shaped to slot into the setup-header writer when
+/// that lands, matching the existing
+/// `write_codebook_into_writer` / `write_floor1_header_into_writer` /
+/// `write_floor0_header_into_writer` / `write_residue_header_into_writer` /
+/// `write_mapping_header_into_writer` splice points.
+///
+/// `mapping_count` is the context value the §4.2.4 walker sources
+/// from the in-progress setup-walker state (i.e. the length of the
+/// mapping list parsed earlier in the setup body). It is used to
+/// validate the §4.2.4 step 2e "vorbis_mode_mapping must not be
+/// greater than the highest number mapping in use" constraint.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte carries 7 bits of zero padding to byte-align the
+/// 41-bit body; the parser stops after the 8-bit mapping index per
+/// §4.2.4 step 2d.
+///
+/// Returns [`WriteModeError`] without emitting any bits if the
+/// supplied header (or the context) violates a §4.2.4 invariant.
+///
+/// ## Bit-exact roundtrip guarantee
+///
+/// For every value `h: ModeHeader` and matching context
+/// `mapping_count` for which the §4.2.4 invariants hold:
+///
+/// ```text
+/// local_parse_mode_for_tests(
+///     &mut BitReaderLsb::new(&write_mode_header(&h, mapping_count)?),
+///     mapping_count,
+/// ) == h
+/// ```
+///
+/// ## Spec source
+///
+/// `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.2.4 "Modes" (the four-step
+/// fixed-width body — `blockflag`, `windowtype`, `transformtype`,
+/// `mapping`), with the "zero is the only legal value" rule on the
+/// 16-bit window and transform fields and the
+/// `mapping < vorbis_mapping_count` constraint at step 2e; §2.1.4
+/// (LSB-first packing).
+pub fn write_mode_header(
+    header: &ModeHeader,
+    mapping_count: usize,
+) -> Result<Vec<u8>, WriteModeError> {
+    let mut writer = BitWriterLsb::with_capacity(8);
+    write_mode_header_into_writer(header, mapping_count, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a mode body into a larger bit-packed
+/// stream. The setup-header writer will use this in a later round,
+/// mirroring [`write_codebook_into_writer`] /
+/// [`write_floor1_header_into_writer`] /
+/// [`write_floor0_header_into_writer`] /
+/// [`write_residue_header_into_writer`] /
+/// [`write_mapping_header_into_writer`].
+///
+/// Writes the body's bits into `writer` at its current bit position.
+/// On error, the writer has had no bits appended (we validate before
+/// emitting).
+pub(crate) fn write_mode_header_into_writer(
+    header: &ModeHeader,
+    mapping_count: usize,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteModeError> {
+    // ---- §4.2.4 invariant gate. ----
+    // Fail-closed: refuse to emit a single bit if any field cannot be
+    // serialised back to a body the parser would accept.
+
+    // step 2e: windowtype must be 0.
+    if header.windowtype != 0 {
+        return Err(WriteModeError::NonZeroWindowType(header.windowtype));
+    }
+    // step 2e: transformtype must be 0.
+    if header.transformtype != 0 {
+        return Err(WriteModeError::NonZeroTransformType(header.transformtype));
+    }
+    // step 2e: mapping < mapping_count.
+    if (header.mapping as usize) >= mapping_count {
+        return Err(WriteModeError::BadMapping {
+            mapping: header.mapping,
+            mapping_count,
+        });
+    }
+
+    // ---- §4.2.4 emit. ----
+    // step 2a: 1-bit blockflag.
+    writer.write_bit(header.blockflag);
+    // step 2b: 16-bit windowtype (always 0, by the gate above).
+    writer.write_u32(header.windowtype as u32, 16);
+    // step 2c: 16-bit transformtype (always 0, by the gate above).
+    writer.write_u32(header.transformtype as u32, 16);
+    // step 2d: 8-bit mapping (range-checked above).
+    writer.write_u32(header.mapping as u32, 8);
 
     Ok(())
 }
@@ -5941,6 +6132,323 @@ mod tests {
         assert_eq!(err, WriteMappingError::UnsupportedMappingType(9));
 
         // bit_position unchanged: the gate ran before any write call.
+        assert_eq!(w.bit_position(), before);
+    }
+
+    // ================================================================
+    // Mode header writer — §4.2.4 "Modes" (round 26, umbrella round 228).
+    // ================================================================
+
+    /// Stand-alone bit-level mode reader, exercising the §4.2.4 step
+    /// 2a–2d field order without dragging in the wider
+    /// `parse_setup_header` walker. Mirrors the splice-point + roundtrip
+    /// pattern used for codebook / floor / residue / mapping.
+    fn local_parse_mode_for_tests(
+        reader: &mut oxideav_core::bits::BitReaderLsb<'_>,
+        _mapping_count: usize,
+    ) -> ModeHeader {
+        let blockflag = reader.read_bit().unwrap();
+        let windowtype = reader.read_u32(16).unwrap() as u16;
+        let transformtype = reader.read_u32(16).unwrap() as u16;
+        let mapping = reader.read_u32(8).unwrap() as u8;
+        ModeHeader {
+            blockflag,
+            windowtype,
+            transformtype,
+            mapping,
+        }
+    }
+
+    /// The "minimal" mode configuration: short block, mapping index 0.
+    /// Pins the densest §4.2.4 emit (every gate at its all-zeros legal
+    /// value).
+    fn minimal_short_mode() -> ModeHeader {
+        ModeHeader {
+            blockflag: false,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 0,
+        }
+    }
+
+    /// The companion "long-block" mode at mapping index 1. Used to pin
+    /// the `blockflag = 1` bit position and the `mapping` byte position.
+    fn minimal_long_mode() -> ModeHeader {
+        ModeHeader {
+            blockflag: true,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 1,
+        }
+    }
+
+    fn mode_roundtrips(header: &ModeHeader, mapping_count: usize) {
+        let bytes = write_mode_header(header, mapping_count).expect("write must succeed");
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let parsed = local_parse_mode_for_tests(&mut reader, mapping_count);
+        assert_eq!(&parsed, header, "mode roundtrip equality");
+    }
+
+    /// Pin the §4.2.4 byte layout for the minimal short-block fixture.
+    /// 41 bits total → 6 bytes with 7 bits of §2.1.8 zero padding in
+    /// the final byte.
+    #[test]
+    fn mode_byte_shape_short_block_minimal() {
+        let bytes = write_mode_header(&minimal_short_mode(), 1).expect("must build");
+        // Bits emitted (LSB-first per §2.1.4):
+        //   blockflag=0      ->  1 bit
+        //   windowtype=0     -> 16 bits
+        //   transformtype=0  -> 16 bits
+        //   mapping=0        ->  8 bits
+        // Total = 1 + 16 + 16 + 8 = 41 bits = 6 bytes (with 7 bits of
+        // §2.1.8 zero padding in the final byte).
+        let total_bits = 1 + 16 + 16 + 8;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+
+        let mut expected = BitWriterLsb::with_capacity(8);
+        expected.write_bit(false); // blockflag
+        expected.write_u32(0, 16); // windowtype
+        expected.write_u32(0, 16); // transformtype
+        expected.write_u32(0, 8); // mapping
+        assert_eq!(bytes, expected.finish());
+    }
+
+    /// Pin the §4.2.4 byte layout for the long-block fixture at
+    /// `mapping = 1`. The `blockflag = 1` shows up in the LSB of the
+    /// first byte; the 8-bit `mapping = 1` shows up at the well-defined
+    /// bit offset 33.
+    #[test]
+    fn mode_byte_shape_long_block_mapping1() {
+        let bytes = write_mode_header(&minimal_long_mode(), 2).expect("must build");
+        let total_bits = 1 + 16 + 16 + 8;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+
+        // Re-decode the body and confirm both the per-field structure
+        // and the LSB-first packing.
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        assert!(reader.read_bit().unwrap(), "blockflag bit must be set");
+        assert_eq!(reader.read_u32(16).unwrap(), 0, "windowtype must be 0");
+        assert_eq!(reader.read_u32(16).unwrap(), 0, "transformtype must be 0");
+        assert_eq!(reader.read_u32(8).unwrap(), 1, "mapping must be 1");
+    }
+
+    /// Fixed-width body: 41 bits regardless of mapping-table size.
+    /// Cross-check that the byte length does not vary with
+    /// `mapping_count`.
+    #[test]
+    fn mode_bit_length_is_constant_41_bits() {
+        for mapping_count in [1usize, 2, 7, 32, 255] {
+            let h = ModeHeader {
+                blockflag: false,
+                windowtype: 0,
+                transformtype: 0,
+                mapping: (mapping_count - 1) as u8,
+            };
+            let bytes = write_mode_header(&h, mapping_count).expect("write must succeed");
+            assert_eq!(
+                bytes.len(),
+                6,
+                "41 bits → 6 bytes for mapping_count={mapping_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_roundtrips_short_block() {
+        mode_roundtrips(&minimal_short_mode(), 1);
+    }
+
+    #[test]
+    fn mode_roundtrips_long_block_mapping1() {
+        mode_roundtrips(&minimal_long_mode(), 2);
+    }
+
+    #[test]
+    fn mode_roundtrips_full_legal_mapping_range() {
+        // 8-bit mapping field is exactly 256 possible values; exercise
+        // the boundary at the table's high end.
+        let h = ModeHeader {
+            blockflag: true,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 255,
+        };
+        mode_roundtrips(&h, 256);
+    }
+
+    #[test]
+    fn mode_rejects_nonzero_windowtype() {
+        let h = ModeHeader {
+            blockflag: false,
+            windowtype: 1,
+            transformtype: 0,
+            mapping: 0,
+        };
+        assert_eq!(
+            write_mode_header(&h, 1),
+            Err(WriteModeError::NonZeroWindowType(1))
+        );
+    }
+
+    #[test]
+    fn mode_rejects_nonzero_transformtype() {
+        let h = ModeHeader {
+            blockflag: false,
+            windowtype: 0,
+            transformtype: 2,
+            mapping: 0,
+        };
+        assert_eq!(
+            write_mode_header(&h, 1),
+            Err(WriteModeError::NonZeroTransformType(2))
+        );
+    }
+
+    #[test]
+    fn mode_rejects_mapping_equal_to_count() {
+        // mapping == mapping_count is the first illegal value.
+        let h = ModeHeader {
+            blockflag: false,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 1,
+        };
+        assert_eq!(
+            write_mode_header(&h, 1),
+            Err(WriteModeError::BadMapping {
+                mapping: 1,
+                mapping_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn mode_rejects_mapping_far_above_count() {
+        let h = ModeHeader {
+            blockflag: false,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 200,
+        };
+        assert_eq!(
+            write_mode_header(&h, 4),
+            Err(WriteModeError::BadMapping {
+                mapping: 200,
+                mapping_count: 4,
+            })
+        );
+    }
+
+    /// `WriteError::Mode(e)` carries the inner enum through the
+    /// `From` impl, preserving the variant for caller inspection and
+    /// the source chain.
+    #[test]
+    fn write_error_mode_glue() {
+        let inner: WriteError = WriteModeError::NonZeroWindowType(5).into();
+        assert_eq!(
+            inner,
+            WriteError::Mode(WriteModeError::NonZeroWindowType(5))
+        );
+        use std::error::Error as StdError;
+        let src = StdError::source(&inner).expect("source chain should reach Mode");
+        // The chained Display must non-trivially echo the mode tag.
+        assert!(format!("{src}").contains("mode"));
+    }
+
+    /// `WriteError::Mode` Display goes through the inner enum.
+    #[test]
+    fn write_error_mode_display_forwards_inner() {
+        let err: WriteError = WriteModeError::BadMapping {
+            mapping: 9,
+            mapping_count: 2,
+        }
+        .into();
+        let s = format!("{err}");
+        assert!(s.contains("mapping=9"));
+        assert!(s.contains("mapping_count=2"));
+    }
+
+    // ----------------------------------------------------------------
+    // Mode header writer — splice point.
+    // ----------------------------------------------------------------
+
+    /// The `write_mode_header_into_writer` splice point appends to an
+    /// in-progress writer at the current bit offset, leaving
+    /// pre-existing bits intact. Pins the shape the setup-header
+    /// writer will splice the mode body into.
+    #[test]
+    fn mode_into_writer_splice_appends_after_existing_bits() {
+        let mut w = BitWriterLsb::with_capacity(8);
+        // Seed: write 11 bits (sub-byte, crosses byte boundary) before
+        // splicing.
+        w.write_u32(0b101_1010_0101, 11);
+        write_mode_header_into_writer(&minimal_long_mode(), 2, &mut w).expect("splice");
+        let with_splice = w.finish();
+
+        // Standalone bytes, for comparison.
+        let standalone = write_mode_header(&minimal_long_mode(), 2).expect("standalone");
+        assert!(with_splice.len() >= standalone.len());
+
+        // Re-decode the spliced output: consume the 11 seed bits then
+        // run the mode parser at the resumed position.
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&with_splice);
+        let seed = r.read_u32(11).unwrap();
+        assert_eq!(seed, 0b101_1010_0101);
+        let parsed = local_parse_mode_for_tests(&mut r, 2);
+        assert_eq!(parsed, minimal_long_mode());
+    }
+
+    /// The fail-closed gate: when the writer rejects a header, no
+    /// bits are appended to the supplied splice writer. Pins the
+    /// "validate before emit" contract documented on
+    /// [`write_mode_header_into_writer`].
+    #[test]
+    fn mode_into_writer_splice_emits_no_bits_on_error() {
+        let mut w = BitWriterLsb::with_capacity(8);
+        // Seed 5 bits to give the writer some pre-existing state.
+        w.write_u32(0b1_0101, 5);
+        let before = w.bit_position();
+
+        let bad = ModeHeader {
+            blockflag: false,
+            windowtype: 7, // §4.2.4 step 2e only defines 0
+            transformtype: 0,
+            mapping: 0,
+        };
+
+        let err = write_mode_header_into_writer(&bad, 1, &mut w)
+            .expect_err("must reject nonzero windowtype");
+        assert_eq!(err, WriteModeError::NonZeroWindowType(7));
+
+        // bit_position unchanged: the gate ran before any write call.
+        assert_eq!(w.bit_position(), before);
+    }
+
+    /// The splice point also rejects `mapping >= mapping_count` without
+    /// emitting any bits, the same fail-closed semantics as the
+    /// stand-alone writer.
+    #[test]
+    fn mode_into_writer_splice_emits_no_bits_on_bad_mapping() {
+        let mut w = BitWriterLsb::with_capacity(8);
+        w.write_u32(0b11, 2);
+        let before = w.bit_position();
+
+        let bad = ModeHeader {
+            blockflag: false,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 4,
+        };
+
+        let err = write_mode_header_into_writer(&bad, 4, &mut w)
+            .expect_err("must reject mapping == mapping_count");
+        assert_eq!(
+            err,
+            WriteModeError::BadMapping {
+                mapping: 4,
+                mapping_count: 4,
+            }
+        );
         assert_eq!(w.bit_position(), before);
     }
 }

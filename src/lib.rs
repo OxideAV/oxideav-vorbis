@@ -157,8 +157,9 @@ pub use comment::{
 };
 pub use encoder::{
     write_codebook, write_comment_header, write_floor0_header, write_floor1_header,
-    write_identification_header, write_mapping_header, write_residue_header, WriteCodebookError,
-    WriteError, WriteFloor0Error, WriteFloor1Error, WriteMappingError, WriteResidueError,
+    write_identification_header, write_mapping_header, write_mode_header, write_residue_header,
+    WriteCodebookError, WriteError, WriteFloor0Error, WriteFloor1Error, WriteMappingError,
+    WriteModeError, WriteResidueError,
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
