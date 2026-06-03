@@ -1,6 +1,70 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 24.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 25.
+
+## Status — 2026-06-03 (round 25, umbrella round 223)
+
+**Round 25 landed: the §4.2.4 mapping header WRITE primitive.** New
+public function [`encoder::write_mapping_header`] serialises a
+[`crate::setup::MappingHeader`] (the round-5 parser's output type) to
+the §4.2.4 "Mappings" body bit pattern. This is the fifth nested-block
+writer (after [`write_codebook`] in round 21, [`write_floor1_header`]
+in round 22, [`write_floor0_header`] in round 23, and
+[`write_residue_header`] in round 24) and the first mapping-side
+encoder primitive. Given the same context tuple the parser is supplied
+with — `(mapping_type, audio_channels, floor_count, residue_count)` —
+the bit-exact roundtrip property
+`local_parse_mapping_for_tests(&mut BitReaderLsb::new(&write_mapping_header(&h, audio_channels, floor_count, residue_count)?), audio_channels) == h`
+holds for every legal [`MappingHeader`]. The crate-private
+[`write_mapping_header_into_writer`] companion is shaped to splice
+the mapping body into the surrounding setup-header writer (still a
+followup), matching the existing `write_codebook_into_writer` /
+`write_floor1_header_into_writer` / `write_floor0_header_into_writer` /
+`write_residue_header_into_writer` splice points. A new
+[`WriteMappingError`] enumerates eleven §4.2.4 invariant violations
+(`UnsupportedMappingType`, `ZeroAudioChannels`, `SubmapsOutOfRange`,
+`CouplingStepsOverflow`, `BadCouplingChannels`,
+`CouplingChannelOverflow`, `MuxLengthMismatch`, `BadMuxValue`,
+`SubmapCountMismatch`, `BadSubmapFloor`, `BadSubmapResidue`) — the
+writer refuses each rather than emit a header the parser would
+reject. The umbrella [`WriteError`] grows a [`WriteError::Mapping`]
+variant with the matching `From` glue and `source()` chain.
+
+The encoder reverses §4.2.4 step 2c.i and step 2c.ii exactly. When
+`submaps == 1` the writer pins the densest legal encoding
+(`submaps_flag = 0`, the 4-bit body elided) and when
+`coupling.is_empty()` the writer pins `square_polar_flag = 0` (the
+8-bit step-count body and per-step magnitude/angle body elided). The
+§4.2.4 step 2c.ii.A per-coupling-step channel-number field width is
+sourced from `codebook::ilog(audio_channels - 1)` — the same §9.2.1
+helper the round-5 parser consults — so the writer's bit budget
+tracks the parser's bit cursor exactly on every legal input.
+
+36 new unit tests bring the in-module suite to **488 (452 → 488)**:
+byte-shape pinning for the minimal-mono fixture (44-bit body,
+exactly the layout the densest-encoding defaults emit) and the
+stereo-coupled fixture (54-bit body at `audio_channels = 2`,
+`channel_bits = 1`), the closed-form bit-length formula
+`16 + 1 + 4·(submaps>1) + 1 + 8·non_empty_coupling + 2·channel_bits·|coupling| + 2 + 4·audio_channels·(submaps>1) + 24·submaps`
+on a 4-channel 2-submap shape with one coupling step (100 bits),
+eleven bit-exact roundtrip fixtures (minimal-mono, stereo-coupled,
+stereo no-coupling, 5.1-channel with three coupling steps and two
+submaps, submaps at the 16 upper edge, coupling_steps at the 256
+upper edge, submap floor and residue indices at the 255 upper edge
+against 256-entry floor/residue counts, time_placeholder sweep,
+8-channel coupling width, 3-channel coupling width, 255-channel
+coupling width at the 8-bit `ilog` upper edge, 4-channel 2-submap
+mux cycle), three encoding-form selection tests (dense submaps form
+when `submaps == 1`, dense coupling form when `coupling.is_empty()`,
+explicit submaps form when `submaps > 1`), every
+`WriteMappingError` rejection variant (including the
+`magnitude == angle` case and the coupling-on-mono case at field
+width zero), the `WriteMappingError::Display` non-emptiness smoke
+test across twelve enumerated cases, the `WriteError::Mapping`
+`From` + `source()` chain, and the two splice-point tests
+(appends-after-existing-bits + emits-no-bits-on-error). Mode WRITE,
+audio-packet WRITE, and the setup-header splice that stitches all
+six nested-block writers together remain explicit followups.
 
 ## Status — 2026-06-03 (round 24, umbrella round 218)
 
