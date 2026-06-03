@@ -1,6 +1,73 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 22.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 24.
+
+## Status — 2026-06-03 (round 24, umbrella round 218)
+
+**Round 24 landed: the §8.6.1 residue header WRITE primitive.** New
+public function [`encoder::write_residue_header`] serialises a
+[`crate::setup::ResidueHeader`] (the round-5 parser's output type) to
+the §8.6.1 residue-header bit pattern that is common to all three
+residue formats (0, 1, 2). This is the fourth nested-block writer
+(after [`write_codebook`] in round 21, [`write_floor1_header`] in
+round 22, and [`write_floor0_header`] in round 23) and the first
+residue-side encoder primitive. The bit-exact roundtrip property
+`local_parse_residue_for_tests(&mut BitReaderLsb::new(&write_residue_header(&h)?), h.residue_type) == h`
+holds for every legal [`ResidueHeader`]. The crate-private
+[`write_residue_header_into_writer`] companion is shaped to splice
+the residue body into the surrounding setup-header writer (still a
+followup), matching the existing `write_codebook_into_writer` /
+`write_floor1_header_into_writer` / `write_floor0_header_into_writer`
+splice points. A new [`WriteResidueError`] enumerates eight §8.6.1
+invariant violations (`UnsupportedResidueType`,
+`ResidueBeginOverflow`, `ResidueEndOverflow`,
+`PartitionSizeOutOfRange`, `ClassificationsOutOfRange`,
+`CascadeLengthMismatch`, `BooksLengthMismatch`,
+`BooksCascadeMismatch`) — the writer refuses each rather than emit a
+header the parser would reject. The umbrella [`WriteError`] grows a
+[`WriteError::Residue`] variant with the matching `From` glue and
+`source()` chain.
+
+The encoder reverses §8.6.1 step 6 exactly: per-classification
+`cascade[i]` is split into `low_bits = cascade[i] & 7` plus
+`high_bits = cascade[i] >> 3`, and the writer elides the 5-bit
+high-bits read iff `high_bits == 0` (matching the parser's `bitflag`
+branch). The §8.6.1 step-7 per-stage book emission consults each
+cascade bit and emits the 8-bit book index iff that bit is set; the
+writer's invariant gate refuses any `Some(_) ↔ cascade-set` mismatch
+so a stale field cannot quietly persist.
+
+28 new unit tests bring the in-module suite to **452 (424 → 452)**:
+byte-shape pinning for the minimal §8.6.1 fixture (98-bit packet,
+exactly the layout the residue-type-2 setup-header test suite
+emits), the closed-form bit-length formula on a non-trivial
+two-class shape with mixed cascade halves (one class with
+`high_bits > 0` ⇒ bitflag=1 + 5 extra bits, one with `high_bits == 0`
+⇒ bitflag=0 + no extra), eleven bit-exact roundtrip fixtures
+(minimal, type-0, type-1, begin/end at the 24-bit upper edge,
+partition_size at the 2^24 upper edge, classifications at the
+6-bit upper edge (64) with a 64-byte cascade table sweep,
+cascade-all-set 0xFF, cascade-all-clear 0x00, cascade
+high-bits=31/low-bits=7 upper edge, alternating bitflag classes
+across consecutive entries, classbook at the 255 upper edge),
+every `WriteResidueError` rejection variant (each of the eight,
+with `BooksCascadeMismatch` exercised in both
+`book_present: true` and `book_present: false` directions), the
+`WriteResidueError::Display` non-emptiness smoke test across every
+variant, the `WriteError::Residue` `From` + `source()` chain, and
+the two splice-point tests (appends-after-existing-bits + emits-no-
+bits-on-error). Mapping WRITE, mode WRITE, audio-packet WRITE, and
+the setup-header splice that stitches all six nested-block writers
+together remain explicit followups.
+
+## Status — 2026-06-02 (round 23, umbrella round 212)
+
+**Round 23 landed: the §6.2.1 floor type 0 header WRITE primitive.**
+The third floor-side encoder primitive; sibling of
+[`encoder::write_floor1_header`]. See git log entry `5f6c77e` for
+the diff. The umbrella [`WriteError`] grew a `Floor0` variant with
+the matching `From` glue. (Round-23 prose summary deferred to git
+log to keep the README index-shaped.)
 
 ## Status — 2026-06-02 (round 22, umbrella round 206)
 

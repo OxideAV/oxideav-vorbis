@@ -1,4 +1,4 @@
-//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212).
+//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218).
 //!
 //! This module collects the encoder-side functions that mirror the
 //! parser surface in [`crate::identification`], [`crate::comment`],
@@ -24,6 +24,11 @@
 //!   §6.2.1 floor-type-0 setup-header bit pattern. Sibling of
 //!   [`write_floor1_header`] and the second per-floor encoder
 //!   primitive.
+//! * [`write_residue_header`] — serialises a [`ResidueHeader`] to the
+//!   §8.6.1 residue-header bit pattern. Common to all three residue
+//!   types (0, 1, 2); the outer 16-bit `residue_type` selector is the
+//!   setup walker's responsibility, mirroring the floor 0 / floor 1
+//!   convention. Round 218.
 //!
 //! Both functions validate the same spec-mandated invariants that the
 //! corresponding parser enforces on input, so a typo in the caller's
@@ -84,7 +89,7 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
-use crate::setup::{Floor0Header, Floor1Header};
+use crate::setup::{Floor0Header, Floor1Header, ResidueHeader};
 
 /// Errors that may arise while writing a Vorbis I header packet.
 ///
@@ -135,6 +140,9 @@ pub enum WriteError {
     /// A nested floor type 0 header (§6.2.1) failed one of the
     /// writer-side invariants checked by [`write_floor0_header`].
     Floor0(WriteFloor0Error),
+    /// A nested residue header (§8.6.1) failed one of the writer-side
+    /// invariants checked by [`write_residue_header`].
+    Residue(WriteResidueError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -557,6 +565,124 @@ impl fmt::Display for WriteFloor0Error {
 
 impl std::error::Error for WriteFloor0Error {}
 
+/// Errors that may arise while writing a Vorbis I residue header
+/// (§8.6.1) via [`write_residue_header`].
+///
+/// Each variant flags a §8.6.1 invariant the caller-supplied
+/// [`ResidueHeader`] does not satisfy. The writer refuses the call
+/// without emitting any bits, preserving the bit-exact roundtrip
+/// guarantee
+/// `parse_residue_header(&write_residue_header(&h)?, h.residue_type)? == h`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteResidueError {
+    /// `residue_type` was a value outside `{0, 1, 2}`. §8.6 only
+    /// defines those three formats; the §4.2.4 setup walker rejects
+    /// `> 2` on input and the writer mirrors the rule — even though
+    /// the §8.6.1 layout itself does not serialise `residue_type` (the
+    /// 16-bit selector is the setup walker's responsibility), the
+    /// writer refuses the call so a stale field cannot quietly persist.
+    UnsupportedResidueType(u16),
+    /// `residue_begin` exceeded the 24-bit `[residue_begin]` field's
+    /// representable range (`0..=0xFF_FFFF`).
+    ResidueBeginOverflow(u32),
+    /// `residue_end` exceeded the 24-bit `[residue_end]` field's
+    /// representable range (`0..=0xFF_FFFF`).
+    ResidueEndOverflow(u32),
+    /// `partition_size` was `0`, or exceeded the encodable cap. §8.6.1
+    /// stores the field as `read 24 bits + 1`, so the legal range is
+    /// `1..=2^24`. The writer refuses both ends.
+    PartitionSizeOutOfRange(u32),
+    /// `classifications` was `0`, or exceeded the encodable cap. §8.6.1
+    /// stores the field as `read 6 bits + 1`, so the legal range is
+    /// `1..=64`. The writer refuses both ends.
+    ClassificationsOutOfRange(u8),
+    /// `cascade.len()` did not equal `classifications`. The §8.6.1
+    /// layout has exactly one cascade byte per classification.
+    CascadeLengthMismatch {
+        /// `classifications` from the header.
+        classifications: u8,
+        /// Actual length of the supplied `cascade` vector.
+        actual: usize,
+    },
+    /// `books.len()` did not equal `classifications`. The §8.6.1
+    /// layout has exactly one 8-slot row per classification.
+    BooksLengthMismatch {
+        /// `classifications` from the header.
+        classifications: u8,
+        /// Actual length of the supplied `books` vector.
+        actual: usize,
+    },
+    /// A `books[class][stage]` slot was `Some(_)` but the matching
+    /// `cascade[class]` bit was unset, or the slot was `None` but the
+    /// matching cascade bit was set. The §8.6.1 layout reads each
+    /// 8-bit `residue_books[class][stage]` *iff* `cascade[class]` bit
+    /// `stage` is set — the writer refuses any inconsistency rather
+    /// than emit a header whose round-trip would silently differ.
+    BooksCascadeMismatch {
+        /// Classification index.
+        class: usize,
+        /// Cascade stage index `0..=7`.
+        stage: usize,
+        /// `true` if a codebook was supplied but the cascade bit is
+        /// clear; `false` if no codebook was supplied but the cascade
+        /// bit is set.
+        book_present: bool,
+    },
+}
+
+impl fmt::Display for WriteResidueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteResidueError::UnsupportedResidueType(t) => write!(
+                f,
+                "vorbis residue header (write): residue_type={t} not in {{0,1,2}} (§4.2.4 step 2c / §8.6)"
+            ),
+            WriteResidueError::ResidueBeginOverflow(v) => write!(
+                f,
+                "vorbis residue header (write): residue_begin={v} > 0xFFFFFF (§8.6.1 is a 24-bit field)"
+            ),
+            WriteResidueError::ResidueEndOverflow(v) => write!(
+                f,
+                "vorbis residue header (write): residue_end={v} > 0xFFFFFF (§8.6.1 is a 24-bit field)"
+            ),
+            WriteResidueError::PartitionSizeOutOfRange(v) => write!(
+                f,
+                "vorbis residue header (write): partition_size={v} outside legal 1..=2^24 (§8.6.1 stores `read 24 bits + 1`)"
+            ),
+            WriteResidueError::ClassificationsOutOfRange(v) => write!(
+                f,
+                "vorbis residue header (write): classifications={v} outside legal 1..=64 (§8.6.1 stores `read 6 bits + 1`)"
+            ),
+            WriteResidueError::CascadeLengthMismatch {
+                classifications,
+                actual,
+            } => write!(
+                f,
+                "vorbis residue header (write): cascade.len()={actual} != classifications={classifications} (§8.6.1)"
+            ),
+            WriteResidueError::BooksLengthMismatch {
+                classifications,
+                actual,
+            } => write!(
+                f,
+                "vorbis residue header (write): books.len()={actual} != classifications={classifications} (§8.6.1)"
+            ),
+            WriteResidueError::BooksCascadeMismatch {
+                class,
+                stage,
+                book_present,
+            } => write!(
+                f,
+                "vorbis residue header (write): books[{class}][{stage}] {} but cascade[{class}] bit {stage} {} (§8.6.1)",
+                if *book_present { "is Some" } else { "is None" },
+                if *book_present { "is clear" } else { "is set" },
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteResidueError {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -598,6 +724,7 @@ impl fmt::Display for WriteError {
             WriteError::Codebook(e) => write!(f, "{e}"),
             WriteError::Floor1(e) => write!(f, "{e}"),
             WriteError::Floor0(e) => write!(f, "{e}"),
+            WriteError::Residue(e) => write!(f, "{e}"),
         }
     }
 }
@@ -608,6 +735,7 @@ impl std::error::Error for WriteError {
             WriteError::Codebook(e) => Some(e),
             WriteError::Floor1(e) => Some(e),
             WriteError::Floor0(e) => Some(e),
+            WriteError::Residue(e) => Some(e),
             _ => None,
         }
     }
@@ -628,6 +756,12 @@ impl From<WriteFloor1Error> for WriteError {
 impl From<WriteFloor0Error> for WriteError {
     fn from(value: WriteFloor0Error) -> Self {
         WriteError::Floor0(value)
+    }
+}
+
+impl From<WriteResidueError> for WriteError {
+    fn from(value: WriteResidueError) -> Self {
+        WriteError::Residue(value)
     }
 }
 
@@ -1421,6 +1555,178 @@ pub(crate) fn write_floor0_header_into_writer(
     // step 7.
     for &book in &header.book_list {
         writer.write_u32(book as u32, 8);
+    }
+    Ok(())
+}
+
+/// Serialises a [`ResidueHeader`] to the §8.6.1 residue-header bit
+/// pattern.
+///
+/// §8.6.1 fields (each value is unsigned, written LSB-first into the
+/// bit stream per §2.1.4):
+///
+/// | Step | Field                              | Width  | Notes                                            |
+/// | ---: | ---------------------------------- | -----: | ------------------------------------------------ |
+/// |    1 | `residue_begin`                    |  24 b  | Raw `u32` in `0..=0xFFFFFF`.                     |
+/// |    2 | `residue_end`                      |  24 b  | Raw `u32` in `0..=0xFFFFFF`.                     |
+/// |    3 | `residue_partition_size - 1`       |  24 b  | `partition_size` in `1..=2^24`.                  |
+/// |    4 | `residue_classifications - 1`      |   6 b  | `classifications` in `1..=64`.                   |
+/// |    5 | `residue_classbook`                |   8 b  | Raw `u8` index into the codebook table.          |
+/// |  6.a | per-classification: `low_bits`     |   3 b  | `cascade[i] & 0x07`.                             |
+/// |  6.b | per-classification: `bitflag`      |   1 b  | `1` iff `cascade[i] >> 3 != 0`, else `0`.        |
+/// |  6.c | per-classification: `high_bits`    |   5 b  | Only when `bitflag == 1`; `cascade[i] >> 3`.     |
+/// |    7 | per-classification × stage 0..=7   |   8 b  | `books[i][j]` iff `cascade[i]` bit `j` is set.   |
+///
+/// The header is emitted **without** the outer 16-bit `residue_type`
+/// selector — that field is the setup-header walker's responsibility
+/// (mirroring the [`write_floor1_header`] / [`write_floor0_header`]
+/// convention). The companion [`write_residue_header_into_writer`]
+/// splice point is shaped to slot into the setup-header writer when
+/// that lands in a later round.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte may carry up to 7 bits of zero padding to byte-align
+/// the slice; the parser stops after the last `residue_books[i][7]`
+/// per §8.6.1.
+///
+/// Returns [`WriteResidueError`] without emitting any bits if the
+/// supplied header violates a §8.6.1 invariant.
+///
+/// ## Spec source
+///
+/// `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.1 ("Residue setup
+/// header decode" — the residue-header field list common to all three
+/// formats), §4.2.4 step 2c (the `residue_type ∈ {0, 1, 2}`
+/// constraint), and §2.1.4 (LSB-first packing).
+pub fn write_residue_header(header: &ResidueHeader) -> Result<Vec<u8>, WriteResidueError> {
+    let mut writer = BitWriterLsb::with_capacity(16);
+    write_residue_header_into_writer(header, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a residue header into a larger
+/// bit-packed stream. The setup-header writer will use this in a
+/// later round, mirroring
+/// [`write_floor0_header_into_writer`] / [`write_floor1_header_into_writer`]
+/// / [`write_codebook_into_writer`].
+///
+/// Writes the header's bits into `writer` at its current bit
+/// position. On error, the writer has had no bits appended (we
+/// validate before emitting).
+pub(crate) fn write_residue_header_into_writer(
+    header: &ResidueHeader,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteResidueError> {
+    // ---- §8.6.1 invariant gate. ----
+    // Fail-closed: refuse to emit a single bit if any field cannot be
+    // serialised back to a packet the parser would accept.
+
+    // §4.2.4 step 2c gate (mirrors the setup-walker rejection).
+    if header.residue_type > 2 {
+        return Err(WriteResidueError::UnsupportedResidueType(
+            header.residue_type,
+        ));
+    }
+    // step 1: residue_begin fits in a 24-bit field.
+    if header.residue_begin > 0x00FF_FFFF {
+        return Err(WriteResidueError::ResidueBeginOverflow(
+            header.residue_begin,
+        ));
+    }
+    // step 2: residue_end fits in a 24-bit field.
+    if header.residue_end > 0x00FF_FFFF {
+        return Err(WriteResidueError::ResidueEndOverflow(header.residue_end));
+    }
+    // step 3: partition_size in 1..=2^24 (stored as `read 24 bits + 1`).
+    if header.partition_size == 0 || header.partition_size > (1u32 << 24) {
+        return Err(WriteResidueError::PartitionSizeOutOfRange(
+            header.partition_size,
+        ));
+    }
+    // step 4: classifications in 1..=64 (stored as `read 6 bits + 1`).
+    if header.classifications == 0 || header.classifications > 64 {
+        return Err(WriteResidueError::ClassificationsOutOfRange(
+            header.classifications,
+        ));
+    }
+    // The cascade and books tables must each carry exactly one entry
+    // per classification per the §8.6.1 outer loops.
+    if header.cascade.len() != header.classifications as usize {
+        return Err(WriteResidueError::CascadeLengthMismatch {
+            classifications: header.classifications,
+            actual: header.cascade.len(),
+        });
+    }
+    if header.books.len() != header.classifications as usize {
+        return Err(WriteResidueError::BooksLengthMismatch {
+            classifications: header.classifications,
+            actual: header.books.len(),
+        });
+    }
+    // Each `books[class][stage]` slot must match the cascade bit
+    // (Some(_) iff cascade bit set).
+    for (class_idx, (&cas, row)) in header.cascade.iter().zip(header.books.iter()).enumerate() {
+        for (stage, slot) in row.iter().enumerate() {
+            let cascade_bit_set = (cas >> stage) & 1 == 1;
+            match (slot, cascade_bit_set) {
+                (Some(_), false) => {
+                    return Err(WriteResidueError::BooksCascadeMismatch {
+                        class: class_idx,
+                        stage,
+                        book_present: true,
+                    });
+                }
+                (None, true) => {
+                    return Err(WriteResidueError::BooksCascadeMismatch {
+                        class: class_idx,
+                        stage,
+                        book_present: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    // Note: `residue_classbook` is a raw `u8` whose 8-bit field width
+    // accepts every u8 value; no further bound check is required.
+
+    // ---- §8.6.1 emit. ----
+    // step 1.
+    writer.write_u32(header.residue_begin, 24);
+    // step 2.
+    writer.write_u32(header.residue_end, 24);
+    // step 3.
+    writer.write_u32(header.partition_size - 1, 24);
+    // step 4.
+    writer.write_u32((header.classifications - 1) as u32, 6);
+    // step 5.
+    writer.write_u32(header.classbook as u32, 8);
+    // step 6: cascade — split each byte into 3 low bits + bitflag +
+    // optional 5 high bits. The parser computes
+    // `cascade[i] = high_bits * 8 + low_bits`; the inverse is
+    // `low_bits = byte & 7`, `high_bits = byte >> 3`. We elide the
+    // 5-bit high read iff `high_bits == 0`, which matches the parser's
+    // `bitflag` branch.
+    for &cas in &header.cascade {
+        let low_bits = (cas & 0x07) as u32;
+        let high_bits = (cas >> 3) as u32;
+        writer.write_u32(low_bits, 3);
+        if high_bits == 0 {
+            writer.write_u32(0, 1);
+        } else {
+            writer.write_u32(1, 1);
+            writer.write_u32(high_bits, 5);
+        }
+    }
+    // step 7: per-class × per-stage: write 8-bit book iff cascade bit
+    // set. The invariant gate above guarantees Some(_) ↔ cascade-set.
+    for (cas, row) in header.cascade.iter().zip(header.books.iter()) {
+        for (stage, slot) in row.iter().enumerate() {
+            if (cas >> stage) & 1 == 1 {
+                let book = slot.expect("invariant-gate-validated");
+                writer.write_u32(book as u32, 8);
+            }
+        }
     }
     Ok(())
 }
@@ -3536,6 +3842,610 @@ mod tests {
 
         let err = write_floor0_header_into_writer(&bad, &mut w).expect_err("must reject overflow");
         assert_eq!(err, WriteFloor0Error::AmplitudeBitsOverflow(64));
+
+        // bit_position unchanged: the gate ran before any write call.
+        assert_eq!(w.bit_position(), before);
+    }
+
+    // ================================================================
+    // Residue header writer (§8.6.1) — fixture builders + tests
+    // ================================================================
+
+    /// Clean-room reproduction of `setup::parse_residue_header` from
+    /// the §8.6.1 step list, used only to exercise the writer's
+    /// bit-exact roundtrip property without coupling the encoder test
+    /// suite to the setup-header outer walker.
+    ///
+    /// Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.1.
+    fn local_parse_residue_for_tests(
+        reader: &mut oxideav_core::bits::BitReaderLsb<'_>,
+        residue_type: u16,
+    ) -> ResidueHeader {
+        let residue_begin = reader.read_u32(24).unwrap();
+        let residue_end = reader.read_u32(24).unwrap();
+        let partition_size = reader.read_u32(24).unwrap() + 1;
+        let classifications = (reader.read_u32(6).unwrap() as u8) + 1;
+        let classbook = reader.read_u32(8).unwrap() as u8;
+
+        let mut cascade = Vec::with_capacity(classifications as usize);
+        for _ in 0..classifications {
+            let low_bits = reader.read_u32(3).unwrap() as u8;
+            let bitflag = reader.read_u32(1).unwrap();
+            let high_bits = if bitflag == 1 {
+                reader.read_u32(5).unwrap() as u8
+            } else {
+                0
+            };
+            cascade.push(high_bits.wrapping_mul(8).wrapping_add(low_bits));
+        }
+
+        let mut books = Vec::with_capacity(classifications as usize);
+        for &cas in &cascade {
+            let mut row: [Option<u8>; 8] = [None; 8];
+            for (j, slot) in row.iter_mut().enumerate() {
+                if (cas >> j) & 1 == 1 {
+                    *slot = Some(reader.read_u32(8).unwrap() as u8);
+                }
+            }
+            books.push(row);
+        }
+
+        ResidueHeader {
+            residue_type,
+            residue_begin,
+            residue_end,
+            partition_size,
+            classifications,
+            classbook,
+            cascade,
+            books,
+        }
+    }
+
+    /// The "minimal" residue header: residue_type=2, residue_begin=0,
+    /// residue_end=128, partition_size=32, classifications=1,
+    /// classbook=0, cascade=[1] (only stage 0 present),
+    /// books=[[Some(0),None,None,None,None,None,None,None]].
+    /// Mirrors the `minimal_residue_type2` setup-builder shape.
+    fn minimal_residue() -> ResidueHeader {
+        ResidueHeader {
+            residue_type: 2,
+            residue_begin: 0,
+            residue_end: 128,
+            partition_size: 32,
+            classifications: 1,
+            classbook: 0,
+            cascade: vec![1],
+            books: vec![[Some(0), None, None, None, None, None, None, None]],
+        }
+    }
+
+    fn residue_roundtrips(header: &ResidueHeader) {
+        let bytes = write_residue_header(header).expect("write must succeed");
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let parsed = local_parse_residue_for_tests(&mut reader, header.residue_type);
+        assert_eq!(&parsed, header, "residue roundtrip equality");
+    }
+
+    // ----------------------------------------------------------------
+    // Residue header writer — byte-shape pinning.
+    // ----------------------------------------------------------------
+
+    /// Pin the exact bit layout of the minimal residue fixture. This
+    /// reproduces a single hand-rolled `BitWriterLsb` stream against
+    /// the actual writer output, so the §8.6.1 field order + widths
+    /// are locked, not merely "roundtrips through the parser."
+    #[test]
+    fn residue_byte_shape_minimal() {
+        let bytes = write_residue_header(&minimal_residue()).expect("must build");
+        // Bits emitted (LSB-first per §2.1.4):
+        //   residue_begin=0          -> 24 bits
+        //   residue_end=128          -> 24 bits
+        //   partition_size-1=31      -> 24 bits
+        //   classifications-1=0      ->  6 bits
+        //   classbook=0              ->  8 bits
+        //   cascade[0]=1: low=1 bf=0 ->  3 + 1 = 4 bits
+        //   books[0][0]=Some(0)      ->  8 bits
+        // Total = 24+24+24+6+8+4+8 = 98 bits.
+        let total_bits = 24 + 24 + 24 + 6 + 8 + 4 + 8;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+
+        let mut expected = BitWriterLsb::with_capacity(16);
+        expected.write_u32(0, 24); // residue_begin
+        expected.write_u32(128, 24); // residue_end
+        expected.write_u32(31, 24); // partition_size - 1
+        expected.write_u32(0, 6); // classifications - 1
+        expected.write_u32(0, 8); // classbook
+        expected.write_u32(1, 3); // cascade[0] low_bits
+        expected.write_u32(0, 1); // cascade[0] bitflag (high == 0)
+        expected.write_u32(0, 8); // books[0][0]
+        assert_eq!(bytes, expected.finish());
+    }
+
+    /// Closed-form bit-length formula on a non-trivial fixture: two
+    /// classifications, the first cascade-byte uses both halves
+    /// (high_bits > 0 → bitflag=1 + 5 more bits), the second is
+    /// low-only (high_bits == 0 → bitflag=0).
+    ///
+    /// Per-cascade-byte bits =
+    ///   3 (low) + 1 (bitflag) + (bitflag ? 5 : 0)
+    /// Total header bits =
+    ///   24 (begin) + 24 (end) + 24 (psize-1) + 6 (class-1) + 8 (classbook)
+    ///   + Σ per-class (3 + 1 + maybe 5) + 8 × popcount(cascade[i])
+    #[test]
+    fn residue_bit_length_formula_two_classes_mixed_cascades() {
+        let header = ResidueHeader {
+            residue_type: 1,
+            residue_begin: 0,
+            residue_end: 1024,
+            partition_size: 32,
+            classifications: 2,
+            classbook: 3,
+            cascade: vec![
+                0b0010_0001, // 33: low=1, high=4 (bitflag=1, +5 bits); 2 bits set → 2 books
+                0b0000_0010, // 2:  low=2, high=0 (bitflag=0, no extra);  1 bit set → 1 book
+            ],
+            books: vec![
+                [Some(7), None, None, None, None, Some(11), None, None],
+                [None, Some(2), None, None, None, None, None, None],
+            ],
+        };
+        let bytes = write_residue_header(&header).expect("write");
+        // Header constants + per-class cascade emission + per-book emission.
+        let cascade_bits = (3 + 1 + 5) + (3 + 1); // class 0 high>0, class 1 high==0
+        let book_bits = 8 * (2 + 1);
+        let total_bits = 24 + 24 + 24 + 6 + 8 + cascade_bits + book_bits;
+        assert_eq!(bytes.len(), (total_bits as usize).div_ceil(8));
+        residue_roundtrips(&header);
+    }
+
+    // ----------------------------------------------------------------
+    // Residue header writer — bit-exact roundtrip.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn residue_roundtrips_minimal() {
+        residue_roundtrips(&minimal_residue());
+    }
+
+    /// Residue type 0 is the format-0 (interleaved) classifier. The
+    /// header layout is identical to types 1 and 2 — only the runtime
+    /// decode differs.
+    #[test]
+    fn residue_roundtrips_type_0() {
+        let mut h = minimal_residue();
+        h.residue_type = 0;
+        residue_roundtrips(&h);
+    }
+
+    /// Residue type 1 (contiguous layout).
+    #[test]
+    fn residue_roundtrips_type_1() {
+        let mut h = minimal_residue();
+        h.residue_type = 1;
+        residue_roundtrips(&h);
+    }
+
+    /// Begin/end at the 24-bit field upper edge.
+    #[test]
+    fn residue_roundtrips_begin_end_at_24bit_edge() {
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 2,
+            residue_begin: 0x00FF_FFFE,
+            residue_end: 0x00FF_FFFF,
+            partition_size: 1,
+            classifications: 1,
+            classbook: 255,
+            cascade: vec![0],
+            books: vec![[None; 8]],
+        });
+    }
+
+    /// partition_size at the upper edge (2^24, encoded as 24-bit all-ones).
+    #[test]
+    fn residue_roundtrips_partition_size_upper_edge() {
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 2,
+            residue_begin: 0,
+            residue_end: 0,
+            partition_size: 1u32 << 24,
+            classifications: 1,
+            classbook: 0,
+            cascade: vec![0],
+            books: vec![[None; 8]],
+        });
+    }
+
+    /// classifications at the upper edge (64, encoded as 6-bit all-ones).
+    /// Mixed cascade bytes to also exercise the high-bits branch.
+    #[test]
+    fn residue_roundtrips_classifications_upper_edge() {
+        let cascade: Vec<u8> = (0u8..64).collect();
+        let mut books = Vec::with_capacity(64);
+        for &cas in &cascade {
+            let mut row: [Option<u8>; 8] = [None; 8];
+            for (j, slot) in row.iter_mut().enumerate() {
+                if (cas >> j) & 1 == 1 {
+                    *slot = Some((j as u8).wrapping_mul(7).wrapping_add(cas));
+                }
+            }
+            books.push(row);
+        }
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 2,
+            residue_begin: 16,
+            residue_end: 4096,
+            partition_size: 128,
+            classifications: 64,
+            classbook: 17,
+            cascade,
+            books,
+        });
+    }
+
+    /// Cascade byte 0xFF (all 8 stages present) — exercises every
+    /// stage's 8-bit book read.
+    #[test]
+    fn residue_roundtrips_cascade_all_stages_set() {
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 0,
+            residue_begin: 0,
+            residue_end: 256,
+            partition_size: 32,
+            classifications: 1,
+            classbook: 0,
+            cascade: vec![0xFF],
+            books: vec![[
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+            ]],
+        });
+    }
+
+    /// Cascade byte 0x00 (no stages) — no per-stage book bytes are
+    /// emitted; the roundtrip still must hold.
+    #[test]
+    fn residue_roundtrips_cascade_all_stages_clear() {
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 0,
+            residue_begin: 0,
+            residue_end: 256,
+            partition_size: 32,
+            classifications: 1,
+            classbook: 0,
+            cascade: vec![0x00],
+            books: vec![[None; 8]],
+        });
+    }
+
+    /// Cascade byte with high_bits at the 5-bit upper edge (31) and
+    /// low_bits at the 3-bit upper edge (7) — packs as 0xFF, the same
+    /// numeric byte the all-stages-set test uses but reached via the
+    /// (high*8 + low) accounting.
+    #[test]
+    fn residue_roundtrips_cascade_high_bits_upper_edge() {
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 1,
+            residue_begin: 0,
+            residue_end: 128,
+            partition_size: 8,
+            classifications: 1,
+            classbook: 42,
+            // 31 * 8 + 7 = 255 = 0xFF.
+            cascade: vec![31u8.wrapping_mul(8).wrapping_add(7)],
+            books: vec![[
+                Some(10),
+                Some(11),
+                Some(12),
+                Some(13),
+                Some(14),
+                Some(15),
+                Some(16),
+                Some(17),
+            ]],
+        });
+    }
+
+    /// Mix of bitflag=0 and bitflag=1 cascades across consecutive
+    /// classifications — the parser's bitflag branch is per-class, so
+    /// transitions across the classification loop must be bit-exact.
+    #[test]
+    fn residue_roundtrips_alternating_bitflag_classes() {
+        // 4 classifications: low-only, high>0, low-only, high>0.
+        let cascade: Vec<u8> = vec![
+            0b0000_0011, // low=3, high=0
+            0b0010_0001, // low=1, high=4
+            0b0000_0010, // low=2, high=0
+            0b0001_0100, // low=4, high=2
+        ];
+        let mut books = Vec::with_capacity(4);
+        for (i, &cas) in cascade.iter().enumerate() {
+            let mut row: [Option<u8>; 8] = [None; 8];
+            for (j, slot) in row.iter_mut().enumerate() {
+                if (cas >> j) & 1 == 1 {
+                    *slot = Some(((i * 8 + j) % 250) as u8);
+                }
+            }
+            books.push(row);
+        }
+        residue_roundtrips(&ResidueHeader {
+            residue_type: 2,
+            residue_begin: 4,
+            residue_end: 512,
+            partition_size: 16,
+            classifications: 4,
+            classbook: 9,
+            cascade,
+            books,
+        });
+    }
+
+    /// classbook = 255 (upper edge of the 8-bit field).
+    #[test]
+    fn residue_roundtrips_classbook_at_upper_edge() {
+        let mut h = minimal_residue();
+        h.classbook = u8::MAX;
+        residue_roundtrips(&h);
+    }
+
+    // ----------------------------------------------------------------
+    // Residue header writer — rejection variants.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn residue_rejects_unsupported_residue_type() {
+        let mut h = minimal_residue();
+        h.residue_type = 3; // §4.2.4 step 2c cap is 2
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::UnsupportedResidueType(3))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_residue_begin_overflow() {
+        let mut h = minimal_residue();
+        h.residue_begin = 0x0100_0000; // 24-bit field caps at 0x00FF_FFFF
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::ResidueBeginOverflow(0x0100_0000))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_residue_end_overflow() {
+        let mut h = minimal_residue();
+        h.residue_end = 0x0100_0000;
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::ResidueEndOverflow(0x0100_0000))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_partition_size_zero() {
+        let mut h = minimal_residue();
+        h.partition_size = 0;
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::PartitionSizeOutOfRange(0))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_partition_size_above_cap() {
+        let mut h = minimal_residue();
+        h.partition_size = (1u32 << 24) + 1; // one past the cap
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::PartitionSizeOutOfRange((1u32 << 24) + 1))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_classifications_zero() {
+        let mut h = minimal_residue();
+        h.classifications = 0;
+        // cascade/books length checks fire later, so this rejection
+        // gates first.
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::ClassificationsOutOfRange(0))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_classifications_above_cap() {
+        let mut h = minimal_residue();
+        h.classifications = 65;
+        h.cascade = vec![0; 65];
+        h.books = vec![[None; 8]; 65];
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::ClassificationsOutOfRange(65))
+        );
+    }
+
+    #[test]
+    fn residue_rejects_cascade_length_mismatch() {
+        let mut h = minimal_residue();
+        // classifications=1 but cascade has 2 entries.
+        h.cascade = vec![0, 0];
+        h.books = vec![[None; 8], [None; 8]];
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::CascadeLengthMismatch {
+                classifications: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn residue_rejects_books_length_mismatch() {
+        let mut h = minimal_residue();
+        // classifications=1, cascade length=1, but books length=2.
+        h.books = vec![
+            [Some(0), None, None, None, None, None, None, None],
+            [None; 8],
+        ];
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::BooksLengthMismatch {
+                classifications: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn residue_rejects_books_present_but_cascade_clear() {
+        let mut h = minimal_residue();
+        // cascade=1 (bit 0 set), books[0][0]=Some, books[0][1]=Some
+        // but cascade bit 1 is clear.
+        h.cascade = vec![1];
+        h.books = vec![[Some(0), Some(7), None, None, None, None, None, None]];
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::BooksCascadeMismatch {
+                class: 0,
+                stage: 1,
+                book_present: true,
+            })
+        );
+    }
+
+    #[test]
+    fn residue_rejects_books_absent_but_cascade_set() {
+        let mut h = minimal_residue();
+        // cascade=3 (bits 0 and 1 set), books only fills stage 0.
+        h.cascade = vec![3];
+        h.books = vec![[Some(0), None, None, None, None, None, None, None]];
+        assert_eq!(
+            write_residue_header(&h),
+            Err(WriteResidueError::BooksCascadeMismatch {
+                class: 0,
+                stage: 1,
+                book_present: false,
+            })
+        );
+    }
+
+    /// `WriteResidueError::Display` is non-empty for every variant
+    /// and echoes the §8.6.1 / residue context tag.
+    #[test]
+    fn residue_error_display_smoke() {
+        let cases = [
+            WriteResidueError::UnsupportedResidueType(5),
+            WriteResidueError::ResidueBeginOverflow(0x0100_0000),
+            WriteResidueError::ResidueEndOverflow(0x0100_0000),
+            WriteResidueError::PartitionSizeOutOfRange(0),
+            WriteResidueError::ClassificationsOutOfRange(0),
+            WriteResidueError::CascadeLengthMismatch {
+                classifications: 1,
+                actual: 2,
+            },
+            WriteResidueError::BooksLengthMismatch {
+                classifications: 1,
+                actual: 2,
+            },
+            WriteResidueError::BooksCascadeMismatch {
+                class: 0,
+                stage: 1,
+                book_present: true,
+            },
+            WriteResidueError::BooksCascadeMismatch {
+                class: 0,
+                stage: 1,
+                book_present: false,
+            },
+        ];
+        for case in cases {
+            let s = format!("{case}");
+            assert!(!s.is_empty(), "Display empty for {case:?}");
+            assert!(
+                s.contains("residue"),
+                "Display for {case:?} must mention residue context"
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Residue header writer — WriteError glue.
+    // ----------------------------------------------------------------
+
+    /// Residue write errors surface as `WriteError::Residue` via the
+    /// `From` impl, preserving the variant for caller inspection and
+    /// the source chain.
+    #[test]
+    fn write_error_residue_glue() {
+        let inner: WriteError = WriteResidueError::UnsupportedResidueType(7).into();
+        assert_eq!(
+            inner,
+            WriteError::Residue(WriteResidueError::UnsupportedResidueType(7))
+        );
+        use std::error::Error as StdError;
+        let src = StdError::source(&inner).expect("source chain should reach Residue");
+        // The chained Display must non-trivially echo the residue tag.
+        assert!(format!("{src}").contains("residue"));
+    }
+
+    // ----------------------------------------------------------------
+    // Residue header writer — splice point.
+    // ----------------------------------------------------------------
+
+    /// The `write_residue_header_into_writer` splice point appends to
+    /// an in-progress writer at the current bit offset, leaving
+    /// pre-existing bits intact. This pins the shape the setup-header
+    /// writer will splice the residue body into.
+    #[test]
+    fn residue_into_writer_splice_appends_after_existing_bits() {
+        let mut w = BitWriterLsb::with_capacity(16);
+        // Seed: write 7 bits (sub-byte) before splicing.
+        w.write_u32(0b1010101, 7);
+        write_residue_header_into_writer(&minimal_residue(), &mut w).expect("splice");
+        let with_splice = w.finish();
+
+        // Standalone residue bytes, for comparison.
+        let standalone = write_residue_header(&minimal_residue()).expect("standalone");
+
+        // Spliced output must be at least as long as the standalone
+        // slice (because the seed bits push the splice forward, and
+        // rounding pushes a partial last byte up).
+        assert!(with_splice.len() >= standalone.len());
+
+        // Re-decode the spliced output: consume the 7 seed bits then
+        // run the residue parser at the resumed position.
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&with_splice);
+        let seed = r.read_u32(7).unwrap();
+        assert_eq!(seed, 0b1010101);
+        let parsed = local_parse_residue_for_tests(&mut r, 2);
+        assert_eq!(parsed, minimal_residue());
+    }
+
+    /// The fail-closed gate: when the writer rejects a header, no
+    /// bits are appended to the supplied splice writer. This pins the
+    /// "validate before emit" contract documented on
+    /// [`write_residue_header_into_writer`].
+    #[test]
+    fn residue_into_writer_splice_emits_no_bits_on_error() {
+        let mut w = BitWriterLsb::with_capacity(16);
+        // Seed 3 bits to give the writer some pre-existing state.
+        w.write_u32(0b101, 3);
+        let before = w.bit_position();
+
+        let mut bad = minimal_residue();
+        bad.residue_type = 7; // §4.2.4 step 2c cap is 2
+
+        let err = write_residue_header_into_writer(&bad, &mut w)
+            .expect_err("must reject unsupported residue_type");
+        assert_eq!(err, WriteResidueError::UnsupportedResidueType(7));
 
         // bit_position unchanged: the gate ran before any write call.
         assert_eq!(w.bit_position(), before);

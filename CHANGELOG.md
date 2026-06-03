@@ -6,6 +6,48 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §8.6.1 residue header WRITE primitive (round 24,
+  umbrella round 218).** New public function
+  `encoder::write_residue_header` serialises a
+  `crate::setup::ResidueHeader` to the §8.6.1 residue-header bit
+  pattern common to all three residue formats (0, 1, 2). The function
+  is the bit-exact inverse of the round-5 residue header parser
+  (`setup::parse_residue_header`): the property
+  `parse_residue_header_via_local_helper(&write_residue_header(&h)?, h.residue_type) == h`
+  holds for every legal `ResidueHeader`. The crate-private
+  `write_residue_header_into_writer` companion mirrors the splice
+  point shape established by `write_codebook_into_writer`,
+  `write_floor1_header_into_writer`, and
+  `write_floor0_header_into_writer`, allowing the still-pending
+  setup-header writer to slot the residue body into a wider
+  bit-packed stream. A new `WriteResidueError` enum enumerates eight
+  §8.6.1 invariant violations (`UnsupportedResidueType`,
+  `ResidueBeginOverflow`, `ResidueEndOverflow`,
+  `PartitionSizeOutOfRange`, `ClassificationsOutOfRange`,
+  `CascadeLengthMismatch`, `BooksLengthMismatch`,
+  `BooksCascadeMismatch`); each refuses the call without emitting any
+  bits rather than serialise a header the parser would reject. The
+  umbrella `WriteError` enum grows a
+  `WriteError::Residue(WriteResidueError)` variant with the matching
+  `From` glue and `source()` chain. Twenty-eight new tests pin the
+  byte shape on the residue-type-2 minimal fixture (98-bit packet),
+  the closed-form bit-length formula on a two-class mixed-cascade
+  shape, eleven roundtrip fixtures (type-0 / type-1 / type-2; begin
+  and end at the 24-bit upper edge; partition_size at the 2^24 upper
+  edge; classifications at the 64 upper edge with a 64-byte cascade
+  sweep; cascade=0xFF (all eight stages) and cascade=0x00 (no
+  stages); cascade high-bits=31/low-bits=7 upper edge; alternating
+  bitflag classes across consecutive entries; classbook=255 upper
+  edge), every `WriteResidueError` rejection variant (with
+  `BooksCascadeMismatch` in both `book_present` directions), the
+  `WriteResidueError::Display` non-emptiness smoke test, the
+  `WriteError::Residue` `From` + `source()` chain, and two
+  splice-point tests (appends-after-existing-bits + emits-no-bits-on-
+  error). The crate's public surface also gains
+  `encoder::write_floor0_header` and `encoder::WriteFloor0Error`
+  re-exports retroactively for round 23 (they were already
+  implemented but missed the lib.rs re-export list).
+
 * **Vorbis I §6.2.1 floor type 0 header WRITE primitive (round 23,
   umbrella round 212).** New public function
   `encoder::write_floor0_header` serialises a
