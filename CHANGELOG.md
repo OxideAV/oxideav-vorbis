@@ -4,6 +4,17 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.10...v0.0.11) - 2026-06-03
+
+### Other
+
+- §4.2.4 mapping header WRITE primitive (round 25)
+- §8.6.1 residue header WRITE primitive (round 24)
+- §6.2.1 floor type 0 header WRITE primitive (round 23)
+- §7.2.2 floor type 1 header WRITE primitive (round 22)
+- §3.2.1 codebook WRITE primitive + §9.2.2 float32_pack (round 21)
+- write_identification_header + write_comment_header — first WRITE primitives (round 20)
+
 ### Added
 
 * **Vorbis I §4.2.4 mapping header WRITE primitive (round 25,
