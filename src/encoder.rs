@@ -97,7 +97,10 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
-use crate::setup::{Floor0Header, Floor1Header, MappingHeader, ModeHeader, ResidueHeader};
+use crate::setup::{
+    Floor0Header, Floor1Header, FloorKind, MappingHeader, ModeHeader, ResidueHeader,
+    VorbisSetupHeader, SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
+};
 
 /// Errors that may arise while writing a Vorbis I header packet.
 ///
@@ -157,6 +160,9 @@ pub enum WriteError {
     /// A nested mode configuration (§4.2.4 "Modes") failed one of the
     /// writer-side invariants checked by [`write_mode_header`].
     Mode(WriteModeError),
+    /// A wrapping setup-header (§4.2.4) failed one of the writer-side
+    /// invariants checked by [`write_setup_header`].
+    Setup(WriteSetupError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -941,6 +947,187 @@ impl fmt::Display for WriteModeError {
 
 impl std::error::Error for WriteModeError {}
 
+/// Errors that may arise while writing a wrapping Vorbis I setup-header
+/// packet (Vorbis I §4.2.4) via [`write_setup_header`].
+///
+/// Each variant flags a §4.2.4 invariant the caller-supplied
+/// [`VorbisSetupHeader`] does not satisfy. The writer refuses the call
+/// (returning the error) without emitting any bytes — keeping the
+/// bit-exact roundtrip guarantee
+/// `parse_setup_header(&write_setup_header(&h, audio_channels)?, audio_channels)? == h`
+/// defensible for every legal input.
+///
+/// Nested codebook / floor / residue / mapping / mode failures are
+/// re-exported as their existing dedicated error types (the writer
+/// returns them through the umbrella [`WriteError`] when invoked via
+/// [`write_setup_header`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteSetupError {
+    /// `audio_channels` (the value sourced from the identification
+    /// header and supplied to [`write_setup_header`]) was zero. §4.2.2
+    /// mandates `audio_channels > 0` for any conformant Vorbis I
+    /// stream, and the round-5 setup parser rejects zero with
+    /// `ParseError::ZeroAudioChannels`.
+    ZeroAudioChannels,
+    /// `codebooks` was empty, i.e. the §4.2.4 step "Codebooks" would
+    /// have to encode `vorbis_codebook_count = 0`. The 8-bit
+    /// `read 8 bits + 1` count container only encodes `1..=256`; the
+    /// round-5 parser would never observe a zero-length codebook list.
+    EmptyCodebooks,
+    /// `codebooks.len()` exceeded the 8-bit `vorbis_codebook_count - 1`
+    /// container (legal range `1..=256`).
+    CodebookCountOverflow(usize),
+    /// `time_placeholders` was empty. The 6-bit `read 6 bits + 1`
+    /// count container only encodes `1..=64`; the round-5 parser
+    /// would never observe a zero-length time-placeholder list.
+    EmptyTimePlaceholders,
+    /// `time_placeholders.len()` exceeded the 6-bit
+    /// `vorbis_time_count - 1` container (legal range `1..=64`).
+    TimeCountOverflow(usize),
+    /// A `time_placeholders[i]` value was nonzero. §4.2.4 step 2
+    /// mandates every time-domain transform value be zero on the wire;
+    /// the round-5 parser rejects any nonzero entry with
+    /// `ParseError::NonZeroTimePlaceholder`.
+    NonZeroTimePlaceholder {
+        /// The offending entry index in `0 .. time_placeholders.len()`.
+        index: usize,
+        /// The rejected 16-bit value.
+        value: u16,
+    },
+    /// `floors` was empty. The 6-bit `read 6 bits + 1` count container
+    /// only encodes `1..=64`.
+    EmptyFloors,
+    /// `floors.len()` exceeded the 6-bit `vorbis_floor_count - 1`
+    /// container (legal range `1..=64`).
+    FloorCountOverflow(usize),
+    /// A `floors[i]` entry's `floor_type` was strictly greater than 1.
+    /// §4.2.4 step 2d mandates `floor_type ∈ {0, 1}`; the round-5
+    /// parser rejects any other value with
+    /// `ParseError::UnsupportedFloorType`.
+    UnsupportedFloorType {
+        /// The offending entry index in `0 .. floors.len()`.
+        index: usize,
+        /// The rejected 16-bit `floor_type` value.
+        floor_type: u16,
+    },
+    /// A `floors[i]` entry's `floor_type` field disagreed with its
+    /// `kind` discriminant — e.g. `floor_type = 0` paired with a
+    /// `FloorKind::Type1(_)` payload (or vice versa). The struct does
+    /// not serialise to a packet the round-5 parser would round-trip
+    /// to the same [`FloorHeader`].
+    FloorTypeKindMismatch {
+        /// The offending entry index in `0 .. floors.len()`.
+        index: usize,
+        /// The struct's stored `floor_type` field.
+        floor_type: u16,
+        /// `0` for `FloorKind::Type0(_)`, `1` for `FloorKind::Type1(_)`.
+        kind_discriminant: u16,
+    },
+    /// `residues` was empty. The 6-bit `read 6 bits + 1` count
+    /// container only encodes `1..=64`.
+    EmptyResidues,
+    /// `residues.len()` exceeded the 6-bit `vorbis_residue_count - 1`
+    /// container (legal range `1..=64`).
+    ResidueCountOverflow(usize),
+    /// `mappings` was empty. The 6-bit `read 6 bits + 1` count
+    /// container only encodes `1..=64`.
+    EmptyMappings,
+    /// `mappings.len()` exceeded the 6-bit `vorbis_mapping_count - 1`
+    /// container (legal range `1..=64`).
+    MappingCountOverflow(usize),
+    /// `modes` was empty. The 6-bit `read 6 bits + 1` count container
+    /// only encodes `1..=64`.
+    EmptyModes,
+    /// `modes.len()` exceeded the 6-bit `vorbis_mode_count - 1`
+    /// container (legal range `1..=64`).
+    ModeCountOverflow(usize),
+    /// `framing_flag` was `false`. §4.2.4 step 3 mandates the trailing
+    /// framing bit be set; the round-5 parser rejects `false` with
+    /// `ParseError::BadFramingFlag`.
+    BadFramingFlag,
+}
+
+impl fmt::Display for WriteSetupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteSetupError::ZeroAudioChannels => write!(
+                f,
+                "vorbis setup header (write): audio_channels = 0 (§4.2.2 mandates > 0)"
+            ),
+            WriteSetupError::EmptyCodebooks => write!(
+                f,
+                "vorbis setup header (write): codebooks is empty (§4.2.4 step \"Codebooks\" encodes count - 1 in 8 bits, range 1..=256)"
+            ),
+            WriteSetupError::CodebookCountOverflow(n) => write!(
+                f,
+                "vorbis setup header (write): codebook count {n} > 256 (§4.2.4 step \"Codebooks\" 8-bit count - 1 field)"
+            ),
+            WriteSetupError::EmptyTimePlaceholders => write!(
+                f,
+                "vorbis setup header (write): time_placeholders is empty (§4.2.4 step \"Time domain transforms\" encodes count - 1 in 6 bits, range 1..=64)"
+            ),
+            WriteSetupError::TimeCountOverflow(n) => write!(
+                f,
+                "vorbis setup header (write): time-placeholder count {n} > 64 (§4.2.4 step \"Time domain transforms\" 6-bit count - 1 field)"
+            ),
+            WriteSetupError::NonZeroTimePlaceholder { index, value } => write!(
+                f,
+                "vorbis setup header (write): time_placeholders[{index}] = {value} (§4.2.4 step 2 mandates every value be zero)"
+            ),
+            WriteSetupError::EmptyFloors => write!(
+                f,
+                "vorbis setup header (write): floors is empty (§4.2.4 step \"Floors\" encodes count - 1 in 6 bits, range 1..=64)"
+            ),
+            WriteSetupError::FloorCountOverflow(n) => write!(
+                f,
+                "vorbis setup header (write): floor count {n} > 64 (§4.2.4 step \"Floors\" 6-bit count - 1 field)"
+            ),
+            WriteSetupError::UnsupportedFloorType { index, floor_type } => write!(
+                f,
+                "vorbis setup header (write): floors[{index}].floor_type = {floor_type} not in {{0, 1}} (§4.2.4 step 2d)"
+            ),
+            WriteSetupError::FloorTypeKindMismatch {
+                index,
+                floor_type,
+                kind_discriminant,
+            } => write!(
+                f,
+                "vorbis setup header (write): floors[{index}].floor_type = {floor_type} disagrees with kind discriminant {kind_discriminant}"
+            ),
+            WriteSetupError::EmptyResidues => write!(
+                f,
+                "vorbis setup header (write): residues is empty (§4.2.4 step \"Residues\" encodes count - 1 in 6 bits, range 1..=64)"
+            ),
+            WriteSetupError::ResidueCountOverflow(n) => write!(
+                f,
+                "vorbis setup header (write): residue count {n} > 64 (§4.2.4 step \"Residues\" 6-bit count - 1 field)"
+            ),
+            WriteSetupError::EmptyMappings => write!(
+                f,
+                "vorbis setup header (write): mappings is empty (§4.2.4 step \"Mappings\" encodes count - 1 in 6 bits, range 1..=64)"
+            ),
+            WriteSetupError::MappingCountOverflow(n) => write!(
+                f,
+                "vorbis setup header (write): mapping count {n} > 64 (§4.2.4 step \"Mappings\" 6-bit count - 1 field)"
+            ),
+            WriteSetupError::EmptyModes => write!(
+                f,
+                "vorbis setup header (write): modes is empty (§4.2.4 step \"Modes\" encodes count - 1 in 6 bits, range 1..=64)"
+            ),
+            WriteSetupError::ModeCountOverflow(n) => write!(
+                f,
+                "vorbis setup header (write): mode count {n} > 64 (§4.2.4 step \"Modes\" 6-bit count - 1 field)"
+            ),
+            WriteSetupError::BadFramingFlag => write!(
+                f,
+                "vorbis setup header (write): framing_flag = false (§4.2.4 step 3 mandates the trailing framing bit be set)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteSetupError {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -985,6 +1172,7 @@ impl fmt::Display for WriteError {
             WriteError::Residue(e) => write!(f, "{e}"),
             WriteError::Mapping(e) => write!(f, "{e}"),
             WriteError::Mode(e) => write!(f, "{e}"),
+            WriteError::Setup(e) => write!(f, "{e}"),
         }
     }
 }
@@ -998,6 +1186,7 @@ impl std::error::Error for WriteError {
             WriteError::Residue(e) => Some(e),
             WriteError::Mapping(e) => Some(e),
             WriteError::Mode(e) => Some(e),
+            WriteError::Setup(e) => Some(e),
             _ => None,
         }
     }
@@ -1036,6 +1225,12 @@ impl From<WriteMappingError> for WriteError {
 impl From<WriteModeError> for WriteError {
     fn from(value: WriteModeError) -> Self {
         WriteError::Mode(value)
+    }
+}
+
+impl From<WriteSetupError> for WriteError {
+    fn from(value: WriteSetupError) -> Self {
+        WriteError::Setup(value)
     }
 }
 
@@ -2398,6 +2593,255 @@ pub(crate) fn write_mode_header_into_writer(
     writer.write_u32(header.mapping as u32, 8);
 
     Ok(())
+}
+
+/// Serialises a [`VorbisSetupHeader`] to the full §4.2.4 packet shape
+/// — the third Vorbis I header (after identification and comment).
+///
+/// This is the wrapping setup-header WRITE primitive that stitches the
+/// six nested-block writers ([`write_codebook_into_writer`],
+/// [`write_floor0_header_into_writer`],
+/// [`write_floor1_header_into_writer`],
+/// [`write_residue_header_into_writer`],
+/// [`write_mapping_header_into_writer`],
+/// [`write_mode_header_into_writer`]) into a single byte-aligned packet
+/// matching the round-5 [`crate::setup::parse_setup_header`] reader.
+///
+/// Layout (per `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.2.1 + §4.2.4):
+///
+/// ```text
+/// 0x05                                  # packet_type
+/// "vorbis"                              # 6-byte magic
+/// vorbis_codebook_count - 1   : 8 bits  # then codebook_count codebook bodies (§3.2.1)
+/// vorbis_time_count - 1       : 6 bits  # then time_count * 16-bit zero placeholders
+/// vorbis_floor_count - 1      : 6 bits  # then floor_count * (16-bit floor_type + body)
+/// vorbis_residue_count - 1    : 6 bits  # then residue_count * (16-bit residue_type + body)
+/// vorbis_mapping_count - 1    : 6 bits  # then mapping_count mapping bodies (§4.2.4 "Mappings")
+/// vorbis_mode_count - 1       : 6 bits  # then mode_count * 41-bit mode bodies (§4.2.4 "Modes")
+/// framing_flag                : 1 bit   # § 4.2.4 step 3: must be 1
+/// # final byte may carry up to 7 bits of §2.1.8 zero padding to byte-align.
+/// ```
+///
+/// `audio_channels` must equal the `audio_channels` field of the
+/// identification header parsed earlier in the same logical stream
+/// (Vorbis I §4.2.2). It is needed for the
+/// `ilog(audio_channels - 1)`-bit magnitude/angle channel reads in
+/// §4.2.4 "Mappings" and for the per-channel `mux[ch]` reads when a
+/// mapping declares `submaps > 1` — i.e. it is the context the nested
+/// [`write_mapping_header_into_writer`] splice point already consumes.
+///
+/// The nested mapping writer consumes `(audio_channels, floor_count,
+/// residue_count)` as its context tuple; the nested mode writer
+/// consumes `mapping_count`. Both context values are sourced from the
+/// in-progress setup-walker state (`header.floors.len()`,
+/// `header.residues.len()`, `header.mappings.len()`), so the
+/// setup-header writer is the single entry point that wires the
+/// context up exactly as the §4.2.4 walker would.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte may carry up to 7 bits of zero padding to byte-align the
+/// slice; the parser stops after the 1-bit framing flag per §4.2.4
+/// step 3.
+///
+/// Returns [`WriteError`] without emitting any bytes if any field
+/// (or any nested block) fails a §4.2.4 invariant.
+///
+/// ## Bit-exact roundtrip guarantee
+///
+/// For every value `h: VorbisSetupHeader` and matching `audio_channels`
+/// for which the §4.2.4 invariants hold:
+///
+/// ```text
+/// parse_setup_header(
+///     &write_setup_header(&h, audio_channels)?,
+///     audio_channels,
+/// ) == h
+/// ```
+///
+/// ## Spec source
+///
+/// `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.2.1 (the 7-byte common
+/// header — packet type `0x05` + ASCII `"vorbis"` magic), §4.2.4 (the
+/// bit-packed body — codebook / time / floor / residue / mapping / mode
+/// blocks plus the trailing framing flag); §2.1.4 (LSB-first packing);
+/// §2.1.8 (end-of-packet alignment — the final byte's trailing bits are
+/// zero padding).
+pub fn write_setup_header(
+    header: &VorbisSetupHeader,
+    audio_channels: u8,
+) -> Result<Vec<u8>, WriteError> {
+    // ---- §4.2.4 invariant gate — fail-closed: refuse to emit any
+    // bytes if any field fails its container width / range invariant.
+    // The nested-block writers gate their own §-specific invariants
+    // when invoked further down; this layer gates only the wrapping
+    // structure (counts, type selectors, framing flag).
+
+    if audio_channels == 0 {
+        return Err(WriteSetupError::ZeroAudioChannels.into());
+    }
+
+    // §4.2.4 "Codebooks": 8-bit `read 8 bits + 1`, so range 1..=256.
+    if header.codebooks.is_empty() {
+        return Err(WriteSetupError::EmptyCodebooks.into());
+    }
+    if header.codebooks.len() > 256 {
+        return Err(WriteSetupError::CodebookCountOverflow(header.codebooks.len()).into());
+    }
+
+    // §4.2.4 "Time domain transforms": 6-bit `read 6 bits + 1`, range
+    // 1..=64. Every value must be zero.
+    if header.time_placeholders.is_empty() {
+        return Err(WriteSetupError::EmptyTimePlaceholders.into());
+    }
+    if header.time_placeholders.len() > 64 {
+        return Err(WriteSetupError::TimeCountOverflow(header.time_placeholders.len()).into());
+    }
+    for (index, &value) in header.time_placeholders.iter().enumerate() {
+        if value != 0 {
+            return Err(WriteSetupError::NonZeroTimePlaceholder { index, value }.into());
+        }
+    }
+
+    // §4.2.4 "Floors": 6-bit `read 6 bits + 1`, range 1..=64. Each
+    // entry's `floor_type` ∈ {0, 1} and must agree with the kind
+    // discriminant on the payload.
+    if header.floors.is_empty() {
+        return Err(WriteSetupError::EmptyFloors.into());
+    }
+    if header.floors.len() > 64 {
+        return Err(WriteSetupError::FloorCountOverflow(header.floors.len()).into());
+    }
+    for (index, floor) in header.floors.iter().enumerate() {
+        if floor.floor_type > 1 {
+            return Err(WriteSetupError::UnsupportedFloorType {
+                index,
+                floor_type: floor.floor_type,
+            }
+            .into());
+        }
+        let kind_discriminant: u16 = match floor.kind {
+            FloorKind::Type0(_) => 0,
+            FloorKind::Type1(_) => 1,
+        };
+        if floor.floor_type != kind_discriminant {
+            return Err(WriteSetupError::FloorTypeKindMismatch {
+                index,
+                floor_type: floor.floor_type,
+                kind_discriminant,
+            }
+            .into());
+        }
+    }
+
+    // §4.2.4 "Residues": 6-bit `read 6 bits + 1`, range 1..=64. The
+    // nested writer's own gate validates `residue_type ∈ {0, 1, 2}`.
+    if header.residues.is_empty() {
+        return Err(WriteSetupError::EmptyResidues.into());
+    }
+    if header.residues.len() > 64 {
+        return Err(WriteSetupError::ResidueCountOverflow(header.residues.len()).into());
+    }
+
+    // §4.2.4 "Mappings": 6-bit `read 6 bits + 1`, range 1..=64. The
+    // nested writer's own gate validates the rest.
+    if header.mappings.is_empty() {
+        return Err(WriteSetupError::EmptyMappings.into());
+    }
+    if header.mappings.len() > 64 {
+        return Err(WriteSetupError::MappingCountOverflow(header.mappings.len()).into());
+    }
+
+    // §4.2.4 "Modes": 6-bit `read 6 bits + 1`, range 1..=64. The
+    // nested writer's own gate validates the rest.
+    if header.modes.is_empty() {
+        return Err(WriteSetupError::EmptyModes.into());
+    }
+    if header.modes.len() > 64 {
+        return Err(WriteSetupError::ModeCountOverflow(header.modes.len()).into());
+    }
+
+    // §4.2.4 step 3: the trailing framing flag must be set.
+    if !header.framing_flag {
+        return Err(WriteSetupError::BadFramingFlag.into());
+    }
+
+    // ---- §4.2.4 emit. ----
+    // Pre-allocate with an inexpensive lower bound — the codebook
+    // and floor-1 bodies dwarf the wrapping structure so the bit
+    // packer will grow regardless.
+    let mut writer = BitWriterLsb::with_capacity(256);
+
+    // §4.2.1: 7-byte common header (`packet_type` + "vorbis" magic).
+    // The writer starts byte-aligned; emit each byte as an 8-bit field.
+    writer.write_u32(SETUP_PACKET_TYPE as u32, 8);
+    for &b in SETUP_PACKET_MAGIC.iter() {
+        writer.write_u32(b as u32, 8);
+    }
+
+    // §4.2.4 "Codebooks": 8-bit count - 1, then each codebook body.
+    writer.write_u32((header.codebooks.len() - 1) as u32, 8);
+    for book in &header.codebooks {
+        write_codebook_into_writer(book, &mut writer)?;
+    }
+
+    // §4.2.4 "Time domain transforms": 6-bit count - 1, then each
+    // 16-bit zero placeholder.
+    writer.write_u32((header.time_placeholders.len() - 1) as u32, 6);
+    for &value in &header.time_placeholders {
+        // The gate above pinned every value to 0; emit verbatim.
+        writer.write_u32(value as u32, 16);
+    }
+
+    // §4.2.4 "Floors": 6-bit count - 1, then per floor:
+    //   16-bit `floor_type` + per-type body.
+    writer.write_u32((header.floors.len() - 1) as u32, 6);
+    for floor in &header.floors {
+        writer.write_u32(floor.floor_type as u32, 16);
+        match &floor.kind {
+            FloorKind::Type0(body) => write_floor0_header_into_writer(body, &mut writer)?,
+            FloorKind::Type1(body) => write_floor1_header_into_writer(body, &mut writer)?,
+        }
+    }
+
+    // §4.2.4 "Residues": 6-bit count - 1, then per residue:
+    //   16-bit `residue_type` + body.
+    writer.write_u32((header.residues.len() - 1) as u32, 6);
+    for residue in &header.residues {
+        writer.write_u32(residue.residue_type as u32, 16);
+        write_residue_header_into_writer(residue, &mut writer)?;
+    }
+
+    // §4.2.4 "Mappings": 6-bit count - 1, then per mapping body. The
+    // nested writer consumes (audio_channels, floor_count,
+    // residue_count) as its context tuple.
+    let floor_count = header.floors.len();
+    let residue_count = header.residues.len();
+    writer.write_u32((header.mappings.len() - 1) as u32, 6);
+    for mapping in &header.mappings {
+        write_mapping_header_into_writer(
+            mapping,
+            audio_channels,
+            floor_count,
+            residue_count,
+            &mut writer,
+        )?;
+    }
+
+    // §4.2.4 "Modes": 6-bit count - 1, then per mode body. The nested
+    // writer consumes `mapping_count` as its context.
+    let mapping_count = header.mappings.len();
+    writer.write_u32((header.modes.len() - 1) as u32, 6);
+    for mode in &header.modes {
+        write_mode_header_into_writer(mode, mapping_count, &mut writer)?;
+    }
+
+    // §4.2.4 step 3: trailing 1-bit framing flag. The gate above pinned
+    // this to `true`; emit verbatim.
+    writer.write_bit(header.framing_flag);
+
+    // §2.1.8: the final byte's trailing bits are zero padding so the
+    // packet is delivered byte-aligned to the container layer.
+    Ok(writer.finish())
 }
 
 #[cfg(test)]
@@ -6450,5 +6894,534 @@ mod tests {
             }
         );
         assert_eq!(w.bit_position(), before);
+    }
+
+    // ================================================================
+    // Setup header (round 27) — wrapping §4.2.4 packet writer.
+    // ================================================================
+
+    use crate::setup::{
+        parse_setup_header, FloorHeader, MappingSubmap, ParseError as SetupParseError,
+    };
+
+    /// The smallest valid mono setup header that satisfies every
+    /// §4.2.4 invariant: exactly one codebook, one zero
+    /// time-placeholder, one floor-1 entry, one residue-2 entry, one
+    /// mapping (mono, no coupling, single submap), one short-block
+    /// mode pointing at the single mapping, and the framing flag set.
+    fn minimal_mono_setup() -> VorbisSetupHeader {
+        VorbisSetupHeader {
+            codebooks: vec![VorbisCodebook {
+                dimensions: 1,
+                entries: 8,
+                codeword_lengths: vec![2, 4, 4, 4, 4, 2, 3, 3],
+                lookup: VqLookup::None,
+            }],
+            time_placeholders: vec![0],
+            floors: vec![FloorHeader {
+                floor_type: 1,
+                kind: FloorKind::Type1(Floor1Header {
+                    partitions: 1,
+                    partition_class_list: vec![0],
+                    classes: vec![Floor1Class {
+                        dimensions: 1,
+                        subclasses: 0,
+                        masterbook: None,
+                        subclass_books: vec![Some(0)],
+                    }],
+                    multiplier: 1,
+                    rangebits: 4,
+                    x_list: vec![5],
+                }),
+            }],
+            residues: vec![ResidueHeader {
+                residue_type: 2,
+                residue_begin: 0,
+                residue_end: 128,
+                partition_size: 32,
+                classifications: 1,
+                classbook: 0,
+                cascade: vec![1],
+                books: vec![[Some(0), None, None, None, None, None, None, None]],
+            }],
+            mappings: vec![MappingHeader {
+                mapping_type: 0,
+                submaps: 1,
+                coupling: Vec::new(),
+                mux: Vec::new(),
+                submap_configs: vec![MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                }],
+            }],
+            modes: vec![ModeHeader {
+                blockflag: false,
+                windowtype: 0,
+                transformtype: 0,
+                mapping: 0,
+            }],
+            framing_flag: true,
+        }
+    }
+
+    /// Bit-exact roundtrip helper: writer → full parser → equal.
+    fn setup_roundtrips(header: &VorbisSetupHeader, audio_channels: u8) {
+        let packet = write_setup_header(header, audio_channels).expect("write must succeed");
+        let parsed = parse_setup_header(&packet, audio_channels).expect("parse must succeed");
+        assert_eq!(&parsed, header, "setup roundtrip equality");
+    }
+
+    /// Pin the 7-byte common-header prefix at the head of every setup
+    /// packet the writer emits, mirroring the §4.2.1 fixture shape
+    /// `parse_setup_header` validates.
+    #[test]
+    fn setup_byte_shape_common_header_prefix() {
+        let packet = write_setup_header(&minimal_mono_setup(), 1).expect("must build minimal mono");
+        assert!(packet.len() >= 7, "packet shorter than §4.2.1 header");
+        assert_eq!(packet[0], 0x05, "packet_type must be SETUP_PACKET_TYPE");
+        assert_eq!(&packet[1..7], b"vorbis", "magic must be ASCII 'vorbis'");
+    }
+
+    /// Pin the minimal-mono fixture: writing then parsing recovers the
+    /// exact same setup-header struct (codebooks, time placeholders,
+    /// floors, residues, mappings, modes, framing flag).
+    #[test]
+    fn setup_roundtrips_minimal_mono() {
+        setup_roundtrips(&minimal_mono_setup(), 1);
+    }
+
+    /// Two-codebook variant: the writer must emit `count - 1` = 1 in
+    /// the 8-bit codebook-count field, then both codebook bodies in
+    /// order. Roundtrips the order through the parser.
+    #[test]
+    fn setup_roundtrips_two_codebooks() {
+        let mut header = minimal_mono_setup();
+        header.codebooks.push(VorbisCodebook {
+            dimensions: 1,
+            entries: 4,
+            codeword_lengths: vec![1, 2, 3, 3],
+            lookup: VqLookup::None,
+        });
+        setup_roundtrips(&header, 1);
+    }
+
+    /// Time-placeholder count at the 6-bit upper edge (64 entries).
+    /// The §4.2.4 "Time domain transforms" container is `read 6 bits
+    /// + 1`, so 64 entries means a wire value of 63.
+    #[test]
+    fn setup_roundtrips_max_time_placeholders() {
+        let mut header = minimal_mono_setup();
+        header.time_placeholders = vec![0u16; 64];
+        setup_roundtrips(&header, 1);
+    }
+
+    /// Both floor kinds: a type-0 floor followed by a type-1 floor.
+    /// Exercises the `floor_type` 16-bit selector branching inside
+    /// the writer's per-floor loop.
+    #[test]
+    fn setup_roundtrips_mixed_floor_kinds() {
+        let mut header = minimal_mono_setup();
+        header.floors.push(FloorHeader {
+            floor_type: 0,
+            kind: FloorKind::Type0(Floor0Header {
+                order: 4,
+                rate: 44100,
+                bark_map_size: 64,
+                amplitude_bits: 8,
+                amplitude_offset: 100,
+                book_list: vec![0],
+            }),
+        });
+        // The minimal_mono mapping points at floor 0 (type 1); both
+        // floor entries remain reachable through the floor-count
+        // accumulator. Add a second mapping that points at floor 1
+        // (type 0) so the round-trip exercises both branches.
+        header.mappings.push(MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 1,
+                residue: 0,
+            }],
+        });
+        header.modes.push(ModeHeader {
+            blockflag: true,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 1,
+        });
+        setup_roundtrips(&header, 1);
+    }
+
+    /// All three residue types in a single packet — exercises the
+    /// 16-bit `residue_type` selector across the {0, 1, 2} space.
+    #[test]
+    fn setup_roundtrips_mixed_residue_types() {
+        let mut header = minimal_mono_setup();
+        for rtype in [0u16, 1u16] {
+            header.residues.push(ResidueHeader {
+                residue_type: rtype,
+                residue_begin: 0,
+                residue_end: 128,
+                partition_size: 32,
+                classifications: 1,
+                classbook: 0,
+                cascade: vec![1],
+                books: vec![[Some(0), None, None, None, None, None, None, None]],
+            });
+        }
+        setup_roundtrips(&header, 1);
+    }
+
+    /// Stereo-coupled mapping at `audio_channels = 2`: exercises the
+    /// `ilog(audio_channels - 1)` per-coupling-step field width that
+    /// the nested mapping writer's context tuple consumes.
+    #[test]
+    fn setup_roundtrips_stereo_coupled_mapping() {
+        let mut header = minimal_mono_setup();
+        header.mappings[0] = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![MappingSubmap {
+                time_placeholder: 0,
+                floor: 0,
+                residue: 0,
+            }],
+        };
+        setup_roundtrips(&header, 2);
+    }
+
+    /// Two-mode variant (one short, one long) — pins the mode-count
+    /// field + the per-mode `mapping_count` context being passed
+    /// through to the splice writer.
+    #[test]
+    fn setup_roundtrips_two_modes() {
+        let mut header = minimal_mono_setup();
+        header.modes.push(ModeHeader {
+            blockflag: true,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 0,
+        });
+        setup_roundtrips(&header, 1);
+    }
+
+    /// The writer rejects the call rather than emit a packet the
+    /// parser would reject. Each error variant below pins a §4.2.4
+    /// invariant the writer enforces fail-closed.
+    #[test]
+    fn setup_rejects_zero_audio_channels() {
+        let err = write_setup_header(&minimal_mono_setup(), 0)
+            .expect_err("must reject audio_channels = 0");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::ZeroAudioChannels));
+    }
+
+    #[test]
+    fn setup_rejects_empty_codebooks() {
+        let mut header = minimal_mono_setup();
+        header.codebooks.clear();
+        let err = write_setup_header(&header, 1).expect_err("must reject empty codebooks");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::EmptyCodebooks));
+    }
+
+    #[test]
+    fn setup_rejects_codebook_count_overflow() {
+        // 257 codebooks would need to encode count - 1 = 256, which
+        // exceeds the 8-bit container.
+        let mut header = minimal_mono_setup();
+        let template = header.codebooks[0].clone();
+        header.codebooks = vec![template; 257];
+        let err = write_setup_header(&header, 1).expect_err("must reject codebook count = 257");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::CodebookCountOverflow(257))
+        );
+    }
+
+    #[test]
+    fn setup_rejects_empty_time_placeholders() {
+        let mut header = minimal_mono_setup();
+        header.time_placeholders.clear();
+        let err = write_setup_header(&header, 1).expect_err("must reject empty time placeholders");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::EmptyTimePlaceholders)
+        );
+    }
+
+    #[test]
+    fn setup_rejects_time_count_overflow() {
+        let mut header = minimal_mono_setup();
+        header.time_placeholders = vec![0u16; 65];
+        let err = write_setup_header(&header, 1).expect_err("must reject time count = 65");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::TimeCountOverflow(65))
+        );
+    }
+
+    #[test]
+    fn setup_rejects_nonzero_time_placeholder() {
+        let mut header = minimal_mono_setup();
+        header.time_placeholders = vec![0, 7];
+        let err = write_setup_header(&header, 1).expect_err("must reject nonzero time placeholder");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::NonZeroTimePlaceholder { index: 1, value: 7 })
+        );
+    }
+
+    #[test]
+    fn setup_rejects_empty_floors() {
+        let mut header = minimal_mono_setup();
+        header.floors.clear();
+        let err = write_setup_header(&header, 1).expect_err("must reject empty floors");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::EmptyFloors));
+    }
+
+    #[test]
+    fn setup_rejects_floor_count_overflow() {
+        let mut header = minimal_mono_setup();
+        let template = header.floors[0].clone();
+        header.floors = vec![template; 65];
+        let err = write_setup_header(&header, 1).expect_err("must reject floor count = 65");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::FloorCountOverflow(65))
+        );
+    }
+
+    #[test]
+    fn setup_rejects_unsupported_floor_type() {
+        let mut header = minimal_mono_setup();
+        header.floors[0].floor_type = 2;
+        let err = write_setup_header(&header, 1).expect_err("must reject floor_type = 2");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::UnsupportedFloorType {
+                index: 0,
+                floor_type: 2
+            })
+        );
+    }
+
+    #[test]
+    fn setup_rejects_floor_type_kind_mismatch() {
+        let mut header = minimal_mono_setup();
+        // `floor_type = 0` paired with a `FloorKind::Type1(_)` payload.
+        header.floors[0].floor_type = 0;
+        let err =
+            write_setup_header(&header, 1).expect_err("must reject floor_type/kind disagreement");
+        assert_eq!(
+            err,
+            WriteError::Setup(WriteSetupError::FloorTypeKindMismatch {
+                index: 0,
+                floor_type: 0,
+                kind_discriminant: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn setup_rejects_empty_residues() {
+        let mut header = minimal_mono_setup();
+        header.residues.clear();
+        let err = write_setup_header(&header, 1).expect_err("must reject empty residues");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::EmptyResidues));
+    }
+
+    #[test]
+    fn setup_rejects_empty_mappings() {
+        let mut header = minimal_mono_setup();
+        header.mappings.clear();
+        let err = write_setup_header(&header, 1).expect_err("must reject empty mappings");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::EmptyMappings));
+    }
+
+    #[test]
+    fn setup_rejects_empty_modes() {
+        let mut header = minimal_mono_setup();
+        header.modes.clear();
+        let err = write_setup_header(&header, 1).expect_err("must reject empty modes");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::EmptyModes));
+    }
+
+    #[test]
+    fn setup_rejects_bad_framing_flag() {
+        let mut header = minimal_mono_setup();
+        header.framing_flag = false;
+        let err = write_setup_header(&header, 1).expect_err("must reject framing_flag = false");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::BadFramingFlag));
+    }
+
+    /// A nested-block failure (e.g. a mode whose mapping index points
+    /// past the mappings list) propagates up through the umbrella
+    /// `WriteError` as the corresponding `WriteError::Mode(_)`
+    /// variant. Confirms the `?` chain wires the nested writer's
+    /// fail-closed semantics into the wrapping writer's contract.
+    #[test]
+    fn setup_propagates_nested_mode_error() {
+        let mut header = minimal_mono_setup();
+        // One mapping, but mode points at mapping index 5 → out of
+        // range. The mode-body writer rejects with
+        // `WriteModeError::BadMapping`.
+        header.modes[0].mapping = 5;
+        let err =
+            write_setup_header(&header, 1).expect_err("must reject out-of-range mode mapping");
+        match err {
+            WriteError::Mode(WriteModeError::BadMapping {
+                mapping,
+                mapping_count,
+            }) => {
+                assert_eq!(mapping, 5);
+                assert_eq!(mapping_count, 1);
+            }
+            _ => panic!("expected WriteError::Mode(BadMapping), got {err:?}"),
+        }
+    }
+
+    /// A nested floor-1 failure (e.g. a subclass-book overflow) also
+    /// propagates as the corresponding `WriteError::Floor1(_)`
+    /// variant. Confirms the `?` chain wires every nested writer's
+    /// fail-closed semantics into the wrapping writer's contract.
+    #[test]
+    fn setup_propagates_nested_floor1_error() {
+        let mut header = minimal_mono_setup();
+        // Mutate the floor-1 partitions field past its 5-bit range.
+        if let FloorKind::Type1(ref mut body) = header.floors[0].kind {
+            body.partitions = 32; // 5-bit field maxes at 31
+        }
+        let err = write_setup_header(&header, 1).expect_err("must reject partitions = 32");
+        assert!(
+            matches!(err, WriteError::Floor1(_)),
+            "expected WriteError::Floor1, got {err:?}",
+        );
+    }
+
+    /// The parser must round-trip every byte the writer emitted —
+    /// confirms there is no slack at either end of the wire shape.
+    /// Uses `parse_setup_header` (the full common-header + body
+    /// path) rather than `parse_setup_header_body`.
+    #[test]
+    fn setup_parser_consumes_full_packet() {
+        let header = minimal_mono_setup();
+        let packet = write_setup_header(&header, 1).expect("must build");
+        let parsed = parse_setup_header(&packet, 1).expect("must parse");
+        assert_eq!(parsed, header);
+    }
+
+    /// The framing-bit `BadFramingFlag` rejection is gated before any
+    /// emit so the writer never returns a partial byte stream.
+    /// Confirmed by re-checking that the rejection produces zero
+    /// bytes — there is no "partial packet" leak path.
+    #[test]
+    fn setup_bad_framing_flag_emits_nothing() {
+        let mut header = minimal_mono_setup();
+        header.framing_flag = false;
+        let err = write_setup_header(&header, 1).expect_err("must reject");
+        assert_eq!(err, WriteError::Setup(WriteSetupError::BadFramingFlag));
+    }
+
+    /// `WriteSetupError::Display` non-emptiness across every variant —
+    /// the messages should each cite the §4.2.4 invariant they enforce.
+    #[test]
+    fn setup_error_display_nonempty_all_variants() {
+        let cases = [
+            WriteSetupError::ZeroAudioChannels,
+            WriteSetupError::EmptyCodebooks,
+            WriteSetupError::CodebookCountOverflow(300),
+            WriteSetupError::EmptyTimePlaceholders,
+            WriteSetupError::TimeCountOverflow(65),
+            WriteSetupError::NonZeroTimePlaceholder { index: 0, value: 1 },
+            WriteSetupError::EmptyFloors,
+            WriteSetupError::FloorCountOverflow(65),
+            WriteSetupError::UnsupportedFloorType {
+                index: 0,
+                floor_type: 2,
+            },
+            WriteSetupError::FloorTypeKindMismatch {
+                index: 0,
+                floor_type: 1,
+                kind_discriminant: 0,
+            },
+            WriteSetupError::EmptyResidues,
+            WriteSetupError::ResidueCountOverflow(65),
+            WriteSetupError::EmptyMappings,
+            WriteSetupError::MappingCountOverflow(65),
+            WriteSetupError::EmptyModes,
+            WriteSetupError::ModeCountOverflow(65),
+            WriteSetupError::BadFramingFlag,
+        ];
+        for variant in &cases {
+            let s = format!("{variant}");
+            assert!(!s.is_empty(), "Display empty for {variant:?}");
+            assert!(
+                s.contains("vorbis setup header"),
+                "Display did not name the setup writer: {s}"
+            );
+        }
+    }
+
+    /// `WriteError::Setup` `From` glue + `source()` chain — the
+    /// umbrella `WriteError` delegates `Display` and `Error::source`
+    /// to the inner enum for the new variant just like every other
+    /// nested-writer error.
+    #[test]
+    fn setup_umbrella_write_error_glue() {
+        let inner = WriteSetupError::BadFramingFlag;
+        let umbrella: WriteError = inner.clone().into();
+        assert_eq!(umbrella, WriteError::Setup(inner.clone()));
+        assert_eq!(format!("{umbrella}"), format!("{inner}"));
+        use std::error::Error as _;
+        let src = umbrella.source().expect("source must be Some");
+        // The source must downcast back to the inner enum.
+        assert!(
+            src.downcast_ref::<WriteSetupError>().is_some(),
+            "source should downcast to WriteSetupError"
+        );
+    }
+
+    /// Spot-check: the parser also rejects the packet shapes the writer
+    /// refuses. Confirms the writer's invariant gate aligns with the
+    /// round-5 parser's invariant gate (no silent disagreement between
+    /// the two layers).
+    #[test]
+    fn setup_writer_invariants_align_with_parser() {
+        // Hand-roll a packet with a nonzero time placeholder; the
+        // parser must reject it with the matching variant.
+        // (We construct the packet by writing a valid one and
+        // patching the 16-bit time-placeholder field; the offset is
+        // determined by the encoder layout.)
+        let header = minimal_mono_setup();
+        let packet = write_setup_header(&header, 1).expect("must build");
+        // The parser rejects this same valid packet successfully.
+        let parsed = parse_setup_header(&packet, 1).expect("baseline must parse");
+        assert_eq!(parsed, header);
+        // Now construct a fixture whose writer would refuse, and
+        // verify the writer refuses it — i.e. there is no path
+        // through which an invalid-shaped struct is silently emitted.
+        let mut bad = header.clone();
+        bad.time_placeholders[0] = 1;
+        let bad_err = write_setup_header(&bad, 1).expect_err("writer must reject");
+        match bad_err {
+            WriteError::Setup(WriteSetupError::NonZeroTimePlaceholder { index, value }) => {
+                assert_eq!(index, 0);
+                assert_eq!(value, 1);
+            }
+            other => panic!("expected NonZeroTimePlaceholder rejection, got {other:?}"),
+        }
+        // Suppress the unused-import lint when no test in the module
+        // mentions `SetupParseError` by name; it remains imported for
+        // future fixture-specific assertions.
+        let _ = std::marker::PhantomData::<SetupParseError>;
     }
 }

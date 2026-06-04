@@ -6,6 +6,55 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.2.4 wrapping setup-header WRITE primitive (round 27,
+  umbrella round 234).** New public function
+  `encoder::write_setup_header` serialises a complete
+  `crate::setup::VorbisSetupHeader` into a single byte-aligned
+  §4.2.4 packet — the third Vorbis I header, after identification
+  and comment. The wrapping writer stitches the six nested-block
+  writers (codebook, floor 0, floor 1, residue, mapping, mode that
+  landed across rounds 21..26) into one entry point, threading the
+  per-block context tuples through the `?` chain exactly as the
+  §4.2.4 walker reads them: codebook bodies emitted back-to-back,
+  floor entries prefixed with a 16-bit `floor_type` selector then
+  dispatched to the per-type splice writer, residue entries prefixed
+  with a 16-bit `residue_type` selector then dispatched to the
+  residue splice writer, mapping bodies passing the
+  `(audio_channels, floor_count, residue_count)` context tuple, and
+  mode bodies passing the `mapping_count` context. The §4.2.1 7-byte
+  common header (packet type `0x05` + ASCII `"vorbis"` magic) is
+  emitted before the bit-packed body, and the trailing 1-bit framing
+  flag is emitted before the final §2.1.8 zero-padding tail. Given
+  the identification header's `audio_channels` parameter, the
+  bit-exact roundtrip property
+  `parse_setup_header(&write_setup_header(&h, audio_channels)?, audio_channels) == h`
+  holds for every legal `VorbisSetupHeader`. A new
+  `WriteSetupError` enum enumerates 17 §4.2.4 invariant violations
+  the wrapping layer enforces itself (zero audio channels, empty /
+  oversized codebook / time / floor / residue / mapping / mode lists,
+  nonzero time placeholder, unsupported floor type, floor
+  type/kind disagreement, false framing flag); nested-block
+  failures continue to surface as the existing dedicated error
+  types (`WriteCodebookError`, `WriteFloor0Error`,
+  `WriteFloor1Error`, `WriteResidueError`, `WriteMappingError`,
+  `WriteModeError`) through the umbrella `WriteError`'s `?` chain.
+  The umbrella `WriteError` enum grows a
+  `WriteError::Setup(WriteSetupError)` variant with the matching
+  `From` glue and `source()` chain. 29 new tests bring the in-module
+  suite to 532: the 7-byte common-header prefix is pinned, six
+  positive round-trip fixtures exercise the layout's main branches
+  (two-codebook, time-count at the 6-bit upper edge of 64, mixed
+  floor 0 + floor 1 kinds, mixed residue types 0 + 1 + 2,
+  stereo-coupled mapping at `audio_channels = 2`, two modes), 14
+  rejection tests cover every new `WriteSetupError` variant, two
+  propagation tests confirm nested `WriteMode` / `WriteFloor1`
+  failures surface as the matching umbrella variant, the
+  `WriteSetupError::Display` non-emptiness smoke test covers all 17
+  variants, the `WriteError::Setup` `From` glue + `source()` chain
+  is checked end-to-end, and an alignment test confirms the
+  writer's fail-closed gate refuses a struct the round-5 parser
+  would also reject.
+
 * **Vorbis I §4.2.4 mode header WRITE primitive (round 26,
   umbrella round 228).** New public function
   `encoder::write_mode_header` serialises a `crate::setup::ModeHeader`

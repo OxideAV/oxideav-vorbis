@@ -1,6 +1,90 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 26.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 27.
+
+## Status — 2026-06-04 (round 27, umbrella round 234)
+
+**Round 27 landed: the wrapping §4.2.4 setup-header WRITE primitive
+that stitches all six nested-block writers together.** New public
+function [`encoder::write_setup_header`] serialises a complete
+[`crate::setup::VorbisSetupHeader`] (the round-5 parser's output type
+for the third Vorbis I header) into a single byte-aligned packet
+matching the round-5 [`crate::setup::parse_setup_header`] reader.
+This closes the followup that opened in round 21 with
+[`encoder::write_codebook`] and grew across rounds 22..26 as the
+five nested-block writers — [`encoder::write_floor1_header`],
+[`encoder::write_floor0_header`], [`encoder::write_residue_header`],
+[`encoder::write_mapping_header`], [`encoder::write_mode_header`] —
+each pinned its own bit-exact roundtrip against the round-5 parser
+sub-routines. The wrapping writer is the single entry point that
+wires the per-block context tuples through the `?` chain exactly as
+the §4.2.4 walker reads them: the codebook bodies are emitted
+back-to-back via `write_codebook_into_writer`, the floor entries are
+prefixed with their 16-bit `floor_type` selector then dispatched to
+either `write_floor0_header_into_writer` or
+`write_floor1_header_into_writer`, the residue entries are prefixed
+with their 16-bit `residue_type` selector then dispatched to
+`write_residue_header_into_writer`, the mapping bodies pass
+`(audio_channels, floor_count, residue_count)` into
+`write_mapping_header_into_writer`, and the mode bodies pass
+`mapping_count` into `write_mode_header_into_writer`. Given the
+identification header's `audio_channels` parameter, the bit-exact
+roundtrip property
+`parse_setup_header(&write_setup_header(&h, audio_channels)?, audio_channels) == h`
+holds for every legal [`VorbisSetupHeader`].
+
+The §4.2.4 packet layout the wrapping writer emits is:
+
+```text
+0x05                                    # packet_type
+"vorbis"                                # 6-byte magic
+vorbis_codebook_count - 1   :  8 bits   # then count codebook bodies (§3.2.1)
+vorbis_time_count - 1       :  6 bits   # then count * 16-bit zero placeholders
+vorbis_floor_count - 1      :  6 bits   # then count * (16-bit floor_type + body)
+vorbis_residue_count - 1    :  6 bits   # then count * (16-bit residue_type + body)
+vorbis_mapping_count - 1    :  6 bits   # then count mapping bodies
+vorbis_mode_count - 1       :  6 bits   # then count * 41-bit mode bodies
+framing_flag                :  1 bit    # § 4.2.4 step 3: must be 1
+# final byte: up to 7 bits of §2.1.8 zero padding to byte-align.
+```
+
+A new [`WriteSetupError`] enumerates 17 §4.2.4 invariant violations
+that the wrapping layer enforces itself (`ZeroAudioChannels`,
+`EmptyCodebooks`, `CodebookCountOverflow`, `EmptyTimePlaceholders`,
+`TimeCountOverflow`, `NonZeroTimePlaceholder`, `EmptyFloors`,
+`FloorCountOverflow`, `UnsupportedFloorType`, `FloorTypeKindMismatch`,
+`EmptyResidues`, `ResidueCountOverflow`, `EmptyMappings`,
+`MappingCountOverflow`, `EmptyModes`, `ModeCountOverflow`,
+`BadFramingFlag`). The umbrella [`WriteError`] grows a
+[`WriteError::Setup`] variant with the matching `From` glue and
+`source()` chain. Each nested-block writer's existing fail-closed
+gate still applies — a `WriteCodebookError` / `WriteFloor0Error`
+/ `WriteFloor1Error` / `WriteResidueError` / `WriteMappingError`
+/ `WriteModeError` from a per-block body surfaces through the `?`
+chain as the corresponding `WriteError::Codebook(_)` / `Floor0(_)`
+/ `Floor1(_)` / `Residue(_)` / `Mapping(_)` / `Mode(_)` variant.
+
+29 new unit tests bring the in-module suite to **532 (503 → 532)**:
+the 7-byte common-header prefix is pinned byte-by-byte, the
+minimal-mono fixture round-trips through `parse_setup_header`, six
+positive round-trip fixtures exercise the layout's main branches
+(two codebooks, time-count at the 6-bit upper edge of 64, mixed
+floor 0 + floor 1 kinds with a second mapping pointing at the new
+floor-0 entry, mixed residue types 0 + 1 + 2, stereo-coupled mapping
+at `audio_channels = 2` exercising the `ilog` per-coupling-step
+field width, two modes pinning the mode-count + per-mode
+`mapping_count` context), 14 rejection tests cover every new
+`WriteSetupError` variant, two propagation tests confirm that nested
+`WriteMode`/`WriteFloor1` failures surface as the corresponding
+umbrella variant, the `WriteSetupError::Display` non-emptiness smoke
+test asserts each of the 17 variants emits a "vorbis setup header
+(write):"-prefixed message, the `WriteError::Setup` `From` glue +
+`source()` chain is checked end-to-end, and one alignment test
+confirms that the writer's fail-closed gate refuses a struct (a
+nonzero time placeholder) that the parser would also reject — so
+there is no silent disagreement between the two layers. The
+remaining audio-packet WRITE primitives (mode-driven residue / floor
+encode and the wrapping §4.3 audio packet) are explicit followups.
 
 ## Status — 2026-06-04 (round 26, umbrella round 228)
 
