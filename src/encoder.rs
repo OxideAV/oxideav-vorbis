@@ -2599,13 +2599,14 @@ pub(crate) fn write_mode_header_into_writer(
 /// — the third Vorbis I header (after identification and comment).
 ///
 /// This is the wrapping setup-header WRITE primitive that stitches the
-/// six nested-block writers ([`write_codebook_into_writer`],
-/// [`write_floor0_header_into_writer`],
-/// [`write_floor1_header_into_writer`],
-/// [`write_residue_header_into_writer`],
-/// [`write_mapping_header_into_writer`],
-/// [`write_mode_header_into_writer`]) into a single byte-aligned packet
-/// matching the round-5 [`crate::setup::parse_setup_header`] reader.
+/// six nested-block writers (the crate-private `write_codebook_into_writer`,
+/// `write_floor0_header_into_writer`, `write_floor1_header_into_writer`,
+/// `write_residue_header_into_writer`, `write_mapping_header_into_writer`,
+/// and `write_mode_header_into_writer` splice points exposed alongside the
+/// public per-block writers [`write_codebook`], [`write_floor0_header`],
+/// [`write_floor1_header`], [`write_residue_header`], [`write_mapping_header`],
+/// [`write_mode_header`]) into a single byte-aligned packet matching the
+/// round-5 [`crate::setup::parse_setup_header`] reader.
 ///
 /// Layout (per `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.2.1 + §4.2.4):
 ///
@@ -2628,7 +2629,7 @@ pub(crate) fn write_mode_header_into_writer(
 /// `ilog(audio_channels - 1)`-bit magnitude/angle channel reads in
 /// §4.2.4 "Mappings" and for the per-channel `mux[ch]` reads when a
 /// mapping declares `submaps > 1` — i.e. it is the context the nested
-/// [`write_mapping_header_into_writer`] splice point already consumes.
+/// `write_mapping_header_into_writer` splice point already consumes.
 ///
 /// The nested mapping writer consumes `(audio_channels, floor_count,
 /// residue_count)` as its context tuple; the nested mode writer
