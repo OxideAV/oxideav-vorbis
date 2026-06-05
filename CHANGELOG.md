@@ -6,6 +6,55 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.1 audio-packet header WRITE primitive (round 28,
+  umbrella round 240).** New public function
+  `encoder::write_audio_packet_header` serialises an
+  `crate::packet::AudioPacketHeader` to the §4.3.1 audio-packet
+  prelude bit pattern — the first audio-packet WRITE primitive (after
+  the three header-packet writers and the six nested setup-header
+  sub-block writers + the round-27 wrapping setup-header writer). The
+  prelude is the §4.3.1 step 1..4 region: a 1-bit `packet_type` (must
+  be 0; §4.3 reject path is not on the writer's emission set), an
+  `ilog([vorbis_mode_count] - 1)`-bit `mode_number` (using the
+  existing `codebook::ilog` helper — collapses to a zero-bit read in
+  the single-mode degenerate case), and then on a long block, two
+  1-bit window flags (`previous_window_flag`, `next_window_flag`);
+  the short-block path emits no further bits per §4.3.1 step 4b. The
+  writer is the byte-exact inverse of `crate::packet::read_packet_header`:
+  given a matching `(setup, blocksize_0, blocksize_1)` context the
+  roundtrip property
+  `read_packet_header(&mut BitReaderLsb::new(&write_audio_packet_header(&h, &setup, b0, b1)?), &setup, b0, b1) == Ok(h)`
+  holds for every legal `AudioPacketHeader`. A new
+  `WriteAudioPacketHeaderError` enum enumerates five §4.3.1 invariant
+  violations — `EmptyModeList`, `BadModeNumber`, `BlockflagMismatch`,
+  `BlocksizeMismatch`, `ShortBlockHasWindowFlag` — that the writer
+  refuses with a fail-closed gate rather than emit a prelude the
+  parser would reject. The crate-private
+  `write_audio_packet_header_into_writer` companion is shaped to
+  splice the prelude into the (still-followup) wrapping §4.3 audio-
+  packet writer, matching the existing `write_codebook_into_writer` /
+  `write_floor0_header_into_writer` /
+  `write_floor1_header_into_writer` /
+  `write_residue_header_into_writer` /
+  `write_mapping_header_into_writer` / `write_mode_header_into_writer`
+  splice points. The umbrella `WriteError` grows a
+  `WriteError::AudioPacket(WriteAudioPacketHeaderError)` variant with
+  the matching `From` glue and `source()` chain. 21 new in-module
+  unit tests cover the 1-bit short-block emission, the 3-bit long-
+  block emission, byte-shape pinning for the long-block two-mode
+  fixture, parser-side fixture cross-verification, an exhaustive
+  scan across all four (`previous_window_flag`, `next_window_flag`)
+  combinations on a long-block single-mode stream, a roundtrip
+  across every `mode_count` value in `1..=64` (the 6-bit setup-header
+  `mode_count - 1` range), five rejection tests covering each new
+  error variant, two short-block-with-flag rejection variants,
+  the `WriteError::AudioPacket` `From` glue + `source()` chain
+  pinning, a `Display` non-emptiness smoke test across all five
+  variants, a writer-vs-parser invariant cross-check that confirms
+  a struct the writer refuses is also refused by the parser when the
+  equivalent bits are hand-rolled, and a splice-vs-public-writer
+  byte equality check.
+
 * **Vorbis I §4.2.4 wrapping setup-header WRITE primitive (round 27,
   umbrella round 234).** New public function
   `encoder::write_setup_header` serialises a complete

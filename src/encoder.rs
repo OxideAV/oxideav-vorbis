@@ -1,4 +1,4 @@
-//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218 + 228).
+//! Vorbis I header-packet + codebook encoder primitives (rounds 195 + 201 + 206 + 212 + 218 + 228 + 240).
 //!
 //! This module collects the encoder-side functions that mirror the
 //! parser surface in [`crate::identification`], [`crate::comment`],
@@ -35,6 +35,14 @@
 //!   8-bit `mapping`). The writer is the byte-exact inverse of the
 //!   round-5 mode parser and refuses any header whose `mapping`
 //!   index falls outside the supplied `mapping_count`. Round 228.
+//! * [`write_audio_packet_header`] — serialises an [`AudioPacketHeader`]
+//!   to the §4.3.1 audio-packet prelude bit pattern. The byte-exact
+//!   inverse of [`crate::packet::read_packet_header`]: 1-bit
+//!   `packet_type`, `ilog([vorbis_mode_count] - 1)`-bit `mode_number`,
+//!   then two 1-bit window flags on long blocks. The writer cross-
+//!   checks the cached `(blockflag, n)` pair against the §4.3.1 step-3
+//!   blocksize selection so a malformed struct cannot silently
+//!   round-trip. Round 240 — the first audio-packet WRITE primitive.
 //!
 //! Both functions validate the same spec-mandated invariants that the
 //! corresponding parser enforces on input, so a typo in the caller's
@@ -85,10 +93,18 @@
 //! * `docs/audio/vorbis/Vorbis_I_spec.pdf` §2.1.8 "end-of-packet
 //!   alignment" (the framing-byte's seven high bits are zero padding).
 //!
-//! Audio-packet encode and the wrapping setup-header WRITE primitive
-//! (which splices codebook / floor / residue / mapping / mode bodies
-//! into a single §4.2.4 packet) are explicit followups for subsequent
-//! rounds.
+//! Round 27 (umbrella round 234) landed [`write_setup_header`]: the
+//! wrapping §4.2.4 setup-header WRITE primitive that splices the six
+//! nested-block writers (codebook / floor 0 / floor 1 / residue /
+//! mapping / mode) into a single byte-aligned packet matching the
+//! round-5 [`crate::setup::parse_setup_header`] reader.
+//!
+//! Round 240 lands [`write_audio_packet_header`]: the first audio-
+//! packet WRITE primitive — the §4.3.1 prelude. The rest of the §4.3
+//! audio packet (floor / residue / spectrum / inverse couple / IMDCT)
+//! and a wrapping §4.3 audio-packet writer that splices the prelude
+//! into the per-channel payload remain explicit followups for
+//! subsequent rounds.
 
 use core::fmt;
 
@@ -97,6 +113,7 @@ use oxideav_core::bits::BitWriterLsb;
 use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
+use crate::packet::AudioPacketHeader;
 use crate::setup::{
     Floor0Header, Floor1Header, FloorKind, MappingHeader, ModeHeader, ResidueHeader,
     VorbisSetupHeader, SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
@@ -163,6 +180,9 @@ pub enum WriteError {
     /// A wrapping setup-header (§4.2.4) failed one of the writer-side
     /// invariants checked by [`write_setup_header`].
     Setup(WriteSetupError),
+    /// An audio-packet prelude (§4.3.1) failed one of the writer-side
+    /// invariants checked by [`write_audio_packet_header`].
+    AudioPacket(WriteAudioPacketHeaderError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -1128,6 +1148,115 @@ impl fmt::Display for WriteSetupError {
 
 impl std::error::Error for WriteSetupError {}
 
+/// Errors that may arise while writing a §4.3.1 audio-packet prelude
+/// via [`write_audio_packet_header`].
+///
+/// Each variant flags a §4.3.1 invariant the caller-supplied
+/// [`AudioPacketHeader`] does not satisfy together with the supplied
+/// `(setup, blocksize_0, blocksize_1)` context. The writer refuses the
+/// call without emitting any bits, preserving the bit-exact roundtrip
+/// guarantee
+/// `read_packet_header(&write_audio_packet_header(&h, &setup, b0, b1)?, &setup, b0, b1)? == h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAudioPacketHeaderError {
+    /// The supplied [`crate::setup::VorbisSetupHeader::modes`] list was
+    /// empty. A well-formed Vorbis I stream always has at least one mode
+    /// (§4.2.4 mode count is `read 6 bits + 1`, so the minimum is 1);
+    /// this is a defensive caller-bug guard mirroring
+    /// `PacketError::EmptyModeList` on the parser side.
+    EmptyModeList,
+    /// `header.mode_number` indexed past the supplied setup header's
+    /// mode list. §4.3.1 step 2 cannot serialise an out-of-range
+    /// `mode_number`; the parser would reject it with
+    /// `PacketError::BadModeNumber`.
+    BadModeNumber {
+        /// The offending mode-number value supplied by the caller.
+        mode_number: u32,
+        /// `vorbis_mode_count` from the supplied setup header.
+        mode_count: usize,
+    },
+    /// `header.blockflag` disagreed with the selected mode's
+    /// [`ModeHeader::blockflag`]. §4.3.1 step 3 reads `blockflag` from
+    /// the mode entry, not from the packet — a packet whose cached
+    /// `blockflag` disagrees with `setup.modes[mode_number].blockflag`
+    /// is internally inconsistent (the parser ignores the cached value
+    /// on the wire because it is not transmitted; the writer cross-
+    /// checks rather than silently emit the mode's value).
+    BlockflagMismatch {
+        /// `header.blockflag` as supplied by the caller.
+        header_blockflag: bool,
+        /// `setup.modes[mode_number].blockflag`.
+        mode_blockflag: bool,
+    },
+    /// `header.n` disagreed with the §4.3.1 step-3 blocksize selection
+    /// (`blocksize_0` when `blockflag` is clear, otherwise
+    /// `blocksize_1`). Like [`Self::BlockflagMismatch`], `n` is not on
+    /// the wire — the writer cross-checks it rather than silently emit
+    /// a header whose cached `n` disagrees with the spec-derived value
+    /// the parser will recompute.
+    BlocksizeMismatch {
+        /// `header.n` as supplied by the caller.
+        header_n: usize,
+        /// The spec-derived `n` value: `blocksize_0` for short blocks,
+        /// `blocksize_1` for long blocks.
+        expected_n: usize,
+    },
+    /// On a short block (`blockflag == false`), the §4.3.1 step 4b
+    /// path is taken and the window flags are not transmitted on the
+    /// wire. The reader returns `(false, false)` placeholders on a
+    /// short block; the writer mirrors the rule and refuses to emit a
+    /// header whose `previous_window_flag` or `next_window_flag` is set
+    /// on a short block, because no equivalent bit pattern would round-
+    /// trip to the same struct.
+    ShortBlockHasWindowFlag {
+        /// `header.previous_window_flag`.
+        previous_window_flag: bool,
+        /// `header.next_window_flag`.
+        next_window_flag: bool,
+    },
+}
+
+impl fmt::Display for WriteAudioPacketHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteAudioPacketHeaderError::EmptyModeList => write!(
+                f,
+                "vorbis audio packet (write): setup.modes is empty (§4.2.4 mode count >= 1)"
+            ),
+            WriteAudioPacketHeaderError::BadModeNumber {
+                mode_number,
+                mode_count,
+            } => write!(
+                f,
+                "vorbis audio packet (write): mode_number={mode_number} >= mode_count={mode_count} (§4.3.1 step 2)"
+            ),
+            WriteAudioPacketHeaderError::BlockflagMismatch {
+                header_blockflag,
+                mode_blockflag,
+            } => write!(
+                f,
+                "vorbis audio packet (write): header.blockflag={header_blockflag} disagrees with setup.modes[mode_number].blockflag={mode_blockflag} (§4.3.1 step 3)"
+            ),
+            WriteAudioPacketHeaderError::BlocksizeMismatch {
+                header_n,
+                expected_n,
+            } => write!(
+                f,
+                "vorbis audio packet (write): header.n={header_n} disagrees with §4.3.1 step 3 blocksize selection (expected {expected_n})"
+            ),
+            WriteAudioPacketHeaderError::ShortBlockHasWindowFlag {
+                previous_window_flag,
+                next_window_flag,
+            } => write!(
+                f,
+                "vorbis audio packet (write): short block carries previous_window_flag={previous_window_flag} / next_window_flag={next_window_flag}; §4.3.1 step 4b transmits no window flags on a short block"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteAudioPacketHeaderError {}
+
 impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1173,6 +1302,7 @@ impl fmt::Display for WriteError {
             WriteError::Mapping(e) => write!(f, "{e}"),
             WriteError::Mode(e) => write!(f, "{e}"),
             WriteError::Setup(e) => write!(f, "{e}"),
+            WriteError::AudioPacket(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1187,6 +1317,7 @@ impl std::error::Error for WriteError {
             WriteError::Mapping(e) => Some(e),
             WriteError::Mode(e) => Some(e),
             WriteError::Setup(e) => Some(e),
+            WriteError::AudioPacket(e) => Some(e),
             _ => None,
         }
     }
@@ -1231,6 +1362,12 @@ impl From<WriteModeError> for WriteError {
 impl From<WriteSetupError> for WriteError {
     fn from(value: WriteSetupError) -> Self {
         WriteError::Setup(value)
+    }
+}
+
+impl From<WriteAudioPacketHeaderError> for WriteError {
+    fn from(value: WriteAudioPacketHeaderError) -> Self {
+        WriteError::AudioPacket(value)
     }
 }
 
@@ -2843,6 +2980,197 @@ pub fn write_setup_header(
     // §2.1.8: the final byte's trailing bits are zero padding so the
     // packet is delivered byte-aligned to the container layer.
     Ok(writer.finish())
+}
+
+/// Serialises a [`AudioPacketHeader`] to the §4.3.1 audio-packet prelude
+/// bit pattern — the partial audio-packet WRITE primitive that emits the
+/// prelude bits a §4.3 audio packet starts with.
+///
+/// This is the first audio-packet writer (after the three header-packet
+/// writers and the six setup-header sub-block writers). The prelude is
+/// the §4.3.1 step 1..4 region — `packet_type`, `mode_number`, and the
+/// long-block `previous_window_flag` / `next_window_flag` — i.e. the
+/// bits the parser side [`crate::packet::read_packet_header`] consumes. The audio
+/// floor / residue / spectrum payload that follows is the subject of
+/// further followup writers.
+///
+/// Layout (per `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.1):
+///
+/// ```text
+/// packet_type           : 1 bit                              # step 1: must be 0
+/// mode_number           : ilog([vorbis_mode_count] - 1) bits # step 2
+/// # step 3: blocksize resolution is not on the wire; the parser
+/// #         recomputes n = blocksize_0 or blocksize_1 from
+/// #         setup.modes[mode_number].blockflag. The writer cross-
+/// #         checks `header.n` against the spec-derived value.
+/// # step 4: short block (blockflag == false) → no further bits.
+/// #         long  block (blockflag == true ) → two more 1-bit reads:
+/// previous_window_flag  : 1 bit   # step 4a.i  (long block only)
+/// next_window_flag      : 1 bit   # step 4a.ii (long block only)
+/// # final byte: §2.1.8 zero padding to byte-align the slice.
+/// ```
+///
+/// `setup` supplies `setup.modes` — its length sizes the
+/// `ilog([vorbis_mode_count] - 1)`-bit `mode_number` field per §4.3.1
+/// step 2 (using [`ilog`] / [`crate::codebook::ilog`]) and the selected
+/// mode's [`crate::setup::ModeHeader::blockflag`] resolves the
+/// blocksize. The other setup-header lists (codebooks, floors,
+/// residues, mappings) are ignored, matching the reader.
+///
+/// `blocksize_0` / `blocksize_1` come from the parsed identification
+/// header (§4.2.2). They are not on the §4.3.1 wire — the writer uses
+/// them only to cross-check `header.n` against the spec-derived
+/// blocksize selection so a malformed `(blockflag, n)` cached pair
+/// cannot silently be emitted.
+///
+/// **Return value** — the produced bitstream as a [`Vec<u8>`]. The
+/// final byte may carry up to 7 bits of §2.1.8 zero padding to byte-
+/// align the slice; the parser stops after the last consumed bit
+/// (§4.3.1 step 4 closing position).
+///
+/// Returns [`WriteAudioPacketHeaderError`] without emitting any bytes
+/// if any field fails a §4.3.1 invariant.
+///
+/// # Bit-exact roundtrip guarantee
+///
+/// For every value `h: AudioPacketHeader` and matching context
+/// `(setup, blocksize_0, blocksize_1)` for which the §4.3.1 invariants
+/// hold:
+///
+/// ```text
+/// read_packet_header(
+///     &mut BitReaderLsb::new(&write_audio_packet_header(&h, &setup, blocksize_0, blocksize_1)?),
+///     &setup,
+///     blocksize_0,
+///     blocksize_1,
+/// ) == Ok(h)
+/// ```
+///
+/// # Spec source
+///
+/// `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.1 "packet type, mode and
+/// window decode" (steps 1..4 — `packet_type`, `mode_number`, blocksize
+/// resolution, and the long-block window flags); §4.2.4 "Modes" (the
+/// mode list whose length sizes the step-2 read); §9.2.1 "ilog" (the
+/// bit-width formula for the step-2 read width — single-mode degenerate
+/// case `ilog(0) == 0` reads zero bits and resolves to mode 0
+/// unconditionally); §2.1.4 "coding bits into byte sequences" (LSB-
+/// first packing); §2.1.8 "end-of-packet alignment" (final byte zero
+/// padding).
+///
+/// # Errors
+///
+/// [`WriteAudioPacketHeaderError::EmptyModeList`] if `setup.modes` is
+/// empty. [`WriteAudioPacketHeaderError::BadModeNumber`] if
+/// `header.mode_number >= setup.modes.len()`.
+/// [`WriteAudioPacketHeaderError::BlockflagMismatch`] if
+/// `header.blockflag` disagrees with the selected mode's
+/// `blockflag`. [`WriteAudioPacketHeaderError::BlocksizeMismatch`] if
+/// `header.n` disagrees with the §4.3.1 step-3 blocksize selection.
+/// [`WriteAudioPacketHeaderError::ShortBlockHasWindowFlag`] if
+/// `header.blockflag` is `false` but a window flag is set (no bit
+/// pattern would round-trip to that struct on the short-block path).
+pub fn write_audio_packet_header(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+) -> Result<Vec<u8>, WriteAudioPacketHeaderError> {
+    let mut writer = BitWriterLsb::with_capacity(1);
+    write_audio_packet_header_into_writer(header, setup, blocksize_0, blocksize_1, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice an audio-packet prelude into a larger
+/// bit-packed stream. A wrapping audio-packet writer (the §4.3 packet
+/// builder, an explicit followup) will use this to thread the prelude
+/// into the per-channel floor / residue / spectrum payload, mirroring
+/// the existing `write_codebook_into_writer` /
+/// `write_floor0_header_into_writer` / `write_floor1_header_into_writer` /
+/// `write_residue_header_into_writer` / `write_mapping_header_into_writer` /
+/// `write_mode_header_into_writer` splice points.
+///
+/// Writes the prelude's bits into `writer` at its current bit position.
+/// On error, the writer has had no bits appended (we validate before
+/// emitting).
+pub(crate) fn write_audio_packet_header_into_writer(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteAudioPacketHeaderError> {
+    // ---- §4.3.1 invariant gate. ----
+    // Fail-closed: refuse to emit a single bit if any field cannot be
+    // serialised back to a prelude the parser would accept.
+
+    if setup.modes.is_empty() {
+        return Err(WriteAudioPacketHeaderError::EmptyModeList);
+    }
+    let mode_count = setup.modes.len();
+    if (header.mode_number as usize) >= mode_count {
+        return Err(WriteAudioPacketHeaderError::BadModeNumber {
+            mode_number: header.mode_number,
+            mode_count,
+        });
+    }
+
+    // §4.3.1 step 3: blockflag is sourced from the selected mode; the
+    // parser does not transmit `blockflag` on the wire but caches the
+    // mode's value into `AudioPacketHeader`. Cross-check rather than
+    // silently emit the mode's value when the caller's struct disagrees.
+    let mode = setup.modes[header.mode_number as usize];
+    let mode_blockflag = mode.blockflag;
+    if header.blockflag != mode_blockflag {
+        return Err(WriteAudioPacketHeaderError::BlockflagMismatch {
+            header_blockflag: header.blockflag,
+            mode_blockflag,
+        });
+    }
+
+    // §4.3.1 step 3: n = blocksize_0 (short) or blocksize_1 (long).
+    let expected_n = if mode_blockflag {
+        blocksize_1
+    } else {
+        blocksize_0
+    };
+    if header.n != expected_n {
+        return Err(WriteAudioPacketHeaderError::BlocksizeMismatch {
+            header_n: header.n,
+            expected_n,
+        });
+    }
+
+    // §4.3.1 step 4b: short block does not transmit window flags. The
+    // parser returns (false, false) placeholders on the short-block
+    // path; refuse a struct whose flags would silently disappear in
+    // the round-trip.
+    if !mode_blockflag && (header.previous_window_flag || header.next_window_flag) {
+        return Err(WriteAudioPacketHeaderError::ShortBlockHasWindowFlag {
+            previous_window_flag: header.previous_window_flag,
+            next_window_flag: header.next_window_flag,
+        });
+    }
+
+    // ---- §4.3.1 emit. ----
+    // step 1: 1-bit packet_type = 0 (the §4.3 "is this an audio packet?"
+    // discriminant; non-audio packets are rejected by the parser, so the
+    // writer always emits zero).
+    writer.write_bit(false);
+    // step 2: ilog([vorbis_mode_count] - 1) bits, LSB-first. §9.2.1
+    // `ilog(0) == 0` collapses to a zero-bit read in the single-mode
+    // degenerate case — write_u32(v, 0) emits nothing per the bit
+    // packer's contract, matching the reader.
+    let mode_bits = ilog((mode_count as u32).saturating_sub(1));
+    writer.write_u32(header.mode_number, mode_bits);
+    // step 4: long block adds two 1-bit fields; short block emits no
+    // further bits.
+    if mode_blockflag {
+        writer.write_bit(header.previous_window_flag);
+        writer.write_bit(header.next_window_flag);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7424,5 +7752,549 @@ mod tests {
         // mentions `SetupParseError` by name; it remains imported for
         // future fixture-specific assertions.
         let _ = std::marker::PhantomData::<SetupParseError>;
+    }
+
+    // ----------------------------------------------------------------
+    // §4.3.1 audio-packet header — WRITE primitive.
+    // ----------------------------------------------------------------
+
+    fn ap_mode(blockflag: bool, mapping: u8) -> ModeHeader {
+        ModeHeader {
+            blockflag,
+            windowtype: 0,
+            transformtype: 0,
+            mapping,
+        }
+    }
+
+    fn ap_setup(modes: Vec<ModeHeader>) -> VorbisSetupHeader {
+        VorbisSetupHeader {
+            codebooks: Vec::new(),
+            time_placeholders: Vec::new(),
+            floors: Vec::new(),
+            residues: Vec::new(),
+            mappings: Vec::new(),
+            modes,
+            framing_flag: true,
+        }
+    }
+
+    /// Round-trip: emit the prelude, parse it back through
+    /// `read_packet_header`, struct must equal input. Single-mode short
+    /// block — `ilog(0) == 0` collapses the mode-number field to zero
+    /// bits, so total bits emitted = 1.
+    #[test]
+    fn audio_packet_header_single_mode_short_roundtrips() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let setup = ap_setup(vec![ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        let bytes = write_audio_packet_header(&h, &setup, 64, 1024).unwrap();
+        // §4.3.1 emits a single `packet_type` bit; §2.1.8 zero-pads
+        // the final byte. The total slice is therefore one byte.
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0x00);
+
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = read_packet_header(&mut r, &setup, 64, 1024).unwrap();
+        assert_eq!(parsed, h);
+        // Parser consumed exactly the one bit we emitted.
+        assert_eq!(r.bit_position(), 1);
+    }
+
+    /// Round-trip: single-mode long block. `ilog(0)==0` collapses the
+    /// mode-number field; the long block adds two 1-bit window flags.
+    /// Total bits = 1 (packet_type) + 2 (window flags) = 3.
+    #[test]
+    fn audio_packet_header_single_mode_long_roundtrips() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let setup = ap_setup(vec![ap_mode(true, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: true,
+            n: 1024,
+            previous_window_flag: true,
+            next_window_flag: false,
+        };
+        let bytes = write_audio_packet_header(&h, &setup, 64, 1024).unwrap();
+        assert_eq!(bytes.len(), 1);
+        // bit 0: packet_type = 0
+        // bit 1: previous_window_flag = 1
+        // bit 2: next_window_flag     = 0
+        // bits 3..8: §2.1.8 zero padding.
+        // Packed LSB-first: 0b00000_010 = 0x02.
+        assert_eq!(bytes[0], 0b0000_0010);
+
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = read_packet_header(&mut r, &setup, 64, 1024).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(r.bit_position(), 3);
+    }
+
+    /// Round-trip: two modes (`ilog(1) == 1`-bit `mode_number`).
+    /// Selecting mode 1 (short) → 1 + 1 = 2 bits emitted.
+    #[test]
+    fn audio_packet_header_two_modes_short_roundtrips() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let setup = ap_setup(vec![ap_mode(true, 0), ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 1,
+            blockflag: false,
+            n: 256,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        let bytes = write_audio_packet_header(&h, &setup, 256, 2048).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = read_packet_header(&mut r, &setup, 256, 2048).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(r.bit_position(), 2);
+    }
+
+    /// Round-trip: two modes (`ilog(1) == 1`), pick mode 0 (long).
+    /// Total bits = 1 + 1 + 2 = 4.
+    #[test]
+    fn audio_packet_header_two_modes_long_roundtrips() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let setup = ap_setup(vec![ap_mode(true, 0), ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: true,
+            n: 2048,
+            previous_window_flag: true,
+            next_window_flag: true,
+        };
+        let bytes = write_audio_packet_header(&h, &setup, 256, 2048).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = read_packet_header(&mut r, &setup, 256, 2048).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(r.bit_position(), 4);
+    }
+
+    /// Round-trip: three modes — `ilog(2) == 2`-bit `mode_number`.
+    /// Pick mode 2 (long). Total bits = 1 + 2 + 2 = 5.
+    #[test]
+    fn audio_packet_header_three_modes_long_roundtrips() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let setup = ap_setup(vec![ap_mode(false, 0), ap_mode(false, 0), ap_mode(true, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 2,
+            blockflag: true,
+            n: 1024,
+            previous_window_flag: false,
+            next_window_flag: true,
+        };
+        let bytes = write_audio_packet_header(&h, &setup, 64, 1024).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = read_packet_header(&mut r, &setup, 64, 1024).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(r.bit_position(), 5);
+    }
+
+    /// Byte-level pin: long block, 4 bits emitted, LSB-first packing.
+    /// Two modes (1-bit mode_number), mode 0 (long).
+    ///   bit 0: packet_type      = 0
+    ///   bit 1: mode_number      = 0
+    ///   bit 2: previous_window_flag = 1
+    ///   bit 3: next_window_flag     = 1
+    /// Byte (LSB-first): 0b0000_1100 = 0x0c.
+    #[test]
+    fn audio_packet_header_byte_shape_long_block_two_modes() {
+        let setup = ap_setup(vec![ap_mode(true, 0), ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: true,
+            n: 2048,
+            previous_window_flag: true,
+            next_window_flag: true,
+        };
+        let bytes = write_audio_packet_header(&h, &setup, 256, 2048).unwrap();
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0b0000_1100);
+    }
+
+    /// Cross-verify against the parser-side test fixture pattern:
+    /// `read_packet_header` test `packet_header_three_modes_uses_two_mode_bits`
+    /// wrote `(packet_type, mode_number=2, prev=0, next=0)` and parsed
+    /// to `(mode_number=2, blockflag=true, n=1024)`. The writer fed the
+    /// same struct must emit the same bytes.
+    #[test]
+    fn audio_packet_header_matches_parser_fixture_three_modes() {
+        use oxideav_core::bits::BitWriterLsb;
+
+        let setup = ap_setup(vec![ap_mode(false, 0), ap_mode(false, 0), ap_mode(true, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 2,
+            blockflag: true,
+            n: 1024,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        let writer_bytes = write_audio_packet_header(&h, &setup, 64, 1024).unwrap();
+
+        // The hand-rolled writer in the parser test:
+        let mut w = BitWriterLsb::new();
+        w.write_u32(0, 1); // packet_type
+        w.write_u32(2, 2); // mode_number
+        w.write_u32(0, 1); // previous_window_flag
+        w.write_u32(0, 1); // next_window_flag
+        let expected = w.finish();
+
+        assert_eq!(writer_bytes, expected);
+    }
+
+    /// Reject: empty modes list.
+    #[test]
+    fn audio_packet_header_rejects_empty_mode_list() {
+        let setup = ap_setup(Vec::new());
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::EmptyModeList)
+        );
+    }
+
+    /// Reject: mode_number indexes past the mode list.
+    #[test]
+    fn audio_packet_header_rejects_bad_mode_number() {
+        let setup = ap_setup(vec![ap_mode(false, 0), ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 2,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::BadModeNumber {
+                mode_number: 2,
+                mode_count: 2,
+            })
+        );
+    }
+
+    /// Reject: cached blockflag disagrees with the selected mode.
+    #[test]
+    fn audio_packet_header_rejects_blockflag_mismatch() {
+        let setup = ap_setup(vec![ap_mode(true, 0)]);
+        // Caller says short block but the mode is long.
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::BlockflagMismatch {
+                header_blockflag: false,
+                mode_blockflag: true,
+            })
+        );
+    }
+
+    /// Reject: cached `n` disagrees with `blocksize_0` on a short block.
+    #[test]
+    fn audio_packet_header_rejects_blocksize_mismatch_short() {
+        let setup = ap_setup(vec![ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 1024, // wrong: should be blocksize_0 = 64
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::BlocksizeMismatch {
+                header_n: 1024,
+                expected_n: 64,
+            })
+        );
+    }
+
+    /// Reject: cached `n` disagrees with `blocksize_1` on a long block.
+    #[test]
+    fn audio_packet_header_rejects_blocksize_mismatch_long() {
+        let setup = ap_setup(vec![ap_mode(true, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: true,
+            n: 64, // wrong: should be blocksize_1 = 1024
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::BlocksizeMismatch {
+                header_n: 64,
+                expected_n: 1024,
+            })
+        );
+    }
+
+    /// Reject: short block carries a previous_window_flag (no on-wire
+    /// bit pattern round-trips to a short block + a set window flag).
+    #[test]
+    fn audio_packet_header_rejects_short_block_previous_flag() {
+        let setup = ap_setup(vec![ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: true,
+            next_window_flag: false,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::ShortBlockHasWindowFlag {
+                previous_window_flag: true,
+                next_window_flag: false,
+            })
+        );
+    }
+
+    /// Reject: short block carries a next_window_flag.
+    #[test]
+    fn audio_packet_header_rejects_short_block_next_flag() {
+        let setup = ap_setup(vec![ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: true,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::ShortBlockHasWindowFlag {
+                previous_window_flag: false,
+                next_window_flag: true,
+            })
+        );
+    }
+
+    /// Confirm a short block with both window flags set is also
+    /// rejected (single variant fires regardless of which flag the
+    /// caller mis-cached).
+    #[test]
+    fn audio_packet_header_rejects_short_block_both_flags() {
+        let setup = ap_setup(vec![ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: true,
+            next_window_flag: true,
+        };
+        assert_eq!(
+            write_audio_packet_header(&h, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::ShortBlockHasWindowFlag {
+                previous_window_flag: true,
+                next_window_flag: true,
+            })
+        );
+    }
+
+    /// Exhaustive roundtrip across the four (blockflag, prev, next)
+    /// combinations on a single-mode long-block stream.
+    #[test]
+    fn audio_packet_header_exhaustive_long_block_window_flag_combinations() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let setup = ap_setup(vec![ap_mode(true, 0)]);
+        for prev in [false, true] {
+            for next in [false, true] {
+                let h = AudioPacketHeader {
+                    mode_number: 0,
+                    blockflag: true,
+                    n: 1024,
+                    previous_window_flag: prev,
+                    next_window_flag: next,
+                };
+                let bytes = write_audio_packet_header(&h, &setup, 64, 1024).expect("must build");
+                let mut r = BitReaderLsb::new(&bytes);
+                let parsed = read_packet_header(&mut r, &setup, 64, 1024).expect("must parse");
+                assert_eq!(
+                    parsed, h,
+                    "round-trip failed for (prev={prev}, next={next})"
+                );
+            }
+        }
+    }
+
+    /// Round-trip across all mode-count values 1..=64 with the maximum
+    /// `mode_number` selected. Confirms the `ilog(mode_count - 1)` bit
+    /// width matches the reader for every value of the 6-bit setup-
+    /// header `mode_count - 1` field.
+    #[test]
+    fn audio_packet_header_roundtrips_for_all_mode_counts() {
+        use crate::packet::read_packet_header;
+        use oxideav_core::bits::BitReaderLsb;
+
+        for mode_count in 1..=64usize {
+            // Build a setup where the last mode is the chosen one and
+            // is short (blockflag = false). All others are also short
+            // so we don't have to track per-mode blockflags.
+            let modes: Vec<ModeHeader> = (0..mode_count).map(|_| ap_mode(false, 0)).collect();
+            let setup = ap_setup(modes);
+            let h = AudioPacketHeader {
+                mode_number: (mode_count - 1) as u32,
+                blockflag: false,
+                n: 64,
+                previous_window_flag: false,
+                next_window_flag: false,
+            };
+            let bytes = write_audio_packet_header(&h, &setup, 64, 1024).unwrap();
+            let mut r = BitReaderLsb::new(&bytes);
+            let parsed = read_packet_header(&mut r, &setup, 64, 1024).unwrap();
+            assert_eq!(parsed, h, "round-trip failed at mode_count={mode_count}");
+        }
+    }
+
+    /// `WriteError::AudioPacket` glue: a writer-side rejection bubbles
+    /// up through the umbrella `WriteError` via the `From` impl with
+    /// the right `source()` chain.
+    #[test]
+    fn audio_packet_header_umbrella_write_error_glue() {
+        use std::error::Error as StdError;
+
+        let inner = WriteAudioPacketHeaderError::EmptyModeList;
+        let wrapped: WriteError = inner.into();
+        match wrapped {
+            WriteError::AudioPacket(WriteAudioPacketHeaderError::EmptyModeList) => {}
+            other => panic!("expected WriteError::AudioPacket(EmptyModeList), got {other:?}"),
+        }
+        let displayed = format!("{wrapped}");
+        assert!(displayed.contains("setup.modes is empty"));
+        let src = wrapped.source().expect("source must be set");
+        assert!(format!("{src}").contains("setup.modes is empty"));
+    }
+
+    /// `WriteAudioPacketHeaderError::Display` non-emptiness across all
+    /// five variants — the §-prefixed strings are part of the public
+    /// diagnostic surface.
+    #[test]
+    fn audio_packet_header_error_display_nonempty_all_variants() {
+        let variants = [
+            WriteAudioPacketHeaderError::EmptyModeList,
+            WriteAudioPacketHeaderError::BadModeNumber {
+                mode_number: 2,
+                mode_count: 2,
+            },
+            WriteAudioPacketHeaderError::BlockflagMismatch {
+                header_blockflag: false,
+                mode_blockflag: true,
+            },
+            WriteAudioPacketHeaderError::BlocksizeMismatch {
+                header_n: 64,
+                expected_n: 1024,
+            },
+            WriteAudioPacketHeaderError::ShortBlockHasWindowFlag {
+                previous_window_flag: true,
+                next_window_flag: false,
+            },
+        ];
+        for v in variants {
+            let s = format!("{v}");
+            assert!(s.starts_with("vorbis audio packet (write):"));
+            assert!(!s.is_empty());
+        }
+    }
+
+    /// Writer invariants align with the parser side: a struct the
+    /// writer refuses (out-of-range mode_number) — when we hand-roll
+    /// the equivalent bit pattern — is also refused by the parser
+    /// with the matching `PacketError` variant.
+    #[test]
+    fn audio_packet_header_writer_invariants_align_with_parser() {
+        use crate::packet::{read_packet_header, PacketError};
+        use oxideav_core::bits::{BitReaderLsb, BitWriterLsb};
+
+        let setup = ap_setup(vec![
+            ap_mode(false, 0),
+            ap_mode(false, 0),
+            ap_mode(false, 0),
+        ]);
+        // The writer refuses this:
+        let bad = AudioPacketHeader {
+            mode_number: 3,
+            blockflag: false,
+            n: 64,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        assert!(matches!(
+            write_audio_packet_header(&bad, &setup, 64, 1024),
+            Err(WriteAudioPacketHeaderError::BadModeNumber {
+                mode_number: 3,
+                mode_count: 3,
+            })
+        ));
+
+        // Hand-roll the equivalent bits the writer would have emitted
+        // had it ignored the gate (1-bit packet_type + 2-bit mode_number
+        // = 3). The parser side rejects it for the same reason.
+        let mut w = BitWriterLsb::new();
+        w.write_u32(0, 1); // packet_type
+        w.write_u32(3, 2); // mode_number = 3 (>= mode_count = 3)
+        let bytes = w.finish();
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(
+            read_packet_header(&mut r, &setup, 64, 1024),
+            Err(PacketError::BadModeNumber {
+                mode_number: 3,
+                mode_count: 3,
+            })
+        );
+    }
+
+    /// `write_audio_packet_header_into_writer` (the splice helper)
+    /// preserves the byte-aligned-output property of the public
+    /// wrapper: append into a writer that is already byte-aligned, the
+    /// resulting bytes equal the public function's output.
+    #[test]
+    fn audio_packet_header_splice_matches_public_writer() {
+        use oxideav_core::bits::BitWriterLsb;
+
+        let setup = ap_setup(vec![ap_mode(true, 0), ap_mode(false, 0)]);
+        let h = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: true,
+            n: 1024,
+            previous_window_flag: true,
+            next_window_flag: false,
+        };
+        let public = write_audio_packet_header(&h, &setup, 64, 1024).unwrap();
+
+        let mut w = BitWriterLsb::with_capacity(1);
+        write_audio_packet_header_into_writer(&h, &setup, 64, 1024, &mut w).unwrap();
+        let splice = w.finish();
+
+        assert_eq!(splice, public);
     }
 }

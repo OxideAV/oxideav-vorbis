@@ -1,6 +1,106 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 27.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 28.
+
+## Status — 2026-06-06 (round 28, umbrella round 240)
+
+**Round 28 lands the §4.3.1 audio-packet header WRITE primitive — the
+first audio-packet WRITE primitive.** New public function
+[`encoder::write_audio_packet_header`] serialises a
+[`crate::packet::AudioPacketHeader`] to the §4.3.1 audio-packet prelude
+bit pattern. This is the byte-exact inverse of the round-9
+[`crate::packet::read_packet_header`] and the first writer on the §4.3
+audio-packet side (after the three header-packet writers in rounds
+20..21 plus the six nested setup-header sub-block writers in rounds
+21..26 and the round-27 wrapping setup-header writer
+[`encoder::write_setup_header`]). Given a matching
+`(setup, blocksize_0, blocksize_1)` context tuple — the same context
+the parser-side reader consumes — the bit-exact roundtrip property
+
+```text
+read_packet_header(
+    &mut BitReaderLsb::new(&write_audio_packet_header(&h, &setup, b0, b1)?),
+    &setup,
+    b0,
+    b1,
+) == Ok(h)
+```
+
+holds for every legal [`AudioPacketHeader`]. The §4.3.1 prelude is the
+bits the parser side reads in steps 1..4: a 1-bit `packet_type` (must
+be 0 — §4.3 rejects packets whose discriminant is 1, so the writer
+emits zero unconditionally), an `ilog([vorbis_mode_count] - 1)`-bit
+`mode_number` (using the existing [`crate::codebook::ilog`] helper;
+collapses to zero bits in the single-mode degenerate case
+`mode_count == 1`), then on a long block two more 1-bit window flags
+(`previous_window_flag`, `next_window_flag`); short blocks emit no
+further bits per §4.3.1 step 4b. The §4.3.1 step 3 blocksize
+resolution (`n = blocksize_0` for short blocks, `blocksize_1` for long
+blocks) is not on the wire — the writer cross-checks `header.n`
+against the spec-derived value rather than silently emit a header
+whose cached `n` disagrees with what the parser will recompute.
+Similarly `header.blockflag` is cross-checked against the selected
+mode's `blockflag`, and a short block carrying a set window flag is
+refused — no on-wire bit pattern round-trips to that struct, so the
+fail-closed gate refuses the call.
+
+The §4.3.1 prelude layout the writer emits is:
+
+```text
+packet_type           : 1 bit                              # step 1: must be 0
+mode_number           : ilog([vorbis_mode_count] - 1) bits # step 2
+# step 3: blocksize resolution is not on the wire; cross-checked.
+# step 4: short block → no further bits.
+# step 4: long  block → two more 1-bit reads:
+previous_window_flag  : 1 bit   # step 4a.i  (long block only)
+next_window_flag      : 1 bit   # step 4a.ii (long block only)
+# final byte: §2.1.8 zero padding to byte-align the slice.
+```
+
+A new [`WriteAudioPacketHeaderError`] enumerates five §4.3.1
+invariant violations (`EmptyModeList`, `BadModeNumber`,
+`BlockflagMismatch`, `BlocksizeMismatch`, `ShortBlockHasWindowFlag`)
+that the writer enforces with a fail-closed gate. The umbrella
+[`WriteError`] grows a [`WriteError::AudioPacket`] variant with the
+matching `From` glue and `source()` chain. The crate-private
+`write_audio_packet_header_into_writer` companion is shaped to
+splice the prelude into the surrounding §4.3 audio-packet writer
+(still a followup), matching the existing
+`write_codebook_into_writer` / `write_floor0_header_into_writer` /
+`write_floor1_header_into_writer` / `write_residue_header_into_writer`
+/ `write_mapping_header_into_writer` / `write_mode_header_into_writer`
+splice points.
+
+21 new unit tests bring the in-module suite to **553 (532 → 553)**:
+a single-mode short-block emission pins the 1-byte slice
+(packet_type bit + 7 padding bits → `0x00`); a single-mode long-
+block emission pins the 1-byte slice
+(packet_type + previous_window_flag + next_window_flag → `0x02` for
+`(true, false)`); a long-block two-mode emission pins the byte to
+`0x0c` for `(mode_number=0, prev=true, next=true)` (the LSB-first
+bit layout); a parser-side fixture cross-verification reuses the
+three-modes parser test's hand-rolled bytes and confirms the writer
+emits identical bytes; an exhaustive 4-combination scan across
+`(previous_window_flag, next_window_flag)` on a long-block single-
+mode stream; a roundtrip across every `mode_count ∈ 1..=64` (the
+6-bit setup-header `mode_count - 1` range) selecting the maximum
+`mode_number` each time; five rejection tests cover each new
+`WriteAudioPacketHeaderError` variant; two more cover the
+short-block-carries-next-flag and short-block-carries-both-flags
+edge cases; a writer-vs-parser invariant cross-check confirms a
+struct the writer refuses is also refused by the parser when the
+equivalent bits are hand-rolled; a splice-vs-public-writer byte
+equality check pins
+`write_audio_packet_header_into_writer == write_audio_packet_header`
+at byte alignment; the `WriteAudioPacketHeaderError::Display`
+non-emptiness smoke test asserts each of the five variants emits a
+"vorbis audio packet (write):"-prefixed message; the
+`WriteError::AudioPacket` `From` glue + `source()` chain is checked
+end-to-end. The remaining audio-packet WRITE primitives — mode-
+driven floor / residue encode, inverse-couple invert, IMDCT/window
+synthesis encode, and the wrapping §4.3 audio-packet writer that
+splices the prelude into the per-channel payload — are explicit
+followups.
 
 ## Status — 2026-06-04 (round 27, umbrella round 234)
 
@@ -1500,6 +1600,14 @@ crate that wraps or implements the format).
 [`AudioPacketHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/struct.AudioPacketHeader.html
 [`AudioPacketHeader::build_window`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/struct.AudioPacketHeader.html#method.build_window
 [`VorbisSetupHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/setup/struct.VorbisSetupHeader.html
+[`encoder::write_audio_packet_header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/encoder/fn.write_audio_packet_header.html
+[`encoder::write_setup_header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/encoder/fn.write_setup_header.html
+[`WriteAudioPacketHeaderError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/encoder/enum.WriteAudioPacketHeaderError.html
+[`WriteError::AudioPacket`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/encoder/enum.WriteError.html#variant.AudioPacket
+[`WriteError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/encoder/enum.WriteError.html
+[`crate::codebook::ilog`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/codebook/fn.ilog.html
+[`crate::packet::AudioPacketHeader`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/struct.AudioPacketHeader.html
+[`crate::packet::read_packet_header`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/packet/fn.read_packet_header.html
 
 ## License
 
