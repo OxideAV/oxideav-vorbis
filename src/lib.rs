@@ -120,6 +120,16 @@
 //! [`WriteError::Floor1`] variant with the matching `From` glue.
 //! Floor 0 WRITE, residue WRITE, mapping / mode WRITE, audio-packet
 //! WRITE, and the setup-header splice remain explicit followups.
+//!
+//! Round 29 (umbrella round 243) lands the §4.3.7 forward-MDCT
+//! cosine-summation kernel as a standalone primitive — the
+//! encoder-side counterpart to the round-16 inverse-MDCT kernel.
+//! See [`mdct`]. The forward kernel is the linear matrix-transpose
+//! of the IMDCT kernel; the two directions share one cosine matrix
+//! and the derived identity `mdct(imdct(X)) == (N/2) · X` holds at
+//! every legal blocksize. The derivation is laid out in the
+//! [`mdct`] module documentation and uses only the IMDCT formula
+//! already in `docs/audio/vorbis/imdct-cross-reference.md`.
 
 #![warn(missing_debug_implementations)]
 
@@ -134,6 +144,7 @@ pub mod floor1;
 pub mod huffman;
 pub mod identification;
 pub mod imdct;
+pub mod mdct;
 pub mod overlap;
 pub mod packet;
 pub mod packet_kind;
@@ -172,6 +183,7 @@ pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
 pub use imdct::{imdct_naive, imdct_naive_vec, ImdctError};
+pub use mdct::{mdct_naive, mdct_naive_vec, MdctError};
 pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
@@ -237,6 +249,10 @@ pub enum Error {
     /// input — either an invalid spectrum length, or a mismatched
     /// output buffer length.
     Imdct(ImdctError),
+    /// The §4.3.7 forward-MDCT cosine-summation kernel rejected its
+    /// input — either an invalid block length, or a mismatched
+    /// output buffer length.
+    Mdct(MdctError),
     /// The top-level §4.3 audio-packet driver failed at the §4.3.2
     /// through §4.3.6 stages (mapping/submap routing, floor or residue
     /// decode failure, inverse coupling, dot product), or stopped at the
@@ -293,6 +309,7 @@ impl core::fmt::Display for Error {
             Error::Packet(e) => write!(f, "{e}"),
             Error::Overlap(e) => write!(f, "{e}"),
             Error::Imdct(e) => write!(f, "{e}"),
+            Error::Mdct(e) => write!(f, "{e}"),
             Error::AudioPacket(e) => write!(f, "{e}"),
             Error::Streaming(e) => write!(f, "{e}"),
             Error::Classify(e) => write!(f, "{e}"),
@@ -320,6 +337,7 @@ impl std::error::Error for Error {
             Error::Packet(e) => Some(e),
             Error::Overlap(e) => Some(e),
             Error::Imdct(e) => Some(e),
+            Error::Mdct(e) => Some(e),
             Error::AudioPacket(e) => Some(e),
             Error::Streaming(e) => Some(e),
             Error::Classify(e) => Some(e),
@@ -417,6 +435,12 @@ impl From<OverlapError> for Error {
 impl From<ImdctError> for Error {
     fn from(value: ImdctError) -> Self {
         Error::Imdct(value)
+    }
+}
+
+impl From<MdctError> for Error {
+    fn from(value: MdctError) -> Self {
+        Error::Mdct(value)
     }
 }
 

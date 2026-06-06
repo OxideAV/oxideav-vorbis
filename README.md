@@ -1,6 +1,85 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 28.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 29.
+
+## Status — 2026-06-07 (round 29, umbrella round 243)
+
+**Round 29 lands the §4.3.7 forward-MDCT cosine-summation kernel — the
+encode-side counterpart to the round-16 inverse-MDCT primitive.** New
+public function [`mdct::mdct_naive`] takes one channel's length-`N`
+time-domain block and returns the length-`N/2` audio-spectrum vector,
+mirroring [`imdct::imdct_naive`]'s structure on the encoder side. The
+direct-form O(N²) cosine summation it implements is derived from the
+IMDCT formula pinned in `docs/audio/vorbis/imdct-cross-reference.md`
+by a single mathematical step: the forward kernel is the linear
+**matrix transpose** of the IMDCT kernel. The cosine matrix is
+shared between the two directions — `mdct(imdct(X)) == (N/2) · X`
+follows by direct calculation of `Cᵀ · C` from the cosine summation
+plus the standard product-to-sum identity, with every off-diagonal
+entry vanishing because its cosine arguments sum / difference to a
+non-zero rational multiple of `2π/N` that integrates to zero over
+the `N`-term sum. The derivation is laid out in the module
+documentation (`src/mdct.rs`) line-by-line and uses only the IMDCT
+formula already in `imdct-cross-reference.md`, the standard cosine
+product-to-sum identity, and the closed-form sum of a cosine
+sampled at integer multiples of `2π/N`.
+
+A new [`MdctError`] enumerates two structural invariants
+(`BlockNotPowerOfTwo`, `OutputLenMismatch`), matching the
+[`ImdctError`] shape, and the umbrella [`Error`] grows a matching
+`Error::Mdct(MdctError)` variant with the corresponding `From` glue
+and `source()` chain.
+
+14 new in-module unit tests bring the crate-wide test count from
+**555 → 569 (+14)**:
+
+* six error-path tests cover the new `MdctError` variants (empty
+  block, length-one block, odd-length block, even-but-not-power-of-
+  two block, mismatched output length, the vec wrapper);
+* `zero_input_gives_zero_output` and `linearity_in_block` pin the
+  module-doc Property 1 + 2 (linearity, zero preservation) across
+  the representative blocksize set `{64, 256, 1024}`;
+* `mdct_of_imdct_is_scaled_identity` pins the module-doc Property 3
+  (the derived `mdct(imdct(X)) == (N/2) · X` identity) on randomised
+  spectra at every test blocksize, with an `O(N · ε)` tolerance to
+  account for the `f64`-accumulator-to-`f32`-cast loss;
+* `mdct_of_imdct_with_two_over_n_scale_recovers_spectrum` pins the
+  closed-form scale that recovers `X` directly through the bare
+  kernel — useful as the `scale` parameter for downstream callers
+  that want a numerically-normalised forward kernel without folding
+  the `N/2` factor into a follow-up step;
+* `scale_is_pure_output_multiplier` guards against a future refactor
+  applying `scale` inside the cosine sum (where it would be
+  incorrect);
+* three hand-computed N=4 impulse tests pin the kernel's cosine
+  argument formula bit-for-bit at three distinct input indices —
+  `x[0]`, `x[1]`, `x[2]` — cross-checking the `(2n + 1 + N/2)`
+  substitution against the IMDCT module's own hand-computed tests
+  for the same matrix entries;
+* `mdct_is_transpose_of_imdct` sweeps the full N=64 basis and pins
+  every `(n, k)` entry of the cosine matrix obtained two ways
+  (`imdct(spectrum_basis_vector_k)[n]` and
+  `mdct(block_basis_vector_n)[k]`), within `f32` tolerance — the
+  numerical confirmation of the matrix-transpose derivation;
+* an `error_display` smoke test pins the two new `MdctError`
+  `Display` strings.
+
+Like the inverse direction, the forward kernel is bare (un-normalized)
+— the Vorbis-specific normalization scalar is documented in the
+existing IMDCT cross-reference document as "absorbed into the floor
+and residue scaling and into the window" and remains a deferred-
+fixture concern. The kernel exposes the same `scale: f32` knob the
+IMDCT kernel does, so a future round can plug the fixture-derived
+factor in at the call site without changing the signature.
+
+Followups (explicit): encoder-side §4.3.6 window pre-multiplication,
+the §4.3.8 overlap-add inversion / framing on the encode side, an
+FFT-decomposed forward-MDCT fast path validating against this
+kernel's output, the §4.3 audio-packet writer wrapping mode + floor +
+residue + spectrum + MDCT encode (the round-28 prelude is the first
+piece of that), and pinning the Vorbis-specific normalization scalar
+once fixture traces under `docs/audio/vorbis/fixtures/<case>/` extend
+through the post-MDCT trace point.
 
 ## Status — 2026-06-06 (round 28, umbrella round 240)
 
