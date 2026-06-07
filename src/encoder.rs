@@ -183,6 +183,9 @@ pub enum WriteError {
     /// An audio-packet prelude (§4.3.1) failed one of the writer-side
     /// invariants checked by [`write_audio_packet_header`].
     AudioPacket(WriteAudioPacketHeaderError),
+    /// A floor 1 audio-packet body (§7.2.3) failed one of the
+    /// writer-side invariants checked by [`write_floor1_packet`].
+    Floor1Packet(WriteFloor1PacketError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -1148,6 +1151,267 @@ impl fmt::Display for WriteSetupError {
 
 impl std::error::Error for WriteSetupError {}
 
+/// A floor 1 audio-packet body (§7.2.3), in the shape the writer
+/// emits.
+///
+/// `nonzero == false` represents the "this channel carried no audio
+/// energy this frame" path: the packet is a single `0` bit and the
+/// other fields are ignored. `nonzero == true` represents the full
+/// per-partition emission: the two endpoint amplitudes plus per-class
+/// master / sub-book codewords reconstructing the [`floor1_y`] vector
+/// the §4.3.2 floor decoder will read back.
+///
+/// The struct round-trips with [`crate::floor1::Floor1Decoder::decode`]
+/// up to the [`crate::floor1::FloorCurve`] return value when the
+/// supplied `partition_cvals` and `floor1_y` are consistent with the
+/// supplied `Floor1Header` + codebook table — see
+/// [`write_floor1_packet`] for the consistency rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Floor1Packet {
+    /// `[nonzero]` flag (§7.2.3 step 1). Clear when the channel is
+    /// unused this frame, set when an endpoint + per-partition body
+    /// follows.
+    pub nonzero: bool,
+    /// `[floor1_Y]` (§7.2.3): the full Y vector including the two
+    /// endpoint amplitudes at positions 0 and 1, then per-partition
+    /// per-dimension Y values. Length must equal
+    /// `Floor1Header::x_list.len() + 2` (= the decoder's
+    /// `floor1_values`). Only consulted when `nonzero == true`.
+    pub floor1_y: Vec<u32>,
+    /// Per-partition master-selector value (§7.2.3 step 12), one entry
+    /// per partition (length must equal
+    /// `Floor1Header::partition_class_list.len()`). Each entry's
+    /// `subclasses > 0` partitions emit `cval` as a master-book
+    /// codeword; `subclasses == 0` partitions ignore the value
+    /// (per §7.2.3 step 10 [cval] is initialised to 0 and the
+    /// masterbook read is skipped). Only consulted when
+    /// `nonzero == true`.
+    pub partition_cvals: Vec<u32>,
+}
+
+/// Errors that may arise while writing a §7.2.3 floor 1 audio-packet
+/// body via [`write_floor1_packet`].
+///
+/// Each variant flags a §7.2.3 invariant the caller-supplied
+/// [`Floor1Packet`] / [`Floor1Header`] / codebook table tuple does
+/// not satisfy. The writer refuses the call without emitting any
+/// bits, preserving the round-trip guarantee that the floor 1 decoder
+/// reads the same `[floor1_Y]` back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFloor1PacketError {
+    /// `floor1_y.len()` does not match the decoder's `floor1_values`
+    /// count (= `header.x_list.len() + 2`). §7.2.3 reads exactly that
+    /// many Y values — two endpoints plus
+    /// `sum(class.dimensions over partitions)` per-dimension values.
+    YLengthMismatch {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        actual: usize,
+    },
+    /// `partition_cvals.len()` does not match the partition count
+    /// (= `header.partition_class_list.len()`). §7.2.3 step 5 iterates
+    /// over exactly `partitions` partitions; the writer needs one
+    /// `cval` per partition.
+    CvalListLengthMismatch {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        actual: usize,
+    },
+    /// `header.multiplier` was outside `1..=4`. §7.2.3 step 1 selects
+    /// `[range]` from the four-element table indexed by `multiplier - 1`,
+    /// so the legal range is `1..=4`.
+    IllegalMultiplier(u8),
+    /// An endpoint amplitude (`floor1_y[0]` or `floor1_y[1]`) was
+    /// outside the §7.2.3 step 2/3 emission range
+    /// (`0..(range)`, expressible in `ilog(range - 1)` bits).
+    EndpointOverflow {
+        /// `0` for `floor1_y[0]`, `1` for `floor1_y[1]`.
+        index: usize,
+        /// The rejected value.
+        value: u32,
+        /// `range` for the current `multiplier`.
+        range: u32,
+    },
+    /// A partition referenced a class index outside `header.classes`.
+    /// §7.2.3 step 6 indexes `header.classes` by the per-partition
+    /// class number; the writer refuses to consult a non-existent
+    /// class entry.
+    BadClassIndex {
+        /// Partition index in `0..partitions`.
+        partition: usize,
+        /// The rejected class index.
+        class: u8,
+        /// `header.classes.len()`.
+        class_count: usize,
+    },
+    /// A class's `masterbook` referenced an out-of-range codebook.
+    /// §7.2.2 already validates this on the header parser side, but
+    /// the packet writer needs to look it up to encode the master
+    /// codeword, so the caller-side codebook table must contain it.
+    MasterbookOutOfRange {
+        /// Class index.
+        class: usize,
+        /// The rejected codebook index.
+        book: u8,
+        /// `codebooks.len()`.
+        codebook_count: usize,
+    },
+    /// A sub-book referenced an out-of-range codebook. Symmetric to
+    /// [`Self::MasterbookOutOfRange`].
+    SubclassBookOutOfRange {
+        /// Class index.
+        class: usize,
+        /// Subclass slot index.
+        subclass: usize,
+        /// The rejected codebook index.
+        book: u8,
+        /// `codebooks.len()`.
+        codebook_count: usize,
+    },
+    /// Building the Huffman tree for a referenced codebook failed.
+    /// Mirrors [`crate::huffman::BuildError`] surfacing through the
+    /// packet writer.
+    Huffman(crate::huffman::BuildError),
+    /// A sub-book emission was asked to encode a Y value the book
+    /// cannot represent (the entry is not in the codebook's used set,
+    /// or its index is past `entries`). §7.2.3 step 17 reads each Y
+    /// value as a codebook entry, so the writer needs the value's
+    /// entry to be a valid leaf of the Huffman tree.
+    UnencodableY {
+        /// Partition index.
+        partition: usize,
+        /// Dimension index within the partition.
+        dimension: usize,
+        /// The Y value the writer was asked to emit.
+        y_value: u32,
+        /// The codebook index the sub-book pointed at.
+        book: u8,
+    },
+    /// A partition with a `None` sub-book (encoded `-1`, "no codebook
+    /// for this subclass") was asked to encode a non-zero Y value.
+    /// §7.2.3 step 18 forces the Y value to 0 when the sub-book is
+    /// negative; a non-zero Y in this slot has no on-wire
+    /// representation that round-trips.
+    NoneBookNonzeroY {
+        /// Partition index.
+        partition: usize,
+        /// Dimension index within the partition.
+        dimension: usize,
+        /// The non-zero Y value the writer was refusing to encode.
+        y_value: u32,
+    },
+    /// A master-book emission was asked to encode a `cval` index that
+    /// is not in the master codebook's used set. Symmetric to
+    /// [`Self::UnencodableY`] for the master selector.
+    UnencodableCval {
+        /// Partition index.
+        partition: usize,
+        /// The `cval` value the writer was asked to emit.
+        cval: u32,
+        /// The codebook index the masterbook pointed at.
+        book: u8,
+    },
+}
+
+impl fmt::Display for WriteFloor1PacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteFloor1PacketError::YLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis floor1 packet (write): floor1_y.len()={actual} != floor1_values={expected} (§7.2.3)"
+            ),
+            WriteFloor1PacketError::CvalListLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis floor1 packet (write): partition_cvals.len()={actual} != partitions={expected} (§7.2.3 step 5)"
+            ),
+            WriteFloor1PacketError::IllegalMultiplier(m) => write!(
+                f,
+                "vorbis floor1 packet (write): multiplier={m} outside 1..=4 (§7.2.3 step 1)"
+            ),
+            WriteFloor1PacketError::EndpointOverflow {
+                index,
+                value,
+                range,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): floor1_y[{index}]={value} >= range={range} (§7.2.3 step {})",
+                index + 2
+            ),
+            WriteFloor1PacketError::BadClassIndex {
+                partition,
+                class,
+                class_count,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): partition {partition} class index {class} outside header.classes (count={class_count}) (§7.2.3 step 6)"
+            ),
+            WriteFloor1PacketError::MasterbookOutOfRange {
+                class,
+                book,
+                codebook_count,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): classes[{class}].masterbook={book} >= codebooks.len()={codebook_count} (§7.2.2)"
+            ),
+            WriteFloor1PacketError::SubclassBookOutOfRange {
+                class,
+                subclass,
+                book,
+                codebook_count,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): classes[{class}].subclass_books[{subclass}]={book} >= codebooks.len()={codebook_count} (§7.2.2)"
+            ),
+            WriteFloor1PacketError::Huffman(e) => write!(
+                f,
+                "vorbis floor1 packet (write): Huffman build error: {e}"
+            ),
+            WriteFloor1PacketError::UnencodableY {
+                partition,
+                dimension,
+                y_value,
+                book,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): partition {partition} dimension {dimension} Y={y_value} not encodable by codebook {book} (§7.2.3 step 17)"
+            ),
+            WriteFloor1PacketError::NoneBookNonzeroY {
+                partition,
+                dimension,
+                y_value,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): partition {partition} dimension {dimension} Y={y_value} != 0 but its sub-book is None (§7.2.3 step 18 forces 0)"
+            ),
+            WriteFloor1PacketError::UnencodableCval {
+                partition,
+                cval,
+                book,
+            } => write!(
+                f,
+                "vorbis floor1 packet (write): partition {partition} cval={cval} not encodable by master codebook {book} (§7.2.3 step 12)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteFloor1PacketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WriteFloor1PacketError::Huffman(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::huffman::BuildError> for WriteFloor1PacketError {
+    fn from(value: crate::huffman::BuildError) -> Self {
+        WriteFloor1PacketError::Huffman(value)
+    }
+}
+
 /// Errors that may arise while writing a §4.3.1 audio-packet prelude
 /// via [`write_audio_packet_header`].
 ///
@@ -1303,6 +1567,7 @@ impl fmt::Display for WriteError {
             WriteError::Mode(e) => write!(f, "{e}"),
             WriteError::Setup(e) => write!(f, "{e}"),
             WriteError::AudioPacket(e) => write!(f, "{e}"),
+            WriteError::Floor1Packet(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1318,6 +1583,7 @@ impl std::error::Error for WriteError {
             WriteError::Mode(e) => Some(e),
             WriteError::Setup(e) => Some(e),
             WriteError::AudioPacket(e) => Some(e),
+            WriteError::Floor1Packet(e) => Some(e),
             _ => None,
         }
     }
@@ -1368,6 +1634,12 @@ impl From<WriteSetupError> for WriteError {
 impl From<WriteAudioPacketHeaderError> for WriteError {
     fn from(value: WriteAudioPacketHeaderError) -> Self {
         WriteError::AudioPacket(value)
+    }
+}
+
+impl From<WriteFloor1PacketError> for WriteError {
+    fn from(value: WriteFloor1PacketError) -> Self {
+        WriteError::Floor1Packet(value)
     }
 }
 
@@ -3172,6 +3444,333 @@ pub(crate) fn write_audio_packet_header_into_writer(
 
     Ok(())
 }
+
+/// Serialises a [`Floor1Packet`] to the §7.2.3 floor 1 audio-packet
+/// body bitstream shape.
+///
+/// This is the encoder-side counterpart of
+/// [`crate::floor1::Floor1Decoder::decode`]: given the same
+/// `(header, codebooks)` context the decoder was built with, the
+/// emitted packet decodes back to the `floor1_y` vector the caller
+/// supplied (modulo §7.2.4's `[floor1_final_Y]` derivation, which is
+/// the curve-computation stage).
+///
+/// Layout per §7.2.3:
+///
+/// | Step | Field             | Bits                              |
+/// | ---: | ----------------- | --------------------------------- |
+/// |    1 | `[nonzero]`       | 1                                 |
+/// |  2-3 | endpoints         | `2 × ilog(range - 1)` (if nonzero)|
+/// |    5 | per partition i { | iterate over `partition_class_list`|
+/// |   12 |   master `cval`   | masterbook codeword (if cbits > 0)|
+/// |   13 |   per dimension j { | iterate over `class.dimensions`  |
+/// |   17 |     sub-book Y    | sub-book codeword (if Some)       |
+/// |   18 |     (forced 0)    | 0 bits (if None)                  |
+/// |      |   }               |                                   |
+/// |      | }                 |                                   |
+///
+/// `[range]` is the `{256, 128, 86, 64}` entry indexed by
+/// `multiplier - 1` (§7.2.3 step 1). Each codeword is emitted MSb-first
+/// via [`crate::huffman::HuffmanTree::encode_entry`], matching the
+/// §3.2.1 canonical-codeword convention the decoder reads.
+///
+/// # Errors
+///
+/// Returns [`WriteFloor1PacketError`] without emitting any bits if any
+/// of the per-variant invariants is violated — see the type's variant
+/// documentation. The roundtrip property holds for every valid call:
+///
+/// ```text
+/// // For every legal Floor1Packet `p`, header `h`, codebooks `cb`:
+/// let bytes = write_floor1_packet(&p, &h, &cb).unwrap();
+/// let dec = Floor1Decoder::new(&h, &cb).unwrap();
+/// let curve = dec.decode(&mut BitReaderLsb::new(&bytes), n);
+/// // when nonzero: curve == Curve(expected_curve_from_p.floor1_y)
+/// // when !nonzero: curve == Unused
+/// ```
+pub fn write_floor1_packet(
+    packet: &Floor1Packet,
+    header: &crate::setup::Floor1Header,
+    codebooks: &[VorbisCodebook],
+) -> Result<Vec<u8>, WriteFloor1PacketError> {
+    let mut writer = BitWriterLsb::with_capacity(2);
+    write_floor1_packet_into_writer(packet, header, codebooks, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a §7.2.3 floor 1 audio-packet body into a
+/// larger bit-packed stream. The wrapping §4.3 audio-packet writer
+/// (explicit followup) will use this to thread the per-channel floor 1
+/// body between the §4.3.1 prelude and the §4.3.4 residue body,
+/// mirroring the existing per-header `_into_writer` splice points.
+///
+/// Writes the body's bits into `writer` at its current bit position.
+/// On error, no bits are emitted (validation precedes emission).
+pub(crate) fn write_floor1_packet_into_writer(
+    packet: &Floor1Packet,
+    header: &crate::setup::Floor1Header,
+    codebooks: &[VorbisCodebook],
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteFloor1PacketError> {
+    // ---- §7.2.3 step 1: unused short-circuit. ----
+    if !packet.nonzero {
+        // Emit only the `[nonzero] = 0` bit; the decoder returns
+        // FloorCurve::Unused without reading further. The other packet
+        // fields are intentionally ignored to keep "build an Unused
+        // packet without populating floor1_y / partition_cvals"
+        // ergonomic.
+        writer.write_bit(false);
+        return Ok(());
+    }
+
+    // ---- §7.2.3 fail-closed invariant gate. ----
+    // multiplier in 1..=4 (§7.2.3 step 1).
+    if !(1..=4).contains(&header.multiplier) {
+        return Err(WriteFloor1PacketError::IllegalMultiplier(header.multiplier));
+    }
+    let range = RANGE_TABLE_FLOOR1[(header.multiplier - 1) as usize];
+    let amp_bits = ilog(range - 1);
+
+    // floor1_y length = floor1_values (x_list.len() + 2 implicit endpoints).
+    let expected_y_len = header.x_list.len() + 2;
+    if packet.floor1_y.len() != expected_y_len {
+        return Err(WriteFloor1PacketError::YLengthMismatch {
+            expected: expected_y_len,
+            actual: packet.floor1_y.len(),
+        });
+    }
+
+    // partition_cvals length = partition_class_list.len() (§7.2.3 step 5).
+    let partitions = header.partition_class_list.len();
+    if packet.partition_cvals.len() != partitions {
+        return Err(WriteFloor1PacketError::CvalListLengthMismatch {
+            expected: partitions,
+            actual: packet.partition_cvals.len(),
+        });
+    }
+
+    // Endpoint ranges (§7.2.3 step 2/3): each Y must fit in `amp_bits`,
+    // i.e. be strictly less than `range`.
+    for idx in 0..2 {
+        let v = packet.floor1_y[idx];
+        if v >= range {
+            return Err(WriteFloor1PacketError::EndpointOverflow {
+                index: idx,
+                value: v,
+                range,
+            });
+        }
+    }
+
+    // Pre-resolve every partition's class + its master/sub-book Huffman
+    // trees in one pass so we fail fast on a bad class index or a
+    // dangling codebook reference *before* we start emitting bits. The
+    // partition_class_list / class-list out-of-range cases are then
+    // gated upstream; on success we have a parallel `Vec<ClassEnc>`
+    // ready for the emit pass.
+    struct ClassEnc {
+        dimensions: usize,
+        subclasses: u8,
+        masterbook_tree: Option<crate::huffman::HuffmanTree>,
+        subclass_trees: Vec<Option<crate::huffman::HuffmanTree>>,
+    }
+
+    let mut per_partition: Vec<ClassEnc> = Vec::with_capacity(partitions);
+    for (partition_idx, &class_no) in header.partition_class_list.iter().enumerate() {
+        let class =
+            header
+                .classes
+                .get(class_no as usize)
+                .ok_or(WriteFloor1PacketError::BadClassIndex {
+                    partition: partition_idx,
+                    class: class_no,
+                    class_count: header.classes.len(),
+                })?;
+
+        let masterbook_tree = if class.subclasses > 0 {
+            match class.masterbook {
+                Some(book) => {
+                    let cb = codebooks.get(book as usize).ok_or(
+                        WriteFloor1PacketError::MasterbookOutOfRange {
+                            class: class_no as usize,
+                            book,
+                            codebook_count: codebooks.len(),
+                        },
+                    )?;
+                    Some(crate::huffman::HuffmanTree::from_codebook(cb)?)
+                }
+                // (header parser already rejects subclasses > 0 with no
+                // masterbook; defensive None here means the decoder
+                // wouldn't read the masterbook either, so emit nothing.)
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let mut subclass_trees: Vec<Option<crate::huffman::HuffmanTree>> =
+            Vec::with_capacity(class.subclass_books.len());
+        for (sub_idx, slot) in class.subclass_books.iter().enumerate() {
+            match slot {
+                None => subclass_trees.push(None),
+                Some(book) => {
+                    let cb = codebooks.get(*book as usize).ok_or(
+                        WriteFloor1PacketError::SubclassBookOutOfRange {
+                            class: class_no as usize,
+                            subclass: sub_idx,
+                            book: *book,
+                            codebook_count: codebooks.len(),
+                        },
+                    )?;
+                    subclass_trees.push(Some(crate::huffman::HuffmanTree::from_codebook(cb)?));
+                }
+            }
+        }
+
+        per_partition.push(ClassEnc {
+            dimensions: class.dimensions as usize,
+            subclasses: class.subclasses,
+            masterbook_tree,
+            subclass_trees,
+        });
+    }
+
+    // Cross-check the implied Y length against `expected_y_len`: the
+    // sum of per-partition dimensions plus the two endpoint slots must
+    // equal x_list.len() + 2. (Header-side parser enforces this on
+    // input; we re-check defensively because a hand-built Floor1Header
+    // could disagree.)
+    let dims_sum: usize = per_partition.iter().map(|c| c.dimensions).sum();
+    let implied_y_len = dims_sum + 2;
+    if implied_y_len != expected_y_len {
+        return Err(WriteFloor1PacketError::YLengthMismatch {
+            expected: implied_y_len,
+            actual: expected_y_len,
+        });
+    }
+
+    // Per-partition encodability pre-check: walk `floor1_y` from
+    // offset 2, comparing each Y value against the corresponding
+    // sub-book's used-set. We need to do this BEFORE emitting any
+    // bits — see the fail-closed contract. We also resolve which
+    // sub-book each dimension uses by replaying the same `cval & csub
+    // → cval >>= cbits` decode logic on the encoder side.
+    //
+    // The check also catches the `cval` overflow case implicitly: if a
+    // class has cbits > 0 but the caller supplied a cval too large to
+    // emit through the master book (i.e. cval is not in the master
+    // book's used set), encode_entry will refuse — surfaced through
+    // UnencodableCval.
+
+    let mut offset = 2usize;
+    for (partition_idx, class) in per_partition.iter().enumerate() {
+        let cbits = class.subclasses;
+        let csub: u32 = (1u32 << cbits).saturating_sub(1);
+        let mut cval = packet.partition_cvals[partition_idx];
+
+        // Master selector: encodable only if a master tree exists and
+        // `cval` is a leaf.
+        if cbits > 0 {
+            if let Some(tree) = &class.masterbook_tree {
+                let mut dummy = BitWriterLsb::new();
+                tree.encode_entry(cval, &mut dummy).map_err(|_| {
+                    WriteFloor1PacketError::UnencodableCval {
+                        partition: partition_idx,
+                        cval,
+                        book: header.classes[header.partition_class_list[partition_idx] as usize]
+                            .masterbook
+                            .unwrap_or(0),
+                    }
+                })?;
+            }
+        }
+
+        for dim_idx in 0..class.dimensions {
+            let sub_idx = (cval & csub) as usize;
+            cval >>= cbits;
+            let y = packet.floor1_y[offset + dim_idx];
+            match class.subclass_trees.get(sub_idx).and_then(|t| t.as_ref()) {
+                Some(tree) => {
+                    let mut dummy = BitWriterLsb::new();
+                    tree.encode_entry(y, &mut dummy).map_err(|_| {
+                        // Resolve the codebook index for the error
+                        // message via the same path the decoder would
+                        // take.
+                        let class_no = header.partition_class_list[partition_idx] as usize;
+                        let book = header.classes[class_no].subclass_books[sub_idx].unwrap_or(0);
+                        WriteFloor1PacketError::UnencodableY {
+                            partition: partition_idx,
+                            dimension: dim_idx,
+                            y_value: y,
+                            book,
+                        }
+                    })?;
+                }
+                // §7.2.3 step 18: `None` sub-book forces Y = 0; a
+                // non-zero Y here has no on-wire round-trip.
+                None => {
+                    if y != 0 {
+                        return Err(WriteFloor1PacketError::NoneBookNonzeroY {
+                            partition: partition_idx,
+                            dimension: dim_idx,
+                            y_value: y,
+                        });
+                    }
+                }
+            }
+        }
+        offset += class.dimensions;
+    }
+
+    // ---- §7.2.3 emit. ----
+    // step 1: [nonzero] = 1.
+    writer.write_bit(true);
+    // steps 2..3: endpoints, each `amp_bits` wide.
+    writer.write_u32(packet.floor1_y[0], amp_bits);
+    writer.write_u32(packet.floor1_y[1], amp_bits);
+
+    // step 5: iterate partitions.
+    let mut offset = 2usize;
+    for (partition_idx, class) in per_partition.iter().enumerate() {
+        let cbits = class.subclasses;
+        let csub: u32 = (1u32 << cbits).saturating_sub(1);
+        let mut cval = packet.partition_cvals[partition_idx];
+
+        // step 12: master selector (only when cbits > 0).
+        if cbits > 0 {
+            if let Some(tree) = &class.masterbook_tree {
+                // `encode_entry` is infallible here because the
+                // pre-check verified `cval` is a leaf.
+                tree.encode_entry(cval, writer)
+                    .expect("encode_entry must succeed after pre-check; cval already validated");
+            }
+        }
+
+        // step 13: per-dimension Y emission.
+        for dim_idx in 0..class.dimensions {
+            let sub_idx = (cval & csub) as usize;
+            cval >>= cbits;
+            let y = packet.floor1_y[offset + dim_idx];
+            match class.subclass_trees.get(sub_idx).and_then(|t| t.as_ref()) {
+                Some(tree) => {
+                    tree.encode_entry(y, writer)
+                        .expect("encode_entry must succeed after pre-check; Y already validated");
+                }
+                None => {
+                    // §7.2.3 step 18: Y is forced to 0; no bits emitted.
+                }
+            }
+        }
+        offset += class.dimensions;
+    }
+
+    // step 20: done.
+    Ok(())
+}
+
+/// `[range]` table for floor 1 (§7.2.3 step 1, also §7.2.4 step-1 step 1):
+/// `{ 256, 128, 86, 64 }` indexed by `[floor1_multiplier] - 1`.
+const RANGE_TABLE_FLOOR1: [u32; 4] = [256, 128, 86, 64];
 
 #[cfg(test)]
 mod tests {
@@ -8296,5 +8895,633 @@ mod tests {
         let splice = w.finish();
 
         assert_eq!(splice, public);
+    }
+
+    // ----------------------------------------------------------------
+    // Floor 1 audio-packet body (§7.2.3) — round 250.
+    // ----------------------------------------------------------------
+
+    use crate::floor1::{Floor1Decoder, FloorCurve};
+
+    /// Minimal scalar codebook with `entries` length-1 entries (so a
+    /// 2-entry book assigns entry 0 → '0', entry 1 → '1'). Mirrors the
+    /// helper in `floor1` tests so the §7.2.3 packet shape exercised
+    /// here matches what `Floor1Decoder::decode` reads.
+    fn fp_scalar_book(entries: u32) -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions: 1,
+            entries,
+            codeword_lengths: vec![1u8; entries as usize],
+            lookup: VqLookup::None,
+        }
+    }
+
+    /// One-partition fixture matching the `floor1::tests::header_one_partition`
+    /// configuration: 1 partition of class 0; class 0 dim 2, subclasses 0,
+    /// one subclass book (index 0). multiplier 2, rangebits 4.
+    fn fp_header_one_partition() -> crate::setup::Floor1Header {
+        crate::setup::Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        }
+    }
+
+    /// `[nonzero] = 0` packet is exactly one zero bit; decoder returns
+    /// `Unused` regardless of x_list / floor1_values.
+    #[test]
+    fn floor1_packet_unused_is_single_zero_bit() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: false,
+            floor1_y: vec![], // ignored when nonzero == false
+            partition_cvals: vec![],
+        };
+        let bytes = write_floor1_packet(&packet, &header, &codebooks).expect("must encode");
+        // Single zero bit packs to one byte of value 0.
+        assert_eq!(bytes, vec![0u8]);
+
+        // Decoder roundtrip: FloorCurve::Unused.
+        let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(dec.decode(&mut r, 16), FloorCurve::Unused);
+    }
+
+    /// Roundtrip a `[nonzero] = 1` packet through the §7.2.3 decoder
+    /// and confirm the recovered curve matches the floor1_packet_full_curve_round_trip
+    /// fixture from the floor1 tests.
+    #[test]
+    fn floor1_packet_full_body_round_trips_against_decoder() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+
+        // Y values from the floor1 hand-trace test: endpoints 40, 20;
+        // interior values 1, 0 (entry 1 then entry 0 of the 2-entry book).
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0], // unused (class.subclasses == 0)
+        };
+        let bytes = write_floor1_packet(&packet, &header, &codebooks).expect("must encode");
+
+        // Decode and check curve == the hand-trace expected.
+        let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let expected_int: [usize; 16] = [
+            80, 77, 74, 71, 68, 66, 64, 61, 59, 57, 54, 52, 50, 47, 45, 43,
+        ];
+        let expected: Vec<f32> = expected_int
+            .iter()
+            .map(|&i| crate::floor1::INVERSE_DB_TABLE[i])
+            .collect();
+        match dec.decode(&mut r, 16) {
+            FloorCurve::Curve(c) => assert_eq!(c, expected),
+            FloorCurve::Unused => panic!("expected a curve, got Unused"),
+        }
+    }
+
+    /// Byte-shape pinning: the one-partition non-zero packet is a fixed
+    /// bit pattern.
+    ///   [nonzero=1] + [ep0=40,7b] + [ep1=20,7b] + [Y=1,1b] + [Y=0,1b]
+    ///   = 1 + 7 + 7 + 1 + 1 = 17 bits → 3 bytes.
+    /// LSB-first packing assembles those bits into:
+    ///   bit 0 (LSb of byte 0): nonzero = 1
+    ///   bits 1..=7 (rest of byte 0 + bit 0 of byte 1): ep0 = 40 LSb-first
+    ///   ...
+    /// We compute the expected bytes via BitWriterLsb directly so the
+    /// test pins the bit ordering rather than guessing.
+    #[test]
+    fn floor1_packet_byte_shape_one_partition() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        let bytes = write_floor1_packet(&packet, &header, &codebooks).unwrap();
+
+        // Build the same bit sequence with the raw bit writer.
+        let mut expected_w = BitWriterLsb::with_capacity(3);
+        expected_w.write_bit(true); // nonzero
+        expected_w.write_u32(40, 7); // ep0 (ilog(127) = 7 bits)
+        expected_w.write_u32(20, 7); // ep1
+                                     // Class subclasses == 0: no master codeword. csub = 0,
+                                     // cval = 0 → sub_idx = 0 for both dimensions, reads
+                                     // 2-entry scalar book whose codewords are '0' and '1'.
+        expected_w.write_bit(true); // Y[2] = 1 → entry 1 → codeword '1'
+        expected_w.write_bit(false); // Y[3] = 0 → entry 0 → codeword '0'
+        let expected = expected_w.finish();
+        assert_eq!(bytes, expected);
+    }
+
+    /// Master/sub-cascade roundtrip: a class with subclasses > 0 reads
+    /// a master selector then per-dim sub-book codewords. The packet
+    /// writer must emit both, threading `cval` through `cval & csub`
+    /// then `cval >>= cbits` on each dimension exactly like the
+    /// decoder.
+    #[test]
+    fn floor1_packet_master_subclass_cascade_round_trips() {
+        // Mirror of `floor1::tests::packet_decode_master_subclass_cascade`.
+        let header = crate::setup::Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        // 4-entry master book; lengths [2,2,2,2] yield codewords
+        //   entry 0 = 00, entry 1 = 01, entry 2 = 10, entry 3 = 11.
+        let master = VorbisCodebook {
+            dimensions: 1,
+            entries: 4,
+            codeword_lengths: vec![2, 2, 2, 2],
+            lookup: VqLookup::None,
+        };
+        let codebooks = vec![master, fp_scalar_book(2), fp_scalar_book(2)];
+
+        // Pick cval = 2 (binary 10):
+        //   dim 0: sub_idx = cval & 1 = 0 → subbook A (index 1); cval >>= 1 → 1.
+        //   dim 1: sub_idx = cval & 1 = 1 → subbook B (index 2); cval >>= 1 → 0.
+        // So Y[2] is encoded via subbook A; Y[3] via subbook B.
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![2],
+        };
+        let bytes = write_floor1_packet(&packet, &header, &codebooks).unwrap();
+
+        let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let expected_int: [usize; 16] = [
+            80, 77, 74, 71, 68, 66, 64, 61, 59, 57, 54, 52, 50, 47, 45, 43,
+        ];
+        let expected: Vec<f32> = expected_int
+            .iter()
+            .map(|&i| crate::floor1::INVERSE_DB_TABLE[i])
+            .collect();
+        match dec.decode(&mut r, 16) {
+            FloorCurve::Curve(c) => assert_eq!(c, expected),
+            FloorCurve::Unused => panic!("expected a curve, got Unused"),
+        }
+    }
+
+    /// A `None` sub-book (encoded `-1`) forces the Y value to 0 and
+    /// emits zero bits for that dimension. The writer accepts Y = 0
+    /// and rejects any non-zero Y in that slot.
+    #[test]
+    fn floor1_packet_none_subclass_book_accepts_zero_rejects_nonzero() {
+        let header = crate::setup::Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![None], // forces Y = 0
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks = [fp_scalar_book(2)];
+
+        // Zero interior Ys: encodes cleanly; decoder yields a curve.
+        let ok = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 0, 0],
+            partition_cvals: vec![0],
+        };
+        let bytes = write_floor1_packet(&ok, &header, &codebooks).unwrap();
+        let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        match dec.decode(&mut r, 16) {
+            FloorCurve::Curve(c) => assert_eq!(c.len(), 16),
+            FloorCurve::Unused => panic!("expected a curve"),
+        }
+
+        // Non-zero in a `None` slot is rejected.
+        let bad = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 7, 0],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&bad, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::NoneBookNonzeroY {
+                partition: 0,
+                dimension: 0,
+                y_value: 7,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `floor1_y.len()` must equal `floor1_values` (= x_list.len() + 2).
+    #[test]
+    fn floor1_packet_rejects_y_length_mismatch() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        // expected 4 (2 endpoints + 2 from one partition of dim 2);
+        // give 3 → reject.
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::YLengthMismatch {
+                expected: 4,
+                actual: 3,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `partition_cvals.len()` must equal `partitions`.
+    #[test]
+    fn floor1_packet_rejects_cval_list_length_mismatch() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0, 1], // 2 != partitions (1)
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::CvalListLengthMismatch {
+                expected: 1,
+                actual: 2,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `multiplier` outside `1..=4` is rejected.
+    #[test]
+    fn floor1_packet_rejects_illegal_multiplier() {
+        let mut header = fp_header_one_partition();
+        header.multiplier = 0;
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::IllegalMultiplier(0) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Endpoint amplitude `>= range` is rejected; multiplier 2 → range
+    /// 128, so a value of 128 is the smallest illegal endpoint.
+    #[test]
+    fn floor1_packet_rejects_endpoint_overflow() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        // ep0 = 128 = range for multiplier 2.
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![128, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::EndpointOverflow {
+                index: 0,
+                value: 128,
+                range: 128,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `partition_class_list[i]` pointing at a missing class entry
+    /// is rejected.
+    #[test]
+    fn floor1_packet_rejects_bad_class_index() {
+        let mut header = fp_header_one_partition();
+        // Point at class 5 which does not exist.
+        header.partition_class_list = vec![5];
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::BadClassIndex {
+                partition: 0,
+                class: 5,
+                class_count: 1,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `masterbook` pointing past the codebook table is rejected.
+    #[test]
+    fn floor1_packet_rejects_masterbook_out_of_range() {
+        let header = crate::setup::Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(9), // out of range
+                subclass_books: vec![Some(0), Some(0)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::MasterbookOutOfRange {
+                class: 0,
+                book: 9,
+                codebook_count: 1,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A subclass book pointing past the codebook table is rejected.
+    #[test]
+    fn floor1_packet_rejects_subclass_book_out_of_range() {
+        let header = crate::setup::Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(9)], // out of range
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::SubclassBookOutOfRange {
+                class: 0,
+                subclass: 0,
+                book: 9,
+                codebook_count: 1,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A Y value not present in the sub-book's used set is rejected
+    /// with `UnencodableY`.
+    #[test]
+    fn floor1_packet_rejects_unencodable_y() {
+        let header = fp_header_one_partition();
+        // 2-entry book → only Y values 0 and 1 are encodable.
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 7, 0], // Y=7 doesn't fit the book
+            partition_cvals: vec![0],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::UnencodableY {
+                partition: 0,
+                dimension: 0,
+                y_value: 7,
+                book: 0,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A `cval` value larger than the master book's used set is
+    /// rejected with `UnencodableCval`.
+    #[test]
+    fn floor1_packet_rejects_unencodable_cval() {
+        let header = crate::setup::Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        // Master book has only 4 entries (lengths [2,2,2,2]).
+        let master = VorbisCodebook {
+            dimensions: 1,
+            entries: 4,
+            codeword_lengths: vec![2, 2, 2, 2],
+            lookup: VqLookup::None,
+        };
+        let codebooks = vec![master, fp_scalar_book(2), fp_scalar_book(2)];
+        // cval = 9 is past the 4 entries → unencodable.
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 0, 0],
+            partition_cvals: vec![9],
+        };
+        match write_floor1_packet(&packet, &header, &codebooks).unwrap_err() {
+            WriteFloor1PacketError::UnencodableCval {
+                partition: 0,
+                cval: 9,
+                book: 0,
+            } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Roundtrip across the four multiplier values (1..=4) on the
+    /// one-partition fixture. Each multiplier yields a different
+    /// `[range]`; the writer derives `amp_bits = ilog(range - 1)` and
+    /// the decoder must read back the same endpoint values.
+    #[test]
+    fn floor1_packet_round_trips_across_all_multipliers() {
+        let mut header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        for multiplier in 1u8..=4 {
+            header.multiplier = multiplier;
+            let range = RANGE_TABLE_FLOOR1[(multiplier - 1) as usize];
+            // Use endpoint values inside `range`.
+            let ep0 = range / 4;
+            let ep1 = range / 8;
+            let packet = Floor1Packet {
+                nonzero: true,
+                floor1_y: vec![ep0, ep1, 0, 0],
+                partition_cvals: vec![0],
+            };
+            let bytes = write_floor1_packet(&packet, &header, &codebooks).unwrap();
+            let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+            let mut r = BitReaderLsb::new(&bytes);
+            // For this fixture (interior Ys = 0) decode yields a
+            // FloorCurve::Curve.
+            match dec.decode(&mut r, 16) {
+                FloorCurve::Curve(c) => assert_eq!(c.len(), 16),
+                FloorCurve::Unused => {
+                    panic!("multiplier {multiplier}: expected a curve, got Unused")
+                }
+            }
+        }
+    }
+
+    /// The splice helper `write_floor1_packet_into_writer` produces the
+    /// same bytes as the public wrapper when the writer starts byte-
+    /// aligned at position 0.
+    #[test]
+    fn floor1_packet_splice_matches_public_writer() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![40, 20, 1, 0],
+            partition_cvals: vec![0],
+        };
+        let public = write_floor1_packet(&packet, &header, &codebooks).unwrap();
+
+        let mut w = BitWriterLsb::with_capacity(1);
+        write_floor1_packet_into_writer(&packet, &header, &codebooks, &mut w).unwrap();
+        let splice = w.finish();
+
+        assert_eq!(splice, public);
+    }
+
+    /// The unused-path splice helper writes exactly one zero bit.
+    /// When the writer is already byte-aligned, this packs to a single
+    /// 0x00 byte.
+    #[test]
+    fn floor1_packet_unused_splice_writes_one_zero_bit() {
+        let header = fp_header_one_partition();
+        let codebooks = [fp_scalar_book(2)];
+        let packet = Floor1Packet {
+            nonzero: false,
+            floor1_y: vec![],
+            partition_cvals: vec![],
+        };
+        let mut w = BitWriterLsb::with_capacity(1);
+        // Establish the bit position is 0 → byte boundary.
+        let pos_before = w.bit_position();
+        write_floor1_packet_into_writer(&packet, &header, &codebooks, &mut w).unwrap();
+        let pos_after = w.bit_position();
+        assert_eq!(pos_after - pos_before, 1, "unused emits exactly one bit");
+        let bytes = w.finish();
+        assert_eq!(bytes, vec![0u8]);
+    }
+
+    /// The umbrella `WriteError` From-glue forwards
+    /// `WriteFloor1PacketError` into `WriteError::Floor1Packet` and
+    /// preserves `source()` chaining for the wrapping error.
+    #[test]
+    fn floor1_packet_umbrella_write_error_glue() {
+        let err: WriteError = WriteFloor1PacketError::IllegalMultiplier(5).into();
+        match &err {
+            WriteError::Floor1Packet(WriteFloor1PacketError::IllegalMultiplier(5)) => {}
+            other => panic!("From glue wrong variant: {other:?}"),
+        }
+        let source = std::error::Error::source(&err);
+        assert!(source.is_some(), "Floor1Packet must chain its source");
+
+        let crate_err: crate::Error = err.into();
+        match &crate_err {
+            crate::Error::Write(WriteError::Floor1Packet(
+                WriteFloor1PacketError::IllegalMultiplier(5),
+            )) => {}
+            other => panic!("crate::Error glue wrong variant: {other:?}"),
+        }
+    }
+
+    /// `Display` of every `WriteFloor1PacketError` variant is non-empty
+    /// and (where applicable) contains the offending number.
+    #[test]
+    fn floor1_packet_error_displays_are_informative() {
+        let cases: Vec<WriteFloor1PacketError> = vec![
+            WriteFloor1PacketError::YLengthMismatch {
+                expected: 4,
+                actual: 3,
+            },
+            WriteFloor1PacketError::CvalListLengthMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            WriteFloor1PacketError::IllegalMultiplier(5),
+            WriteFloor1PacketError::EndpointOverflow {
+                index: 0,
+                value: 128,
+                range: 128,
+            },
+            WriteFloor1PacketError::BadClassIndex {
+                partition: 0,
+                class: 5,
+                class_count: 1,
+            },
+            WriteFloor1PacketError::MasterbookOutOfRange {
+                class: 0,
+                book: 9,
+                codebook_count: 1,
+            },
+            WriteFloor1PacketError::SubclassBookOutOfRange {
+                class: 0,
+                subclass: 0,
+                book: 9,
+                codebook_count: 1,
+            },
+            WriteFloor1PacketError::UnencodableY {
+                partition: 0,
+                dimension: 1,
+                y_value: 42,
+                book: 3,
+            },
+            WriteFloor1PacketError::NoneBookNonzeroY {
+                partition: 0,
+                dimension: 0,
+                y_value: 7,
+            },
+            WriteFloor1PacketError::UnencodableCval {
+                partition: 0,
+                cval: 9,
+                book: 0,
+            },
+        ];
+        for e in &cases {
+            let s = format!("{e}");
+            assert!(
+                !s.is_empty(),
+                "Display for {e:?} must produce non-empty output"
+            );
+            assert!(
+                s.contains("floor1") || s.contains("vorbis"),
+                "Display for {e:?} should be grep-able: {s}"
+            );
+        }
     }
 }

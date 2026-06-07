@@ -6,6 +6,59 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §7.2.3 floor 1 audio-packet body WRITE primitive
+  (round 31, umbrella round 250).** First audio-packet *body* WRITE
+  primitive — the next step in the §4.3 audio-packet writer after the
+  round-28 §4.3.1 prelude. New public function
+  `encoder::write_floor1_packet(&Floor1Packet, &Floor1Header,
+  &[VorbisCodebook])` serialises the §7.2.3 floor 1 per-channel
+  payload: the `[nonzero]=0` unused short-circuit (single zero bit),
+  or the full `[nonzero]=1` body — two endpoint amplitudes
+  (`ilog([range]-1)` bits each) followed by per-partition emissions
+  threading `cval` through `cval & csub` → `cval >>= cbits` exactly
+  like the round-9 decoder reads them back. Each codeword is emitted
+  MSb-first via the new `HuffmanTree::encode_entry` helper, matching
+  the §3.2.1 canonical-codeword convention.
+  A `Floor1Packet` struct (`nonzero`, `floor1_y`, `partition_cvals`)
+  describes the on-wire shape; a `WriteFloor1PacketError` enum
+  enumerates ten §7.2.3 invariant violations
+  (`YLengthMismatch`, `CvalListLengthMismatch`, `IllegalMultiplier`,
+  `EndpointOverflow`, `BadClassIndex`, `MasterbookOutOfRange`,
+  `SubclassBookOutOfRange`, `Huffman`, `UnencodableY`,
+  `NoneBookNonzeroY`, `UnencodableCval`). The umbrella `WriteError`
+  grows a matching `WriteError::Floor1Packet` variant with the
+  `From` glue and `source()` chain. The encoder-side Huffman helper
+  `HuffmanTree::encode_entry(entry, &mut BitWriterLsb)` performs the
+  byte-exact inverse of `decode_entry`: a DFS path from the root to
+  the requested leaf records the canonical codeword, emitted
+  MSb-first; an `EncodeError::UnknownEntry` variant flags entries
+  not present in the tree's used set. A crate-private
+  `write_floor1_packet_into_writer` splice helper is shaped to
+  thread the body between the §4.3.1 prelude and the §4.3.4
+  residue body in the wrapping audio-packet writer (followup).
+  26 new in-module unit tests bring the suite from 578 to 604: the
+  unused short-circuit byte shape, the full-body byte shape, the
+  hand-trace `floor1_packet_full_body_round_trips_against_decoder`
+  matching the round-9 floor1 decoder fixture, the master/sub-cascade
+  roundtrip with a 4-entry master book + two sub-books, the `None`
+  sub-book Y=0 acceptance + nonzero rejection, length-mismatch
+  rejections on both `floor1_y` and `partition_cvals`, illegal-
+  multiplier rejection, endpoint-overflow rejection, bad-class-index
+  rejection, masterbook / subclass-book out-of-range rejections,
+  unencodable-Y / unencodable-cval rejections, roundtrip across all
+  four multiplier values, splice helper matches public writer, splice
+  in unused path writes exactly one bit, the umbrella `WriteError`
+  From glue + `crate::Error` glue, and `Display` informativeness for
+  every error variant. The Huffman side adds seven more tests
+  exercising `encode_entry`: the §3.2.1 worked-example codeword
+  emission, concatenated encode→decode roundtrip across the worked
+  example, balanced 16-entry length-4 tree roundtrip, sparse codebook
+  rejection of unused entries, single-entry codebook emits one zero
+  bit + non-sole entry rejection, generic encode→decode roundtrip on
+  a mixed-length tree, `EncodeError` `Display` content. Spec source:
+  `docs/audio/vorbis/Vorbis_I_spec.pdf` §7.2.3, §7.2.2, §3.2.1,
+  §9.2.1 (`ilog`), §2.1.4 (LSB-first packing).
+
 * **Vorbis I §4.3.6 window pre-multiplication primitive (round 30,
   umbrella round 246).** New public function
   `synthesis::window_premultiply(time_frame, window)` that applies

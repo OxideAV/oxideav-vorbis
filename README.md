@@ -1,6 +1,129 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 30.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 31.
+
+## Status — 2026-06-07 (round 31, umbrella round 250)
+
+**Round 31 lands the §7.2.3 floor 1 audio-packet *body* WRITE primitive
+— the next encoder write step after the round-28 §4.3.1 prelude.**
+New public function `encoder::write_floor1_packet(&Floor1Packet,
+&Floor1Header, &[VorbisCodebook])` serialises the §7.2.3 floor 1
+per-channel payload to the bitstream the round-9
+`Floor1Decoder::decode` reads back. Both §7.2.3 paths are emitted:
+
+* `[nonzero] = 0` — single zero bit; the decoder yields
+  `FloorCurve::Unused` without reading further. The other
+  `Floor1Packet` fields are ignored, so the unused case is ergonomic
+  to construct.
+* `[nonzero] = 1` — two endpoint amplitudes (each `ilog([range] - 1)`
+  bits, where `[range] = {256, 128, 86, 64}[multiplier - 1]`) followed
+  by per-partition emissions. Each partition optionally emits a
+  master-book codeword (only when `class.subclasses > 0`) and then
+  per-dimension sub-book codewords, threading `cval` through
+  `cval & csub` → `cval >>= cbits` exactly like the decoder reads
+  them back.
+
+Each canonical Huffman codeword is emitted MSb-first via the new
+`HuffmanTree::encode_entry(entry, &mut BitWriterLsb)` helper — the
+byte-exact inverse of the round-4 `decode_entry`. A DFS path from
+the tree's root to the requested leaf records the codeword bits in
+root-to-leaf order (already MSb-first under §3.2.1's "leftmost bit
+is the MSb" convention), then streams them into the writer. An
+`EncodeError::UnknownEntry` variant flags entries not present in the
+tree's used set, surfaced through the floor 1 packet writer as
+`WriteFloor1PacketError::UnencodableY` or `::UnencodableCval`.
+
+A `Floor1Packet` struct describes the on-wire shape: `nonzero` flag,
+`floor1_y: Vec<u32>` (length `header.x_list.len() + 2` — two
+endpoints + every per-dimension Y), and `partition_cvals: Vec<u32>`
+(one per partition; only consulted when the class has
+`subclasses > 0`). The encoder choice exposed in `partition_cvals`
+is the master-selector value the §7.2.3 spec reads as a master
+codeword and then bit-decomposes per dimension; making it explicit
+lets a future psychoacoustic encoder pick the value that produces
+the lowest-rate sub-book assignment without the writer guessing.
+
+`WriteFloor1PacketError` enumerates ten §7.2.3 invariant violations:
+`YLengthMismatch`, `CvalListLengthMismatch`, `IllegalMultiplier`,
+`EndpointOverflow`, `BadClassIndex`, `MasterbookOutOfRange`,
+`SubclassBookOutOfRange`, `Huffman`, `UnencodableY`,
+`NoneBookNonzeroY`, `UnencodableCval`. The writer pre-validates every
+invariant before emitting a single bit (fail-closed semantics
+mirroring the round-22 floor 1 header writer + the round-28 audio-
+packet header writer). The umbrella `WriteError` grows a
+`WriteError::Floor1Packet` variant with the matching `From` glue and
+`source()` chain; the umbrella `crate::Error::Write` doc-comment
+lists `write_floor1_packet` alongside the existing header writers.
+
+A crate-private `write_floor1_packet_into_writer` splice helper
+matches the existing per-header `_into_writer` pattern; the wrapping
+§4.3 audio-packet writer (explicit followup) will use it to thread
+the floor 1 body between the §4.3.1 prelude and the §4.3.4 residue
+body.
+
+26 new in-module unit tests bring the crate-wide test count from
+**578 → 604 (+26)**:
+
+* the unused short-circuit byte shape (single 0x00 byte);
+* the full-body byte shape pinned bit-by-bit against `BitWriterLsb`
+  on the one-partition fixture;
+* the hand-trace round-trip
+  `floor1_packet_full_body_round_trips_against_decoder` matching the
+  round-9 floor 1 decoder's `packet_decode_full_curve_round_trip`
+  expected curve;
+* the master/sub-cascade roundtrip mirroring round-9
+  `packet_decode_master_subclass_cascade` with a 4-entry master book
+  + two sub-books;
+* a `None` sub-book accepts Y = 0 and rejects nonzero Y;
+* length-mismatch rejections on both `floor1_y` and
+  `partition_cvals`;
+* illegal-multiplier rejection;
+* endpoint-overflow rejection at the `>= range` boundary;
+* bad-class-index rejection (partition pointing at a missing class);
+* masterbook / subclass-book out-of-range rejections;
+* unencodable-Y rejection (Y not in the sub-book's used set);
+* unencodable-cval rejection (cval not in the master-book's used
+  set);
+* roundtrip across all four multiplier values (1..=4) producing
+  per-multiplier `[range]` values {256, 128, 86, 64};
+* splice helper matches the public writer's bytes;
+* unused-path splice emits exactly one bit;
+* the umbrella `WriteError::Floor1Packet` From glue plus the
+  crate-level `Error::Write` glue chain;
+* `Display` content for every `WriteFloor1PacketError` variant is
+  non-empty and grep-friendly.
+
+The Huffman side adds seven tests exercising `encode_entry`: the
+§3.2.1 worked-example codeword emission, the concatenated
+encode→decode roundtrip across the worked example, balanced 16-entry
+length-4 tree roundtrip, sparse codebook rejection of unused
+entries, single-entry codebook emits one zero bit and rejects
+non-sole entries, a generic encode→decode roundtrip on a
+mixed-length `[2,2,3,3,3,3]` tree, `EncodeError::UnknownEntry`
+`Display` content.
+
+Followups (explicit):
+
+* The wrapping §4.3 audio-packet writer that splices §4.3.1 prelude
+  + per-channel §7.2.3 floor 1 body + the §4.3.4 residue body + the
+  §4.3.6 dot-product spectrum + §4.3.7 forward MDCT.
+* The §6.2.2 floor 0 packet-body WRITE primitive (the
+  amplitude/coefficient inverse — needs a VQ-encode side; floor 1 is
+  the dominant format in every fixture under
+  `docs/audio/vorbis/fixtures/`, so floor 0 packet WRITE follows in
+  a later round).
+* The §8.6.2 residue-body WRITE primitive (three format variants
+  0/1/2 plus the bundle / scatter machinery).
+* Pinning the Vorbis-specific MDCT normalization scalar once
+  fixture traces under `docs/audio/vorbis/fixtures/<case>/` extend
+  through the post-MDCT trace point.
+* The §4.3.8 encoder-side framing-inverse (a forward window +
+  overlap-segment splitter).
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §7.2.3 (floor 1
+packet decode), §7.2.2 (floor 1 setup invariants), §3.2.1
+(canonical Huffman codeword assignment + the MSb-first emission
+convention), §9.2.1 (`ilog`), §2.1.4 (LSB-first packing).
 
 ## Status — 2026-06-07 (round 30, umbrella round 246)
 

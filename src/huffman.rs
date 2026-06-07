@@ -100,7 +100,7 @@
 
 use core::fmt;
 
-use oxideav_core::bits::BitReaderLsb;
+use oxideav_core::bits::{BitReaderLsb, BitWriterLsb};
 
 use crate::codebook::{VorbisCodebook, UNUSED_ENTRY};
 
@@ -227,6 +227,36 @@ pub enum DecodeError {
     /// to the decoder."
     UnexpectedEndOfPacket,
 }
+
+/// Errors raised by [`HuffmanTree::encode_entry`] while emitting the
+/// canonical codeword for a codebook entry to a bitstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    /// The requested entry index is outside the tree's leaf set. A
+    /// well-formed call only ever asks for an entry index that the tree
+    /// has a leaf for; an out-of-range index either points past the
+    /// codebook's `entries` field or names an entry whose codeword
+    /// length was [`UNUSED_ENTRY`] at build time.
+    UnknownEntry {
+        /// The offending entry index.
+        entry: u32,
+        /// Number of used (leaf) entries the tree was built with.
+        used_count: u32,
+    },
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EncodeError::UnknownEntry { entry, used_count } => write!(
+                f,
+                "vorbis huffman: no canonical codeword for entry {entry} (tree has {used_count} used entries)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -489,6 +519,94 @@ impl HuffmanTree {
                         .map_err(|_| DecodeError::UnexpectedEndOfPacket)?;
                     cur = if bit { right } else { left };
                 }
+            }
+        }
+    }
+
+    /// Encode a single codebook entry index to an LSb-first packet
+    /// bitstream as its canonical Huffman codeword, emitting MSb-first.
+    ///
+    /// This is the byte-exact inverse of [`HuffmanTree::decode_entry`]:
+    /// for every entry index `e` the tree has a leaf for, calling
+    /// `encode_entry(e, &mut writer)` followed by `decode_entry` on a
+    /// reader over `writer.finish()` returns `e`. The first bit written
+    /// is the MSb of the canonical codeword (matching §3.2.1's
+    /// "leftmost bit is the MSb" convention); subsequent bits stream
+    /// the lower bits of the codeword down to the LSb at codeword
+    /// length `L`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeError::UnknownEntry`] if `entry` does not name a
+    /// leaf of the tree — either because it points past the codebook's
+    /// `entries` field or because the entry's codeword length was
+    /// [`UNUSED_ENTRY`] at build time. The writer is not mutated on
+    /// failure (validation happens via a single tree walk that emits
+    /// nothing until it has determined the codeword).
+    ///
+    /// # Single-entry codebook fast path
+    ///
+    /// Per errata 20150226 a single-entry codebook always returns its
+    /// sole entry from `decode_entry` while sinking one bit. The encode
+    /// counterpart emits one zero bit for the sole entry (the spec also
+    /// permits a `1` for decoder tolerance, but the writer always picks
+    /// `0` so the round-trip is deterministic). Any other entry index
+    /// is rejected.
+    pub fn encode_entry(&self, entry: u32, writer: &mut BitWriterLsb) -> Result<(), EncodeError> {
+        // Single-entry codebook fast path (errata 20150226): the tree
+        // has exactly one leaf reached by either bit. Emit `0` as the
+        // canonical "first bit" for round-trip determinism.
+        if let Some(only) = self.single_entry {
+            if entry != only {
+                return Err(EncodeError::UnknownEntry {
+                    entry,
+                    used_count: 1,
+                });
+            }
+            writer.write_bit(false);
+            return Ok(());
+        }
+
+        // Walk the tree from the root, recording the bit (0 = left,
+        // 1 = right) taken at each internal node, until we hit the
+        // requested leaf. The recorded `Vec<bool>` is the canonical
+        // codeword for `entry`, MSb-first. Tree depth is bounded by
+        // §3.2.1's 32-bit hard limit on codeword length, so the
+        // recursion budget is tiny.
+        let mut codeword: Vec<bool> = Vec::with_capacity(32);
+        if !self.walk_to_leaf(0, entry, &mut codeword) {
+            return Err(EncodeError::UnknownEntry {
+                entry,
+                used_count: self.used_count,
+            });
+        }
+        // Emit the codeword bits MSb-first: walk_to_leaf appends bits
+        // in root-to-leaf order, which is already MSb-first.
+        for bit in &codeword {
+            writer.write_bit(*bit);
+        }
+        Ok(())
+    }
+
+    /// DFS helper for [`Self::encode_entry`]: walk from `node_idx`
+    /// looking for `Leaf(entry)`, appending the chosen bit (false for
+    /// `left`, true for `right`) at each internal node and back-tracking
+    /// on miss. Returns `true` iff the leaf was found.
+    fn walk_to_leaf(&self, node_idx: u32, entry: u32, path: &mut Vec<bool>) -> bool {
+        match self.nodes[node_idx as usize] {
+            HuffmanNode::Leaf(found) => found == entry,
+            HuffmanNode::Internal { left, right } => {
+                path.push(false);
+                if self.walk_to_leaf(left, entry, path) {
+                    return true;
+                }
+                path.pop();
+                path.push(true);
+                if self.walk_to_leaf(right, entry, path) {
+                    return true;
+                }
+                path.pop();
+                false
             }
         }
     }
@@ -801,5 +919,162 @@ mod tests {
         let bytes = pack_codewords(&[(0, 1)]);
         let mut r = BitReaderLsb::new(&bytes);
         assert_eq!(tree.decode_entry(&mut r).unwrap(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // encode_entry tests (round 250) — encoder-side canonical codeword
+    // emission, the byte-exact inverse of decode_entry.
+    // ----------------------------------------------------------------
+
+    /// §3.2.1 worked example: encoding each entry emits exactly the
+    /// canonical codeword bits the spec lists for it, MSb-first.
+    #[test]
+    fn encodes_spec_worked_example_codewords() {
+        let lengths = [2u8, 4, 4, 4, 4, 2, 3, 3];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("must build");
+        let expected: [(u32, u8); 8] = [
+            (0b00, 2),
+            (0b0100, 4),
+            (0b0101, 4),
+            (0b0110, 4),
+            (0b0111, 4),
+            (0b10, 2),
+            (0b110, 3),
+            (0b111, 3),
+        ];
+        for (entry, &(code, len)) in expected.iter().enumerate() {
+            let mut w = BitWriterLsb::with_capacity(2);
+            tree.encode_entry(entry as u32, &mut w)
+                .expect("encode must succeed");
+            let bytes = w.finish();
+            let expected_bytes = pack_codewords(&[(code, len)]);
+            assert_eq!(
+                bytes,
+                expected_bytes,
+                "entry {entry} should emit codeword {code:0width$b}",
+                width = len as usize,
+            );
+        }
+    }
+
+    /// Concatenated encode → decode roundtrip across the spec example.
+    /// Encodes every entry into one buffer and decodes back; recovers
+    /// the original 0..8 sequence.
+    #[test]
+    fn concatenated_encode_decode_round_trips_worked_example() {
+        let lengths = [2u8, 4, 4, 4, 4, 2, 3, 3];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("must build");
+        let mut w = BitWriterLsb::with_capacity(8);
+        for entry in 0u32..8 {
+            tree.encode_entry(entry, &mut w).unwrap();
+        }
+        let bytes = w.finish();
+        let mut r = BitReaderLsb::new(&bytes);
+        for expected in 0u32..8 {
+            assert_eq!(tree.decode_entry(&mut r).unwrap(), expected);
+        }
+    }
+
+    /// Balanced 16-entry length-4 tree: every entry encodes to its own
+    /// codeword bits (i for entry i, length 4).
+    #[test]
+    fn balanced_16_entry_length4_tree_encode_decode_roundtrips() {
+        let lengths = vec![4u8; 16];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("must build");
+        for entry in 0u32..16 {
+            let mut w = BitWriterLsb::with_capacity(1);
+            tree.encode_entry(entry, &mut w).unwrap();
+            let bytes = w.finish();
+            // Canonical codeword for entry i is just i, MSb-first, len 4.
+            let expected = pack_codewords(&[(entry, 4)]);
+            assert_eq!(bytes, expected, "entry {entry} canonical codeword");
+            // And decode round-trips.
+            let mut r = BitReaderLsb::new(&bytes);
+            assert_eq!(tree.decode_entry(&mut r).unwrap(), entry);
+        }
+    }
+
+    /// A sparse codebook (only entries 0, 2, 4, 6 used at length 2)
+    /// encodes only those entries; other indices return
+    /// [`EncodeError::UnknownEntry`].
+    #[test]
+    fn sparse_codebook_encode_rejects_unused_entries() {
+        // 8-slot length table with only entries 0, 2, 4, 6 used at
+        // length 2 each (Kraft 4/4 = 1, so the tree is well-formed).
+        let lengths = [2u8, 0, 2, 0, 2, 0, 2, 0];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("must build");
+        assert_eq!(tree.used_count(), 4);
+        // Used entries (0, 2, 4, 6) encode successfully.
+        for &used in &[0u32, 2, 4, 6] {
+            let mut w = BitWriterLsb::with_capacity(1);
+            tree.encode_entry(used, &mut w).expect("used entry encodes");
+        }
+        // Unused entries are rejected.
+        for &unused in &[1u32, 3, 5, 7, 8, 100] {
+            let mut w = BitWriterLsb::with_capacity(1);
+            let err = tree
+                .encode_entry(unused, &mut w)
+                .expect_err("unused entry rejected");
+            match err {
+                EncodeError::UnknownEntry {
+                    entry,
+                    used_count: 4,
+                } => assert_eq!(entry, unused),
+                _ => panic!("unexpected error: {err:?}"),
+            }
+        }
+    }
+
+    /// Single-entry codebook (errata 20150226): encode emits one `0`
+    /// bit; any non-sole entry is rejected.
+    #[test]
+    fn single_entry_codebook_encode_emits_one_zero_bit() {
+        // 4-slot table with only entry 2 used at length 1.
+        let lengths = [0u8, 0, 1, 0];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("must build");
+        assert!(tree.is_single_entry());
+        let mut w = BitWriterLsb::with_capacity(1);
+        tree.encode_entry(2, &mut w).expect("sole entry encodes");
+        let bytes = w.finish();
+        assert_eq!(bytes, vec![0u8]);
+        // Decoder tolerates both 0 and 1; verify our `0` round-trips.
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(tree.decode_entry(&mut r).unwrap(), 2);
+        // Other entries rejected.
+        let mut w = BitWriterLsb::with_capacity(1);
+        assert_eq!(
+            tree.encode_entry(0, &mut w).unwrap_err(),
+            EncodeError::UnknownEntry {
+                entry: 0,
+                used_count: 1
+            }
+        );
+    }
+
+    /// Generic encode-decode roundtrip on a hand-built mixed-length tree.
+    /// Lengths `[2,2,3,3,3,3]` form a complete tree (Kraft 2/4 + 4/8 = 1).
+    #[test]
+    fn encode_then_decode_recovers_every_entry() {
+        let lengths = [2u8, 2, 3, 3, 3, 3];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("must build");
+        for entry in 0u32..6 {
+            let mut w = BitWriterLsb::with_capacity(1);
+            tree.encode_entry(entry, &mut w).unwrap();
+            let bytes = w.finish();
+            let mut r = BitReaderLsb::new(&bytes);
+            assert_eq!(tree.decode_entry(&mut r).unwrap(), entry);
+        }
+    }
+
+    /// `EncodeError::UnknownEntry` Display contains both numbers.
+    #[test]
+    fn encode_error_display_contains_numbers() {
+        let err = EncodeError::UnknownEntry {
+            entry: 42,
+            used_count: 8,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("42"), "Display should contain entry index: {s}");
+        assert!(s.contains('8'), "Display should contain used count: {s}");
     }
 }
