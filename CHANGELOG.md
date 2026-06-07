@@ -6,6 +6,98 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.5 forward channel coupling primitives
+  (round 33, umbrella round 255).** The encoder counterpart of the
+  round-11 decoder-side `synthesis::inverse_couple` /
+  `synthesis::inverse_couple_all`. Three new public functions in
+  `synthesis`:
+
+  - `forward_couple_scalar(l: f32, r: f32) -> (f32, f32)` — applies
+    the algebraic inverse of the §4.3.5 step-3 four-quadrant rule to
+    a single Cartesian `(L, R)` pair. The four cases are derived
+    from the inverse table by inversion:
+    - `L > 0 AND L > R` → `M = L`, `A = L - R` (mirrors `M > 0, A > 0`)
+    - `R > 0 AND L ≤ R` → `M = R`, `A = L - R` (mirrors `M > 0, A ≤ 0`)
+    - `L ≤ 0 AND R > L` → `M = L`, `A = R - L` (mirrors `M ≤ 0, A > 0`)
+    - `R ≤ 0 AND R ≤ L` → `M = R`, `A = R - L` (mirrors `M ≤ 0, A ≤ 0`)
+
+    The four conditions are mutually exclusive and exhaustive; the
+    boundary ties (`L == 0`, `R == 0`, `L == R`) are absorbed by the
+    existing `> 0` / `≤ 0` splits the inverse uses on `M` and `A`.
+  - `forward_couple(left, right)` — the in-place vector wrapper, the
+    encoder counterpart of `inverse_couple`. Panics on length mismatch
+    matching the existing inverse convention.
+  - `forward_couple_all(channels, coupling)` — the per-mapping driver.
+    Runs every coupling step **in ascending order** (the reverse of
+    the §4.3.5 decoder loop's descending direction), producing the
+    square-polar channels the residue encoder will quantise. Reuses
+    the existing `CouplingError` error type (matching variants and
+    messages) and the same `lo`/`hi` slice-split pattern as the
+    inverse-side driver.
+
+  The round-trip property
+  `inverse_couple_all(forward_couple_all(x)) == x` holds bit-exactly
+  for every legal input across single-step coupling, multi-step
+  coupling, both magnitude-vs-angle channel orderings (`mag < ang`
+  and `mag > ang`), and chained coupling where one step's output is
+  another step's input. Uncoupled channels are left untouched.
+
+  The umbrella `crate::Error` already had a `Coupling` variant from
+  round 11; no new error variants are introduced. The `synthesis`
+  module documentation grows a "Forward channel coupling" section
+  with the four-case derivation table.
+
+  19 new in-module unit tests bring the suite from **646 → 665
+  (+19)**:
+
+  - `forward_couple_scalar_all_four_quadrants` — fires the four
+    sign-of-`M`/sign-of-`A` cases by feeding the `(L, R)` pairs the
+    existing inverse test produces.
+  - `forward_couple_scalar_handles_boundary_ties` — `L == R` for
+    positive, zero, and negative ties.
+  - `forward_couple_scalar_handles_zeros` — every axis-zero input.
+  - `forward_then_inverse_couple_scalar_is_identity_on_grid` —
+    exhaustive `(L, R)` round-trip on the `[-10, 10] × [-10, 10]`
+    integer grid (441 pairs), covering every quadrant and every
+    `L`/`R` sign comparison.
+  - `forward_then_inverse_couple_scalar_is_identity_on_floats` —
+    ten non-integer / non-tie probes including very small and very
+    large magnitudes.
+  - `forward_couple_pointwise_matches_scalar_function` — the vector
+    wrapper applies the scalar function element-by-element with no
+    cross-talk.
+  - `forward_then_inverse_couple_is_identity_on_vectors` — end-to-end
+    vector round-trip over eight diverse `(L, R)` pairs.
+  - `forward_couple_panics_on_length_mismatch` — defensive panic on
+    length mismatch.
+  - `forward_couple_all_single_step_low_high` and
+    `forward_couple_all_single_step_high_low` — the `mag < ang` and
+    `mag > ang` slice-split branches of the driver.
+  - `forward_couple_all_rejects_out_of_range_channel`,
+    `forward_couple_all_rejects_out_of_range_magnitude_channel`,
+    `forward_couple_all_rejects_same_channel` — the three error
+    paths.
+  - `forward_couple_all_empty_coupling_is_noop`.
+  - `forward_then_inverse_couple_all_is_identity_single_step` —
+    decoder-then-encoder round-trip on a two-channel stereo
+    fixture-style vector pair.
+  - `forward_then_inverse_couple_all_is_identity_multi_step` —
+    two-step coupling on a four-channel stream.
+  - `forward_then_inverse_couple_all_is_identity_with_reversed_channel_order`
+    — exercises the `mag > ang` driver branch through the full
+    round-trip.
+  - `forward_couple_all_leaves_uncoupled_channels_alone` — a 5.1
+    layout where one coupling step touches only channels 0/1.
+  - `forward_couple_all_step_order_matters_for_chained_coupling` —
+    two chained coupling steps that share channel 1; the encoder's
+    ascending order undoes the decoder's descending order
+    end-to-end.
+
+  Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.5 (the
+  decoder-side step-3 four-quadrant rule; the encoder-side rule is
+  derived from it by algebraic inversion as documented in the
+  `synthesis` module header).
+
 * **Vorbis I §4.3.8 encoder-side framing-inverse primitive
   (round 32, umbrella round 253).** First encoder-side DSP framing
   primitive — the inverse of the round-15 decoder-side

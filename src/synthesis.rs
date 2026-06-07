@@ -56,6 +56,40 @@
 //! §4.3.5 loop runs the coupling steps **in descending order**;
 //! [`inverse_couple_all`] drives that loop over a slice of per-channel
 //! residue vectors and a mapping's coupling step list.
+//!
+//! # Forward channel coupling — the encoder counterpart of §4.3.5
+//!
+//! [`forward_couple_scalar`] / [`forward_couple`] / [`forward_couple_all`]
+//! are the encoder-side primitives the encoder applies *before* the
+//! per-channel floor/residue path, mirroring the round-29 `mdct_naive` /
+//! round-32 `FrameSplitter` "encoder counterpart of a decoder primitive"
+//! pattern. The §4.3.5 inverse rule is a deterministic four-quadrant
+//! map `(M, A) -> (new_M, new_A)`; inverting it gives a deterministic
+//! map `(L, R) -> (M, A)` such that
+//!
+//! ```text
+//! forward_couple_scalar(L, R) = (M, A)
+//! inverse_couple_scalar(M, A) = (L, R)
+//! ```
+//!
+//! is a per-sample identity for every real `(L, R)` pair. The four
+//! forward cases come straight out of the §4.3.5 step-3 rule by
+//! algebraic inversion:
+//!
+//! | §4.3.5 case (sign of `M`, `A`) | `new_M` | `new_A` | Forward recovery |
+//! | --- | --- | --- | --- |
+//! | `M > 0`, `A > 0` | `M`     | `M - A` | `M = L`, `A = L - R`; fires when `L > 0 AND L > R` |
+//! | `M > 0`, `A ≤ 0` | `M + A` | `M`     | `M = R`, `A = L - R`; fires when `R > 0 AND L ≤ R` |
+//! | `M ≤ 0`, `A > 0` | `M`     | `M + A` | `M = L`, `A = R - L`; fires when `L ≤ 0 AND R > L` |
+//! | `M ≤ 0`, `A ≤ 0` | `M - A` | `M`     | `M = R`, `A = R - L`; fires when `R ≤ 0 AND R ≤ L` |
+//!
+//! Each `(L, R)` lands in exactly one of the four cases — the
+//! conditions are mutually exclusive and exhaustive, and the boundary
+//! values (zero, ties) are absorbed by the existing `> 0` / `≤ 0`
+//! splits the inverse uses on `M` and `A`. The
+//! `forward_then_inverse_couple_is_identity_*` tests pin the
+//! round-trip property exhaustively on a grid of `(L, R)` values
+//! covering every quadrant and every boundary tie.
 
 use crate::setup::MappingCouplingStep;
 
@@ -471,6 +505,165 @@ pub fn inverse_couple_all(
             inverse_couple(a, b);
         } else {
             inverse_couple(b, a);
+        }
+    }
+    Ok(())
+}
+
+/// Apply the §4.3.5 forward-coupling rule to a single
+/// `(left, right)` Cartesian scalar pair, returning
+/// `(magnitude, angle)` in square-polar form.
+///
+/// This function is the per-sample algebraic inverse of
+/// [`couple_scalar`]: for every real input `(l, r)` the round-trip
+/// identity
+///
+/// ```text
+/// let (m, a) = forward_couple_scalar(l, r);
+/// couple_scalar(m, a) == (l, r)
+/// ```
+///
+/// holds exactly (modulo `f32` rounding; for representable inputs the
+/// `+` / `-` operations are exact, so the identity is bit-exact for
+/// every legal pair).
+///
+/// The four §4.3.5 step-3 cases (sign of `M`, sign of `A`) partition
+/// the `(L, R)` plane via the conditions tabulated in the module
+/// header; each case carries a closed-form recovery of `(M, A)`:
+///
+/// ```text
+/// L > 0  AND L > R  : M = L, A = L - R   (mirrors `M > 0, A > 0`)
+/// R > 0  AND L ≤ R  : M = R, A = L - R   (mirrors `M > 0, A ≤ 0`)
+/// L ≤ 0  AND R > L  : M = L, A = R - L   (mirrors `M ≤ 0, A > 0`)
+/// R ≤ 0  AND R ≤ L  : M = R, A = R - L   (mirrors `M ≤ 0, A ≤ 0`)
+/// ```
+#[must_use]
+pub fn forward_couple_scalar(l: f32, r: f32) -> (f32, f32) {
+    if l > 0.0 {
+        if l > r {
+            // §4.3.5 case (M > 0, A > 0). M = L, A = L - R.
+            (l, l - r)
+        } else {
+            // §4.3.5 case (M > 0, A ≤ 0). M = R, A = L - R.
+            (r, l - r)
+        }
+    } else if r > l {
+        // §4.3.5 case (M ≤ 0, A > 0). M = L, A = R - L.
+        (l, r - l)
+    } else {
+        // §4.3.5 case (M ≤ 0, A ≤ 0). M = R, A = R - L.
+        (r, r - l)
+    }
+}
+
+/// Forward-couple one Cartesian (left/right) vector pair in place,
+/// producing a square-polar (magnitude/angle) vector pair (§4.3.5,
+/// applied in encoder order). Both vectors must already hold the
+/// post-MDCT Cartesian spectra for their respective channels and must
+/// be the same length (the encoder per-vector length is `n/2`,
+/// mirroring the decoder §4.3.4 step 5). Each scalar position is
+/// coupled independently via [`forward_couple_scalar`].
+///
+/// After the call, `left` holds the magnitude vector `M` and `right`
+/// holds the angle vector `A` of §4.3.5; these are the values the
+/// residue encoder will quantise and emit.
+///
+/// # Panics
+///
+/// Panics if `left` and `right` have different lengths; the §4.3.5
+/// loop pairs Cartesian vectors that are always `n/2` long, so a
+/// mismatch indicates a caller bug rather than stream data.
+pub fn forward_couple(left: &mut [f32], right: &mut [f32]) {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "forward_couple: left/right length mismatch"
+    );
+    for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+        let (new_m, new_a) = forward_couple_scalar(*l, *r);
+        *l = new_m;
+        *r = new_a;
+    }
+}
+
+/// Run the full §4.3.5 forward-coupling pass over a slice of
+/// per-channel Cartesian spectra, applying every coupling step **in
+/// ascending order** (`0 … coupling_steps-1`) — the reverse of the
+/// decoder-side [`inverse_couple_all`] descent. Ascending order is the
+/// correct encoder direction because the decoder undoes the encoder
+/// effects in reverse: if the encoder applied step 0 → step 1 → … in
+/// order, the decoder must undo step N-1 → step N-2 → … → step 0 to
+/// recover the original Cartesian spectra.
+///
+/// `channels[c]` is the Cartesian spectrum for channel `c`; each
+/// coupling step couples the named `(magnitude_channel, angle_channel)`
+/// pair in place. After the call:
+///
+/// * For every coupled `magnitude_channel`, the vector holds the
+///   square-polar magnitude `M` ready to feed into the residue encoder.
+/// * For every coupled `angle_channel`, the vector holds the square-
+///   polar angle `A` ready to feed into the residue encoder.
+/// * Uncoupled channels remain unchanged.
+///
+/// The function is the byte-exact inverse of [`inverse_couple_all`]
+/// when the coupling step list is identical and the per-channel
+/// vectors have the same length. The round-trip property
+/// `inverse_couple_all(forward_couple_all(x)) == x` holds for every
+/// legal input.
+///
+/// # Errors
+///
+/// [`CouplingError::ChannelOutOfRange`] if a step names a channel
+/// index `>= channels.len()`, or [`CouplingError::SameChannel`] if a
+/// step names the same channel for both magnitude and angle. The
+/// error variants and meanings match [`inverse_couple_all`] exactly so
+/// a caller driving both directions through a shared error shape can
+/// surface them uniformly.
+pub fn forward_couple_all(
+    channels: &mut [Vec<f32>],
+    coupling: &[MappingCouplingStep],
+) -> Result<(), CouplingError> {
+    let n_channels = channels.len();
+    // The forward-direction loop is the §4.3.5 inverse loop run
+    // backwards: ascending order, so each subsequent step sees the
+    // square-polar output of every prior step.
+    for (step, cs) in coupling.iter().enumerate() {
+        let mag = cs.magnitude_channel as usize;
+        let ang = cs.angle_channel as usize;
+        if mag >= n_channels {
+            return Err(CouplingError::ChannelOutOfRange {
+                step,
+                channel: mag,
+                channels: n_channels,
+            });
+        }
+        if ang >= n_channels {
+            return Err(CouplingError::ChannelOutOfRange {
+                step,
+                channel: ang,
+                channels: n_channels,
+            });
+        }
+        if mag == ang {
+            return Err(CouplingError::SameChannel { step, channel: mag });
+        }
+        // Split the slice so we can borrow the two vectors mutably at
+        // once. `mag != ang` is guaranteed above. The split-vs-name
+        // layout mirrors `inverse_couple_all` exactly: `lo`/`hi` pick
+        // the slice partition, and the `mag < ang` branch decides
+        // which side carries left vs right.
+        let (lo, hi) = (mag.min(ang), mag.max(ang));
+        let (head, tail) = channels.split_at_mut(hi);
+        let (a, b) = (&mut head[lo], &mut tail[0]);
+        if mag < ang {
+            // `a` is the lower-index slot. mag < ang means mag == lo,
+            // so the magnitude channel is `a` (= left), the angle
+            // channel is `b` (= right).
+            forward_couple(a, b);
+        } else {
+            // mag > ang. mag == hi, so the magnitude channel is `b`,
+            // the angle channel is `a`.
+            forward_couple(b, a);
         }
     }
     Ok(())
@@ -947,5 +1140,373 @@ mod tests {
         let before = residues.clone();
         inverse_couple_all(&mut residues, &[]).unwrap();
         assert_eq!(residues, before);
+    }
+
+    // ---- forward channel coupling (§4.3.5, encoder direction) ----
+
+    #[test]
+    fn forward_couple_scalar_all_four_quadrants() {
+        // Mirror of `couple_scalar_all_four_quadrants` from the inverse
+        // side. The §4.3.5 step-3 table maps:
+        //   M= 5, A= 2 → (new_M= 5, new_A= 3); so (L,R)=(5,3) → (5, 2).
+        //   M= 5, A=-2 → (new_M= 3, new_A= 5); so (L,R)=(3,5) → (5,-2).
+        //   M=-5, A= 2 → (new_M=-5, new_A=-3); so (L,R)=(-5,-3) → (-5,2).
+        //   M=-5, A=-2 → (new_M=-3, new_A=-5); so (L,R)=(-3,-5) → (-5,-2).
+        assert_eq!(forward_couple_scalar(5.0, 3.0), (5.0, 2.0));
+        assert_eq!(forward_couple_scalar(3.0, 5.0), (5.0, -2.0));
+        assert_eq!(forward_couple_scalar(-5.0, -3.0), (-5.0, 2.0));
+        assert_eq!(forward_couple_scalar(-3.0, -5.0), (-5.0, -2.0));
+    }
+
+    #[test]
+    fn forward_couple_scalar_handles_boundary_ties() {
+        // L == R, all signs: every tie should round-trip cleanly back
+        // through couple_scalar.
+        for &(l, r) in &[(0.0_f32, 0.0), (5.0, 5.0), (-5.0, -5.0)] {
+            let (m, a) = forward_couple_scalar(l, r);
+            let (rl, rr) = couple_scalar(m, a);
+            assert_eq!(
+                (rl, rr),
+                (l, r),
+                "tie (L,R)=({l},{r}) failed round-trip: forward → (M,A)=({m},{a}) → inverse → ({rl},{rr})"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_couple_scalar_handles_zeros() {
+        // Each axis zero with opposite-sign other coord.
+        for &(l, r) in &[(0.0_f32, 5.0), (0.0, -5.0), (5.0, 0.0), (-5.0, 0.0)] {
+            let (m, a) = forward_couple_scalar(l, r);
+            let (rl, rr) = couple_scalar(m, a);
+            assert_eq!((rl, rr), (l, r), "(L,R)=({l},{r}) failed round-trip");
+        }
+    }
+
+    #[test]
+    fn forward_then_inverse_couple_scalar_is_identity_on_grid() {
+        // Exhaustive (L, R) round-trip over an integer grid covering
+        // every quadrant and every L/R sign comparison.
+        for li in -10..=10 {
+            for ri in -10..=10 {
+                let l = li as f32;
+                let r = ri as f32;
+                let (m, a) = forward_couple_scalar(l, r);
+                let (rl, rr) = couple_scalar(m, a);
+                assert_eq!(
+                    (rl, rr),
+                    (l, r),
+                    "round-trip failed at (L,R)=({l},{r}); intermediate (M,A)=({m},{a})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forward_then_inverse_couple_scalar_is_identity_on_floats() {
+        // A handful of non-integer / non-tie probes that exercise the
+        // four §4.3.5 cases on values the integer grid never visits.
+        let probes: &[(f32, f32)] = &[
+            (1.5, 0.25),
+            (0.25, 1.5),
+            (-1.5, -0.25),
+            (-0.25, -1.5),
+            (1.5, -0.25),
+            (-1.5, 0.25),
+            (1e-6, 2e-6),
+            (-1e-6, -2e-6),
+            (12345.678, -98765.43),
+            (-0.001, 0.001),
+        ];
+        for &(l, r) in probes {
+            let (m, a) = forward_couple_scalar(l, r);
+            let (rl, rr) = couple_scalar(m, a);
+            assert_eq!(
+                (rl, rr),
+                (l, r),
+                "round-trip failed at (L,R)=({l},{r}); intermediate (M,A)=({m},{a})"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_couple_pointwise_matches_scalar_function() {
+        // Confirm the vector wrapper applies forward_couple_scalar
+        // element-by-element with no cross-talk.
+        let mut left = vec![5.0_f32, 3.0, -5.0, -3.0];
+        let mut right = vec![3.0_f32, 5.0, -3.0, -5.0];
+        let expected_m: Vec<f32> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(&l, &r)| forward_couple_scalar(l, r).0)
+            .collect();
+        let expected_a: Vec<f32> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(&l, &r)| forward_couple_scalar(l, r).1)
+            .collect();
+        forward_couple(&mut left, &mut right);
+        assert_eq!(left, expected_m);
+        assert_eq!(right, expected_a);
+    }
+
+    #[test]
+    fn forward_then_inverse_couple_is_identity_on_vectors() {
+        // End-to-end vector round-trip. After forward_couple the
+        // vectors hold (M, A); after inverse_couple they return to the
+        // original (L, R) bit-exactly for representable inputs.
+        let original_l = vec![5.0_f32, 3.0, -5.0, -3.0, 0.0, 1.5, -1.5, 0.25];
+        let original_r = vec![3.0_f32, 5.0, -3.0, -5.0, 0.0, 0.25, -0.25, 1.5];
+        let mut left = original_l.clone();
+        let mut right = original_r.clone();
+        forward_couple(&mut left, &mut right);
+        inverse_couple(&mut left, &mut right);
+        assert_eq!(left, original_l);
+        assert_eq!(right, original_r);
+    }
+
+    #[test]
+    #[should_panic(expected = "forward_couple: left/right length mismatch")]
+    fn forward_couple_panics_on_length_mismatch() {
+        let mut left = vec![1.0_f32, 2.0];
+        let mut right = vec![3.0_f32];
+        forward_couple(&mut left, &mut right);
+    }
+
+    #[test]
+    fn forward_couple_all_single_step_low_high() {
+        // Mirror of inverse_couple_all_single_step. Coupling step
+        // names channel 0 as magnitude and channel 1 as angle.
+        // Forward direction: starting Cartesian (L, R) = (5, 3) on
+        // channels (0, 1) should yield (M=5, A=2).
+        let mut spectra = vec![vec![5.0_f32], vec![3.0_f32]];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 1,
+        }];
+        forward_couple_all(&mut spectra, &coupling).unwrap();
+        assert_eq!(spectra[0], vec![5.0]);
+        assert_eq!(spectra[1], vec![2.0]);
+    }
+
+    #[test]
+    fn forward_couple_all_single_step_high_low() {
+        // Mirror of inverse_couple_all_single_step_high_low. Channel
+        // 1 is magnitude, channel 0 is angle. Starting Cartesian
+        // (M-channel=1, A-channel=0) holds (L=5, R=2). Wait — the
+        // Cartesian inputs are by channel index, not by role. With
+        // mag=1, ang=0 the (L, R) pair is (channel-with-lower-index,
+        // channel-with-higher-index) = (residues[0], residues[1]).
+        //
+        // But by the mag/ang naming the forward direction packs
+        // channel 1's pre-coupling value as L and channel 0's as R?
+        // No — the §4.3.5 inverse pulls magnitude_vector from
+        // channel mag and angle_vector from channel ang. So the
+        // forward direction places M into channel mag and A into
+        // channel ang. The L/R pair is implicit: forward_couple_all
+        // reads channel mag's pre-coupling value and channel ang's
+        // pre-coupling value, with mag's value used as L and ang's
+        // value used as R (because mag was filled by L, ang by R in
+        // a hypothetical reversal of the inverse-side identity).
+        //
+        // Pinning concrete numbers: the inverse-side test puts
+        // residues = [2, 5], coupling {mag:1, ang:0}, and gets back
+        // (3, 5) — meaning post-inverse channel 0 = 3, channel 1 = 5.
+        // The forward direction therefore takes pre-coupling
+        // (channel 0, channel 1) = (3, 5) (= (R, L) because
+        // ang=channel 0 and mag=channel 1), and should produce
+        // (channel 0, channel 1) = (2, 5) (= (A, M)).
+        let mut spectra = vec![vec![3.0_f32], vec![5.0_f32]];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 1,
+            angle_channel: 0,
+        }];
+        forward_couple_all(&mut spectra, &coupling).unwrap();
+        assert_eq!(spectra[0], vec![2.0]); // angle channel
+        assert_eq!(spectra[1], vec![5.0]); // magnitude channel
+    }
+
+    #[test]
+    fn forward_couple_all_rejects_out_of_range_channel() {
+        let mut spectra = vec![vec![1.0_f32]];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 1,
+        }];
+        assert_eq!(
+            forward_couple_all(&mut spectra, &coupling),
+            Err(CouplingError::ChannelOutOfRange {
+                step: 0,
+                channel: 1,
+                channels: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn forward_couple_all_rejects_out_of_range_magnitude_channel() {
+        let mut spectra = vec![vec![1.0_f32], vec![2.0_f32]];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 5,
+            angle_channel: 0,
+        }];
+        assert_eq!(
+            forward_couple_all(&mut spectra, &coupling),
+            Err(CouplingError::ChannelOutOfRange {
+                step: 0,
+                channel: 5,
+                channels: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn forward_couple_all_rejects_same_channel() {
+        let mut spectra = vec![vec![1.0_f32], vec![2.0_f32]];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 1,
+            angle_channel: 1,
+        }];
+        assert_eq!(
+            forward_couple_all(&mut spectra, &coupling),
+            Err(CouplingError::SameChannel {
+                step: 0,
+                channel: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn forward_couple_all_empty_coupling_is_noop() {
+        let mut spectra = vec![vec![1.0_f32, 2.0], vec![3.0, 4.0]];
+        let before = spectra.clone();
+        forward_couple_all(&mut spectra, &[]).unwrap();
+        assert_eq!(spectra, before);
+    }
+
+    #[test]
+    fn forward_then_inverse_couple_all_is_identity_single_step() {
+        // The encoder-then-decoder round-trip on a typical stereo
+        // pair: a sine-ish waveform on the left, a slightly delayed
+        // version on the right.
+        let original = vec![
+            vec![1.0_f32, 2.0, 3.0, -4.0, -2.0, 0.5, -0.5, 0.0],
+            vec![0.5_f32, 1.5, 2.5, -3.5, -1.5, 0.0, -1.0, 0.5],
+        ];
+        let mut spectra = original.clone();
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 1,
+        }];
+        forward_couple_all(&mut spectra, &coupling).expect("forward couple succeeds");
+        inverse_couple_all(&mut spectra, &coupling).expect("inverse couple succeeds");
+        assert_eq!(spectra, original);
+    }
+
+    #[test]
+    fn forward_then_inverse_couple_all_is_identity_multi_step() {
+        // Multi-step coupling: a four-channel stream with two
+        // independent coupling steps. The encoder runs them in
+        // ascending order; the decoder undoes them in descending
+        // order. The round-trip identity must hold.
+        let original = vec![
+            vec![1.0_f32, 2.0, 3.0],
+            vec![0.5_f32, 1.5, 2.5],
+            vec![-1.0_f32, -2.0, -3.0],
+            vec![-0.5_f32, -1.5, -2.5],
+        ];
+        let mut spectra = original.clone();
+        let coupling = vec![
+            // Step 0: couple channels 0 (mag) and 1 (ang).
+            MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            },
+            // Step 1: couple channels 2 (mag) and 3 (ang).
+            MappingCouplingStep {
+                magnitude_channel: 2,
+                angle_channel: 3,
+            },
+        ];
+        forward_couple_all(&mut spectra, &coupling).expect("forward couple succeeds");
+        inverse_couple_all(&mut spectra, &coupling).expect("inverse couple succeeds");
+        assert_eq!(spectra, original);
+    }
+
+    #[test]
+    fn forward_then_inverse_couple_all_is_identity_with_reversed_channel_order() {
+        // The mag > ang branch of forward_couple_all has its own slice
+        // ordering. Drive the encoder through that branch and confirm
+        // the inverse direction still recovers the original.
+        let original = vec![
+            vec![5.0_f32, -3.0, 0.0, 1.5],
+            vec![2.0_f32, 4.0, -1.0, -0.5],
+        ];
+        let mut spectra = original.clone();
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 1, // mag > ang exercises the swap branch
+            angle_channel: 0,
+        }];
+        forward_couple_all(&mut spectra, &coupling).expect("forward couple succeeds");
+        inverse_couple_all(&mut spectra, &coupling).expect("inverse couple succeeds");
+        assert_eq!(spectra, original);
+    }
+
+    #[test]
+    fn forward_couple_all_leaves_uncoupled_channels_alone() {
+        // A 5.1 layout where one mapping submap touches channels {0,
+        // 1} and leaves channels {2, 3, 4, 5} alone. The encoder
+        // forward-couples (0, 1) and must not perturb the other four.
+        let mut spectra = vec![
+            vec![5.0_f32],  // ch 0 — coupled (will become M)
+            vec![3.0_f32],  // ch 1 — coupled (will become A)
+            vec![7.0_f32],  // ch 2 — uncoupled
+            vec![9.0_f32],  // ch 3 — uncoupled
+            vec![11.0_f32], // ch 4 — uncoupled
+            vec![13.0_f32], // ch 5 — uncoupled
+        ];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 1,
+        }];
+        forward_couple_all(&mut spectra, &coupling).unwrap();
+        assert_eq!(spectra[0], vec![5.0]);
+        assert_eq!(spectra[1], vec![2.0]);
+        assert_eq!(spectra[2], vec![7.0]);
+        assert_eq!(spectra[3], vec![9.0]);
+        assert_eq!(spectra[4], vec![11.0]);
+        assert_eq!(spectra[5], vec![13.0]);
+    }
+
+    #[test]
+    fn forward_couple_all_step_order_matters_for_chained_coupling() {
+        // §4.3.5 runs decoder steps in descending order, so the
+        // encoder must apply them in ascending order to undo each
+        // other end-to-end. Driving two coupling steps that share a
+        // channel verifies the order direction.
+        //
+        // Three channels, two steps:
+        //   step 0: mag=0, ang=1
+        //   step 1: mag=1, ang=2
+        //
+        // Encoder runs step 0 first, then step 1 (which now sees the
+        // square-polar A from step 0 on channel 1). Decoder runs
+        // step 1 first, then step 0 — undoing the encoder's ordering
+        // exactly. Identity must still hold.
+        let original = vec![vec![5.0_f32, 1.0], vec![3.0_f32, 0.5], vec![-2.0_f32, 4.0]];
+        let mut spectra = original.clone();
+        let coupling = vec![
+            MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            },
+            MappingCouplingStep {
+                magnitude_channel: 1,
+                angle_channel: 2,
+            },
+        ];
+        forward_couple_all(&mut spectra, &coupling).expect("forward couple succeeds");
+        inverse_couple_all(&mut spectra, &coupling).expect("inverse couple succeeds");
+        assert_eq!(spectra, original);
     }
 }

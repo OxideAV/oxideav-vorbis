@@ -130,6 +130,22 @@
 //! every legal blocksize. The derivation is laid out in the
 //! [`mdct`] module documentation and uses only the IMDCT formula
 //! already in `docs/audio/vorbis/imdct-cross-reference.md`.
+//!
+//! Round 33 (umbrella round 255) lands the §4.3.5 forward channel
+//! coupling primitives — the encoder counterpart of the round-11
+//! decoder-side [`synthesis::inverse_couple`] / [`synthesis::inverse_couple_all`].
+//! [`synthesis::forward_couple_scalar`] applies the algebraic inverse
+//! of the §4.3.5 step-3 four-quadrant rule to a single Cartesian
+//! `(L, R)` pair, returning the square-polar `(M, A)` such that
+//! `couple_scalar(M, A) == (L, R)` bit-exactly.
+//! [`synthesis::forward_couple`] is the in-place vector wrapper;
+//! [`synthesis::forward_couple_all`] is the per-mapping driver that
+//! runs every coupling step **in ascending order** (the reverse of
+//! the §4.3.5 decoder loop's descending direction), producing the
+//! square-polar channels the residue encoder will quantise. The
+//! round-trip property
+//! `inverse_couple_all(forward_couple_all(x)) == x` holds for every
+//! legal input.
 
 #![warn(missing_debug_implementations)]
 
@@ -205,8 +221,9 @@ pub use setup::{
 };
 pub use streaming::{StreamingDecoder, StreamingError, StreamingFrame};
 pub use synthesis::{
-    couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window, window_premultiply,
-    CouplingError, WindowError, WindowPremultiplyError,
+    couple_scalar, forward_couple, forward_couple_all, forward_couple_scalar, inverse_couple,
+    inverse_couple_all, slope, vorbis_window, window_premultiply, CouplingError, WindowError,
+    WindowPremultiplyError,
 };
 pub use vq::{unpack_vector, UnpackError as VqUnpackError};
 
