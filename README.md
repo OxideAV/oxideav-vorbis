@@ -1,6 +1,127 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 31.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 32.
+
+## Status — 2026-06-08 (round 32, umbrella round 253)
+
+**Round 32 lands the §4.3.8 encoder-side framing-inverse primitive —
+the inverse of the round-15 decoder-side [`overlap::OverlapAdd`].**
+New module `framing` exports [`framing::FrameSplitter`] with one
+public driver method: `take_frame(cur_n, analysis_window) ->
+Result<Vec<f32>, FramingError>`. The splitter slices the next
+length-`cur_n` windowed time-domain block from an internal PCM
+buffer, applies the §4.3.1 analysis window pointwise, and advances
+the read base per the §4.3.8 alignment recurrence
+`g_{N+1} = g_N + prev_n*3/4 - cur_n/4` (the same alignment rule
+the round-15 `OverlapAdd` reverses on the decoder side). The
+output is ready to feed straight into the §4.3.7 forward MDCT
+([`mdct::mdct_naive`]).
+
+The splitter's internal model keeps the previous frame's right
+half buffered between calls (mirroring the decoder
+`OverlapAdd::prev_right_half` storage exactly) so the overlap
+region of the next frame is already in place; a separate
+[`framing::FrameSplitter::advance_pending_stride`] method applies
+the signed `prev_n/4 - cur_n/4` stride before the next slice. A
+positive stride drops samples (long-then-short transition); a
+negative stride is a no-op (short-then-long: the next frame's
+left half intentionally overlaps the buffered right half). On the
+priming frame the caller is expected to push zero-padded left-half
+PCM — the encoder counterpart of §4.3.8's "data is not returned
+from the first frame" priming step.
+
+A new [`FramingError`] enumerates four §4.3.8 invariants:
+
+* `NotPowerOfTwo { n }` — `cur_n` was not a positive power of two
+  (§4.2.2 pins blocksizes to `{64, 128, 256, …, 8192}`).
+* `FrameTooSmall { n }` — `cur_n < 4` (§4.3.8's "windowsize / 4"
+  arithmetic requires `n >= 4`).
+* `NeedMoreInput { shortfall }` — the buffer holds fewer than
+  `cur_n` samples; the caller should `push_pcm` more input and
+  retry. The `shortfall` field tells the caller exactly how many
+  more samples are needed.
+* `WindowLengthMismatch { frame_len, window_len }` — the supplied
+  analysis window length disagrees with `cur_n`. The §4.3.1
+  window builder produces a length-`n` window per its `n` argument;
+  a mismatch indicates a caller bug.
+
+The umbrella `crate::Error` grows a matching `Error::Framing`
+variant with `From` glue and `source()` chain. Two convenience
+`From` impls (`OverlapError -> FramingError`,
+`WindowPremultiplyError -> FramingError`) let callers driving
+both the decoder-side overlap-add and the encoder-side splitter
+through a shared shape normalise on one error type.
+
+The reconstruction property is exercised end-to-end. With the
+symmetric §4.3.1 window, the squared-overlap identity `w[i]² +
+w[i + n/2]² = 1` (the same identity round-15 pins for the decoder
+side) makes the pipeline
+`PCM → FrameSplitter → (per-frame window square) → OverlapAdd → PCM`
+a per-sample identity inside every non-priming overlap-add
+return-range — verified by
+`splitter_then_overlap_add_round_trips_constant` (constant
+signal) and `splitter_then_overlap_add_round_trips_ramp` (ramp
+signal), both within `1e-4` f32 tolerance.
+
+23 new in-module unit tests bring the suite from **604 → 627
+(+23)**:
+
+* four error-path rejections (non-power-of-two, zero-length,
+  too-small, window-length-mismatch);
+* `take_frame_reports_need_more_input_shortfall` with the
+  shortfall correctness + recovery path;
+* the two `From` conversions (`OverlapError`,
+  `WindowPremultiplyError`);
+* `FramingError::Display` content is non-empty + grep-friendly
+  (contains `framing-inverse`, the offending values);
+* priming-state checks (`new_is_priming`, `reset_returns_to_priming`,
+  `is_priming` after first take);
+* `first_frame_takes_buffer_from_position_zero` — the priming
+  frame slices `cur_n` samples starting at buffer 0, then drains
+  `cur_n/2`;
+* `take_frame_applies_analysis_window` — pointwise window
+  multiplication correctness on a known window;
+* `take_frame_zeros_lead_in_and_tail_via_window` — the §4.3.1
+  hybrid window's zero lead-in (`0 .. n/4 - blocksize_0/4`) and
+  zero tail (`n*3/4 + blocksize_0/4 .. n`) zero the corresponding
+  PCM samples in the output frame;
+* three stride/read-base geometry tests (second frame starts at
+  previous center, third frame advances per the recurrence,
+  long-then-short positive stride drops 48 samples);
+* `stride_after_short_then_long_does_not_drop` — the signed
+  stride correctly skips the drop when negative;
+* `splitter_first_frame_left_half_zero_padded` — the priming
+  left-half zero-padding convention;
+* the two end-to-end round-trip reconstructions (constant + ramp);
+* `push_pcm` / `buffered` append + reporting sanity;
+* `frame_required_samples` returns `cur_n` (the API stays simple
+  even when the splitter geometry is messy);
+* `advance_pending_stride` is idempotent in the priming state.
+
+Followups (explicit):
+
+* The §6.2.2 floor 0 packet-body WRITE primitive (the amplitude
+  + per-vector VQ codeword inverse — paired with a master/sub-
+  book selection helper analogous to the `partition_cvals`
+  knob the round-31 floor 1 packet writer exposes).
+* The §8.6.2 residue-body WRITE primitive (three format
+  variants 0/1/2 plus the bundle / scatter machinery).
+* The wrapping §4.3 audio-packet writer splicing §4.3.1
+  prelude + per-channel §7.2.3 floor 1 body + the §4.3.4
+  residue body + the §4.3.6 dot-product spectrum + §4.3.7
+  forward MDCT — now that the §4.3.8 encoder-side framing is
+  the input feed for the forward MDCT, the wrapping writer's
+  call-graph is fully connected from "PCM in" to "audio packet
+  bytes out" except for the residue-body and the §4.3.6
+  spectrum dot-product inverse.
+* Pinning the Vorbis-specific MDCT normalization scalar once
+  fixture traces under `docs/audio/vorbis/fixtures/<case>/`
+  extend through the post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.8
+(overlap-add alignment rule + return-length formula), §4.3.1
+(Vorbis window), §1.3.2 (squared-overlap reconstruction
+property), §4.2.2 (blocksize set).
 
 ## Status — 2026-06-07 (round 31, umbrella round 250)
 

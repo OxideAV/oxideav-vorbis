@@ -6,6 +6,65 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.8 encoder-side framing-inverse primitive
+  (round 32, umbrella round 253).** First encoder-side DSP framing
+  primitive — the inverse of the round-15 decoder-side
+  [`crate::overlap::OverlapAdd`]. New module `framing` exports
+  `FrameSplitter::take_frame(cur_n, analysis_window)` which slices
+  the next length-`cur_n` windowed time-domain block from an internal
+  PCM buffer, applies the §4.3.1 analysis window pointwise, and
+  advances the read base per the §4.3.8 recurrence
+  `g_{N+1} = g_N + prev_n*3/4 - cur_n/4` (the same alignment rule
+  the round-15 `OverlapAdd` reverses on the decoder side). A new
+  `FramingError` enumerates four structural rejections —
+  `NotPowerOfTwo`, `FrameTooSmall`, `NeedMoreInput { shortfall }`,
+  `WindowLengthMismatch` — and surfaces through `Error::Framing` in
+  the umbrella with the matching `From` glue and `source()` chain.
+  Two `From` impls (`OverlapError -> FramingError`,
+  `WindowPremultiplyError -> FramingError`) let callers driving both
+  the decoder-side overlap-add and the encoder-side splitter through
+  a shared shape normalise on one error type.
+
+  The splitter's internal model keeps the previous frame's right
+  half in the buffer between calls (mirroring the decoder
+  `OverlapAdd::prev_right_half` storage) so the overlap region of
+  the next frame is already buffered; a separate
+  `FrameSplitter::advance_pending_stride(cur_n)` method applies the
+  signed `prev_n/4 - cur_n/4` stride before the next slice. On the
+  priming frame, the caller is expected to push zero-padded left-
+  half PCM (the spec's "data is not returned from the first frame"
+  priming step's encoder counterpart).
+
+  The reconstruction property is exercised end-to-end:
+  `splitter_then_overlap_add_round_trips_constant` and
+  `splitter_then_overlap_add_round_trips_ramp` push a continuous
+  PCM stream through `FrameSplitter`, feed each frame through a
+  second window multiplication standing in for the MDCT/IMDCT
+  round-trip, and overlap-add back to PCM; the squared-window
+  identity `w[i]² + w[i + n/2]² = 1` from §1.3.2 makes the round-
+  trip a per-sample identity inside every non-priming overlap-add
+  return-range, modulo `f32` tolerance.
+
+  23 new in-module unit tests bring the suite from 604 to 627:
+  four error-path rejections (non-power-of-two, zero-length,
+  too-small, window-length-mismatch), a `NeedMoreInput` shortfall
+  test that validates the recovery path, the two `From` conversions,
+  priming-state checks, first-frame buffer-zero slicing, reset back
+  to priming, window-application pointwise correctness, the §4.3.1
+  hybrid-window lead-in/tail zeroing, three stride/read-base
+  geometry tests (second frame starts at previous center, third
+  frame advances per the recurrence, long-then-short positive
+  stride drops 48 samples), short-then-long negative-stride no-drop,
+  the priming left-half zero-padding convention, the two end-to-end
+  round-trip reconstructions (constant and ramp), `push_pcm` /
+  `buffered` sanity, `frame_required_samples` returns `cur_n`, and
+  `advance_pending_stride` is idempotent in the priming state.
+
+  Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.8
+  (overlap-add alignment rule + return-length formula), §4.3.1
+  (Vorbis window), §1.3.2 (squared-overlap reconstruction
+  property), §4.2.2 (blocksize set).
+
 * **Vorbis I §7.2.3 floor 1 audio-packet body WRITE primitive
   (round 31, umbrella round 250).** First audio-packet *body* WRITE
   primitive — the next step in the §4.3 audio-packet writer after the

@@ -141,6 +141,7 @@ pub mod comment;
 pub mod encoder;
 pub mod floor0;
 pub mod floor1;
+pub mod framing;
 pub mod huffman;
 pub mod identification;
 pub mod imdct;
@@ -177,6 +178,7 @@ pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
+pub use framing::{FrameSplitter, FramingError};
 pub use huffman::{
     BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,
 };
@@ -246,6 +248,10 @@ pub enum Error {
     /// The §4.3.8 overlap-add primitive rejected a frame as malformed
     /// (length not a positive power of two, or below the spec minimum).
     Overlap(OverlapError),
+    /// The §4.3.8 encoder-side framing-inverse primitive rejected a
+    /// frame request — invalid length, mismatched analysis window
+    /// length, or a buffer that does not yet hold enough PCM samples.
+    Framing(FramingError),
     /// The §4.3.7 inverse-MDCT cosine-summation kernel rejected its
     /// input — either an invalid spectrum length, or a mismatched
     /// output buffer length.
@@ -310,6 +316,7 @@ impl core::fmt::Display for Error {
             Error::Coupling(e) => write!(f, "{e}"),
             Error::Packet(e) => write!(f, "{e}"),
             Error::Overlap(e) => write!(f, "{e}"),
+            Error::Framing(e) => write!(f, "{e}"),
             Error::Imdct(e) => write!(f, "{e}"),
             Error::Mdct(e) => write!(f, "{e}"),
             Error::AudioPacket(e) => write!(f, "{e}"),
@@ -338,6 +345,7 @@ impl std::error::Error for Error {
             Error::Coupling(e) => Some(e),
             Error::Packet(e) => Some(e),
             Error::Overlap(e) => Some(e),
+            Error::Framing(e) => Some(e),
             Error::Imdct(e) => Some(e),
             Error::Mdct(e) => Some(e),
             Error::AudioPacket(e) => Some(e),
@@ -431,6 +439,12 @@ impl From<PacketError> for Error {
 impl From<OverlapError> for Error {
     fn from(value: OverlapError) -> Self {
         Error::Overlap(value)
+    }
+}
+
+impl From<FramingError> for Error {
+    fn from(value: FramingError) -> Self {
+        Error::Framing(value)
     }
 }
 
