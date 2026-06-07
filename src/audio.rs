@@ -104,7 +104,9 @@ use crate::packet::{
 };
 use crate::residue::{ResidueDecoder, ResidueError};
 use crate::setup::{FloorHeader, FloorKind, MappingHeader, VorbisSetupHeader};
-use crate::synthesis::{inverse_couple_all, CouplingError, WindowError};
+use crate::synthesis::{
+    inverse_couple_all, window_premultiply, CouplingError, WindowError, WindowPremultiplyError,
+};
 use oxideav_core::bits::BitReaderLsb;
 
 /// Per-stream cache of every floor and residue decoder a stream may use,
@@ -739,19 +741,17 @@ pub fn apply_imdct_and_window(
             }
 
             // §4.3.7 per channel: IMDCT(spectrum) → length-`n` frame,
-            // then element-wise multiply by `window`.
+            // then §4.3.6 windowing via the [`window_premultiply`]
+            // primitive. The window is `0` at the lead-in and tail, so
+            // the same multiplication zeroes the overlap-out-of-bounds
+            // regions automatically.
             let mut frames: Vec<Vec<f32>> = Vec::with_capacity(spectra.len());
             for spectrum in &spectra {
                 let mut time_frame = vec![0.0f32; n];
                 imdct_naive(spectrum, &mut time_frame, imdct_scale)
                     .map_err(AudioPacketError::Imdct)?;
-                // §4.3.6 windowing: every IMDCT output sample times the
-                // matching window sample. The window is `0` at the
-                // lead-in and tail, so this also zeroes the
-                // overlap-out-of-bounds regions automatically.
-                for (sample, &w) in time_frame.iter_mut().zip(window.iter()) {
-                    *sample *= w;
-                }
+                window_premultiply(&mut time_frame, &window)
+                    .map_err(AudioPacketError::WindowPremultiply)?;
                 frames.push(time_frame);
             }
 
@@ -951,6 +951,12 @@ pub enum AudioPacketError {
     /// validated, so this only arises from a hand-built outcome passed
     /// to [`apply_imdct_and_window`].
     Imdct(ImdctError),
+    /// The §4.3.6 / §4.3.7 window pre-multiplication primitive
+    /// rejected a length mismatch between the IMDCT-output frame and
+    /// the §4.3.1-built window — defensive: both sides are derived
+    /// from the same packet `n` here, so this only arises from a
+    /// hand-built outcome passed to [`apply_imdct_and_window`].
+    WindowPremultiply(WindowPremultiplyError),
 }
 
 impl core::fmt::Display for AudioPacketError {
@@ -1028,6 +1034,10 @@ impl core::fmt::Display for AudioPacketError {
             AudioPacketError::Imdct(e) => {
                 write!(f, "vorbis audio packet: §4.3.7 inverse MDCT: {e}")
             }
+            AudioPacketError::WindowPremultiply(e) => write!(
+                f,
+                "vorbis audio packet: §4.3.6 window pre-multiplication: {e}"
+            ),
         }
     }
 }
@@ -1043,6 +1053,7 @@ impl std::error::Error for AudioPacketError {
             AudioPacketError::ResidueBuild { source, .. } => Some(source),
             AudioPacketError::Window(e) => Some(e),
             AudioPacketError::Imdct(e) => Some(e),
+            AudioPacketError::WindowPremultiply(e) => Some(e),
             AudioPacketError::BadModeMapping { .. }
             | AudioPacketError::BadSubmapIndex { .. }
             | AudioPacketError::BadSubmapFloor { .. }

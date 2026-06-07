@@ -224,6 +224,96 @@ pub fn vorbis_window(
     Ok(window)
 }
 
+/// Errors that can arise while applying the §4.3.6 / §4.3.7 window
+/// pre-multiplication primitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowPremultiplyError {
+    /// The IMDCT-output frame and the §4.3.1-built window disagreed
+    /// on their length. The Vorbis §4.3.7 pipeline mandates one
+    /// window sample per time-domain sample (both sourced from the
+    /// same `n` per §4.3.1 step 3), so a length mismatch indicates a
+    /// caller bug — e.g. building the window from one mode's
+    /// `(blockflag, n)` and the frame from another's. Fail-closed:
+    /// the slice is left untouched.
+    LengthMismatch {
+        /// Length of the IMDCT-output `time_frame`.
+        frame_len: usize,
+        /// Length of the §4.3.1 window slice.
+        window_len: usize,
+    },
+}
+
+impl core::fmt::Display for WindowPremultiplyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WindowPremultiplyError::LengthMismatch {
+                frame_len,
+                window_len,
+            } => write!(
+                f,
+                "vorbis §4.3.6 window pre-multiplication: frame length \
+                 {frame_len} disagrees with window length {window_len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WindowPremultiplyError {}
+
+/// Apply the §4.3.6 / §4.3.7 window pre-multiplication: every IMDCT
+/// time-domain sample is multiplied in place by its matching §4.3.1
+/// window sample.
+///
+/// The Vorbis I spec describes this step under §4.3.7 "inverse MDCT",
+/// closing paragraph: the IMDCT output is windowed according to the
+/// §4.3.1 window. The window is built once per packet via
+/// [`vorbis_window`]; this primitive consumes a built window slice and
+/// a length-`n` IMDCT frame and rescales the frame, yielding the
+/// windowed time-domain samples that the §4.3.8 overlap-add primitive
+/// ([`crate::overlap::OverlapAdd::push_frame`]) consumes.
+///
+/// The window's lead-in and tail bins are zero by §4.3.1 construction
+/// (step 4 / step 8), so a side effect of this multiplication is that
+/// the IMDCT samples falling outside the active overlap region are
+/// zeroed — the §4.3 decode pipeline carries no separate zeroing step.
+///
+/// The transform is *in place*: the same caller-owned `time_frame`
+/// slice carries the IMDCT output on entry and the windowed samples
+/// on return. This matches the [`inverse_couple`] §4.3.5 pattern and
+/// avoids one length-`n` allocation per channel per packet on the hot
+/// path.
+///
+/// # Errors
+///
+/// [`WindowPremultiplyError::LengthMismatch`] when `time_frame.len()`
+/// disagrees with `window.len()`. The slice is left unmodified on
+/// error: the length check runs before any multiplication.
+///
+/// # Spec sources
+///
+/// * `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.7 (the IMDCT step's
+///   closing window-application clause).
+/// * `docs/audio/vorbis/Vorbis_I_spec.pdf` §1.3.2 (the slope-function
+///   definition the §4.3.1 window builds from).
+/// * `docs/audio/vorbis/imdct-cross-reference.md` §"Window-function
+///   equivalence" (paraphrases the §1.3.2 + §4.3.6 window as the
+///   product the spec applies after the IMDCT).
+pub fn window_premultiply(
+    time_frame: &mut [f32],
+    window: &[f32],
+) -> Result<(), WindowPremultiplyError> {
+    if time_frame.len() != window.len() {
+        return Err(WindowPremultiplyError::LengthMismatch {
+            frame_len: time_frame.len(),
+            window_len: window.len(),
+        });
+    }
+    for (sample, &w) in time_frame.iter_mut().zip(window.iter()) {
+        *sample *= w;
+    }
+    Ok(())
+}
+
 /// Apply the §4.3.5 inverse-coupling rule to a single
 /// `(magnitude, angle)` scalar pair, returning `(new_magnitude,
 /// new_angle)` in Cartesian (left/right) form.
@@ -552,6 +642,149 @@ mod tests {
                 "overlap bin {j}: power {sum} != 1"
             );
         }
+    }
+
+    // ---- window pre-multiplication (§4.3.6 / §4.3.7 closing step) ----
+
+    #[test]
+    fn window_premultiply_pointwise_product() {
+        // Canonical use: a length-`n` time frame is multiplied element
+        // by element by the length-`n` window. Use a non-trivial window
+        // and frame so we can spot any sign / stride bug.
+        let mut frame = vec![1.0_f32, 2.0, -3.0, 4.0, 5.0, -6.0, 7.0, -8.0];
+        let window = vec![0.25_f32, 0.5, 1.0, 0.75, 0.0, 0.125, 1.0, -0.5];
+        let expected: Vec<f32> = frame
+            .iter()
+            .zip(window.iter())
+            .map(|(a, b)| a * b)
+            .collect();
+        window_premultiply(&mut frame, &window).unwrap();
+        for (i, (got, want)) in frame.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-7, "bin {i}: {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn window_premultiply_with_built_vorbis_window_zeroes_leadin_and_tail() {
+        // Couples the new primitive with the §4.3.1 [`vorbis_window`]
+        // builder: feed a long-block hybrid window whose lead-in /
+        // tail bins are exactly zero, and confirm the multiplication
+        // pins those frame bins to zero regardless of the IMDCT-side
+        // contents.
+        let n = 256;
+        let bs0 = 64;
+        // previous_window_flag clear → 48-bin lead-in is zero; tail
+        // (right_window_end..n) starts at 3n/4 + bs0/4 = 208 → 48-bin
+        // tail is zero.
+        let window = vorbis_window(n, bs0, true, false, false).unwrap();
+        // Non-zero everywhere so any zero in the result must come from
+        // the window.
+        let mut frame = vec![123.0_f32; n];
+        window_premultiply(&mut frame, &window).unwrap();
+        // Lead-in `0..48` is zero.
+        for (i, &v) in frame.iter().enumerate().take(48) {
+            assert_eq!(v, 0.0, "lead-in bin {i} not zero");
+        }
+        // Tail `208..256` is zero.
+        for (i, v) in frame.iter().enumerate().skip(208) {
+            assert_eq!(*v, 0.0, "tail bin {i} not zero");
+        }
+        // Plateau `80..176` is unchanged (window == 1.0 there).
+        for (i, v) in frame.iter().enumerate().take(176).skip(80) {
+            assert!((v - 123.0).abs() < 1e-4, "plateau bin {i}: {v} != 123");
+        }
+    }
+
+    #[test]
+    fn window_premultiply_zero_window_zeroes_frame() {
+        // §4.3.2 "zeroed" packet path: when the spec mandates a zero
+        // output, the windowing of the IMDCT-of-zero is still zero by
+        // linearity. Pin the simpler fact: an all-zero window forces
+        // the frame to zero regardless of input.
+        let mut frame = vec![42.0_f32; 16];
+        let window = vec![0.0_f32; 16];
+        window_premultiply(&mut frame, &window).unwrap();
+        for v in &frame {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn window_premultiply_unity_window_is_identity() {
+        // The §4.3.1 plateau is exactly one; pinned here as a property
+        // of the primitive at slice-level — an all-ones window leaves
+        // the frame untouched.
+        let mut frame = vec![1.0_f32, -2.0, 3.5, -4.25];
+        let before = frame.clone();
+        let window = vec![1.0_f32; frame.len()];
+        window_premultiply(&mut frame, &window).unwrap();
+        assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn window_premultiply_empty_slices_are_noop() {
+        // Degenerate but valid: zero-length slices have matching length
+        // and the multiplication loop runs zero times.
+        let mut frame: Vec<f32> = vec![];
+        let window: Vec<f32> = vec![];
+        window_premultiply(&mut frame, &window).unwrap();
+        assert!(frame.is_empty());
+    }
+
+    #[test]
+    fn window_premultiply_rejects_length_mismatch_frame_longer() {
+        let mut frame = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let before = frame.clone();
+        let window = vec![1.0_f32, 1.0, 1.0];
+        assert_eq!(
+            window_premultiply(&mut frame, &window),
+            Err(WindowPremultiplyError::LengthMismatch {
+                frame_len: 4,
+                window_len: 3,
+            })
+        );
+        // Fail-closed: no samples mutated.
+        assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn window_premultiply_rejects_length_mismatch_window_longer() {
+        let mut frame = vec![1.0_f32, 2.0];
+        let before = frame.clone();
+        let window = vec![1.0_f32, 1.0, 1.0, 1.0];
+        assert_eq!(
+            window_premultiply(&mut frame, &window),
+            Err(WindowPremultiplyError::LengthMismatch {
+                frame_len: 2,
+                window_len: 4,
+            })
+        );
+        assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn window_premultiply_preserves_sign() {
+        // Negative IMDCT samples times positive window samples stay
+        // negative; pin this so a stray `.abs()` or `+=` would trip.
+        let mut frame = vec![-1.0_f32, -2.0, -3.0, -4.0];
+        let window = vec![0.5_f32; 4];
+        window_premultiply(&mut frame, &window).unwrap();
+        assert_eq!(frame, vec![-0.5, -1.0, -1.5, -2.0]);
+    }
+
+    #[test]
+    fn window_premultiply_error_display_is_descriptive() {
+        // The error message is consumer-facing (surfaces via
+        // `AudioPacketError`); pin a substring of its render so a
+        // copy-edit regression is caught.
+        let err = WindowPremultiplyError::LengthMismatch {
+            frame_len: 1024,
+            window_len: 512,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("1024"));
+        assert!(s.contains("512"));
+        assert!(s.contains("window"));
     }
 
     // ---- inverse coupling scalar rule (§4.3.5 step 3) ----

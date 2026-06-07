@@ -202,8 +202,8 @@ pub use setup::{
 };
 pub use streaming::{StreamingDecoder, StreamingError, StreamingFrame};
 pub use synthesis::{
-    couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window, CouplingError,
-    WindowError,
+    couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window, window_premultiply,
+    CouplingError, WindowError, WindowPremultiplyError,
 };
 pub use vq::{unpack_vector, UnpackError as VqUnpackError};
 

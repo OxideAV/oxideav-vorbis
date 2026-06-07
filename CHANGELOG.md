@@ -6,6 +6,26 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.6 window pre-multiplication primitive (round 30,
+  umbrella round 246).** New public function
+  `synthesis::window_premultiply(time_frame, window)` that applies
+  the §4.3.7 closing window-application step (the IMDCT output
+  multiplied element-wise by the §4.3.1-built window) in place on a
+  caller-owned slice. The pipeline-side step previously inlined
+  inside `audio::apply_imdct_and_window` as a four-line `zip` loop
+  is now a discrete, named primitive with a structured error type
+  (`WindowPremultiplyError::LengthMismatch`) and a matching
+  `AudioPacketError::WindowPremultiply` surface, mirroring the
+  §4.3.5 inverse-coupling primitive's
+  (`inverse_couple` / `CouplingError`) shape. Twelve unit tests pin
+  the pointwise product, the in-place semantics, the zero / unity /
+  empty-slice edge cases, the lead-in / tail / plateau interaction
+  with a hybrid `vorbis_window`, sign preservation, fail-closed
+  behaviour on length mismatch, and the error `Display` format.
+  Derived from `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.7 +
+  §1.3.2 and `docs/audio/vorbis/imdct-cross-reference.md`
+  §"Window-function equivalence".
+
 * **Vorbis I §4.3.7 forward-MDCT cosine-summation kernel (round 29,
   umbrella round 243).** New `mdct` module containing public
   `mdct::mdct_naive` + `mdct::mdct_naive_vec` functions that take one

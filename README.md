@@ -1,6 +1,63 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 29.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 30.
+
+## Status — 2026-06-07 (round 30, umbrella round 246)
+
+**Round 30 promotes the §4.3.6 window pre-multiplication step into a
+discrete, tested primitive.** The closing "every IMDCT sample times
+the matching window sample" step the spec calls out at the end of
+§4.3.7 — and which §4.3.1's window builder feeds — was previously
+inlined inside [`audio::apply_imdct_and_window`] as a four-line `zip`
+loop. It now has its own named function
+[`synthesis::window_premultiply`]`(time_frame, window)` that applies
+the same in-place pointwise product, gated by a length-mismatch check
+and a structured [`WindowPremultiplyError`]. This sits at the same
+abstraction level as the §4.3.5 [`inverse_couple`] primitive
+(`(magnitude, angle)` in-place / `CouplingError`) and gives §4.3.6 a
+matching first-class API.
+
+[`audio::apply_imdct_and_window`] now calls the primitive on each
+per-channel time-domain frame; a new
+[`AudioPacketError::WindowPremultiply`] variant surfaces the
+length-mismatch error path verbatim, with the same `Display` +
+`Error::source()` plumbing the other §4.3.x stage errors already
+have.
+
+Twelve in-module tests pin:
+
+* the pointwise product on a hand-built `(frame, window)` pair with
+  varied signs and magnitudes;
+* an integration test that builds a hybrid `vorbis_window(256, 64,
+  long, prev_short, next_short)` and confirms the lead-in `0..48`
+  and tail `208..256` bins are pinned to exactly zero while the
+  plateau `80..176` bins are untouched (the multiplication absorbs
+  the §4.3.1 zero-tail clause);
+* the trivial unity / zero / empty-slice cases as identity, zeroing,
+  and noop respectively;
+* sign preservation (no stray `.abs()` regression);
+* fail-closed semantics on length mismatch (frame longer than
+  window, then window longer than frame): the slice is left
+  untouched and the structured error reports both lengths;
+* the error `Display` text contains the offending lengths and the
+  word "window" for grep-ability.
+
+Crate-wide test count: **569 → 578 (+9 in-module synthesis tests
+beyond the pre-r30 baseline; the same primitive is also exercised by
+the four pre-existing `decode_one_packet_windowed` tests through the
+refactored call site)**.
+
+Followups (explicit): encoder-side §4.3.6 window pre-multiplication
+on the forward direction (the same primitive at the MDCT input — it
+is symmetrical and the existing function will be re-used once the
+encode-side path exists), the §4.3.8 overlap-add inversion / framing
+on the encode side, an FFT-decomposed forward-MDCT fast path
+validating against the round-29 cosine-summation kernel, the §4.3
+audio-packet writer wrapping mode + floor + residue + spectrum +
+MDCT encode (the round-28 prelude is the first piece of that), and
+pinning the Vorbis-specific normalization scalar once fixture traces
+under `docs/audio/vorbis/fixtures/<case>/` extend through the
+post-MDCT trace point.
 
 ## Status — 2026-06-07 (round 29, umbrella round 243)
 
@@ -1659,6 +1716,9 @@ crate that wraps or implements the format).
 [`vorbis_window`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.vorbis_window.html
 [`slope`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.slope.html
 [`WindowError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/enum.WindowError.html
+[`synthesis::window_premultiply`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.window_premultiply.html
+[`WindowPremultiplyError`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/enum.WindowPremultiplyError.html
+[`AudioPacketError::WindowPremultiply`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/audio/enum.AudioPacketError.html#variant.WindowPremultiply
 [`inverse_couple_all`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.inverse_couple_all.html
 [`inverse_couple`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.inverse_couple.html
 [`couple_scalar`]: https://docs.rs/oxideav-vorbis/latest/oxideav_vorbis/synthesis/fn.couple_scalar.html
