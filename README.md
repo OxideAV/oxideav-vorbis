@@ -1,6 +1,107 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 33.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 34.
+
+## Status — 2026-06-08 (round 34, umbrella round 259)
+
+**Round 34 lands the §4.3.6 / §4.3.7 encoder-side window + forward-MDCT
+composition primitive — the encoder mirror of the decoder's existing
+`audio::apply_imdct_and_window` flow.** The two underlying primitives
+already shipped:
+
+* [`mdct::mdct_naive`] / [`mdct::mdct_naive_vec`] — the bare §4.3.7
+  forward MDCT cosine-summation kernel (round 29).
+* [`synthesis::window_premultiply`] — the §4.3.6 in-place point-wise
+  window product the decode side runs after IMDCT (round 30).
+
+What round 34 adds is the single-call composition the encoder driver
+expects to wire up at the §4.3 transform stage. Two new public
+functions in `mdct` (also re-exported at the crate root):
+
+* [`mdct::apply_window_and_mdct(block, window, output, scale)`] —
+  in-place multiplies a length-`N` time-domain block by a length-`N`
+  §4.3.1-built window and runs the §4.3.7 forward MDCT into a
+  caller-allocated length-`N/2` spectrum buffer. The block-side
+  window product mirrors `synthesis::window_premultiply` exactly
+  (`a *= w`); inlining the kernel keeps `mdct.rs` self-contained
+  instead of pulling in a cross-module dependency for one
+  multiplication.
+* [`mdct::apply_window_and_mdct_vec(block, window, scale)`] — the
+  spectrum-allocating wrapper.
+
+A new public [`mdct::ApplyWindowAndMdctError`] enum unifies the two
+underlying failure modes:
+
+* `WindowLengthMismatch { block_len, window_len }` — the block and
+  window slices disagree on length. Pre-validated before any in-place
+  mutation, so the block is left bit-exactly unchanged on this error
+  path.
+* `Mdct(MdctError)` — the §4.3.7 forward MDCT rejected the windowed
+  block; carries the underlying `MdctError` verbatim. A
+  `From<MdctError>` impl lets the composition `?`-propagate the bare
+  MDCT's errors.
+
+8 new in-module unit tests bring the suite from **647 → 655 (+8)**:
+
+* `apply_window_and_mdct_rejects_length_mismatch` — pre-multiplication
+  length check fires first; the block stays untouched.
+* `apply_window_and_mdct_propagates_block_not_power_of_two` and
+  `apply_window_and_mdct_propagates_output_len_mismatch` — the two
+  `MdctError` arms forward verbatim through the `Mdct` wrapper.
+* `apply_window_and_mdct_zero_window_zeros_output` — the all-zero
+  window collapses both the block (in place) and the spectrum to
+  zero across `N ∈ {64, 256, 1024}`.
+* `apply_window_and_mdct_unity_window_equals_bare_mdct` — the all-one
+  window leaves the block bit-exactly equal to the input and the
+  spectrum bit-exactly equal to `mdct_naive`'s direct output.
+* `apply_window_and_mdct_is_linear_in_block` — `mdct(w · (αX + βY))
+  == α·mdct(w · X) + β·mdct(w · Y)` with a non-trivial alternating
+  window across three blocksizes (64 / 256 / 1024).
+* `apply_window_and_mdct_scale_is_pure_output_multiplier` — the
+  `scale` argument is a pure post-MDCT multiplier (no leakage into
+  the window product or the cosine sum).
+* `apply_window_and_mdct_equals_manual_two_step` — composed result
+  matches the hand-rolled "in-place multiply, then `mdct_naive`"
+  recipe element-wise with a sin² window.
+* `apply_window_and_mdct_error_display_and_source` — Display content
+  + `Error::source()` chaining: the length-mismatch arm has
+  `source() == None`, the `Mdct` arm chains to the wrapped
+  `MdctError`.
+
+With round 34, the encoder transform stage's mathematical content is
+now end-to-end composable: a §4.3 encoder driver lands a windowed
+spectrum with `apply_window_and_mdct`, the decode-side
+`audio::apply_imdct_and_window` reconstructs the same windowed
+time-domain frame, and the round-15 `overlap::OverlapAdd` primitive
+closes the round trip for consecutive blocks at the TDAC
+complementarity boundary `w[i]² + w[i+n/2]² == 1`. The remaining
+encoder-side closure is the per-block §4.3.6 spectrum dot-product
+inverse (`floor × residue` is the §4.3.6 product the encoder must
+factor into its quantised floor curve and residue vectors) and the
+§8.6.2 residue-body WRITE primitive listed below.
+
+Followups (explicit):
+
+* The §6.2.2 floor 0 packet-body WRITE primitive (the amplitude +
+  per-vector VQ codeword inverse — paired with a master/sub-book
+  selection helper analogous to the round-31 floor 1 packet writer's
+  `partition_cvals` knob).
+* The §8.6.2 residue-body WRITE primitive (three format variants
+  0/1/2 plus the bundle / scatter machinery).
+* The wrapping §4.3 audio-packet writer that splices §4.3.1
+  prelude + per-channel §7.2.3 floor body + the §4.3.4 residue body
+  + the §4.3.6 dot-product spectrum + §4.3.7 forward MDCT — with
+  round 34's composition primitive, the wrapping writer's
+  call-graph is one layer thinner.
+* Pinning the Vorbis-specific MDCT normalization scalar once
+  fixture traces under `docs/audio/vorbis/fixtures/<case>/` extend
+  through the post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §§4.3.1, 4.3.6,
+4.3.7 (the window construction, the §4.3.6 pointwise window
+multiplication, and the §4.3.7 MDCT/IMDCT step's closing window-
+application paragraph) plus the staged OxideAV-original
+`docs/audio/vorbis/imdct-cross-reference.md`.
 
 ## Status — 2026-06-08 (round 33, umbrella round 255)
 

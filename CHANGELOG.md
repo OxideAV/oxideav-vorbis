@@ -6,6 +6,70 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.6 / §4.3.7 encoder-side window + forward-MDCT
+  composition primitive (round 34, umbrella round 259).** Closes the
+  encoder-side mirror of the decoder's `audio::apply_imdct_and_window`
+  flow. The forward MDCT (`mdct::mdct_naive`, round 29) and the
+  §4.3.6 point-wise window pre-multiplication
+  (`synthesis::window_premultiply`, round 30) already shipped as
+  independent primitives. This round bundles them into the single
+  encoder transform stage. Two new public functions in `mdct` (also
+  re-exported at the crate root):
+
+  - `apply_window_and_mdct(block, window, output, scale)` —
+    in-place multiplies a length-`N` time-domain block by a length-`N`
+    §4.3.1-built window, then runs the §4.3.7 forward MDCT into a
+    caller-allocated length-`N/2` spectrum buffer. The block-side
+    window product mirrors `synthesis::window_premultiply` exactly
+    (`a *= w`); inlining the kernel here keeps `mdct.rs` self-contained
+    instead of pulling in a cross-module dependency for one
+    multiplication.
+  - `apply_window_and_mdct_vec(block, window, scale)` — the spectrum
+    `Vec<f32>` allocating wrapper.
+
+  A new public `ApplyWindowAndMdctError` enum unifies the two
+  underlying failure modes: a `WindowLengthMismatch` arm for the
+  pre-MDCT length check and a `Mdct(MdctError)` arm that forwards the
+  forward MDCT's existing errors. `From<MdctError>` is provided so
+  the composition can `?` through the bare-MDCT call.
+
+  Tests pin the algebraic content end to end:
+  - Length-mismatch rejection happens before any in-place mutation
+    (the block is verified unchanged on the error path).
+  - Block-length validity and output-slice sizing are propagated
+    verbatim from `mdct_naive` via the wrapping `Mdct` arm.
+  - The zero window collapses both the block and the spectrum to
+    all-zero; the unity window leaves the composed result equal to
+    the bare forward MDCT bit-exactly; an alternating non-trivial
+    window verifies the composed primitive matches a hand-rolled
+    "in-place multiply, then `mdct_naive`" recipe element-wise.
+  - Linearity in the block input is exercised with a non-trivial
+    window at three blocksizes (64, 256, 1024), confirming the two
+    underlying linear maps compose into a still-linear map.
+  - The `scale` argument is pinned as a pure post-MDCT multiplier
+    (no leakage into the window product or into the cosine sum).
+  - `Display` and `Error::source` are checked for both arms — the
+    length-mismatch arm has `source() == None`, the `Mdct` arm
+    chains to the wrapped `MdctError`.
+
+  The encoder transform stage's mathematical content is now
+  end-to-end composable: a §4.3 encoder driver lands a windowed
+  spectrum with `apply_window_and_mdct`, the decode-side
+  `audio::apply_imdct_and_window` reconstructs the same windowed
+  time-domain frame, and the §4.3.8 overlap-add primitive
+  (`overlap::OverlapAdd`) closes the round trip for consecutive
+  blocks at the TDAC complementarity boundary `w[i]² + w[i+n/2]² == 1`
+  that the round-15 `overlap` module already pins.
+
+  Provenance: clean-room implementation grounded entirely in
+  `docs/audio/vorbis/Vorbis_I_spec.pdf` §§4.3.1, 4.3.6, 4.3.7 and the
+  staged OxideAV-original `docs/audio/vorbis/imdct-cross-reference.md`.
+  Each test asserts a mathematical property derivable from the cosine
+  summation alone (linearity, zero-input, unity-window identity,
+  scale linearity) or from the two existing primitives' algebraic
+  composition (manual two-step equivalence) — no fixture data and no
+  external reference is consulted.
+
 * **Vorbis I §4.3.5 forward channel coupling primitives
   (round 33, umbrella round 255).** The encoder counterpart of the
   round-11 decoder-side `synthesis::inverse_couple` /

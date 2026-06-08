@@ -202,7 +202,10 @@ pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
 pub use imdct::{imdct_naive, imdct_naive_vec, ImdctError};
-pub use mdct::{mdct_naive, mdct_naive_vec, MdctError};
+pub use mdct::{
+    apply_window_and_mdct, apply_window_and_mdct_vec, mdct_naive, mdct_naive_vec,
+    ApplyWindowAndMdctError, MdctError,
+};
 pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,

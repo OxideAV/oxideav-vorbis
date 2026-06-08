@@ -353,6 +353,174 @@ pub fn mdct_naive_vec(block: &[f32], scale: f32) -> Result<Vec<f32>, MdctError> 
     Ok(out)
 }
 
+/// Errors that can arise from the encoder-side [`apply_window_and_mdct`]
+/// composition primitive.
+///
+/// This wraps the two underlying error types — the §4.3.6 window
+/// pre-multiplication's [`WindowPremultiplyError`] and the §4.3.7
+/// forward MDCT's [`MdctError`] — so a caller composing the encoder
+/// transform stage gets a single result type and a single match arm
+/// per failure mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyWindowAndMdctError {
+    /// The window slice's length disagrees with the time-domain
+    /// block's length. Mirrors [`WindowPremultiplyError::LengthMismatch`]
+    /// from the decode side; the encoder-side composition has the same
+    /// invariant (one window sample per input PCM sample, both sourced
+    /// from the same §4.3.1 `n`).
+    WindowLengthMismatch {
+        /// Length of the encoder-side time-domain block.
+        block_len: usize,
+        /// Length of the §4.3.1 window slice.
+        window_len: usize,
+    },
+    /// The forward MDCT rejected the windowed block. Carries the
+    /// underlying [`MdctError`] verbatim so the caller can distinguish
+    /// a non-power-of-two block length from a mis-sized output slice.
+    Mdct(MdctError),
+}
+
+impl core::fmt::Display for ApplyWindowAndMdctError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ApplyWindowAndMdctError::WindowLengthMismatch {
+                block_len,
+                window_len,
+            } => write!(
+                f,
+                "vorbis encoder window+mdct: block length {block_len} \
+                 disagrees with window length {window_len}",
+            ),
+            ApplyWindowAndMdctError::Mdct(inner) => {
+                write!(f, "vorbis encoder window+mdct: {inner}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApplyWindowAndMdctError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ApplyWindowAndMdctError::Mdct(inner) => Some(inner),
+            ApplyWindowAndMdctError::WindowLengthMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<MdctError> for ApplyWindowAndMdctError {
+    fn from(value: MdctError) -> Self {
+        ApplyWindowAndMdctError::Mdct(value)
+    }
+}
+
+/// Encoder-side §4.3.6 window pre-multiplication composed with the
+/// §4.3.7 forward MDCT.
+///
+/// This is the encoder-side mirror of [`crate::audio::apply_imdct_and_window`]:
+/// the decoder runs IMDCT *then* multiplies by the §4.3.1 window
+/// (because the §4.3.7 closing-paragraph window applies to the IMDCT's
+/// output), while the encoder multiplies the raw time-domain block by
+/// the same §4.3.1 window *then* runs the forward MDCT (because the
+/// encoder's input is the time-domain PCM, not a spectrum).
+///
+/// The two operations are pure linear maps and they compose in the
+/// algebraically natural order: `mdct ∘ window` for the encoder,
+/// `window ∘ imdct` for the decoder. Both stages share the §4.3.6
+/// window-multiplication primitive [`crate::synthesis::window_premultiply`]
+/// — the same point-wise product applied to a different vector.
+///
+/// `block` is the per-channel length-`N` time-domain PCM block the
+/// encoder is about to transform. The block is `&mut [f32]` because
+/// the window pre-multiplication is in place (matching the decode
+/// side's `apply_imdct_and_window` and avoiding one length-`N`
+/// allocation per channel per packet on the hot path); on a
+/// successful return, `block` holds the windowed time-domain samples
+/// the forward MDCT consumed.
+///
+/// `window` is a §4.3.1-built window slice of length `N`. The
+/// `window` slice is *not* mutated: only its values are read.
+///
+/// `output` is the caller-allocated destination slice for the §4.3.7
+/// forward MDCT spectrum. It must have length exactly `N / 2`.
+///
+/// `scale` is the same forward-MDCT scale parameter [`mdct_naive`]
+/// takes: a per-coefficient multiplier applied after the cosine
+/// summation. The Vorbis-specific normalization is "absorbed into the
+/// floor and residue scaling and into the window" per
+/// `docs/audio/vorbis/imdct-cross-reference.md` §"Vorbis-specific
+/// parameters" item 5; this primitive remains agnostic to the
+/// concrete value and lets callers experiment.
+///
+/// # Errors
+///
+/// * [`ApplyWindowAndMdctError::WindowLengthMismatch`] if
+///   `block.len() != window.len()`. Pre-validated before any
+///   multiplication so neither slice is touched on this error.
+/// * [`ApplyWindowAndMdctError::Mdct`] wrapping [`MdctError::BlockNotPowerOfTwo`]
+///   if `block.len()` is zero, odd, or not a power of two.
+/// * [`ApplyWindowAndMdctError::Mdct`] wrapping [`MdctError::OutputLenMismatch`]
+///   if `output.len() != block.len() / 2`. The block has *already
+///   been window-multiplied in place* by the time this error is
+///   returned — the §4.3.7 MDCT's output-slice validation is the only
+///   check that happens after the in-place window step. This matches
+///   how the decode-side `apply_imdct_and_window` reports the
+///   `WindowError::NotPowerOfTwo` case after the IMDCT has run.
+///
+/// # Spec sources
+///
+/// * `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.1 (window construction).
+/// * `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.6 (window
+///   pre-multiplication).
+/// * `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.7 (the MDCT/IMDCT
+///   step; the §4.3.7 closing paragraph names the window application
+///   the encoder side mirrors).
+/// * `docs/audio/vorbis/imdct-cross-reference.md` §"Verification recipe"
+///   (the matched windowing on encode and decode is what makes the
+///   §4.3.8 overlap-add cancel time-domain aliasing).
+pub fn apply_window_and_mdct(
+    block: &mut [f32],
+    window: &[f32],
+    output: &mut [f32],
+    scale: f32,
+) -> Result<(), ApplyWindowAndMdctError> {
+    if block.len() != window.len() {
+        return Err(ApplyWindowAndMdctError::WindowLengthMismatch {
+            block_len: block.len(),
+            window_len: window.len(),
+        });
+    }
+    // Window pre-multiplication is point-wise — the same arithmetic
+    // [`crate::synthesis::window_premultiply`] performs on the decode
+    // side, repeated here inline so this module doesn't pick up a
+    // cross-module dependency on `synthesis::` solely for the
+    // multiplication kernel. The two callers stay in lock-step by
+    // construction (both are `a *= w`).
+    for (sample, &w) in block.iter_mut().zip(window.iter()) {
+        *sample *= w;
+    }
+    mdct_naive(block, output, scale)?;
+    Ok(())
+}
+
+/// Convenience wrapper that allocates the spectrum output buffer.
+///
+/// The caller still owns `block` (mutated in place by the
+/// pre-multiplication) and `window` (read-only). The returned vector
+/// holds the length-`N/2` forward-MDCT spectrum.
+///
+/// # Errors
+///
+/// Same as [`apply_window_and_mdct`].
+pub fn apply_window_and_mdct_vec(
+    block: &mut [f32],
+    window: &[f32],
+    scale: f32,
+) -> Result<Vec<f32>, ApplyWindowAndMdctError> {
+    let mut out = vec![0.0f32; block.len() / 2];
+    apply_window_and_mdct(block, window, &mut out, scale)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +966,275 @@ mod tests {
             e2.to_string(),
             "vorbis mdct: output buffer length 50 != expected 32",
         );
+    }
+
+    // ---- encoder window + forward MDCT composition primitive ----
+
+    /// Length disagreement between block and window is rejected up
+    /// front, before any in-place multiplication. The block is left
+    /// untouched.
+    #[test]
+    fn apply_window_and_mdct_rejects_length_mismatch() {
+        let mut block = vec![1.0f32; 64];
+        let original = block.clone();
+        let window = vec![0.5f32; 32];
+        let mut out = vec![0.0f32; 32];
+        let result = apply_window_and_mdct(&mut block, &window, &mut out, 1.0);
+        assert_eq!(
+            result,
+            Err(ApplyWindowAndMdctError::WindowLengthMismatch {
+                block_len: 64,
+                window_len: 32,
+            }),
+        );
+        assert_eq!(
+            block, original,
+            "block was mutated despite the length-mismatch reject",
+        );
+    }
+
+    /// A non-power-of-two block length is rejected via the wrapped
+    /// `MdctError`. The window pre-multiplication runs first (it is
+    /// position-wise and has no length-validity requirement of its
+    /// own beyond the equality with `block.len()`), then the MDCT
+    /// rejects.
+    #[test]
+    fn apply_window_and_mdct_propagates_block_not_power_of_two() {
+        let mut block = vec![1.0f32; 96]; // 96 = 64 + 32, not a power of two
+        let window = vec![0.5f32; 96];
+        let mut out = vec![0.0f32; 48];
+        let result = apply_window_and_mdct(&mut block, &window, &mut out, 1.0);
+        assert_eq!(
+            result,
+            Err(ApplyWindowAndMdctError::Mdct(
+                MdctError::BlockNotPowerOfTwo { block_len: 96 },
+            )),
+        );
+    }
+
+    /// An output slice of the wrong length is rejected via the
+    /// wrapped `MdctError`. Documented in the function's `# Errors`
+    /// list as the only error path that occurs *after* the in-place
+    /// window multiplication has run.
+    #[test]
+    fn apply_window_and_mdct_propagates_output_len_mismatch() {
+        let mut block = vec![1.0f32; 64];
+        let window = vec![0.25f32; 64];
+        let mut out = vec![0.0f32; 50];
+        let result = apply_window_and_mdct(&mut block, &window, &mut out, 1.0);
+        assert_eq!(
+            result,
+            Err(ApplyWindowAndMdctError::Mdct(
+                MdctError::OutputLenMismatch {
+                    output_len: 50,
+                    expected_len: 32,
+                }
+            )),
+        );
+    }
+
+    /// The zero window collapses every input sample to zero, so the
+    /// forward MDCT (a linear map of zero) is also zero.
+    #[test]
+    fn apply_window_and_mdct_zero_window_zeros_output() {
+        for &n in TEST_BLOCKSIZES_N {
+            let mut block: Vec<f32> = (0..n).map(|i| ((i + 1) as f32 * 0.13).sin()).collect();
+            let window = vec![0.0f32; n];
+            let out = apply_window_and_mdct_vec(&mut block, &window, 1.0).unwrap();
+            assert_eq!(out.len(), n / 2);
+            for (i, &v) in out.iter().enumerate() {
+                assert_eq!(v, 0.0, "n {} idx {} not zero", n, i);
+            }
+            // Block was also mutated in place to zero (zero * any).
+            for (i, &v) in block.iter().enumerate() {
+                assert_eq!(v, 0.0, "n {} idx {} block not zeroed", n, i);
+            }
+        }
+    }
+
+    /// The unity window leaves the block unchanged, so the composed
+    /// primitive coincides with the bare forward MDCT.
+    #[test]
+    fn apply_window_and_mdct_unity_window_equals_bare_mdct() {
+        for &n in TEST_BLOCKSIZES_N {
+            let initial: Vec<f32> = (0..n).map(|i| ((i + 1) as f32 * 0.07).cos()).collect();
+            let window = vec![1.0f32; n];
+
+            let mut block_a = initial.clone();
+            let composed = apply_window_and_mdct_vec(&mut block_a, &window, 1.0).unwrap();
+            // The in-place pre-multiplication by 1.0 leaves the block
+            // bit-exactly equal to the input.
+            assert_eq!(block_a, initial, "n {}: unity window changed block", n);
+
+            let bare = mdct_naive_vec(&initial, 1.0).unwrap();
+            assert_eq!(composed.len(), bare.len());
+            for i in 0..bare.len() {
+                let diff = (composed[i] - bare[i]).abs();
+                assert!(
+                    diff < 1.0e-6,
+                    "n {} idx {} composed {} != bare {} diff {}",
+                    n,
+                    i,
+                    composed[i],
+                    bare[i],
+                    diff,
+                );
+            }
+        }
+    }
+
+    /// Composition is linear in the block input for a fixed window:
+    /// `mdct(w · (αX + βY)) = α·mdct(w · X) + β·mdct(w · Y)`. This
+    /// follows from the two underlying linear maps composing into a
+    /// (still linear) map; the test guards a future refactor against
+    /// a non-linear branch creeping into either stage.
+    #[test]
+    fn apply_window_and_mdct_is_linear_in_block() {
+        let alpha = 1.5f32;
+        let beta = -0.75f32;
+        for &n in TEST_BLOCKSIZES_N {
+            let x_init: Vec<f32> = (0..n).map(|i| ((i + 1) as f32 * 0.11).sin()).collect();
+            let y_init: Vec<f32> = (0..n).map(|i| ((i + 1) as f32 * 0.23).cos()).collect();
+            // A non-trivial window: alternating 0.5 and 1.0 ramp.
+            let window: Vec<f32> = (0..n).map(|i| 0.5 + (i % 2) as f32 * 0.5).collect();
+
+            let combined_init: Vec<f32> = x_init
+                .iter()
+                .zip(&y_init)
+                .map(|(&xi, &yi)| alpha * xi + beta * yi)
+                .collect();
+
+            let mut x = x_init.clone();
+            let mdct_x = apply_window_and_mdct_vec(&mut x, &window, 1.0).unwrap();
+            let mut y = y_init.clone();
+            let mdct_y = apply_window_and_mdct_vec(&mut y, &window, 1.0).unwrap();
+            let mut combined = combined_init.clone();
+            let mdct_combined = apply_window_and_mdct_vec(&mut combined, &window, 1.0).unwrap();
+
+            for i in 0..(n / 2) {
+                let expected = alpha * mdct_x[i] + beta * mdct_y[i];
+                let diff = (mdct_combined[i] - expected).abs();
+                let tol = (expected.abs() * 1.0e-4).max(1.0e-4);
+                assert!(
+                    diff < tol,
+                    "n {} idx {}: composed linearity gap, got {} expected {} diff {}",
+                    n,
+                    i,
+                    mdct_combined[i],
+                    expected,
+                    diff,
+                );
+            }
+        }
+    }
+
+    /// The `scale` parameter remains a pure post-summation multiplier
+    /// — same property [`mdct_naive`] has, lifted through the
+    /// composition. Pins it against a future refactor accidentally
+    /// applying `scale` inside the window product or inside the
+    /// cosine sum.
+    #[test]
+    fn apply_window_and_mdct_scale_is_pure_output_multiplier() {
+        let n = 64;
+        let block_init: Vec<f32> = (0..n).map(|i| ((i + 1) as f32 * 0.17).cos()).collect();
+        let window: Vec<f32> = (0..n).map(|i| 0.25 + (i as f32) / (n as f32)).collect();
+
+        let mut block_bare = block_init.clone();
+        let bare = apply_window_and_mdct_vec(&mut block_bare, &window, 1.0).unwrap();
+        let mut block_scaled = block_init.clone();
+        let scaled = apply_window_and_mdct_vec(&mut block_scaled, &window, 3.0).unwrap();
+
+        for i in 0..(n / 2) {
+            let expected = bare[i] * 3.0;
+            let diff = (scaled[i] - expected).abs();
+            let tol = (expected.abs() * 1.0e-5).max(1.0e-6);
+            assert!(
+                diff < tol,
+                "idx {}: scaled {} != expected {} diff {}",
+                i,
+                scaled[i],
+                expected,
+                diff,
+            );
+        }
+    }
+
+    /// Cross-check that the composed primitive equals the manual
+    /// two-step recipe `block *= window; mdct_naive(block)`. Confirms
+    /// the wrapper introduces no algebraic difference from the
+    /// underlying `synthesis::window_premultiply` + `mdct_naive`
+    /// sequence the decoder's `apply_imdct_and_window` mirrors on
+    /// the IMDCT side.
+    #[test]
+    fn apply_window_and_mdct_equals_manual_two_step() {
+        for &n in TEST_BLOCKSIZES_N {
+            let block_init: Vec<f32> = (0..n).map(|i| ((i + 1) as f32 * 0.05).cos()).collect();
+            // A window of the form sin² · cos² of an index ramp —
+            // exercises every non-trivial range without depending on
+            // the §4.3.1 window builder.
+            let window: Vec<f32> = (0..n)
+                .map(|i| {
+                    let t = (i as f32) / (n as f32);
+                    (t * core::f32::consts::PI).sin().powi(2)
+                })
+                .collect();
+
+            let mut composed_block = block_init.clone();
+            let composed = apply_window_and_mdct_vec(&mut composed_block, &window, 1.0).unwrap();
+
+            // Manual two-step recipe: in-place window product, then
+            // bare forward MDCT.
+            let mut manual_block = block_init.clone();
+            for (sample, &w) in manual_block.iter_mut().zip(window.iter()) {
+                *sample *= w;
+            }
+            let manual = mdct_naive_vec(&manual_block, 1.0).unwrap();
+
+            assert_eq!(
+                composed_block, manual_block,
+                "n {}: in-place block diverged",
+                n
+            );
+            assert_eq!(composed.len(), manual.len());
+            for i in 0..manual.len() {
+                let diff = (composed[i] - manual[i]).abs();
+                assert!(
+                    diff < 1.0e-6,
+                    "n {} idx {}: composed {} != manual {} diff {}",
+                    n,
+                    i,
+                    composed[i],
+                    manual[i],
+                    diff,
+                );
+            }
+        }
+    }
+
+    /// Display+source pin for the composition primitive's error
+    /// type.
+    #[test]
+    fn apply_window_and_mdct_error_display_and_source() {
+        let len_err = ApplyWindowAndMdctError::WindowLengthMismatch {
+            block_len: 64,
+            window_len: 32,
+        };
+        assert_eq!(
+            len_err.to_string(),
+            "vorbis encoder window+mdct: block length 64 disagrees with window length 32",
+        );
+        // The length-mismatch arm has no underlying cause.
+        assert!(std::error::Error::source(&len_err).is_none());
+
+        let inner = MdctError::BlockNotPowerOfTwo { block_len: 96 };
+        let wrapped: ApplyWindowAndMdctError = inner.clone().into();
+        assert_eq!(
+            wrapped.to_string(),
+            "vorbis encoder window+mdct: vorbis mdct: block length 96 \
+             is not a positive even power of two",
+        );
+        // The `Mdct` arm chains to the wrapped `MdctError`.
+        let src = std::error::Error::source(&wrapped).expect("wrapped MdctError exposes source");
+        assert_eq!(src.to_string(), inner.to_string());
     }
 }
