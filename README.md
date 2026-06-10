@@ -1,6 +1,94 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 34.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 35.
+
+## Status — 2026-06-10 (round 35, umbrella round 267)
+
+**Round 35 lands the §8.6.2 residue classification packing primitive —
+the first piece of the §8.6.2 residue-body WRITE path and the exact
+arithmetic inverse of the residue decoder's classbook *unpack*.** New
+public function [`encoder::pack_residue_classifications`] (re-exported
+at the crate root) packs one group of `classwords_per_codeword`
+classification indices into the single classbook **entry index** the
+§8.6.2 audio-packet residue decode reads in scalar context (step 9's
+`[temp] = [classbook]` read).
+
+The residue decoder, after reading one classbook entry `temp`, recovers
+`classwords_per_codeword` classifications by the descending loop
+
+```text
+for i in (0 .. classwords).rev() {
+    classification[i] = temp % num_classifications;
+    temp /= num_classifications;
+}
+```
+
+so group position 0 holds the **most**-significant base-`C` digit and
+position `classwords - 1` the least-significant. With `C =
+num_classifications` and `L = classwords`, the packer computes
+
+```text
+temp = Σ_{i=0}^{L-1} classification[i] · C^(L-1-i)
+```
+
+by overflow-checked Horner accumulation front-to-back, refusing to
+emit a value that fails to round-trip rather than wrapping silently.
+The round-trip property
+
+```text
+unpack(pack_residue_classifications(group, C)?, group.len(), C) == group
+```
+
+holds for every legal group/base (verified exhaustively against the
+decoder's own unpack loop over bases 1..=6 × lengths 1..=4, plus the
+§8.6.1 maximum base 64).
+
+A new [`PackResidueClassError`] enumerates six fail-closed invariants:
+`ZeroClassifications` / `ClassificationsTooLarge` (base outside the
+§8.6.1 `read 6 bits + 1` range 1..=64), `EmptyGroup` /
+`GroupTooLong` (group length outside 1..=32, the `u32`-classbook-read
+bound), `ClassificationOutOfRange` (a digit `>= C`, which the unpack's
+`temp % C` can never produce), and `PackedValueOverflow` (the packed
+index exceeds `u32::MAX`). The umbrella [`WriteError`] grows a
+[`WriteError::ResidueClassification`] variant with the matching `From`
+glue and `source()` chain; validation precedes any arithmetic, so the
+function is a pure value-to-value transform with no side effects.
+
+14 new in-module unit tests bring the crate suite from **655 → 669
+(+14)**: single-digit identity across every legal base; hand-computed
+positional weights (base 3 / 10 / 2); the most-significant-position
+semantics (bumping the last position changes the value by `C^0`, the
+first by `C^(L-1)`); the exhaustive `pack → decoder-unpack → equal`
+round-trip; the base-64 round-trip; all six error paths; the
+validation-precedes-overflow ordering; the umbrella `WriteError` From
+glue + `source()` chain; and grep-able `Display` content for every
+variant.
+
+Followups (explicit):
+
+* The §8.6.3/§8.6.4/§8.6.5 residue-body VQ-codeword emission (the
+  per-partition value-codeword WRITE — needs a VQ-encode side that
+  maps residue scalars back to codebook entries) plus the wrapping
+  §8.6.2 residue-body writer that threads this classification packer's
+  output through the classbook Huffman code and then emits the
+  per-pass partition bodies. This round's primitive is the
+  classification half of that writer.
+* The §6.2.2 floor 0 packet-body WRITE primitive (the amplitude +
+  per-vector VQ codeword inverse — paired with a master/sub-book
+  selection helper analogous to the round-31 floor 1 packet writer's
+  `partition_cvals` knob).
+* The wrapping §4.3 audio-packet writer that splices §4.3.1 prelude +
+  per-channel §7.2.3 floor body + the §8.6.2 residue body + the
+  §4.3.6 dot-product spectrum + §4.3.7 forward MDCT.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.2 (the
+audio-packet residue decode loop's classbook scalar read + the
+step-10..12 classification unpack), §8.6.1 (the
+`residue_classifications` 1..=64 range and `classwords_per_codeword`
+= classbook dimensions).
 
 ## Status — 2026-06-08 (round 34, umbrella round 259)
 

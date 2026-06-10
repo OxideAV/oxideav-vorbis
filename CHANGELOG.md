@@ -6,6 +6,39 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §8.6.2 residue classification packing primitive (round 35,
+  umbrella round 267).** New public function
+  `encoder::pack_residue_classifications(classifications,
+  num_classifications)` (re-exported at the crate root) — the exact
+  arithmetic inverse of the §8.6.2 step-10..12 classbook *unpack* the
+  residue decoder runs after reading one classbook entry. It packs one
+  group of `classwords_per_codeword` classification indices into the
+  single classbook entry index a residue-body writer will then
+  Huffman-code (§8.6.2 step 9's inverse), the first piece of the
+  §8.6.2 residue-body WRITE path.
+
+  The decoder recovers classifications by the descending loop
+  `for i in (0..classwords).rev() { class[i] = temp % C; temp /= C }`,
+  so group position 0 is the most-significant base-`C` digit and the
+  packer computes `temp = Σ class[i]·C^(L-1-i)` by overflow-checked
+  Horner accumulation. A new `PackResidueClassError` enum enumerates
+  six fail-closed invariants (`ZeroClassifications`,
+  `ClassificationsTooLarge`, `EmptyGroup`, `GroupTooLong`,
+  `ClassificationOutOfRange`, `PackedValueOverflow`); the umbrella
+  `WriteError` grows a `ResidueClassification` variant with `From`
+  glue and `source()` chaining.
+
+  14 new in-module unit tests bring the crate suite from 655 → 669
+  (+14): single-digit identity across every legal base, hand-computed
+  positional weights, the most-significant-position semantics, an
+  exhaustive `pack → decoder-unpack → equal` round-trip over every
+  group at bases 1..=6 and lengths 1..=4, a base-64 (§8.6.1 maximum)
+  round-trip, every error path (zero/oversized base, empty/over-long
+  group, out-of-range digit, packed-value overflow), validation-
+  precedes-overflow ordering, the umbrella `WriteError` From glue +
+  `source()` chain, and grep-able `Display` content for all six
+  variants.
+
 * **Vorbis I §4.3.6 / §4.3.7 encoder-side window + forward-MDCT
   composition primitive (round 34, umbrella round 259).** Closes the
   encoder-side mirror of the decoder's `audio::apply_imdct_and_window`

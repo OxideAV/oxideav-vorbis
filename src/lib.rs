@@ -184,11 +184,12 @@ pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
 pub use encoder::{
-    write_audio_packet_header, write_codebook, write_comment_header, write_floor0_header,
-    write_floor1_header, write_floor1_packet, write_identification_header, write_mapping_header,
-    write_mode_header, write_residue_header, Floor1Packet, WriteAudioPacketHeaderError,
-    WriteCodebookError, WriteError, WriteFloor0Error, WriteFloor1Error, WriteFloor1PacketError,
-    WriteMappingError, WriteModeError, WriteResidueError,
+    pack_residue_classifications, write_audio_packet_header, write_codebook, write_comment_header,
+    write_floor0_header, write_floor1_header, write_floor1_packet, write_identification_header,
+    write_mapping_header, write_mode_header, write_residue_header, Floor1Packet,
+    PackResidueClassError, WriteAudioPacketHeaderError, WriteCodebookError, WriteError,
+    WriteFloor0Error, WriteFloor1Error, WriteFloor1PacketError, WriteMappingError, WriteModeError,
+    WriteResidueError,
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{
@@ -306,10 +307,12 @@ pub enum Error {
     /// [`crate::encoder::write_floor1_header`],
     /// [`crate::encoder::write_floor0_header`],
     /// [`crate::encoder::write_residue_header`],
-    /// [`crate::encoder::write_mapping_header`], or
-    /// [`crate::encoder::write_floor1_packet`]) rejected its input
-    /// because the supplied struct fails one of the §4.2.2 / §5.2.1 /
-    /// §3.2.1 / §6.2.1 / §7.2.2 / §7.2.3 / §8.6.1 / §4.2.4 invariants
+    /// [`crate::encoder::write_mapping_header`],
+    /// [`crate::encoder::write_floor1_packet`], or
+    /// [`crate::encoder::pack_residue_classifications`]) rejected its
+    /// input because the supplied struct fails one of the §4.2.2 /
+    /// §5.2.1 / §3.2.1 / §6.2.1 / §7.2.2 / §7.2.3 / §8.6.1 / §8.6.2 /
+    /// §4.2.4 invariants
     /// the encoder is contracted to refuse rather than emit a
     /// malformed packet.
     Write(WriteError),

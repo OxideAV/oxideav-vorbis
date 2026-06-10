@@ -105,6 +105,16 @@
 //! and a wrapping §4.3 audio-packet writer that splices the prelude
 //! into the per-channel payload remain explicit followups for
 //! subsequent rounds.
+//!
+//! Round 35 (umbrella round 267) lands
+//! [`pack_residue_classifications`]: the §8.6.2 step-9..12 residue
+//! classification packing primitive — the exact arithmetic inverse of
+//! the residue decoder's classbook *unpack*. It packs one group of
+//! `classwords_per_codeword` classification indices into the single
+//! classbook entry index the residue-body writer will Huffman-code,
+//! the first piece of the §8.6.2 residue-body WRITE path. The
+//! VQ-codeword body emission (§8.6.3/§8.6.4/§8.6.5) and the wrapping
+//! §8.6.2 residue-body writer remain explicit followups.
 
 use core::fmt;
 
@@ -186,6 +196,10 @@ pub enum WriteError {
     /// A floor 1 audio-packet body (§7.2.3) failed one of the
     /// writer-side invariants checked by [`write_floor1_packet`].
     Floor1Packet(WriteFloor1PacketError),
+    /// A residue classification group (§8.6.2 steps 9..12) failed one
+    /// of the writer-side invariants checked by
+    /// [`pack_residue_classifications`].
+    ResidueClassification(PackResidueClassError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -1568,6 +1582,7 @@ impl fmt::Display for WriteError {
             WriteError::Setup(e) => write!(f, "{e}"),
             WriteError::AudioPacket(e) => write!(f, "{e}"),
             WriteError::Floor1Packet(e) => write!(f, "{e}"),
+            WriteError::ResidueClassification(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1584,6 +1599,7 @@ impl std::error::Error for WriteError {
             WriteError::Setup(e) => Some(e),
             WriteError::AudioPacket(e) => Some(e),
             WriteError::Floor1Packet(e) => Some(e),
+            WriteError::ResidueClassification(e) => Some(e),
             _ => None,
         }
     }
@@ -1640,6 +1656,12 @@ impl From<WriteAudioPacketHeaderError> for WriteError {
 impl From<WriteFloor1PacketError> for WriteError {
     fn from(value: WriteFloor1PacketError) -> Self {
         WriteError::Floor1Packet(value)
+    }
+}
+
+impl From<PackResidueClassError> for WriteError {
+    fn from(value: PackResidueClassError) -> Self {
+        WriteError::ResidueClassification(value)
     }
 }
 
@@ -3771,6 +3793,207 @@ pub(crate) fn write_floor1_packet_into_writer(
 /// `[range]` table for floor 1 (§7.2.3 step 1, also §7.2.4 step-1 step 1):
 /// `{ 256, 128, 86, 64 }` indexed by `[floor1_multiplier] - 1`.
 const RANGE_TABLE_FLOOR1: [u32; 4] = [256, 128, 86, 64];
+
+/// Errors that may arise while packing a residue classification group
+/// (§8.6.2 steps 9..12) via [`pack_residue_classifications`].
+///
+/// The packer is the exact arithmetic inverse of the §8.6.2 step-10..12
+/// classbook *unpack* the residue decoder performs (see
+/// [`crate::residue::ResidueDecoder`]). Each variant flags an input the
+/// packer cannot serialise back to a classbook entry index the unpack
+/// loop would reproduce, so it refuses the call rather than emit a value
+/// that fails to round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackResidueClassError {
+    /// `num_classifications` was zero. §8.6.1 stores
+    /// `residue_classifications` as a `read 6 bits + 1` field, so the
+    /// legal range is `1..=64`; a zero base has no meaning for the
+    /// positional `temp % C` / `temp /= C` digit extraction.
+    ZeroClassifications,
+    /// `num_classifications` exceeded 64. §8.6.1 caps
+    /// `residue_classifications` at 64 (the `read 6 bits + 1` upper
+    /// edge). The contained value is the rejected base.
+    ClassificationsTooLarge(u32),
+    /// The classification group was empty. §8.6.2 packs
+    /// `classwords_per_codeword` classifications into one classbook
+    /// entry, and that count (the classbook's `dimensions`) is `>= 1`
+    /// for any decodable residue; a zero-length group cannot be the
+    /// inverse of a real classbook read.
+    EmptyGroup,
+    /// The group held more than 32 classifications. A classbook entry
+    /// index is a `u32`, and `C^32 >= 2^32` for every legal base
+    /// `C >= 2`, so a group longer than 32 cannot fit its packed value
+    /// in the `u32` the unpack loop reads in scalar context. The
+    /// contained value is the rejected group length. (In practice
+    /// `classwords_per_codeword` is the classbook's `dimensions`, which
+    /// is far smaller; this is a defensive upper bound, not a §8.6
+    /// limit.)
+    GroupTooLong(usize),
+    /// A classification index was `>= num_classifications`. The unpack
+    /// loop produces `temp % C`, which is always in `0..C`, so any
+    /// index `>= C` has no on-wire round-trip.
+    ClassificationOutOfRange {
+        /// Position of the offending classification within the group
+        /// (0 = the least-significant base-`C` digit).
+        position: usize,
+        /// The rejected classification index.
+        classification: u32,
+        /// `num_classifications` — the legal exclusive upper bound.
+        num_classifications: u32,
+    },
+    /// The packed classbook entry index overflowed `u32`. Even with
+    /// every digit in range, `Σ class[i]·C^i` can exceed `u32::MAX`
+    /// for a large base and group length; the classbook read is a
+    /// scalar `u32` decode, so an index above `u32::MAX` is
+    /// unrepresentable on the wire.
+    PackedValueOverflow {
+        /// `num_classifications` (the digit base `C`).
+        num_classifications: u32,
+        /// The group length (the number of base-`C` digits).
+        group_len: usize,
+    },
+}
+
+impl fmt::Display for PackResidueClassError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackResidueClassError::ZeroClassifications => write!(
+                f,
+                "vorbis residue classification (write): num_classifications=0 (must be 1..=64 per §8.6.1)"
+            ),
+            PackResidueClassError::ClassificationsTooLarge(c) => write!(
+                f,
+                "vorbis residue classification (write): num_classifications={c} > 64 (§8.6.1 caps at 64)"
+            ),
+            PackResidueClassError::EmptyGroup => write!(
+                f,
+                "vorbis residue classification (write): empty classification group (classwords_per_codeword must be >= 1 per §8.6.2)"
+            ),
+            PackResidueClassError::GroupTooLong(n) => write!(
+                f,
+                "vorbis residue classification (write): group length {n} > 32; packed index would exceed u32 (§8.6.2 scalar classbook read)"
+            ),
+            PackResidueClassError::ClassificationOutOfRange {
+                position,
+                classification,
+                num_classifications,
+            } => write!(
+                f,
+                "vorbis residue classification (write): classification[{position}]={classification} >= num_classifications={num_classifications} (no §8.6.2 unpack round-trip)"
+            ),
+            PackResidueClassError::PackedValueOverflow {
+                num_classifications,
+                group_len,
+            } => write!(
+                f,
+                "vorbis residue classification (write): packed classbook index overflows u32 for base {num_classifications}, {group_len} digits (§8.6.2 scalar classbook read)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PackResidueClassError {}
+
+/// Pack one residue classification group into the single classbook
+/// **entry index** the §8.6.2 audio-packet residue decode reads in
+/// scalar context (the `[temp] = [classbook] read` of step 9).
+///
+/// This is the exact arithmetic inverse of the §8.6.2 step-10..12
+/// classbook *unpack* the residue decoder performs. The decoder, after
+/// reading one classbook entry `temp`, recovers `classwords_per_codeword`
+/// classifications by the descending loop
+///
+/// ```text
+/// for i in (0 .. classwords).rev() {
+///     classification[i] = temp % num_classifications;
+///     temp /= num_classifications;
+/// }
+/// ```
+///
+/// The descending `(0..classwords).rev()` index means the *last*
+/// iteration writes `classification[0]` from the lowest base-`C` digit,
+/// so group position 0 is the **most**-significant digit and position
+/// `classwords - 1` is the least-significant. With `C =
+/// num_classifications` and `L = classwords`:
+///
+/// ```text
+/// temp = Σ_{i=0}^{L-1} classification[i] · C^(L-1-i)
+/// ```
+///
+/// `pack_residue_classifications` computes that sum. `classifications`
+/// is one group of exactly `classwords_per_codeword` classification
+/// indices in the decoder's array order (position 0 = the
+/// most-significant base-`C` digit), and the returned `u32` is the
+/// classbook entry index a residue-body writer then Huffman-codes with
+/// the classbook (§8.6.2 step 9's inverse).
+///
+/// The round-trip property
+///
+/// ```text
+/// unpack(pack_residue_classifications(group, C)?, group.len(), C) == group
+/// ```
+///
+/// holds for every legal `group` and base `C` (where `unpack` is the
+/// decoder's step-10..12 loop above).
+///
+/// # Errors
+///
+/// Returns a [`PackResidueClassError`] if `num_classifications` is
+/// outside `1..=64`, the group is empty or longer than 32, any
+/// classification index is `>= num_classifications`, or the packed
+/// index would exceed `u32::MAX`. Validation precedes any arithmetic;
+/// the function is a pure value-to-value transform with no side effects.
+pub fn pack_residue_classifications(
+    classifications: &[u32],
+    num_classifications: u32,
+) -> Result<u32, PackResidueClassError> {
+    // §8.6.1: residue_classifications is a `read 6 bits + 1` field.
+    if num_classifications == 0 {
+        return Err(PackResidueClassError::ZeroClassifications);
+    }
+    if num_classifications > 64 {
+        return Err(PackResidueClassError::ClassificationsTooLarge(
+            num_classifications,
+        ));
+    }
+    // §8.6.2: classwords_per_codeword (= classbook dimensions) is >= 1.
+    if classifications.is_empty() {
+        return Err(PackResidueClassError::EmptyGroup);
+    }
+    if classifications.len() > 32 {
+        return Err(PackResidueClassError::GroupTooLong(classifications.len()));
+    }
+
+    // Validate every digit is in 0..num_classifications before packing
+    // (the unpack loop only ever produces `temp % C`, which is < C).
+    for (position, &classification) in classifications.iter().enumerate() {
+        if classification >= num_classifications {
+            return Err(PackResidueClassError::ClassificationOutOfRange {
+                position,
+                classification,
+                num_classifications,
+            });
+        }
+    }
+
+    // temp = Σ class[i] · C^(L-1-i): group position 0 is the
+    // most-significant digit, so Horner processes the group front-to-back
+    // (`packed = packed·C + class[i]`). Every step is checked against
+    // u32 overflow so an out-of-range packed index is refused rather than
+    // wrapping silently.
+    let base = num_classifications;
+    let mut packed: u32 = 0;
+    for &classification in classifications.iter() {
+        packed = packed
+            .checked_mul(base)
+            .and_then(|p| p.checked_add(classification))
+            .ok_or(PackResidueClassError::PackedValueOverflow {
+                num_classifications,
+                group_len: classifications.len(),
+            })?;
+    }
+    Ok(packed)
+}
 
 #[cfg(test)]
 mod tests {
@@ -9520,6 +9743,216 @@ mod tests {
             );
             assert!(
                 s.contains("floor1") || s.contains("vorbis"),
+                "Display for {e:?} should be grep-able: {s}"
+            );
+        }
+    }
+
+    // ---- §8.6.2 residue classification packing (round 35) ----
+
+    /// Faithful re-statement of the §8.6.2 step-10..12 classbook
+    /// *unpack* the residue decoder performs after reading one classbook
+    /// entry `temp`. Recovers `group_len` classifications in ascending
+    /// group order (position 0 = least-significant base-`C` digit).
+    /// This is the exact loop `ResidueDecoder::decode_core` runs; the
+    /// `pack_residue_classifications` round-trip is checked against it.
+    fn unpack_residue_classifications(mut temp: u32, group_len: usize, base: u32) -> Vec<u32> {
+        let mut out = vec![0u32; group_len];
+        for i in (0..group_len).rev() {
+            out[i] = temp % base;
+            temp /= base;
+        }
+        out
+    }
+
+    #[test]
+    fn pack_residue_classifications_single_digit_is_identity() {
+        // A length-1 group packs to the digit itself for any base.
+        for base in 1..=64u32 {
+            for d in 0..base {
+                assert_eq!(pack_residue_classifications(&[d], base), Ok(d));
+            }
+        }
+    }
+
+    #[test]
+    fn pack_residue_classifications_positional_weights() {
+        // Position 0 is the most-significant digit (matching the
+        // decoder's descending unpack). base = 3, group [0, 1, 2]:
+        // 0·3^2 + 1·3^1 + 2·3^0 = 3 + 2 = 5.
+        assert_eq!(pack_residue_classifications(&[0, 1, 2], 3), Ok(5));
+        // base = 10, group [7, 2, 4]: 700 + 20 + 4 = 724.
+        assert_eq!(pack_residue_classifications(&[7, 2, 4], 10), Ok(724));
+        // base = 2, group [1, 1, 0, 1]: 8 + 4 + 0 + 1 = 13.
+        assert_eq!(pack_residue_classifications(&[1, 1, 0, 1], 2), Ok(13));
+    }
+
+    #[test]
+    fn pack_residue_classifications_position_zero_is_most_significant() {
+        // The last group position is the least-significant digit: bumping
+        // it changes the result by exactly 1 (weight C^0).
+        let base = 5;
+        let a = pack_residue_classifications(&[2, 3, 0], base).unwrap();
+        let b = pack_residue_classifications(&[2, 3, 1], base).unwrap();
+        assert_eq!(b - a, 1);
+        // Bumping position 0 changes it by C^(len-1) per increment.
+        let c = pack_residue_classifications(&[4, 3, 0], base).unwrap();
+        assert_eq!(c - a, (4 - 2) * base.pow(2));
+    }
+
+    #[test]
+    fn pack_residue_classifications_round_trips_against_unpack() {
+        // Exhaustive over small bases and group lengths: pack then run
+        // the decoder's own unpack loop; the group must be recovered.
+        for base in 1..=6u32 {
+            for group_len in 1..=4usize {
+                // Enumerate every legal group (each digit in 0..base).
+                let total = base.pow(group_len as u32);
+                for n in 0..total {
+                    let group = unpack_residue_classifications(n, group_len, base);
+                    let packed = pack_residue_classifications(&group, base).unwrap();
+                    assert_eq!(packed, n, "pack must reproduce the classbook entry");
+                    let recovered = unpack_residue_classifications(packed, group_len, base);
+                    assert_eq!(recovered, group, "unpack(pack(group)) must equal group");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_residue_classifications_round_trips_at_base_64() {
+        // The §8.6.1 maximum base (residue_classifications = 64). A
+        // 5-digit group at base 64 still fits a u32 (64^5 = 2^30).
+        let base = 64;
+        let group = [63, 0, 17, 63, 5];
+        let packed = pack_residue_classifications(&group, base).unwrap();
+        let recovered = unpack_residue_classifications(packed, group.len(), base);
+        assert_eq!(recovered, group.to_vec());
+    }
+
+    #[test]
+    fn pack_residue_classifications_rejects_zero_base() {
+        assert_eq!(
+            pack_residue_classifications(&[0], 0),
+            Err(PackResidueClassError::ZeroClassifications)
+        );
+    }
+
+    #[test]
+    fn pack_residue_classifications_rejects_base_above_64() {
+        assert_eq!(
+            pack_residue_classifications(&[0], 65),
+            Err(PackResidueClassError::ClassificationsTooLarge(65))
+        );
+    }
+
+    #[test]
+    fn pack_residue_classifications_rejects_empty_group() {
+        assert_eq!(
+            pack_residue_classifications(&[], 4),
+            Err(PackResidueClassError::EmptyGroup)
+        );
+    }
+
+    #[test]
+    fn pack_residue_classifications_rejects_group_longer_than_32() {
+        let group = vec![0u32; 33];
+        assert_eq!(
+            pack_residue_classifications(&group, 2),
+            Err(PackResidueClassError::GroupTooLong(33))
+        );
+        // A length-32 group is accepted (the boundary).
+        let group32 = vec![0u32; 32];
+        assert!(pack_residue_classifications(&group32, 2).is_ok());
+    }
+
+    #[test]
+    fn pack_residue_classifications_rejects_out_of_range_digit() {
+        // Digit at position 1 equals the base → out of range.
+        assert_eq!(
+            pack_residue_classifications(&[2, 4, 1], 4),
+            Err(PackResidueClassError::ClassificationOutOfRange {
+                position: 1,
+                classification: 4,
+                num_classifications: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn pack_residue_classifications_rejects_packed_overflow() {
+        // base 64, 33 digits would overflow — but length is gated first,
+        // so build a case that passes the length gate yet overflows: base
+        // 64, 8 digits all = 63. 64^8 = 2^48 >> u32::MAX, so even the
+        // top digit's weight overflows.
+        let group = vec![63u32; 8];
+        assert_eq!(
+            pack_residue_classifications(&group, 64),
+            Err(PackResidueClassError::PackedValueOverflow {
+                num_classifications: 64,
+                group_len: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn pack_residue_classifications_validation_precedes_overflow() {
+        // An out-of-range digit is reported even when the group would
+        // also overflow — validation runs before the packing arithmetic.
+        let mut group = vec![63u32; 8];
+        group[2] = 64; // out of range for base 64
+        assert_eq!(
+            pack_residue_classifications(&group, 64),
+            Err(PackResidueClassError::ClassificationOutOfRange {
+                position: 2,
+                classification: 64,
+                num_classifications: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn pack_residue_classifications_umbrella_write_error_glue() {
+        let err: WriteError = PackResidueClassError::ZeroClassifications.into();
+        match &err {
+            WriteError::ResidueClassification(PackResidueClassError::ZeroClassifications) => {}
+            other => panic!("From glue wrong variant: {other:?}"),
+        }
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "ResidueClassification must chain its source"
+        );
+        let crate_err: crate::Error = err.into();
+        match &crate_err {
+            crate::Error::Write(WriteError::ResidueClassification(
+                PackResidueClassError::ZeroClassifications,
+            )) => {}
+            other => panic!("crate::Error glue wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_residue_class_error_displays_are_informative() {
+        let cases: Vec<PackResidueClassError> = vec![
+            PackResidueClassError::ZeroClassifications,
+            PackResidueClassError::ClassificationsTooLarge(65),
+            PackResidueClassError::EmptyGroup,
+            PackResidueClassError::GroupTooLong(33),
+            PackResidueClassError::ClassificationOutOfRange {
+                position: 1,
+                classification: 4,
+                num_classifications: 4,
+            },
+            PackResidueClassError::PackedValueOverflow {
+                num_classifications: 64,
+                group_len: 8,
+            },
+        ];
+        for e in &cases {
+            let s = format!("{e}");
+            assert!(!s.is_empty(), "Display for {e:?} must be non-empty");
+            assert!(
+                s.contains("vorbis") && s.contains("residue"),
                 "Display for {e:?} should be grep-able: {s}"
             );
         }
