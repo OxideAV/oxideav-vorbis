@@ -184,12 +184,12 @@ pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
 pub use encoder::{
-    pack_residue_classifications, write_audio_packet_header, write_codebook, write_comment_header,
-    write_floor0_header, write_floor1_header, write_floor1_packet, write_identification_header,
-    write_mapping_header, write_mode_header, write_residue_header, Floor1Packet,
-    PackResidueClassError, WriteAudioPacketHeaderError, WriteCodebookError, WriteError,
-    WriteFloor0Error, WriteFloor1Error, WriteFloor1PacketError, WriteMappingError, WriteModeError,
-    WriteResidueError,
+    pack_residue_classification_groups, pack_residue_classifications, write_audio_packet_header,
+    write_codebook, write_comment_header, write_floor0_header, write_floor1_header,
+    write_floor1_packet, write_identification_header, write_mapping_header, write_mode_header,
+    write_residue_header, Floor1Packet, PackResidueClassError, PackResidueClassGroupsError,
+    WriteAudioPacketHeaderError, WriteCodebookError, WriteError, WriteFloor0Error,
+    WriteFloor1Error, WriteFloor1PacketError, WriteMappingError, WriteModeError, WriteResidueError,
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor1::{

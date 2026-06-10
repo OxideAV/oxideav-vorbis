@@ -115,6 +115,19 @@
 //! the first piece of the §8.6.2 residue-body WRITE path. The
 //! VQ-codeword body emission (§8.6.3/§8.6.4/§8.6.5) and the wrapping
 //! §8.6.2 residue-body writer remain explicit followups.
+//!
+//! Round 36 (umbrella round 274) lands
+//! [`pack_residue_classification_groups`]: the grouping layer directly
+//! above the per-group packer. It slices a full per-vector
+//! classification array into consecutive groups of
+//! `classwords_per_codeword`, right-pads the final partial group with
+//! classification index `0` (the digits the decoder reads-and-discards),
+//! packs each group, and returns one classbook entry per group in
+//! stream order — the §8.6.2 step-6..9 decode loop's structural
+//! inverse. The classbook Huffman emission of each returned entry
+//! (§3.2.1 [`crate::huffman::HuffmanTree::encode_entry`]) and the
+//! VQ-codeword body emission (§8.6.3/§8.6.4/§8.6.5) remain explicit
+//! followups.
 
 use core::fmt;
 
@@ -3993,6 +4006,157 @@ pub fn pack_residue_classifications(
             })?;
     }
     Ok(packed)
+}
+
+/// Errors that may arise while grouping a full per-vector residue
+/// classification array into the sequence of classbook entry indices the
+/// §8.6.2 audio-packet residue decode reads (one classbook entry per
+/// group of `classwords_per_codeword` partitions), via
+/// [`pack_residue_classification_groups`].
+///
+/// The grouper is the structural inverse of the §8.6.2 step-6..9 decode
+/// loop, which — on pass 0 — reads one classbook entry per `classwords`
+/// partitions and unpacks it back into that many classifications. Each
+/// variant flags an input the grouper cannot serialise to a classbook
+/// entry sequence the decode loop would reproduce, so it refuses the
+/// call rather than emit a value that fails to round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackResidueClassGroupsError {
+    /// `classwords_per_codeword` was zero. §8.6.2 derives it from the
+    /// classbook's `dimensions`, which is `>= 1` for any decodable
+    /// residue; a zero group width would read no classifications yet
+    /// still consume a classbook codeword, which the spec's
+    /// `classwords_per_codeword > 0` invariant forbids.
+    ZeroClasswords,
+    /// One classification group failed [`pack_residue_classifications`].
+    /// The contained `group` index identifies which group (0-based, in
+    /// stream order) raised the error, and `source` carries the inner
+    /// per-group failure verbatim.
+    Pack {
+        /// The 0-based group index (in stream order) that failed.
+        group: usize,
+        /// The per-group packing error.
+        source: PackResidueClassError,
+    },
+}
+
+impl fmt::Display for PackResidueClassGroupsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackResidueClassGroupsError::ZeroClasswords => write!(
+                f,
+                "vorbis residue classification groups (write): classwords_per_codeword=0 (must be >= 1 per §8.6.2)"
+            ),
+            PackResidueClassGroupsError::Pack { group, source } => write!(
+                f,
+                "vorbis residue classification groups (write): group {group} failed to pack: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PackResidueClassGroupsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PackResidueClassGroupsError::ZeroClasswords => None,
+            PackResidueClassGroupsError::Pack { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Group a full per-vector residue classification array into the sequence
+/// of classbook **entry indices** the §8.6.2 audio-packet residue decode
+/// reads — one classbook entry per group of `classwords_per_codeword`
+/// partitions (§8.6.2 step 9's structural inverse).
+///
+/// This sits directly above [`pack_residue_classifications`]: the decoder
+/// (§8.6.2 step 6..12), on pass 0, walks the partitions in
+/// `classwords_per_codeword`-sized strides; at each stride it reads ONE
+/// classbook entry in scalar context and unpacks it into that many
+/// classifications (only storing those whose partition index is
+/// `< partitions_to_read`). This function performs the inverse walk: it
+/// slices `classifications` into consecutive groups of
+/// `classwords_per_codeword`, packs each group with
+/// [`pack_residue_classifications`], and returns one classbook entry per
+/// group in stream order. A residue-body writer then Huffman-codes each
+/// returned entry with the classbook.
+///
+/// # The final partial group
+///
+/// When `classifications.len()` is not a multiple of
+/// `classwords_per_codeword`, the last group is padded on the **right**
+/// (the least-significant base-`C` digits, positions
+/// `len % classwords .. classwords`) with classification index `0`. This
+/// mirrors the decoder exactly: its step-10..12 unpack loop reads all
+/// `classwords` digits but discards any whose partition index is
+/// `>= partitions_to_read` (`if slot < partitions_to_read`), so the
+/// padding digits are read-and-thrown-away. Zero is the canonical pad —
+/// it yields the smallest classbook entry index that round-trips every
+/// meaningful (kept) classification.
+///
+/// `classifications` is the per-vector classification array in partition
+/// order (`classifications[partition]`), exactly the `classifications[j]`
+/// row the decoder builds for one decode vector `j`. An empty array
+/// yields an empty result (no classbook entries — the decode loop reads
+/// none when `partitions_to_read == 0`).
+///
+/// The round-trip property: for every group `g`, unpacking the returned
+/// `entries[g]` with the decoder's step-10..12 loop reproduces
+/// `classifications[g*classwords .. (g+1)*classwords]` (the final group's
+/// kept prefix matches; its padded tail unpacks back to the `0` pads).
+///
+/// # Errors
+///
+/// Returns [`PackResidueClassGroupsError::ZeroClasswords`] if
+/// `classwords_per_codeword` is zero, or
+/// [`PackResidueClassGroupsError::Pack`] (tagged with the offending group
+/// index) if any group fails [`pack_residue_classifications`] (an
+/// out-of-range classification, an oversized base, or a packed-index
+/// overflow). Validation precedes any output allocation growth past the
+/// failing group; the function is a pure value-to-value transform with no
+/// side effects.
+pub fn pack_residue_classification_groups(
+    classifications: &[u32],
+    num_classifications: u32,
+    classwords_per_codeword: usize,
+) -> Result<Vec<u32>, PackResidueClassGroupsError> {
+    // §8.6.2: classwords_per_codeword (= classbook dimensions) is >= 1.
+    if classwords_per_codeword == 0 {
+        return Err(PackResidueClassGroupsError::ZeroClasswords);
+    }
+
+    // Empty classification array => no classbook entries (the decode loop
+    // runs zero groups when partitions_to_read == 0).
+    if classifications.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Number of classbook entries = ceil(len / classwords). The final
+    // group is right-padded with classification index 0 to a full width
+    // of `classwords_per_codeword`.
+    let total = classifications.len();
+    let num_groups = total.div_ceil(classwords_per_codeword);
+    let mut entries = Vec::with_capacity(num_groups);
+
+    // Scratch buffer reused for each (possibly padded) group so the pad
+    // path allocates nothing extra in the hot loop.
+    let mut group = vec![0u32; classwords_per_codeword];
+    for g in 0..num_groups {
+        let start = g * classwords_per_codeword;
+        let end = (start + classwords_per_codeword).min(total);
+        let kept = end - start;
+        // Copy the kept classifications into the most-significant
+        // positions (0..kept); zero-pad the least-significant tail
+        // (kept..classwords) — the decoder discards those digits.
+        group[..kept].copy_from_slice(&classifications[start..end]);
+        for slot in group.iter_mut().take(classwords_per_codeword).skip(kept) {
+            *slot = 0;
+        }
+        let packed = pack_residue_classifications(&group, num_classifications)
+            .map_err(|source| PackResidueClassGroupsError::Pack { group: g, source })?;
+        entries.push(packed);
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -9956,5 +10120,204 @@ mod tests {
                 "Display for {e:?} should be grep-able: {s}"
             );
         }
+    }
+
+    // ---- §8.6.2 residue classification grouping (round 36) ----
+
+    /// The structural inverse of the §8.6.2 step-6..9 decode walk: with
+    /// `classwords == 1`, every partition is its own group, so each
+    /// classbook entry is just that partition's classification index.
+    #[test]
+    fn pack_residue_class_groups_classwords_one_is_per_partition_identity() {
+        let class = [0u32, 3, 1, 9, 2, 7];
+        let base = 10;
+        let entries = pack_residue_classification_groups(&class, base, 1).unwrap();
+        assert_eq!(entries, class.to_vec());
+    }
+
+    /// An empty classification array yields no classbook entries (the
+    /// decode loop runs zero groups when `partitions_to_read == 0`).
+    #[test]
+    fn pack_residue_class_groups_empty_yields_empty() {
+        assert_eq!(
+            pack_residue_classification_groups(&[], 8, 4),
+            Ok(Vec::new())
+        );
+        // …even with a width that doesn't divide an (absent) length.
+        assert_eq!(
+            pack_residue_classification_groups(&[], 64, 7),
+            Ok(Vec::new())
+        );
+    }
+
+    /// A length that is an exact multiple of `classwords` splits into
+    /// full groups, each packed by the per-group primitive. Hand-check
+    /// the packed values against `pack_residue_classifications`.
+    #[test]
+    fn pack_residue_class_groups_exact_multiple_matches_per_group_pack() {
+        let class = [1u32, 2, 3, 0, 1, 2];
+        let base = 4;
+        let classwords = 3;
+        let entries = pack_residue_classification_groups(&class, base, classwords).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            pack_residue_classifications(&[1, 2, 3], base).unwrap()
+        );
+        assert_eq!(
+            entries[1],
+            pack_residue_classifications(&[0, 1, 2], base).unwrap()
+        );
+    }
+
+    /// A length that is NOT a multiple of `classwords` right-pads the
+    /// final group with classification index 0 (the least-significant
+    /// digits the decoder reads-and-discards). The final entry must equal
+    /// the per-group pack of the kept prefix zero-padded to full width.
+    #[test]
+    fn pack_residue_class_groups_partial_final_group_pads_with_zero() {
+        // 5 partitions, classwords = 3 => 2 groups; the second holds the
+        // kept [4, 2] plus one zero pad => [4, 2, 0].
+        let class = [4u32, 2, 5, 4, 2];
+        let base = 6;
+        let entries = pack_residue_classification_groups(&class, base, 3).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            pack_residue_classifications(&[4, 2, 5], base).unwrap()
+        );
+        assert_eq!(
+            entries[1],
+            pack_residue_classifications(&[4, 2, 0], base).unwrap()
+        );
+    }
+
+    /// End-to-end round-trip against the decoder's own step-10..12 unpack
+    /// loop: group a full classification array, unpack each returned
+    /// entry, concatenate (truncating the final group to the kept count),
+    /// and confirm the original array is recovered. Exhaustive over a
+    /// grid of bases, widths, and lengths (including non-multiples).
+    #[test]
+    fn pack_residue_class_groups_round_trips_against_unpack() {
+        for base in 1..=5u32 {
+            for classwords in 1..=4usize {
+                for len in 0..=11usize {
+                    // Build a deterministic classification array in 0..base.
+                    let class: Vec<u32> = (0..len).map(|p| (p as u32 * 7 + 1) % base).collect();
+                    let entries =
+                        pack_residue_classification_groups(&class, base, classwords).unwrap();
+                    // The decoder unpacks each entry into `classwords`
+                    // classifications, keeping only partition indices
+                    // `< len`. Reconstruct the kept array.
+                    let mut recovered = Vec::with_capacity(len);
+                    for &entry in &entries {
+                        let group = unpack_residue_classifications(entry, classwords, base);
+                        for d in group {
+                            if recovered.len() < len {
+                                recovered.push(d);
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        recovered, class,
+                        "round-trip failed for base={base} classwords={classwords} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `classwords_per_codeword == 0` is refused (the §8.6.2 group width
+    /// is the classbook dimensions, which is >= 1).
+    #[test]
+    fn pack_residue_class_groups_rejects_zero_classwords() {
+        assert_eq!(
+            pack_residue_classification_groups(&[0, 1, 2], 4, 0),
+            Err(PackResidueClassGroupsError::ZeroClasswords)
+        );
+        // Even an empty array is refused on a zero width (the width is an
+        // invariant of the residue config, not of the data length).
+        assert_eq!(
+            pack_residue_classification_groups(&[], 4, 0),
+            Err(PackResidueClassGroupsError::ZeroClasswords)
+        );
+    }
+
+    /// An out-of-range classification surfaces the per-group error tagged
+    /// with the group index that contained it (here group 1).
+    #[test]
+    fn pack_residue_class_groups_tags_failing_group_index() {
+        // base = 4 (legal indices 0..4); group 1 holds the bad index 9.
+        let class = [0u32, 1, 2, 9, 1, 2];
+        let err = pack_residue_classification_groups(&class, 4, 3).unwrap_err();
+        match err {
+            PackResidueClassGroupsError::Pack { group, source } => {
+                assert_eq!(group, 1, "the second group (index 1) holds the bad digit");
+                assert_eq!(
+                    source,
+                    PackResidueClassError::ClassificationOutOfRange {
+                        position: 0,
+                        classification: 9,
+                        num_classifications: 4,
+                    }
+                );
+            }
+            other => panic!("expected Pack error, got {other:?}"),
+        }
+    }
+
+    /// An oversized base propagates from the per-group packer on group 0.
+    #[test]
+    fn pack_residue_class_groups_propagates_base_error() {
+        let err = pack_residue_classification_groups(&[0, 1], 65, 2).unwrap_err();
+        assert_eq!(
+            err,
+            PackResidueClassGroupsError::Pack {
+                group: 0,
+                source: PackResidueClassError::ClassificationsTooLarge(65),
+            }
+        );
+    }
+
+    /// `Error::source()` chains through to the inner per-group error so
+    /// callers can walk the cause chain; `ZeroClasswords` has no source.
+    #[test]
+    fn pack_residue_class_groups_error_source_chains() {
+        use std::error::Error as _;
+        let pack = PackResidueClassGroupsError::Pack {
+            group: 2,
+            source: PackResidueClassError::EmptyGroup,
+        };
+        assert!(
+            pack.source().is_some(),
+            "Pack must chain to the inner error"
+        );
+        assert!(
+            PackResidueClassGroupsError::ZeroClasswords
+                .source()
+                .is_none(),
+            "ZeroClasswords has no source"
+        );
+    }
+
+    /// Both `Display` strings are non-empty and grep-friendly, and the
+    /// `Pack` variant embeds the offending group index and the inner
+    /// message.
+    #[test]
+    fn pack_residue_class_groups_error_displays_are_informative() {
+        let zero = format!("{}", PackResidueClassGroupsError::ZeroClasswords);
+        assert!(zero.contains("vorbis") && zero.contains("classwords_per_codeword"));
+
+        let pack = format!(
+            "{}",
+            PackResidueClassGroupsError::Pack {
+                group: 3,
+                source: PackResidueClassError::ZeroClassifications,
+            }
+        );
+        assert!(
+            pack.contains("group 3") && pack.contains("vorbis"),
+            "Pack Display should name the group and be grep-able: {pack}"
+        );
     }
 }

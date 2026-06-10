@@ -6,6 +6,47 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §8.6.2 residue classification grouping layer (round 36,
+  umbrella round 274).** New public function
+  `encoder::pack_residue_classification_groups(classifications,
+  num_classifications, classwords_per_codeword)` (re-exported at the
+  crate root) — the structural inverse of the §8.6.2 step-6..9 decode
+  walk, sitting directly above the round-35 per-group packer. It slices
+  a full per-vector classification array into consecutive groups of
+  `classwords_per_codeword` partitions, packs each group via
+  `pack_residue_classifications`, and returns one classbook entry index
+  per group in stream order — the sequence a residue-body writer then
+  Huffman-codes with the classbook.
+
+  When the array length is not a multiple of `classwords_per_codeword`,
+  the final partial group is right-padded (the least-significant
+  base-`C` positions) with classification index `0`. This mirrors the
+  decoder exactly: its step-10..12 unpack loop reads all `classwords`
+  digits but discards any whose partition index is
+  `>= partitions_to_read` (`if slot < partitions_to_read`), so the pad
+  digits are read-and-thrown-away; `0` is the canonical pad (the
+  smallest classbook entry that round-trips every kept classification).
+  An empty array yields an empty result (the decode loop runs zero
+  groups when `partitions_to_read == 0`).
+
+  A new `PackResidueClassGroupsError` enum carries two fail-closed
+  paths: `ZeroClasswords` (the §8.6.2 group width = classbook
+  `dimensions`, which is `>= 1`) and `Pack { group, source }` (a
+  per-group failure tagged with the offending 0-based group index, with
+  `Error::source()` chaining through to the inner
+  `PackResidueClassError`).
+
+  10 new in-module unit tests bring the crate suite from 669 → 679
+  (+10): the `classwords == 1` per-partition identity, the empty-array
+  no-op (two widths), an exact-multiple split hand-checked against the
+  per-group packer, the partial-final-group zero-pad, an exhaustive
+  `group → decoder-unpack → equal` round-trip over a grid of bases
+  (1..=5), widths (1..=4), and lengths (0..=11, including non-multiples),
+  `ZeroClasswords` rejection (with and without data), the failing-group
+  index tag on an out-of-range digit, base-error propagation on group 0,
+  `Error::source()` chaining for both variants, and grep-able `Display`
+  content.
+
 * **Vorbis I §8.6.2 residue classification packing primitive (round 35,
   umbrella round 267).** New public function
   `encoder::pack_residue_classifications(classifications,
