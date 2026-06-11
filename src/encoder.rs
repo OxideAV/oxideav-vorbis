@@ -128,6 +128,23 @@
 //! (§3.2.1 [`crate::huffman::HuffmanTree::encode_entry`]) and the
 //! VQ-codeword body emission (§8.6.3/§8.6.4/§8.6.5) remain explicit
 //! followups.
+//!
+//! Round 37 (umbrella round 278) lands [`write_residue_partition`]:
+//! the §8.6.3/§8.6.4/§8.6.5 per-partition value-codeword WRITE
+//! primitive — the value half of the §8.6.2 residue-body writer (the
+//! round-35/36 classification packers are the classification half).
+//! Given the per-partition sequence of VQ codebook **entry indices**
+//! (the encoder's quantisation choice, kept explicit like the floor 1
+//! packet writer's `partition_cvals` knob), it Huffman-codes each
+//! entry with the partition's value book in the exact order the
+//! decoder's partition decode reads them back: `n / dims` codewords
+//! for format 0 (§8.6.3 step 1's `[step]`), `ceil(n / dims)` for
+//! formats 1 and 2 (§8.6.4's read-while-`[i] < [n]` loop; §8.6.5 is
+//! reducible to format 1). [`residue_partition_codeword_count`]
+//! exposes that count so callers can size their entry lists. The
+//! wrapping §8.6.2 residue-body writer that interleaves classbook
+//! codewords with these partition bodies across the pass/partition/
+//! vector loops remains an explicit followup.
 
 use core::fmt;
 
@@ -213,6 +230,10 @@ pub enum WriteError {
     /// of the writer-side invariants checked by
     /// [`pack_residue_classifications`].
     ResidueClassification(PackResidueClassError),
+    /// A residue partition body (§8.6.3/§8.6.4/§8.6.5) failed one of
+    /// the writer-side invariants checked by
+    /// [`write_residue_partition`].
+    ResiduePartition(WriteResiduePartitionError),
 }
 
 /// Errors that may arise while writing a Vorbis I codebook header
@@ -1596,6 +1617,7 @@ impl fmt::Display for WriteError {
             WriteError::AudioPacket(e) => write!(f, "{e}"),
             WriteError::Floor1Packet(e) => write!(f, "{e}"),
             WriteError::ResidueClassification(e) => write!(f, "{e}"),
+            WriteError::ResiduePartition(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1613,6 +1635,7 @@ impl std::error::Error for WriteError {
             WriteError::AudioPacket(e) => Some(e),
             WriteError::Floor1Packet(e) => Some(e),
             WriteError::ResidueClassification(e) => Some(e),
+            WriteError::ResiduePartition(e) => Some(e),
             _ => None,
         }
     }
@@ -1675,6 +1698,12 @@ impl From<WriteFloor1PacketError> for WriteError {
 impl From<PackResidueClassError> for WriteError {
     fn from(value: PackResidueClassError) -> Self {
         WriteError::ResidueClassification(value)
+    }
+}
+
+impl From<WriteResiduePartitionError> for WriteError {
+    fn from(value: WriteResiduePartitionError) -> Self {
+        WriteError::ResiduePartition(value)
     }
 }
 
@@ -4157,6 +4186,304 @@ pub fn pack_residue_classification_groups(
         entries.push(packed);
     }
     Ok(entries)
+}
+
+/// Errors that may arise while writing one residue partition body
+/// (§8.6.3/§8.6.4/§8.6.5) via [`write_residue_partition`] or while
+/// sizing one via [`residue_partition_codeword_count`].
+///
+/// The writer is the on-wire inverse of the residue decoder's
+/// per-partition decode (§8.6.2 step 19's "decode partition ... using
+/// codebook number `[vqbook]` in VQ context"). Each variant flags an
+/// input that cannot serialise to a partition body the decoder would
+/// read back, so the call is refused before any bits are emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteResiduePartitionError {
+    /// `residue_type` was a value other than 0, 1, or 2. §8.6 defines
+    /// only the three formats.
+    UnsupportedResidueType(u16),
+    /// `partition_size` was zero. §8.6.1 stores
+    /// `residue_partition_size` as a `read 24 bits + 1` field, so the
+    /// legal range starts at 1; a zero-size partition reads no
+    /// codewords and has no on-wire body.
+    ZeroPartitionSize,
+    /// The value codebook's `dimensions` was zero. §8.6.3 divides the
+    /// partition size by `[codebook_dimensions]` and §8.6.4 advances
+    /// its read cursor by one codebook dimension per decoded element;
+    /// a zero-dimension book can never cover a partition.
+    ZeroDimensions,
+    /// The value codebook has no value mapping (`codebook_lookup_type`
+    /// 0). §8.6.1: a codebook used in VQ context must carry a vector
+    /// lookup; a scalar (entropy-only) book cannot yield the
+    /// `[entry_temp]` vector §8.6.3/§8.6.4 read.
+    ScalarValueBook,
+    /// Format 0 requires the codebook dimensions to evenly divide the
+    /// partition size (§8.6.3 step 1 computes
+    /// `[step] = [n] / [codebook_dimensions]` and steps 2..5 cover
+    /// exactly `step × dimensions = n` scalars).
+    Format0NotDivisible {
+        /// `residue_partition_size` (the §8.6.3 `[n]`).
+        partition_size: u32,
+        /// The value codebook's `dimensions`.
+        dimensions: u16,
+    },
+    /// The supplied entry list's length disagrees with the codeword
+    /// count the decoder will read for this `(residue_type,
+    /// partition_size, dimensions)` triple — `n / dims` for format 0,
+    /// `ceil(n / dims)` for formats 1 and 2 (see
+    /// [`residue_partition_codeword_count`]).
+    EntryCountMismatch {
+        /// The codeword count the decoder will read.
+        expected: usize,
+        /// The supplied `entries.len()`.
+        actual: usize,
+    },
+    /// Building the value codebook's Huffman tree failed (the book's
+    /// `codeword_lengths` do not describe a valid §3.2.1 canonical
+    /// tree).
+    Huffman(crate::huffman::BuildError),
+    /// An entry index has no canonical codeword in the value codebook
+    /// — it is out of range or marked unused (§3.2.1). No on-wire bit
+    /// pattern decodes to it, so the body cannot round-trip.
+    UnencodableEntry {
+        /// Position of the offending entry within the supplied list.
+        index: usize,
+        /// The rejected entry index.
+        entry: u32,
+        /// Number of used (leaf) entries the book's tree holds.
+        used_count: u32,
+    },
+}
+
+impl fmt::Display for WriteResiduePartitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteResiduePartitionError::UnsupportedResidueType(t) => write!(
+                f,
+                "vorbis residue partition (write): unsupported residue_type {t} (§8.6 defines 0, 1, 2)"
+            ),
+            WriteResiduePartitionError::ZeroPartitionSize => write!(
+                f,
+                "vorbis residue partition (write): partition_size=0 (§8.6.1 stores it as read-24-bits + 1, so >= 1)"
+            ),
+            WriteResiduePartitionError::ZeroDimensions => write!(
+                f,
+                "vorbis residue partition (write): value codebook dimensions=0 (§8.6.3/§8.6.4 advance by one dimension per scalar)"
+            ),
+            WriteResiduePartitionError::ScalarValueBook => write!(
+                f,
+                "vorbis residue partition (write): value codebook has lookup_type 0 (§8.6.1 requires a value mapping in VQ context)"
+            ),
+            WriteResiduePartitionError::Format0NotDivisible {
+                partition_size,
+                dimensions,
+            } => write!(
+                f,
+                "vorbis residue partition (write): format-0 partition_size {partition_size} not divisible by codebook dimensions {dimensions} (§8.6.3 step 1)"
+            ),
+            WriteResiduePartitionError::EntryCountMismatch { expected, actual } => write!(
+                f,
+                "vorbis residue partition (write): {actual} entries supplied but the decoder reads {expected} codewords for this partition (§8.6.3/§8.6.4)"
+            ),
+            WriteResiduePartitionError::Huffman(e) => write!(
+                f,
+                "vorbis residue partition (write): Huffman build error: {e}"
+            ),
+            WriteResiduePartitionError::UnencodableEntry {
+                index,
+                entry,
+                used_count,
+            } => write!(
+                f,
+                "vorbis residue partition (write): entries[{index}]={entry} has no canonical codeword (tree has {used_count} used entries, §3.2.1)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteResiduePartitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WriteResiduePartitionError::Huffman(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::huffman::BuildError> for WriteResiduePartitionError {
+    fn from(value: crate::huffman::BuildError) -> Self {
+        WriteResiduePartitionError::Huffman(value)
+    }
+}
+
+/// The number of VQ codewords the residue decoder reads for one
+/// partition body, given the residue format, the partition size, and
+/// the value codebook's dimensions.
+///
+/// * **Format 0 (§8.6.3).** Step 1 computes
+///   `[step] = [n] / [codebook_dimensions]` and step 2 reads exactly
+///   `[step]` VQ vectors (the dimensions must evenly divide the
+///   partition size — [`WriteResiduePartitionError::Format0NotDivisible`]
+///   otherwise).
+/// * **Formats 1 and 2 (§8.6.4 / §8.6.5).** The decode loop reads one
+///   VQ vector, appends up to `dimensions` scalars, and continues while
+///   `[i] < [n]` — i.e. `ceil(n / dims)` reads, with any surplus
+///   elements of the final vector discarded when `dims` does not divide
+///   `n`. Format 2 is "reducible to format 1" (§8.6.5) and reads with
+///   the same rule over the interleaved vector.
+///
+/// This is the count [`write_residue_partition`] requires its `entries`
+/// list to match; it is exposed so callers can size their per-partition
+/// entry lists before quantising.
+///
+/// # Errors
+///
+/// Returns a [`WriteResiduePartitionError`] for a `residue_type`
+/// outside {0, 1, 2}, a zero `partition_size`, zero `dimensions`, or a
+/// format-0 divisibility failure.
+pub fn residue_partition_codeword_count(
+    residue_type: u16,
+    partition_size: u32,
+    dimensions: u16,
+) -> Result<usize, WriteResiduePartitionError> {
+    if residue_type > 2 {
+        return Err(WriteResiduePartitionError::UnsupportedResidueType(
+            residue_type,
+        ));
+    }
+    if partition_size == 0 {
+        return Err(WriteResiduePartitionError::ZeroPartitionSize);
+    }
+    if dimensions == 0 {
+        return Err(WriteResiduePartitionError::ZeroDimensions);
+    }
+    let n = partition_size as usize;
+    let dims = dimensions as usize;
+    if residue_type == 0 {
+        // §8.6.3 step 1: [step] = [n] / [codebook_dimensions]; steps
+        // 2..5 read exactly [step] VQ vectors covering step×dims = n
+        // scalars, so dims must divide n.
+        if n % dims != 0 {
+            return Err(WriteResiduePartitionError::Format0NotDivisible {
+                partition_size,
+                dimensions,
+            });
+        }
+        Ok(n / dims)
+    } else {
+        // §8.6.4 (and §8.6.5 via "reducible to format 1"): read one VQ
+        // vector per `dims` scalars while [i] < [n] → ceil(n / dims).
+        Ok(n.div_ceil(dims))
+    }
+}
+
+/// Serialise one residue partition body (§8.6.3/§8.6.4/§8.6.5) to a
+/// byte-aligned slice — the per-partition value-codeword WRITE
+/// primitive, the value half of the §8.6.2 residue-body writer (the
+/// classification half is [`pack_residue_classifications`] /
+/// [`pack_residue_classification_groups`]).
+///
+/// `entries` is the partition's sequence of value-codebook **entry
+/// indices** in stream order, exactly the entries the decoder's
+/// partition decode walks the book's Huffman tree to: `n / dims`
+/// entries for format 0 (§8.6.3's `[step]` reads), `ceil(n / dims)`
+/// for formats 1 and 2 (§8.6.4's read-while-`[i] < [n]` loop) — see
+/// [`residue_partition_codeword_count`]. Which entry best quantises a
+/// given run of residue scalars is the encoder's psychoacoustic
+/// choice; keeping the entry indices explicit (like the floor 1
+/// packet writer's `partition_cvals` knob) lets a future VQ-encode
+/// stage pick them without the writer guessing, and makes the
+/// emission bit-exact by construction.
+///
+/// The emission itself is format-independent: every format reads the
+/// partition's codewords one after another with the same book in VQ
+/// context; the §8.6.3 scatter (`[offset]+[i]+[j]*[step]`) versus the
+/// §8.6.4 contiguous append is decode-side *addressing* of the
+/// unpacked scalars, not an on-wire difference. The formats differ
+/// on the wire only in how many codewords the decoder reads, which is
+/// what the fail-closed count gate pins.
+///
+/// The round-trip property: splicing the returned bits into a §8.6.2
+/// packet stream after the partition's classbook codeword yields a
+/// body the residue decoder reads back as exactly
+/// `Σ unpack_vector(book, entries[k])` scattered per the format rule.
+///
+/// # Errors
+///
+/// Returns a [`WriteResiduePartitionError`] for a bad
+/// `(residue_type, partition_size, dimensions)` triple (see
+/// [`residue_partition_codeword_count`]), a value book without a
+/// vector lookup (§8.6.1), an entry-count mismatch, a Huffman build
+/// failure, or an entry with no canonical codeword. Validation
+/// precedes emission; on error no bits are written.
+pub fn write_residue_partition(
+    entries: &[u32],
+    book: &VorbisCodebook,
+    residue_type: u16,
+    partition_size: u32,
+) -> Result<Vec<u8>, WriteResiduePartitionError> {
+    let mut writer = BitWriterLsb::with_capacity(entries.len().div_ceil(2).max(1));
+    write_residue_partition_into_writer(entries, book, residue_type, partition_size, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a §8.6.3/§8.6.4/§8.6.5 residue partition
+/// body into a larger bit-packed stream. The wrapping §8.6.2
+/// residue-body writer (explicit followup) will use this to thread
+/// each partition body between the classbook codewords across the
+/// pass/partition/vector loops, mirroring the existing per-header and
+/// floor-1-packet `_into_writer` splice points.
+///
+/// Writes the body's bits into `writer` at its current bit position.
+/// On error, no bits are emitted (validation precedes emission).
+pub(crate) fn write_residue_partition_into_writer(
+    entries: &[u32],
+    book: &VorbisCodebook,
+    residue_type: u16,
+    partition_size: u32,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteResiduePartitionError> {
+    // ---- fail-closed invariant gate (no bits emitted on error). ----
+    // (1) The (residue_type, partition_size, dimensions) triple pins the
+    // codeword count the decoder will read for this partition.
+    let expected = residue_partition_codeword_count(residue_type, partition_size, book.dimensions)?;
+
+    // (2) §8.6.1: a book used in VQ context must carry a value mapping.
+    if matches!(book.lookup, VqLookup::None) {
+        return Err(WriteResiduePartitionError::ScalarValueBook);
+    }
+
+    // (3) The supplied entry list must match the decoder's read count.
+    if entries.len() != expected {
+        return Err(WriteResiduePartitionError::EntryCountMismatch {
+            expected,
+            actual: entries.len(),
+        });
+    }
+
+    // (4) The book's lengths must build a canonical §3.2.1 tree, and
+    // every entry must be one of its leaves. The encodability pre-check
+    // runs against a scratch writer so the caller's stream is untouched
+    // if any entry is refused.
+    let tree = crate::huffman::HuffmanTree::from_codebook(book)?;
+    for (index, &entry) in entries.iter().enumerate() {
+        let mut scratch = BitWriterLsb::new();
+        tree.encode_entry(entry, &mut scratch).map_err(|e| {
+            let crate::huffman::EncodeError::UnknownEntry { used_count, .. } = e;
+            WriteResiduePartitionError::UnencodableEntry {
+                index,
+                entry,
+                used_count,
+            }
+        })?;
+    }
+
+    // ---- emit: one canonical codeword per entry, in stream order. ----
+    for &entry in entries {
+        tree.encode_entry(entry, writer)
+            .expect("encode_entry must succeed after pre-check; entry already validated");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -10319,5 +10646,422 @@ mod tests {
             pack.contains("group 3") && pack.contains("vorbis"),
             "Pack Display should name the group and be grep-able: {pack}"
         );
+    }
+
+    // ===== §8.6.3/§8.6.4/§8.6.5 residue partition body WRITE (round 37) =====
+
+    /// A scalar (lookup_type 0) codebook — used as a classbook in the
+    /// roundtrip fixtures and as the §8.6.1 rejection input.
+    fn rp_scalar_book(dimensions: u16, lengths: Vec<u8>) -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions,
+            entries: lengths.len() as u32,
+            codeword_lengths: lengths,
+            lookup: VqLookup::None,
+        }
+    }
+
+    /// A tessellation (lookup_type 2) VQ value book with `delta = 1`,
+    /// `min = 0`, no sequence flag — entry `e`'s vector is the
+    /// multiplicand row `multiplicands[e*dims .. (e+1)*dims]` verbatim.
+    fn rp_vq_book(dimensions: u16, lengths: Vec<u8>, multiplicands: Vec<u32>) -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions,
+            entries: lengths.len() as u32,
+            codeword_lengths: lengths,
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands,
+            },
+        }
+    }
+
+    /// A residue header whose cascade bitmap is derived from `books`.
+    fn rp_residue_header(
+        residue_type: u16,
+        begin: u32,
+        end: u32,
+        partition_size: u32,
+        books: Vec<[Option<u8>; 8]>,
+    ) -> crate::setup::ResidueHeader {
+        let cascade = books
+            .iter()
+            .map(|row| {
+                let mut bits = 0u8;
+                for (j, slot) in row.iter().enumerate() {
+                    if slot.is_some() {
+                        bits |= 1 << j;
+                    }
+                }
+                bits
+            })
+            .collect();
+        crate::setup::ResidueHeader {
+            residue_type,
+            residue_begin: begin,
+            residue_end: end,
+            partition_size,
+            classifications: books.len() as u8,
+            classbook: 0,
+            cascade,
+            books,
+        }
+    }
+
+    /// §8.6.3 step 1: format 0 reads exactly `n / dims` codewords.
+    #[test]
+    fn residue_partition_codeword_count_format0_exact_division() {
+        assert_eq!(residue_partition_codeword_count(0, 8, 2), Ok(4));
+        assert_eq!(residue_partition_codeword_count(0, 8, 8), Ok(1));
+        assert_eq!(residue_partition_codeword_count(0, 6, 3), Ok(2));
+    }
+
+    /// §8.6.4 (and §8.6.5 via "reducible to format 1"): formats 1 and 2
+    /// read `ceil(n / dims)` codewords — the read-while-`[i] < [n]`
+    /// loop reads a final partial vector when dims does not divide n.
+    #[test]
+    fn residue_partition_codeword_count_format1_and_2_use_ceil() {
+        assert_eq!(residue_partition_codeword_count(1, 4, 1), Ok(4));
+        assert_eq!(residue_partition_codeword_count(1, 5, 2), Ok(3));
+        assert_eq!(residue_partition_codeword_count(1, 4, 8), Ok(1));
+        assert_eq!(residue_partition_codeword_count(2, 5, 2), Ok(3));
+        assert_eq!(residue_partition_codeword_count(2, 4, 4), Ok(1));
+    }
+
+    /// The count helper carries the four structural rejections shared
+    /// with the writer: bad format, zero partition size, zero
+    /// dimensions, format-0 divisibility.
+    #[test]
+    fn residue_partition_codeword_count_rejects_invalid_inputs() {
+        assert_eq!(
+            residue_partition_codeword_count(3, 4, 2),
+            Err(WriteResiduePartitionError::UnsupportedResidueType(3))
+        );
+        assert_eq!(
+            residue_partition_codeword_count(1, 0, 2),
+            Err(WriteResiduePartitionError::ZeroPartitionSize)
+        );
+        assert_eq!(
+            residue_partition_codeword_count(1, 4, 0),
+            Err(WriteResiduePartitionError::ZeroDimensions)
+        );
+        assert_eq!(
+            residue_partition_codeword_count(0, 5, 2),
+            Err(WriteResiduePartitionError::Format0NotDivisible {
+                partition_size: 5,
+                dimensions: 2,
+            })
+        );
+    }
+
+    /// Byte-shape pin: a 2-entry length-[1,1] book assigns canonical
+    /// 1-bit codewords `0` / `1`; entries [0, 1, 1, 0] emit bits
+    /// 0,1,1,0 which pack LSb-first (§2.1.4) into the single byte
+    /// 0b0000_0110 = 0x06.
+    #[test]
+    fn write_residue_partition_format1_byte_shape() {
+        let book = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+        let bytes = write_residue_partition(&[0, 1, 1, 0], &book, 1, 4).unwrap();
+        assert_eq!(bytes, vec![0x06]);
+    }
+
+    /// End-to-end §8.6.4 roundtrip: classbook codeword + partition body
+    /// composed by hand (the wrapping §8.6.2 writer is a followup),
+    /// then read back through the full residue decoder. Mirrors the
+    /// decoder-side `format1_single_channel_two_partitions` fixture:
+    /// two partitions of two scalars each over a 1-D value book whose
+    /// entries unpack to [3] and [5].
+    #[test]
+    fn write_residue_partition_roundtrips_against_decoder_format1() {
+        use oxideav_core::bits::BitReaderLsb;
+
+        let classbook = rp_scalar_book(1, vec![1, 1]);
+        let valbook = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+
+        let mut row = [None; 8];
+        row[0] = Some(1);
+        let header = rp_residue_header(1, 0, 4, 2, vec![row]);
+        let codebooks = vec![classbook.clone(), valbook.clone()];
+        let dec = crate::residue::ResidueDecoder::new(&header, &codebooks).unwrap();
+
+        // classifications: both partitions are class 0 (the only class);
+        // classwords_per_codeword = classbook dims = 1, so each partition
+        // gets its own classbook entry.
+        let cls_entries = pack_residue_classification_groups(&[0, 0], 1, 1).unwrap();
+        assert_eq!(cls_entries, vec![0, 0]);
+        let cls_tree = crate::huffman::HuffmanTree::from_codebook(&classbook).unwrap();
+
+        // §8.6.2 pass-0 stream order with classwords = 1:
+        //   classbook codeword (partition 0) → partition 0 body
+        //   classbook codeword (partition 1) → partition 1 body
+        let mut w = BitWriterLsb::new();
+        cls_tree.encode_entry(cls_entries[0], &mut w).unwrap();
+        write_residue_partition_into_writer(&[0, 1], &valbook, 1, 2, &mut w).unwrap();
+        cls_tree.encode_entry(cls_entries[1], &mut w).unwrap();
+        write_residue_partition_into_writer(&[1, 0], &valbook, 1, 2, &mut w).unwrap();
+        let bytes = w.finish();
+
+        let mut r = BitReaderLsb::new(&bytes);
+        let out = dec.decode(&mut r, 8, &[false]).unwrap();
+        assert_eq!(out, vec![vec![3.0, 5.0, 5.0, 3.0]]);
+    }
+
+    /// End-to-end §8.6.3 roundtrip: format 0's interleaved scatter
+    /// (`v[offset + i + j*step] += entry_temp[j]`) reorders the decoded
+    /// scalars, but the on-wire body is the same flat codeword
+    /// sequence. With a 2-D book and step = 2, entries [e0, e1] land as
+    /// [e0[0], e1[0], e0[1], e1[1]].
+    #[test]
+    fn write_residue_partition_roundtrips_against_decoder_format0_scatter() {
+        use oxideav_core::bits::BitReaderLsb;
+
+        let classbook = rp_scalar_book(1, vec![1, 1]);
+        let valbook = rp_vq_book(2, vec![1, 1], vec![1, 2, 3, 4]);
+        let e0 = crate::vq::unpack_vector(&valbook, 0).unwrap();
+        let e1 = crate::vq::unpack_vector(&valbook, 1).unwrap();
+
+        let mut row = [None; 8];
+        row[0] = Some(1);
+        let header = rp_residue_header(0, 0, 4, 4, vec![row]);
+        let codebooks = vec![classbook.clone(), valbook.clone()];
+        let dec = crate::residue::ResidueDecoder::new(&header, &codebooks).unwrap();
+
+        // One partition (n_to_read = 4, partition_size = 4); format 0
+        // reads n / dims = 2 codewords.
+        let cls_tree = crate::huffman::HuffmanTree::from_codebook(&classbook).unwrap();
+        let mut w = BitWriterLsb::new();
+        cls_tree.encode_entry(0, &mut w).unwrap();
+        write_residue_partition_into_writer(&[0, 1], &valbook, 0, 4, &mut w).unwrap();
+        let bytes = w.finish();
+
+        let mut r = BitReaderLsb::new(&bytes);
+        let out = dec.decode(&mut r, 8, &[false]).unwrap();
+        assert_eq!(out, vec![vec![e0[0], e1[0], e0[1], e1[1]]]);
+    }
+
+    /// End-to-end §8.6.5 roundtrip: format 2 decodes one interleaved
+    /// vector with the format-1 rule then de-interleaves
+    /// (`output[j][i] = v[i*ch + j]`). The partition body is written
+    /// once for the interleaved vector.
+    #[test]
+    fn write_residue_partition_roundtrips_against_decoder_format2_interleaved() {
+        use oxideav_core::bits::BitReaderLsb;
+
+        let classbook = rp_scalar_book(1, vec![1, 1]);
+        let valbook = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+
+        let mut row = [None; 8];
+        row[0] = Some(1);
+        let header = rp_residue_header(2, 0, 4, 4, vec![row]);
+        let codebooks = vec![classbook.clone(), valbook.clone()];
+        let dec = crate::residue::ResidueDecoder::new(&header, &codebooks).unwrap();
+
+        // blocksize 4, 2 channels → per-channel size 2, interleaved
+        // length 4; one partition of 4 scalars → ceil(4/1) = 4 codewords.
+        let cls_tree = crate::huffman::HuffmanTree::from_codebook(&classbook).unwrap();
+        let mut w = BitWriterLsb::new();
+        cls_tree.encode_entry(0, &mut w).unwrap();
+        write_residue_partition_into_writer(&[0, 1, 1, 0], &valbook, 2, 4, &mut w).unwrap();
+        let bytes = w.finish();
+
+        let mut r = BitReaderLsb::new(&bytes);
+        let out = dec.decode(&mut r, 4, &[false, false]).unwrap();
+        // interleaved [3, 5, 5, 3] → ch0 = [v[0], v[2]] = [3, 5],
+        // ch1 = [v[1], v[3]] = [5, 3].
+        assert_eq!(out, vec![vec![3.0, 5.0], vec![5.0, 3.0]]);
+    }
+
+    /// §8.6.4 partial-final-vector roundtrip: with dims = 2 and
+    /// partition_size = 3, the decoder reads ceil(3/2) = 2 codewords
+    /// and discards the final vector's surplus element.
+    #[test]
+    fn write_residue_partition_format1_partial_final_vector_roundtrip() {
+        use oxideav_core::bits::BitReaderLsb;
+
+        let classbook = rp_scalar_book(1, vec![1, 1]);
+        let valbook = rp_vq_book(2, vec![1, 1], vec![1, 2, 3, 4]);
+        let e0 = crate::vq::unpack_vector(&valbook, 0).unwrap();
+        let e1 = crate::vq::unpack_vector(&valbook, 1).unwrap();
+
+        let mut row = [None; 8];
+        row[0] = Some(1);
+        let header = rp_residue_header(1, 0, 3, 3, vec![row]);
+        let codebooks = vec![classbook.clone(), valbook.clone()];
+        let dec = crate::residue::ResidueDecoder::new(&header, &codebooks).unwrap();
+
+        let cls_tree = crate::huffman::HuffmanTree::from_codebook(&classbook).unwrap();
+        let mut w = BitWriterLsb::new();
+        cls_tree.encode_entry(0, &mut w).unwrap();
+        write_residue_partition_into_writer(&[0, 1], &valbook, 1, 3, &mut w).unwrap();
+        let bytes = w.finish();
+
+        let mut r = BitReaderLsb::new(&bytes);
+        let out = dec.decode(&mut r, 8, &[false]).unwrap();
+        // [e0[0], e0[1], e1[0]] land; e1[1] is discarded (i reaches n);
+        // index 3 stays at the §8.6.2 step-1 zero fill.
+        assert_eq!(out, vec![vec![e0[0], e0[1], e1[0], 0.0]]);
+    }
+
+    /// The entry-count gate fires in both directions (too few / too
+    /// many) before any bits are emitted.
+    #[test]
+    fn write_residue_partition_rejects_entry_count_mismatch() {
+        let book = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+        assert_eq!(
+            write_residue_partition(&[0], &book, 1, 4),
+            Err(WriteResiduePartitionError::EntryCountMismatch {
+                expected: 4,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            write_residue_partition(&[0, 1, 0, 1, 0], &book, 1, 4),
+            Err(WriteResiduePartitionError::EntryCountMismatch {
+                expected: 4,
+                actual: 5,
+            })
+        );
+    }
+
+    /// §8.6.1: a book used in VQ context must carry a value mapping; a
+    /// scalar (lookup_type 0) book is refused — mirroring the decoder's
+    /// `ValueBookHasNoLookup` construction-time rejection.
+    #[test]
+    fn write_residue_partition_rejects_scalar_book() {
+        let book = rp_scalar_book(1, vec![1, 1]);
+        assert_eq!(
+            write_residue_partition(&[0, 1], &book, 1, 2),
+            Err(WriteResiduePartitionError::ScalarValueBook)
+        );
+    }
+
+    /// An entry with no canonical codeword — out of range, or marked
+    /// unused in a sparse book — is refused with its list position.
+    #[test]
+    fn write_residue_partition_rejects_unencodable_entry() {
+        // Out-of-range entry in a dense 2-entry book.
+        let dense = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+        assert_eq!(
+            write_residue_partition(&[0, 7], &dense, 1, 2),
+            Err(WriteResiduePartitionError::UnencodableEntry {
+                index: 1,
+                entry: 7,
+                used_count: 2,
+            })
+        );
+        // Unused (sparse) entry: lengths [1, UNUSED, 1] build a full
+        // 1-bit tree over entries {0, 2}; entry 1 has no codeword.
+        let sparse = rp_vq_book(1, vec![1, UNUSED_ENTRY, 1], vec![3, 9, 5]);
+        assert_eq!(
+            write_residue_partition(&[0, 1], &sparse, 1, 2),
+            Err(WriteResiduePartitionError::UnencodableEntry {
+                index: 1,
+                entry: 1,
+                used_count: 2,
+            })
+        );
+    }
+
+    /// A book whose codeword lengths cannot build a canonical §3.2.1
+    /// tree surfaces as the `Huffman` variant (with `source()`
+    /// chaining to the build error).
+    #[test]
+    fn write_residue_partition_propagates_huffman_build_error() {
+        use std::error::Error as _;
+        // Three 1-bit codewords over-subscribe a binary tree.
+        let bad = rp_vq_book(1, vec![1, 1, 1], vec![3, 5, 7]);
+        let err = write_residue_partition(&[0, 1], &bad, 1, 2).unwrap_err();
+        assert!(
+            matches!(err, WriteResiduePartitionError::Huffman(_)),
+            "expected Huffman build error, got {err:?}"
+        );
+        assert!(err.source().is_some(), "Huffman must chain its source");
+    }
+
+    /// Fail-closed splice contract: on error the caller's writer is
+    /// left bit-exactly as seeded.
+    #[test]
+    fn write_residue_partition_splice_emits_no_bits_on_error() {
+        let book = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+        let mut w = BitWriterLsb::new();
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(true);
+        let err = write_residue_partition_into_writer(&[0], &book, 1, 4, &mut w).unwrap_err();
+        assert!(matches!(
+            err,
+            WriteResiduePartitionError::EntryCountMismatch { .. }
+        ));
+        // Only the three seeded bits (1, 0, 1 LSb-first → 0x05).
+        assert_eq!(w.finish(), vec![0x05]);
+    }
+
+    /// The public byte-aligned wrapper and the splice helper emit the
+    /// same bits at byte alignment.
+    #[test]
+    fn write_residue_partition_public_matches_splice() {
+        let book = rp_vq_book(1, vec![1, 1], vec![3, 5]);
+        let public = write_residue_partition(&[0, 1, 1, 0], &book, 1, 4).unwrap();
+        let mut w = BitWriterLsb::new();
+        write_residue_partition_into_writer(&[0, 1, 1, 0], &book, 1, 4, &mut w).unwrap();
+        assert_eq!(public, w.finish());
+    }
+
+    /// Every `Display` string is non-empty and grep-able.
+    #[test]
+    fn write_residue_partition_error_displays_are_informative() {
+        let huffman_err = crate::huffman::HuffmanTree::from_lengths(&[1, 1, 1]).unwrap_err();
+        let cases: Vec<WriteResiduePartitionError> = vec![
+            WriteResiduePartitionError::UnsupportedResidueType(3),
+            WriteResiduePartitionError::ZeroPartitionSize,
+            WriteResiduePartitionError::ZeroDimensions,
+            WriteResiduePartitionError::ScalarValueBook,
+            WriteResiduePartitionError::Format0NotDivisible {
+                partition_size: 5,
+                dimensions: 2,
+            },
+            WriteResiduePartitionError::EntryCountMismatch {
+                expected: 4,
+                actual: 1,
+            },
+            WriteResiduePartitionError::Huffman(huffman_err),
+            WriteResiduePartitionError::UnencodableEntry {
+                index: 1,
+                entry: 7,
+                used_count: 2,
+            },
+        ];
+        for case in cases {
+            let msg = format!("{case}");
+            assert!(
+                msg.contains("vorbis residue partition (write)"),
+                "Display should be grep-able: {msg}"
+            );
+        }
+    }
+
+    /// Umbrella glue: `WriteError::ResiduePartition` From + `source()`
+    /// chain, then the crate-level `Error::Write` chain on top.
+    #[test]
+    fn write_residue_partition_umbrella_write_error_glue() {
+        let err: WriteError = WriteResiduePartitionError::ZeroPartitionSize.into();
+        match &err {
+            WriteError::ResiduePartition(WriteResiduePartitionError::ZeroPartitionSize) => {}
+            other => panic!("From glue wrong variant: {other:?}"),
+        }
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "ResiduePartition must chain its source"
+        );
+        let crate_err: crate::Error = err.into();
+        match &crate_err {
+            crate::Error::Write(WriteError::ResiduePartition(
+                WriteResiduePartitionError::ZeroPartitionSize,
+            )) => {}
+            other => panic!("crate::Error glue wrong variant: {other:?}"),
+        }
     }
 }

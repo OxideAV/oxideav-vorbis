@@ -6,6 +6,58 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §8.6.3/§8.6.4/§8.6.5 per-partition value-codeword WRITE
+  primitive (round 37, umbrella round 278).** The value half of the
+  §8.6.2 residue-body writer (the round-35/36 classification packers
+  are the classification half). Two new public functions (re-exported
+  at the crate root):
+
+  - `encoder::write_residue_partition(entries, book, residue_type,
+    partition_size)` serialises one residue partition body — the
+    sequence of value-codebook **entry indices** (the encoder's
+    quantisation choice, kept explicit like the floor 1 packet
+    writer's `partition_cvals` knob) Huffman-coded in the exact order
+    the decoder's §8.6.2 step-19 partition decode reads them back.
+    The emission is format-independent: §8.6.3's interleaved scatter
+    versus §8.6.4's contiguous append is decode-side addressing, not
+    an on-wire difference; the formats differ on the wire only in the
+    codeword count. A crate-private
+    `write_residue_partition_into_writer` splice helper matches the
+    established `_into_writer` splice-point contract (validation
+    precedes emission; the caller's writer is untouched on error).
+  - `encoder::residue_partition_codeword_count(residue_type,
+    partition_size, dimensions)` pins that count: `n / dims` for
+    format 0 (§8.6.3 step 1's `[step]`, with the divisibility
+    requirement), `ceil(n / dims)` for formats 1 and 2 (§8.6.4's
+    read-while-`[i] < [n]` loop; §8.6.5 is reducible to format 1 over
+    the interleaved vector).
+
+  A new `WriteResiduePartitionError` enumerates eight fail-closed
+  invariants (`UnsupportedResidueType`, `ZeroPartitionSize`,
+  `ZeroDimensions`, `ScalarValueBook` — §8.6.1's VQ-context
+  value-mapping requirement, mirroring the decoder's
+  `ValueBookHasNoLookup` gate —, `Format0NotDivisible`,
+  `EntryCountMismatch`, `Huffman` with `source()` chaining,
+  `UnencodableEntry`); the umbrella `WriteError` grows a
+  `ResiduePartition` variant with `From` glue and `source()` chain.
+
+  16 new in-module unit tests bring the crate suite from 679 → 695
+  (+16): the codeword-count behaviours (format-0 exact division,
+  format-1/2 ceil, all four structural rejections), a byte-shape pin,
+  four end-to-end roundtrips through the real `ResidueDecoder`
+  composing classbook codeword + partition bodies by hand (format 1
+  two-partition, format 0 scatter, format 2 two-channel
+  de-interleave, format-1 partial-final-vector discard), both
+  entry-count mismatch directions, the scalar-book rejection, the
+  out-of-range and sparse-unused `UnencodableEntry` shapes, the
+  Huffman build-error propagation, the splice-emits-no-bits-on-error
+  contract, public-vs-splice byte equality, grep-able `Display`
+  content for all eight variants, and the umbrella `WriteError` From
+  + `source()` + crate-level `Error::Write` chain.
+
+  Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.2 step 19,
+  §8.6.3, §8.6.4, §8.6.5, §8.6.1, §3.2.1.
+
 * **Vorbis I §8.6.2 residue classification grouping layer (round 36,
   umbrella round 274).** New public function
   `encoder::pack_residue_classification_groups(classifications,

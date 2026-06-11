@@ -1,6 +1,102 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 35.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 37.
+
+## Status — 2026-06-11 (round 37, umbrella round 278)
+
+**Round 37 lands the §8.6.3/§8.6.4/§8.6.5 per-partition value-codeword
+WRITE primitive — the value half of the §8.6.2 residue-body writer.**
+(The classification half shipped as rounds 35/36:
+[`encoder::pack_residue_classifications`] packs one group, and the
+round-36 [`encoder::pack_residue_classification_groups`] — CHANGELOG
+"round 36, umbrella round 274" — slices a full per-vector
+classification array into stream-order classbook entries, right-padding
+the final partial group with the digits the decoder
+reads-and-discards.) Two new public functions, re-exported at the
+crate root:
+
+* [`encoder::write_residue_partition(entries, book, residue_type,
+  partition_size)`] serialises one residue partition body to the
+  bitstream the §8.6.2 step-19 partition decode reads back. `entries`
+  is the partition's sequence of value-codebook **entry indices** in
+  stream order — the encoder's quantisation choice kept explicit (the
+  same knob philosophy as the round-31 floor 1 packet writer's
+  `partition_cvals`), so a future VQ-encode stage picks them and the
+  emission stays bit-exact by construction. Each entry is emitted
+  MSb-first through `HuffmanTree::encode_entry` (§3.2.1 canonical
+  codewords). The emission is format-independent — §8.6.3's
+  interleaved scatter (`v[offset+i+j*step]`) versus §8.6.4's
+  contiguous append is decode-side *addressing*, not an on-wire
+  difference; the formats differ on the wire only in how many
+  codewords the decoder reads.
+* [`encoder::residue_partition_codeword_count(residue_type,
+  partition_size, dimensions)`] pins that count: `n / dims` for
+  format 0 (§8.6.3 step 1's `[step]`, with the divisibility
+  requirement), `ceil(n / dims)` for formats 1 and 2 (§8.6.4's
+  read-while-`[i] < [n]` loop; §8.6.5 is "reducible to format 1" and
+  reads the interleaved vector with the same rule, discarding the
+  final vector's surplus elements when `dims` does not divide `n`).
+
+A new [`WriteResiduePartitionError`] enumerates eight fail-closed
+invariants: `UnsupportedResidueType` (§8.6 defines 0/1/2),
+`ZeroPartitionSize` (§8.6.1 `read 24 bits + 1`), `ZeroDimensions`,
+`ScalarValueBook` (§8.6.1: a book used in VQ context must carry a
+value mapping — mirroring the decoder's construction-time
+`ValueBookHasNoLookup` gate), `Format0NotDivisible`,
+`EntryCountMismatch`, `Huffman` (tree-build failure, `source()`
+chained), and `UnencodableEntry` (no canonical codeword — out of
+range or sparse-unused). Validation precedes emission; the
+crate-private `write_residue_partition_into_writer` splice helper
+leaves the caller's writer bit-exactly untouched on every error path,
+matching the established `_into_writer` splice-point contract. The
+umbrella [`WriteError`] grows a [`WriteError::ResiduePartition`]
+variant with the matching `From` glue and `source()` chain.
+
+16 new in-module unit tests bring the crate suite from **679 → 695
+(+16)**: the three codeword-count behaviours (format-0 exact
+division, format-1/2 ceil including `dims > n`, all four structural
+rejections); a byte-shape pin (entries `[0,1,1,0]` through a 1-bit
+book → `0x06`); **four end-to-end roundtrips through the real
+`ResidueDecoder`** composing classbook codeword + partition bodies by
+hand — format 1 two-partition (`[3,5,5,3]`), format 0 scatter
+(`[e0[0], e1[0], e0[1], e1[1]]` with expectations computed through
+`unpack_vector`), format 2 two-channel de-interleave
+(`[3,5]`/`[5,3]`), and the format-1 partial-final-vector discard;
+both entry-count mismatch directions; the scalar-book rejection; the
+out-of-range and sparse-unused `UnencodableEntry` shapes; the
+Huffman build-error propagation with `source()` chain; the
+splice-emits-no-bits-on-error contract; public-vs-splice byte
+equality; grep-able `Display` content for all eight variants; and the
+umbrella `WriteError` From + `source()` + crate-level `Error::Write`
+chain.
+
+Followups (explicit):
+
+* The wrapping §8.6.2 residue-body writer that interleaves the
+  classbook codewords (rounds 35/36's packers +
+  `HuffmanTree::encode_entry`) with these partition bodies across the
+  §8.6.2 pass/partition/vector loops — both halves now exist; the
+  wrapper is the loop structure plus the `do_not_decode` /
+  `partitions_to_read` bookkeeping.
+* The VQ-encode stage that maps residue scalars to the entry indices
+  this writer consumes (nearest-entry quantisation against the book's
+  `unpack_vector` table).
+* The §6.2.2 floor 0 packet-body WRITE primitive (the amplitude +
+  per-vector VQ codeword inverse).
+* The wrapping §4.3 audio-packet writer that splices §4.3.1 prelude +
+  per-channel §7.2.3 floor body + the §8.6.2 residue body + the
+  §4.3.6 dot-product spectrum + §4.3.7 forward MDCT.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.2 (the
+packet-decode loop's step-19 partition hand-off), §8.6.3 (format 0's
+`[step] = [n]/[codebook_dimensions]` read count + scatter), §8.6.4
+(format 1's read-while-`[i] < [n]` loop), §8.6.5 (format 2 reducible
+to format 1 over the interleaved vector), §8.6.1 (the VQ-context
+value-mapping requirement and the `+1`-decoded field ranges), §3.2.1
+(canonical Huffman codewords).
 
 ## Status — 2026-06-10 (round 35, umbrella round 267)
 
