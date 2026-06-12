@@ -1,6 +1,105 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 37.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 38.
+
+## Status — 2026-06-12 (round 38, umbrella round 281)
+
+**Round 38 lands the wrapping §8.6.2 residue-body WRITE primitive —
+the loop structure that interleaves the round-35/36 classification
+packers' classbook codewords with the round-37 per-partition
+value-codeword bodies across the §8.6.2 pass/partition/vector loops.**
+Both halves existed after round 37; this round closes the residue
+WRITE chain from "per-vector classifications + entry indices" to "one
+byte-aligned §8.6.2 body the residue decoder reads back". New public
+surface, re-exported at the crate root:
+
+* [`encoder::write_residue_body(plans, header, codebooks, blocksize,
+  do_not_decode)`] serialises one full residue body in the exact
+  inverse of the decoder's §8.6.2 step-3..21 read order: passes run
+  0..=7; on pass 0 each stride of `classwords_per_codeword`
+  partitions is preceded by ONE classbook codeword per decoded vector
+  (steps 6..12 — the final partial stride right-padded with the zero
+  digits the decoder reads-and-discards); on every pass each
+  (partition, vector) pair whose classification selects a cascade
+  stage holding a value book emits that partition's body (steps
+  13..20). 'Do not decode' vectors and 'unused' stages emit nothing
+  (steps 15 / 18). A crate-private `write_residue_body_into_writer`
+  splice helper keeps the established `_into_writer` contract —
+  validation precedes emission in full, so the caller's writer is
+  bit-exactly untouched on every error path — ready for the wrapping
+  §4.3 audio-packet writer to thread the body after the per-channel
+  floor bodies.
+* [`encoder::ResidueVectorPlan`] describes one §8.6.2 decode vector:
+  the per-partition `classifications` row plus the per-(partition,
+  pass) `partition_entries` index lists — the encoder's explicit
+  quantisation choices (the `partition_cvals` knob philosophy), so a
+  future VQ-encode stage picks the values and the emission stays
+  bit-exact by construction.
+* [`encoder::residue_body_shape(header, blocksize, do_not_decode)`]
+  pins the §8.6.2 step-1..5 derived [`ResidueBodyShape`] `{ vectors,
+  partitions_to_read }`: one decode vector per channel for formats 0
+  and 1, a single interleaved vector for format 2 (`actual_size *=
+  ch`), and format 2's all-'do not decode' shortcut (zero vectors, no
+  decode at all per §8.6.5) — so callers can size plans before
+  quantising.
+
+A new [`WriteResidueBodyError`] enumerates seventeen fail-closed
+invariants: the §8.6.1 header/codebook gates mirrored from the
+decoder's construction-time checks (`ClassbookOutOfRange`,
+`ZeroClasswordsPerCodeword`, `ValueBookOutOfRange`,
+`ValueBookHasNoLookup`), the shape gates (`UnsupportedResidueType`,
+`ZeroPartitionSize`, `PlanCountMismatch`, `DoNotDecodePlanNotEmpty`,
+`ClassificationCountMismatch`, `PartitionEntriesCountMismatch`), the
+per-partition gates (`ClassificationOutOfRange`,
+`MissingPartitionEntries`, `UnexpectedPartitionEntries`, `Partition`
+wrapping the round-37 error with (vector, partition, pass)
+coordinates), and the classbook-emission gates (`ClassificationPack`,
+`UnencodableClassbookEntry`, `Huffman`), with `source()` chaining on
+the wrapping variants. The umbrella [`WriteError`] grows a
+[`WriteError::ResidueBody`] variant with the matching `From` glue and
+`source()` chain.
+
+26 new in-module unit tests bring the crate suite from **695 → 721
+(+26)**: the three shape behaviours; five end-to-end roundtrips
+through the real `ResidueDecoder` — format 1 single-channel (pinned
+byte-for-byte against a hand-composed classbook-codeword +
+partition-body stream), format 1 two-channel §8.6.2 step-14 vector
+interleave, format 0 scatter, format 2 de-interleave, and a
+multi-pass cascade whose stage-0 and stage-1 bodies accumulate —
+plus the multi-group stream (classwords = 2 over 4 partitions, 2
+classes: classbook codewords interleave mid-stream) and the
+partial-final-group zero-pad, each order-pinned; the 'do not decode'
+channel skip; the two empty-body shapes (format 2 all-dnd → zero
+plans → zero bytes, `begin == end` → empty rows → zero bytes); ten
+error-path rejections; the splice no-bits-on-error contract with the
+error found *late* in validation (after an earlier partition
+validated clean); public-vs-splice + seeded-splice byte equality;
+grep-able `Display` content for all seventeen variants; and the
+umbrella `WriteError` From + `source()` + crate-level `Error::Write`
+chain.
+
+Followups (explicit):
+
+* The VQ-encode stage that maps real residue scalars to the
+  classifications + entry indices a [`ResidueVectorPlan`] carries
+  (nearest-entry quantisation against the book's `unpack_vector`
+  table, per-partition class selection).
+* The §6.2.2 floor 0 packet-body WRITE primitive (the amplitude +
+  per-vector VQ codeword inverse).
+* The wrapping §4.3 audio-packet writer that splices §4.3.1 prelude +
+  per-channel §7.2.3 floor body + this §8.6.2 residue body + the
+  §4.3.6 dot-product spectrum + §4.3.7 forward MDCT — the residue
+  half of its call-graph is now one `_into_writer` splice.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.2 (the
+packet-decode loop, steps 1..21 — the pass iteration, the pass-0
+classbook stride reads, the per-vector partition hand-off), §8.6.5
+(format 2's single-interleaved-vector reduction and its all-'do not
+decode' shortcut), §8.6.1 (the undecodability gates the writer
+mirrors), §3.2.1 (canonical Huffman codewords).
 
 ## Status — 2026-06-11 (round 37, umbrella round 278)
 
