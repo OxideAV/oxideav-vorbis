@@ -12,7 +12,7 @@
 //!
 //! # Status
 //!
-//! libvorbis has never emitted floor 0 (every reference encoder since
+//! No known Vorbis encoder has ever emitted floor 0 (every encoder since
 //! the original beta uses floor 1). A conformant Vorbis I decoder must
 //! still implement the codepath because the spec defines it, and a
 //! third-party encoder could theoretically produce a floor-0 stream.
