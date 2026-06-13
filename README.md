@@ -1,6 +1,86 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 38.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 39.
+
+## Status — 2026-06-13 (round 39, umbrella round 288)
+
+**Round 39 lands the §6.2.2 floor 0 packet-body WRITE primitive — the
+inverse of the floor 0 packet decode (the amplitude + value-book
+selector + per-vector VQ codeword run), and the last missing
+per-channel floor body writer (the floor 1 packet writer shipped
+earlier; the §4.3 audio-packet writer can now splice EITHER floor
+type).** New public surface, re-exported at the crate root:
+
+* [`encoder::write_floor0_packet(packet, header, codebooks)`]
+  serialises one §6.2.2 floor 0 audio-packet body in the exact inverse
+  of the decoder's read order. [`encoder::Floor0Packet::Unused`] emits
+  only the `floor0_amplitude_bits`-wide zero `[amplitude]` field —
+  exactly the bits the §6.2.2 step-2 zero-amplitude short-circuit
+  reads before returning `'unused'`.
+  [`encoder::Floor0Packet::Curve`] `{ amplitude, booknumber, entries }`
+  emits the nonzero amplitude (step 1), the
+  `ilog(floor0_number_of_books)`-wide `[booknumber]` selector (step 4
+  — a *position* in `floor0_book_list`, selecting
+  `codebooks[book_list[booknumber]]`), then one canonical §3.2.1
+  codeword per VQ entry (steps 7..11). The writer requires exactly
+  `ceil(floor0_order / book.dimensions)` entries — the count the
+  decode loop reads to fill `[coefficients]` to `floor0_order` scalars
+  (the decoder reads a trailing partial vector in full and discards
+  its surplus). A crate-private `write_floor0_packet_into_writer`
+  splice helper keeps the established `_into_writer` contract —
+  validation precedes emission in full, so the caller's writer is
+  bit-exactly untouched on every error path — ready for the wrapping
+  §4.3 audio-packet writer to thread the per-channel floor 0 body.
+
+* [`encoder::Floor0Packet`] (`Unused` / `Curve`) describes the
+  encoder's explicit quantisation choices — the same knob philosophy
+  as the floor 1 packet writer's [`Floor1Packet`] and the residue
+  writer's [`ResidueVectorPlan`]: the writer serialises exactly the
+  value-book entry indices it is handed, bit-exact by construction,
+  and a future VQ-encode stage picks the entries that nearest-match a
+  target LSP curve.
+
+* [`encoder::WriteFloor0PacketError`] enumerates fourteen fail-closed
+  invariants: the §6.2.1 header gates mirrored from
+  `Floor0Decoder::new` (`ZeroAmplitudeBits`, `AmplitudeBitsOverflow`,
+  `ZeroOrder`, `EmptyBookList`, `BookListTooLong`), the curve gates
+  (`ZeroAmplitudeCurve`, `AmplitudeOverflow`, `BooknumberOutOfRange`,
+  `ValueBookOutOfRange`, `ValueBookHasNoLookup`, `ZeroDimensionBook`,
+  `EntryCountMismatch`), and the per-entry gates (`EntryOutOfRange`,
+  `UnencodableEntry`, `Huffman`), with `source()` chaining on the
+  wrapping variant.
+
+20 new in-module unit tests bring the crate suite from **721 → 741
+(+20)**: the unused short-circuit's exact one-byte output + decode
+back through the real `Floor0Decoder` to `Floor0Curve::Unused`; three
+`Curve` roundtrips (single vector, multi-vector `ceil(order/dims)`
+count, and second-book selection exercising a 2-bit `[booknumber]`
+field) re-read straight off the produced bytes in decoder read order;
+one `Curve` decoded through `Floor0Decoder` to a full 64-bin curve;
+the public-vs-splice byte equality; the seeded-splice no-bits-on-error
+contract (entry-count mismatch found late); ten error-path rejections;
+and grep-able `Display` content for all fourteen variants.
+
+Followups (explicit):
+
+* The VQ-encode stage that maps a real target LSP curve to the
+  `(amplitude, booknumber, entries)` a [`Floor0Packet::Curve`] carries
+  (nearest-entry quantisation against the book's `unpack_vector`
+  table), paired with the analogous residue VQ-encode stage.
+* The wrapping §4.3 audio-packet writer that splices §4.3.1 prelude +
+  per-channel floor body (NOW either [`write_floor0_packet`] or
+  `write_floor1_packet`) + §8.6.2 residue body + the §4.3.6
+  dot-product spectrum + §4.3.7 forward MDCT — every per-channel body
+  writer is now a `_into_writer` splice point.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §6.2.2 (the floor 0
+packet decode — the amplitude / booknumber / VQ-vector read loop),
+§6.2.1 (the header field bounds the writer mirrors), §3.2.1 (canonical
+Huffman codewords), §3.3 (the VQ-context lookup_type gate), §2.1.4
+(LSB-first packing).
 
 ## Status — 2026-06-12 (round 38, umbrella round 281)
 

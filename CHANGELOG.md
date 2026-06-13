@@ -6,6 +6,57 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §6.2.2 floor 0 packet-body WRITE primitive (round 39,
+  umbrella round 288).** The inverse of the floor 0 packet decode —
+  the amplitude + value-book selector + per-vector VQ codeword run.
+  New public surface (re-exported at the crate root):
+
+  - `encoder::write_floor0_packet(packet, header, codebooks)`
+    serialises one §6.2.2 floor 0 audio-packet body. `Floor0Packet::Unused`
+    emits only the `floor0_amplitude_bits`-wide zero `[amplitude]`
+    field — exactly the bits the §6.2.2 step-2 zero-amplitude
+    short-circuit reads before returning `'unused'`.
+    `Floor0Packet::Curve { amplitude, booknumber, entries }` emits the
+    nonzero amplitude (step 1), the
+    `ilog(floor0_number_of_books)`-wide `[booknumber]` selector
+    (step 4 — a *position* in `floor0_book_list`), then one canonical
+    §3.2.1 codeword per VQ entry (steps 7..11). The writer requires
+    exactly `ceil(floor0_order / book.dimensions)` entries — the count
+    the decode loop reads to fill `[coefficients]` to `floor0_order`
+    scalars. A crate-private `write_floor0_packet_into_writer` splice
+    helper keeps the established `_into_writer` contract (validation
+    precedes emission in full; the caller's writer is bit-exactly
+    untouched on every error path), ready for the wrapping §4.3
+    audio-packet writer to thread the per-channel floor 0 body.
+  - `encoder::Floor0Packet` enum (`Unused` / `Curve`) — the encoder's
+    explicit quantisation choices, same knob philosophy as the floor 1
+    packet writer's `Floor1Packet` and the residue writer's
+    `ResidueVectorPlan`.
+  - `encoder::WriteFloor0PacketError` enumerates fourteen fail-closed
+    invariants: the §6.2.1 header gates mirrored from
+    `Floor0Decoder::new` (`ZeroAmplitudeBits`, `AmplitudeBitsOverflow`,
+    `ZeroOrder`, `EmptyBookList`, `BookListTooLong`), the curve gates
+    (`ZeroAmplitudeCurve`, `AmplitudeOverflow`, `BooknumberOutOfRange`,
+    `ValueBookOutOfRange`, `ValueBookHasNoLookup`, `ZeroDimensionBook`,
+    `EntryCountMismatch`), and the per-entry gates (`EntryOutOfRange`,
+    `UnencodableEntry`, `Huffman`), with `source()` chaining on the
+    wrapping variant.
+
+  20 new in-module unit tests (crate suite **721 → 741, +20**): the
+  unused short-circuit's exact one-byte output + decode-back to
+  `Floor0Curve::Unused`; three `Curve` roundtrips (single vector,
+  multi-vector `ceil(order/dims)` count, second-book selection with a
+  2-bit booknumber field) re-read straight off the produced bytes in
+  decoder read order; one `Curve` decoded through the real
+  `Floor0Decoder` to a 64-bin curve; the public-vs-splice byte
+  equality; the seeded-splice no-bits-on-error contract; ten
+  error-path rejections; and the grep-able `Display` content for all
+  fourteen variants. Spec source:
+  `docs/audio/vorbis/Vorbis_I_spec.pdf` §6.2.2 (the floor 0 packet
+  decode loop), §6.2.1 (header field bounds), §3.2.1 (canonical
+  Huffman codewords), §3.3 (the VQ-context lookup_type gate), §2.1.4
+  (LSB-first packing).
+
 * **Vorbis I §8.6.2 residue-body WRITE primitive (round 38, umbrella
   round 281).** The wrapping writer that runs the §8.6.2 step-3..21
   pass/partition/vector loop in the write direction, interleaving the

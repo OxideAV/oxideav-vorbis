@@ -3868,6 +3868,481 @@ pub(crate) fn write_floor1_packet_into_writer(
 /// `{ 256, 128, 86, 64 }` indexed by `[floor1_multiplier] - 1`.
 const RANGE_TABLE_FLOOR1: [u32; 4] = [256, 128, 86, 64];
 
+/// The encoder's description of one §6.2.2 floor 0 audio-packet body —
+/// the input to [`write_floor0_packet`].
+///
+/// A floor 0 packet is either *unused* (the per-packet `[amplitude]`
+/// field read zero, so the channel carries no energy this frame and the
+/// decoder emits an all-zero curve) or a *curve* (a nonzero amplitude
+/// plus a value-book selector and a run of VQ codewords that rebuild the
+/// LSP coefficient list). [`Floor0Packet::Unused`] emits only the
+/// `floor0_amplitude_bits`-wide zero amplitude field — exactly the bits
+/// the §6.2.2 step-2 zero-amplitude short-circuit reads before returning
+/// `'unused'`. [`Floor0Packet::Curve`] emits the amplitude, the
+/// `ilog(floor0_number_of_books)`-wide `[booknumber]` selector, then one
+/// canonical §3.2.1 codeword per supplied VQ entry.
+///
+/// The `entries` member is the encoder's explicit quantisation choice —
+/// the same knob philosophy as [`Floor1Packet::partition_cvals`] and
+/// [`ResidueVectorPlan`]: the writer serialises exactly the value-book
+/// entry indices it is handed, bit-exact by construction, and a future
+/// VQ-encode stage picks the entries that nearest-match a target LSP
+/// curve. Each entry decodes (through the selected book's
+/// [`crate::vq::unpack_vector`]) to `book.dimensions` coefficients; the
+/// writer requires exactly `ceil(order / dimensions)` entries — the
+/// count the §6.2.2 step-7..11 loop reads to fill `[coefficients]` to
+/// `floor0_order` scalars (the decoder stops the *frame* once
+/// `len(coefficients) >= order`, so a trailing partial vector is read in
+/// full and its surplus scalars discarded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Floor0Packet {
+    /// The channel carried no audio energy this frame: the `[amplitude]`
+    /// field is zero and the §6.2.2 step-2 short-circuit returns
+    /// `'unused'` without reading the `[booknumber]` or any VQ codewords.
+    Unused,
+    /// A nonzero-amplitude curve: the amplitude, the value-book selector,
+    /// and the VQ entry run that rebuilds the LSP coefficients.
+    Curve {
+        /// `[amplitude]` (§6.2.2 step 1), emitted in
+        /// `floor0_amplitude_bits` bits. Must be `> 0` (a zero amplitude
+        /// is [`Floor0Packet::Unused`], not a `Curve`) and must fit the
+        /// `floor0_amplitude_bits`-wide field.
+        amplitude: u32,
+        /// `[booknumber]` (§6.2.2 step 4) — a *position* in
+        /// `floor0_book_list`, emitted in
+        /// `ilog(floor0_number_of_books)` bits. Selects the value book
+        /// `codebooks[book_list[booknumber]]` used for the VQ decode.
+        booknumber: u32,
+        /// The value-book **entry indices** the §6.2.2 step-7 loop
+        /// decodes, in stream order. Length must equal
+        /// `ceil(floor0_order / book.dimensions)`.
+        entries: Vec<u32>,
+    },
+}
+
+/// Errors that may arise while writing a §6.2.2 floor 0 audio-packet
+/// body via [`write_floor0_packet`].
+///
+/// Each variant flags a §6.2.2 invariant the caller-supplied
+/// [`Floor0Packet`] / [`Floor0Header`] / codebook table tuple does not
+/// satisfy. The writer refuses the call without emitting any bits,
+/// preserving the round-trip guarantee that the floor 0 decoder reads
+/// the same amplitude / booknumber / coefficients back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFloor0PacketError {
+    /// `floor0_amplitude_bits` was zero. §6.2.1 stores it as a `read 6
+    /// bits` field; a zero width makes the `[amplitude]` read always
+    /// yield 0, so the decoder constructor (`Floor0Decoder::new`) rejects
+    /// such a header outright and no nonzero-amplitude packet could ever
+    /// round-trip. The writer mirrors that fail-closed gate.
+    ZeroAmplitudeBits,
+    /// `floor0_amplitude_bits` exceeded 63 (the §6.2.1 6-bit field's
+    /// maximum). Symmetric to [`WriteFloor0Error::AmplitudeBitsOverflow`].
+    AmplitudeBitsOverflow(u8),
+    /// `floor0_order` was zero. §6.2.1 stores it as a `read 8 bits`
+    /// field, but `Floor0Decoder::new` rejects a zero order (the §6.2.2
+    /// step-7 loop would read zero vectors and the §6.2.3 curve would be
+    /// empty). The writer mirrors that gate.
+    ZeroOrder,
+    /// `floor0_book_list` was empty. §6.2.1 stores `floor0_number_of_books`
+    /// as `read 4 bits + 1`, so the legal minimum is 1; an empty list has
+    /// no `[booknumber]` field width and no value books to select.
+    EmptyBookList,
+    /// `floor0_book_list.len()` exceeded 16 (the §6.2.1 `read 4 bits + 1`
+    /// field's maximum). Symmetric to [`WriteFloor0Error::BookListTooLong`].
+    BookListTooLong(usize),
+    /// A `Curve` packet carried `amplitude == 0`. §6.2.2 step 2 treats a
+    /// zero amplitude as `'unused'`; a zero-amplitude `Curve` has no
+    /// on-wire representation that round-trips back to a `Curve` (the
+    /// decoder would return `'unused'` and never read the booknumber or
+    /// coefficients). Use [`Floor0Packet::Unused`] instead.
+    ZeroAmplitudeCurve,
+    /// A `Curve` packet's `amplitude` did not fit the
+    /// `floor0_amplitude_bits`-wide field (`amplitude >= 1 <<
+    /// amplitude_bits`). §6.2.2 step 1 reads exactly `amplitude_bits`
+    /// bits, so a wider value cannot be recovered.
+    AmplitudeOverflow {
+        /// The rejected amplitude.
+        amplitude: u32,
+        /// `floor0_amplitude_bits`.
+        amplitude_bits: u8,
+    },
+    /// A `Curve` packet's `booknumber` was `>= floor0_number_of_books`.
+    /// §6.2.2 step 5 maps an out-of-range book selector to `'unused'`
+    /// (the reserved values correspond to no value book), so it cannot
+    /// round-trip back to a `Curve`.
+    BooknumberOutOfRange {
+        /// The rejected `booknumber`.
+        booknumber: u32,
+        /// `floor0_number_of_books` (= `book_list.len()`).
+        number_of_books: usize,
+    },
+    /// The value book a `Curve` selected referenced an out-of-range
+    /// codebook. `floor0_book_list[booknumber]` indexes the codebook
+    /// table; the writer needs the codebook to encode the VQ codewords.
+    ValueBookOutOfRange {
+        /// The `book_list` position (= `booknumber`).
+        position: usize,
+        /// `book_list[booknumber]` — the rejected codebook index.
+        book: u8,
+        /// `codebooks.len()`.
+        codebook_count: usize,
+    },
+    /// The value book a `Curve` selected has `lookup_type == 0` (no VQ
+    /// value mapping). §3.3 forbids a VQ-context decode against a
+    /// scalar-only codebook; `Floor0Decoder::new` rejects such a book at
+    /// construction time. The writer mirrors that gate.
+    ValueBookHasNoLookup {
+        /// The `book_list` position (= `booknumber`).
+        position: usize,
+        /// `book_list[booknumber]` — the offending codebook index.
+        book: u8,
+    },
+    /// The value book a `Curve` selected has `dimensions == 0`. The
+    /// §6.2.2 step-7 loop adds `dimensions` coefficients per vector; a
+    /// zero-dimension book would loop forever, so the decoder treats it
+    /// as undecodable and the writer refuses it.
+    ZeroDimensionBook {
+        /// The `book_list` position (= `booknumber`).
+        position: usize,
+        /// `book_list[booknumber]` — the offending codebook index.
+        book: u8,
+    },
+    /// A `Curve` packet's `entries.len()` did not match the count the
+    /// §6.2.2 step-7..11 loop reads. The decoder reads vectors until
+    /// `len(coefficients) >= order`, i.e. exactly
+    /// `ceil(order / dimensions)` vectors; the writer needs one entry per
+    /// vector so the decode count matches.
+    EntryCountMismatch {
+        /// `ceil(order / dimensions)` — the count the decoder reads.
+        expected: usize,
+        /// The supplied `entries.len()`.
+        actual: usize,
+    },
+    /// A VQ entry index was `>= book.entries` (out of the value book's
+    /// range). §6.2.2 step 7 decodes a codeword whose entry must be a
+    /// valid index into the book's value-mapping table.
+    EntryOutOfRange {
+        /// Index into `entries`.
+        index: usize,
+        /// The rejected entry.
+        entry: u32,
+        /// `book.entries`.
+        entries: u32,
+    },
+    /// A VQ entry index is not in the value book's *used* set (no
+    /// canonical §3.2.1 codeword maps to it). §6.2.2 step 7 decodes each
+    /// codeword through the book's Huffman tree, so every emitted entry
+    /// must be a leaf of that tree.
+    UnencodableEntry {
+        /// Index into `entries`.
+        index: usize,
+        /// The rejected entry.
+        entry: u32,
+        /// The number of used entries in the book's tree.
+        used_count: u32,
+    },
+    /// Building the Huffman tree for the selected value book failed.
+    /// Mirrors [`crate::huffman::BuildError`] surfacing through the
+    /// packet writer.
+    Huffman(crate::huffman::BuildError),
+}
+
+impl fmt::Display for WriteFloor0PacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteFloor0PacketError::ZeroAmplitudeBits => write!(
+                f,
+                "vorbis floor0 packet (write): floor0_amplitude_bits is zero — no curve packet can round-trip (§6.2.1)"
+            ),
+            WriteFloor0PacketError::AmplitudeBitsOverflow(b) => write!(
+                f,
+                "vorbis floor0 packet (write): floor0_amplitude_bits={b} > 63 (§6.2.1 6-bit field)"
+            ),
+            WriteFloor0PacketError::ZeroOrder => write!(
+                f,
+                "vorbis floor0 packet (write): floor0_order is zero (§6.2.1)"
+            ),
+            WriteFloor0PacketError::EmptyBookList => write!(
+                f,
+                "vorbis floor0 packet (write): floor0_book_list is empty (§6.2.1 number_of_books >= 1)"
+            ),
+            WriteFloor0PacketError::BookListTooLong(n) => write!(
+                f,
+                "vorbis floor0 packet (write): floor0_book_list.len()={n} > 16 (§6.2.1 read 4 bits + 1)"
+            ),
+            WriteFloor0PacketError::ZeroAmplitudeCurve => write!(
+                f,
+                "vorbis floor0 packet (write): Curve packet with amplitude=0 — use Floor0Packet::Unused (§6.2.2 step 2)"
+            ),
+            WriteFloor0PacketError::AmplitudeOverflow {
+                amplitude,
+                amplitude_bits,
+            } => write!(
+                f,
+                "vorbis floor0 packet (write): amplitude={amplitude} does not fit floor0_amplitude_bits={amplitude_bits} (§6.2.2 step 1)"
+            ),
+            WriteFloor0PacketError::BooknumberOutOfRange {
+                booknumber,
+                number_of_books,
+            } => write!(
+                f,
+                "vorbis floor0 packet (write): booknumber={booknumber} >= floor0_number_of_books={number_of_books} (§6.2.2 step 5)"
+            ),
+            WriteFloor0PacketError::ValueBookOutOfRange {
+                position,
+                book,
+                codebook_count,
+            } => write!(
+                f,
+                "vorbis floor0 packet (write): book_list[{position}]={book} >= codebooks.len()={codebook_count} (§6.2.1)"
+            ),
+            WriteFloor0PacketError::ValueBookHasNoLookup { position, book } => write!(
+                f,
+                "vorbis floor0 packet (write): value book at position {position} (codebook {book}) has lookup_type=0 (§3.3)"
+            ),
+            WriteFloor0PacketError::ZeroDimensionBook { position, book } => write!(
+                f,
+                "vorbis floor0 packet (write): value book at position {position} (codebook {book}) has dimensions=0 (§6.2.2 step 7 would loop)"
+            ),
+            WriteFloor0PacketError::EntryCountMismatch { expected, actual } => write!(
+                f,
+                "vorbis floor0 packet (write): entries.len()={actual} != ceil(order/dimensions)={expected} (§6.2.2 step 7..11)"
+            ),
+            WriteFloor0PacketError::EntryOutOfRange {
+                index,
+                entry,
+                entries,
+            } => write!(
+                f,
+                "vorbis floor0 packet (write): entries[{index}]={entry} >= book.entries={entries} (§6.2.2 step 7)"
+            ),
+            WriteFloor0PacketError::UnencodableEntry {
+                index,
+                entry,
+                used_count,
+            } => write!(
+                f,
+                "vorbis floor0 packet (write): entries[{index}]={entry} not encodable (book tree has {used_count} used entries) (§6.2.2 step 7)"
+            ),
+            WriteFloor0PacketError::Huffman(e) => write!(
+                f,
+                "vorbis floor0 packet (write): Huffman build error: {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteFloor0PacketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WriteFloor0PacketError::Huffman(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::huffman::BuildError> for WriteFloor0PacketError {
+    fn from(value: crate::huffman::BuildError) -> Self {
+        WriteFloor0PacketError::Huffman(value)
+    }
+}
+
+/// Serialises a §6.2.2 floor 0 audio-packet body to the bitstream the
+/// floor 0 decoder ([`crate::floor0::Floor0Decoder::decode`]) reads
+/// back.
+///
+/// This is the inverse of the §6.2.2 packet decode: an
+/// [`Floor0Packet::Unused`] emits only the `floor0_amplitude_bits`-wide
+/// zero amplitude; an [`Floor0Packet::Curve`] emits the amplitude, the
+/// `ilog(floor0_number_of_books)`-wide `[booknumber]` selector, then one
+/// canonical §3.2.1 codeword per VQ entry. The returned [`Vec<u8>`] is
+/// the body's bits LSB-first (§2.1.4), with up to 7 bits of zero padding
+/// in the final byte to byte-align the slice.
+///
+/// On error the call is refused without emitting a single bit (validation
+/// precedes emission), preserving the round-trip guarantee that the
+/// decoder reads the same amplitude / booknumber / coefficients back.
+///
+/// ## Spec source
+///
+/// `docs/audio/vorbis/Vorbis_I_spec.pdf` §6.2.2 (the floor 0 packet
+/// decode — the amplitude / booknumber / VQ-vector read loop), §6.2.1
+/// (the header field bounds the writer mirrors), §3.2.1 (canonical
+/// Huffman codewords), §3.3 (the VQ-context lookup_type gate), §2.1.4
+/// (LSB-first packing).
+pub fn write_floor0_packet(
+    packet: &Floor0Packet,
+    header: &Floor0Header,
+    codebooks: &[VorbisCodebook],
+) -> Result<Vec<u8>, WriteFloor0PacketError> {
+    let mut writer = BitWriterLsb::with_capacity(2);
+    write_floor0_packet_into_writer(packet, header, codebooks, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a §6.2.2 floor 0 audio-packet body into a
+/// larger bit-packed stream. The wrapping §4.3 audio-packet writer
+/// (explicit followup) will use this to thread the per-channel floor 0
+/// body between the §4.3.1 prelude and the §4.3.4 residue body,
+/// mirroring [`write_floor1_packet_into_writer`] and the existing
+/// per-header `_into_writer` splice points.
+///
+/// Writes the body's bits into `writer` at its current bit position.
+/// On error, no bits are emitted (validation precedes emission).
+pub(crate) fn write_floor0_packet_into_writer(
+    packet: &Floor0Packet,
+    header: &Floor0Header,
+    codebooks: &[VorbisCodebook],
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteFloor0PacketError> {
+    // ---- §6.2.1 header invariant gate (mirrors Floor0Decoder::new). ----
+    // These bound the field widths the packet body uses; a header that
+    // the decoder constructor would reject can never produce a
+    // round-tripping packet, so we fail closed before touching the
+    // packet contents.
+    if header.amplitude_bits == 0 {
+        return Err(WriteFloor0PacketError::ZeroAmplitudeBits);
+    }
+    if header.amplitude_bits > 63 {
+        return Err(WriteFloor0PacketError::AmplitudeBitsOverflow(
+            header.amplitude_bits,
+        ));
+    }
+    if header.order == 0 {
+        return Err(WriteFloor0PacketError::ZeroOrder);
+    }
+    if header.book_list.is_empty() {
+        return Err(WriteFloor0PacketError::EmptyBookList);
+    }
+    if header.book_list.len() > 16 {
+        return Err(WriteFloor0PacketError::BookListTooLong(
+            header.book_list.len(),
+        ));
+    }
+
+    let amplitude_bits = header.amplitude_bits as u32;
+
+    // ---- §6.2.2 step 1/2: the unused short-circuit. ----
+    let (amplitude, booknumber, entries) = match packet {
+        Floor0Packet::Unused => {
+            // Emit only the zero `[amplitude]` field; the decoder's
+            // step-2 short-circuit returns 'unused' without reading
+            // further. (Validation above already passed; nothing in the
+            // packet payload to check.)
+            writer.write_u32(0, amplitude_bits);
+            return Ok(());
+        }
+        Floor0Packet::Curve {
+            amplitude,
+            booknumber,
+            entries,
+        } => (*amplitude, *booknumber, entries),
+    };
+
+    // ---- §6.2.2 Curve invariant gate (no bits emitted on error). ----
+    // (1) amplitude must be nonzero (else it round-trips as 'unused').
+    if amplitude == 0 {
+        return Err(WriteFloor0PacketError::ZeroAmplitudeCurve);
+    }
+    // (2) amplitude must fit the amplitude_bits-wide field.
+    //     (amplitude_bits is 1..=63 here, so `1u64 << amplitude_bits`
+    //     never overflows a u64.)
+    if (amplitude as u64) >= (1u64 << amplitude_bits) {
+        return Err(WriteFloor0PacketError::AmplitudeOverflow {
+            amplitude,
+            amplitude_bits: header.amplitude_bits,
+        });
+    }
+
+    // (3) §6.2.2 step 4/5: booknumber selects a position in book_list.
+    //     The decoder reads ilog(number_of_books) bits and rejects an
+    //     out-of-range selector as 'unused'; that cannot round-trip to a
+    //     Curve, so we refuse it.
+    let number_of_books = header.book_list.len();
+    if (booknumber as usize) >= number_of_books {
+        return Err(WriteFloor0PacketError::BooknumberOutOfRange {
+            booknumber,
+            number_of_books,
+        });
+    }
+    let position = booknumber as usize;
+    let book_index = header.book_list[position];
+
+    // (4) §6.2.1: the selected book must exist, carry a VQ value mapping,
+    //     and have nonzero dimensions (else the decoder loops). These
+    //     mirror Floor0Decoder::new's per-book construction checks.
+    let book =
+        codebooks
+            .get(book_index as usize)
+            .ok_or(WriteFloor0PacketError::ValueBookOutOfRange {
+                position,
+                book: book_index,
+                codebook_count: codebooks.len(),
+            })?;
+    if matches!(book.lookup, VqLookup::None) {
+        return Err(WriteFloor0PacketError::ValueBookHasNoLookup {
+            position,
+            book: book_index,
+        });
+    }
+    let dimensions = book.dimensions as usize;
+    if dimensions == 0 {
+        return Err(WriteFloor0PacketError::ZeroDimensionBook {
+            position,
+            book: book_index,
+        });
+    }
+
+    // (5) §6.2.2 step 7..11: the decoder reads vectors until
+    //     len(coefficients) >= order, i.e. ceil(order / dimensions)
+    //     vectors. The encoder must supply exactly that many entries.
+    let expected = (header.order as usize).div_ceil(dimensions);
+    if entries.len() != expected {
+        return Err(WriteFloor0PacketError::EntryCountMismatch {
+            expected,
+            actual: entries.len(),
+        });
+    }
+
+    // (6) Every entry must be a valid, encodable leaf of the book's
+    //     §3.2.1 Huffman tree. The encodability pre-check runs against a
+    //     scratch writer so the caller's stream is untouched if any entry
+    //     is refused (mirrors write_residue_partition_into_writer).
+    let tree = crate::huffman::HuffmanTree::from_codebook(book)?;
+    for (index, &entry) in entries.iter().enumerate() {
+        if entry >= book.entries {
+            return Err(WriteFloor0PacketError::EntryOutOfRange {
+                index,
+                entry,
+                entries: book.entries,
+            });
+        }
+        let mut scratch = BitWriterLsb::new();
+        tree.encode_entry(entry, &mut scratch).map_err(|e| {
+            let crate::huffman::EncodeError::UnknownEntry { used_count, .. } = e;
+            WriteFloor0PacketError::UnencodableEntry {
+                index,
+                entry,
+                used_count,
+            }
+        })?;
+    }
+
+    // ---- §6.2.2 emit (all validation passed). ----
+    // step 1: [amplitude] in amplitude_bits bits.
+    writer.write_u32(amplitude, amplitude_bits);
+    // step 4: [booknumber] in ilog(number_of_books) bits.
+    let book_index_bits = ilog(number_of_books as u32);
+    writer.write_u32(booknumber, book_index_bits);
+    // step 7: one canonical codeword per VQ entry, in stream order.
+    for &entry in entries {
+        tree.encode_entry(entry, writer)
+            .expect("encode_entry must succeed after pre-check; entry already validated");
+    }
+    Ok(())
+}
+
 /// Errors that may arise while packing a residue classification group
 /// (§8.6.2 steps 9..12) via [`pack_residue_classifications`].
 ///
@@ -12743,6 +13218,445 @@ mod tests {
                 WriteResidueBodyError::ZeroPartitionSize,
             )) => {}
             other => panic!("crate::Error glue wrong variant: {other:?}"),
+        }
+    }
+
+    // ===== §6.2.2 floor 0 packet body WRITE (round 39) =====
+
+    use crate::floor0::{Floor0Curve, Floor0Decoder};
+    use crate::setup::Floor0Header;
+
+    /// A tessellation (lookup_type 2) VQ value book with `delta = 1`,
+    /// `min = 0`, no sequence flag — entry `e`'s vector is the
+    /// multiplicand row `multiplicands[e*dims .. (e+1)*dims]` verbatim.
+    /// Mirrors the round-37 `rp_vq_book` helper.
+    fn f0_vq_book(dimensions: u16, lengths: Vec<u8>, multiplicands: Vec<u32>) -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions,
+            entries: lengths.len() as u32,
+            codeword_lengths: lengths,
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands,
+            },
+        }
+    }
+
+    /// A minimal floor 0 header selecting `book_list` value books.
+    fn f0_header(order: u8, amplitude_bits: u8, book_list: Vec<u8>) -> Floor0Header {
+        Floor0Header {
+            order,
+            rate: 44_100,
+            bark_map_size: 256,
+            amplitude_bits,
+            amplitude_offset: 0,
+            book_list,
+        }
+    }
+
+    /// Re-read amplitude / booknumber / entries straight off the bytes
+    /// the writer produced, in the §6.2.2 decoder read order, so a test
+    /// can pin the on-wire content exactly.
+    fn f0_read_back(
+        bytes: &[u8],
+        header: &Floor0Header,
+        codebooks: &[VorbisCodebook],
+    ) -> (u32, u32, Vec<u32>) {
+        use oxideav_core::bits::BitReaderLsb;
+        let mut r = BitReaderLsb::new(bytes);
+        let amplitude = r.read_u32(header.amplitude_bits as u32).unwrap();
+        if amplitude == 0 {
+            return (0, 0, Vec::new());
+        }
+        let book_index_bits = ilog(header.book_list.len() as u32);
+        let booknumber = r.read_u32(book_index_bits).unwrap();
+        let book = &codebooks[header.book_list[booknumber as usize] as usize];
+        let tree = crate::huffman::HuffmanTree::from_codebook(book).unwrap();
+        let dims = book.dimensions as usize;
+        let count = (header.order as usize).div_ceil(dims);
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(tree.decode_entry(&mut r).unwrap());
+        }
+        (amplitude, booknumber, entries)
+    }
+
+    #[test]
+    fn f0_unused_emits_only_zero_amplitude() {
+        // amplitude_bits = 5 → one 5-bit zero field, no booknumber.
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(4, 5, vec![0]);
+        let books = vec![book];
+        let bytes = write_floor0_packet(&Floor0Packet::Unused, &header, &books).unwrap();
+        // 5 bits of zero → one byte (byte-aligned), all zero.
+        assert_eq!(bytes, vec![0x00]);
+        // Decoder reads it back as Unused.
+        let dec = Floor0Decoder::new(&header, &books).unwrap();
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        assert_eq!(dec.decode(&mut r, 128), Floor0Curve::Unused);
+    }
+
+    #[test]
+    fn f0_curve_single_vector_roundtrip() {
+        // order = 2, dims = 2 → exactly one VQ vector (one entry).
+        let book = f0_vq_book(2, vec![1, 1], vec![10, 20, 30, 40]);
+        let header = f0_header(2, 6, vec![0]);
+        let packet = Floor0Packet::Curve {
+            amplitude: 17,
+            booknumber: 0,
+            entries: vec![1],
+        };
+        let books = vec![book];
+        let bytes = write_floor0_packet(&packet, &header, &books).unwrap();
+        let (amp, bn, entries) = f0_read_back(&bytes, &header, &books);
+        assert_eq!(amp, 17);
+        assert_eq!(bn, 0);
+        assert_eq!(entries, vec![1]);
+        // And the real decoder produces a nonzero-length curve, not Unused.
+        let dec = Floor0Decoder::new(&header, &books).unwrap();
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        match dec.decode(&mut r, 64) {
+            Floor0Curve::Curve(c) => assert_eq!(c.len(), 64),
+            other => panic!("expected Curve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f0_curve_multi_vector_count() {
+        // order = 5, dims = 2 → ceil(5/2) = 3 vectors (3 entries).
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(5, 4, vec![0]);
+        let packet = Floor0Packet::Curve {
+            amplitude: 9,
+            booknumber: 0,
+            entries: vec![0, 1, 0],
+        };
+        let books = vec![book];
+        let bytes = write_floor0_packet(&packet, &header, &books).unwrap();
+        let (amp, bn, entries) = f0_read_back(&bytes, &header, &books);
+        assert_eq!(amp, 9);
+        assert_eq!(bn, 0);
+        assert_eq!(entries, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn f0_curve_second_book_selected() {
+        // Two books in book_list; booknumber = 1 selects the second.
+        // book_list.len() = 2 → ilog(2) = 2-bit booknumber field.
+        let book0 = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let book1 = f0_vq_book(1, vec![1, 1], vec![5, 6]);
+        let codebooks = vec![book0, book1];
+        // book_list maps positions 0,1 → codebook indices 0,1.
+        let header = f0_header(3, 6, vec![0, 1]);
+        // booknumber 1 → book_list[1] = codebook 1 (dims 1) → 3 entries.
+        let packet = Floor0Packet::Curve {
+            amplitude: 33,
+            booknumber: 1,
+            entries: vec![0, 1, 0],
+        };
+        let bytes = write_floor0_packet(&packet, &header, &codebooks).unwrap();
+        let (amp, bn, entries) = f0_read_back(&bytes, &header, &codebooks);
+        assert_eq!(amp, 33);
+        assert_eq!(bn, 1);
+        assert_eq!(entries, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn f0_into_writer_splice_no_bits_on_error() {
+        // A seeded writer must be byte-identical after a refused call.
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0]);
+        // entries.len() mismatch (expected 1, got 2) → late error.
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 0,
+            entries: vec![0, 1],
+        };
+        let mut w = BitWriterLsb::new();
+        w.write_u32(0b101, 3); // seed 3 bits
+        let before = {
+            let mut probe = BitWriterLsb::new();
+            probe.write_u32(0b101, 3);
+            probe.finish()
+        };
+        let err = write_floor0_packet_into_writer(&bad, &header, &[book], &mut w).unwrap_err();
+        assert!(matches!(
+            err,
+            WriteFloor0PacketError::EntryCountMismatch {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        assert_eq!(w.finish(), before, "no bits emitted on error");
+    }
+
+    #[test]
+    fn f0_public_matches_splice() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0]);
+        let packet = Floor0Packet::Curve {
+            amplitude: 5,
+            booknumber: 0,
+            entries: vec![1],
+        };
+        let books = vec![book];
+        let pubbytes = write_floor0_packet(&packet, &header, &books).unwrap();
+        let mut w = BitWriterLsb::new();
+        write_floor0_packet_into_writer(&packet, &header, &books, &mut w).unwrap();
+        assert_eq!(pubbytes, w.finish());
+    }
+
+    #[test]
+    fn f0_rejects_zero_amplitude_bits_header() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 0, vec![0]);
+        let err = write_floor0_packet(&Floor0Packet::Unused, &header, &[book]).unwrap_err();
+        assert_eq!(err, WriteFloor0PacketError::ZeroAmplitudeBits);
+    }
+
+    #[test]
+    fn f0_rejects_amplitude_bits_overflow() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 64, vec![0]);
+        let err = write_floor0_packet(&Floor0Packet::Unused, &header, &[book]).unwrap_err();
+        assert_eq!(err, WriteFloor0PacketError::AmplitudeBitsOverflow(64));
+    }
+
+    #[test]
+    fn f0_rejects_zero_order() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(0, 6, vec![0]);
+        let err = write_floor0_packet(&Floor0Packet::Unused, &header, &[book]).unwrap_err();
+        assert_eq!(err, WriteFloor0PacketError::ZeroOrder);
+    }
+
+    #[test]
+    fn f0_rejects_empty_book_list() {
+        let header = f0_header(2, 6, vec![]);
+        let err = write_floor0_packet(&Floor0Packet::Unused, &header, &[]).unwrap_err();
+        assert_eq!(err, WriteFloor0PacketError::EmptyBookList);
+    }
+
+    #[test]
+    fn f0_rejects_book_list_too_long() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0; 17]);
+        let err = write_floor0_packet(&Floor0Packet::Unused, &header, &[book]).unwrap_err();
+        assert_eq!(err, WriteFloor0PacketError::BookListTooLong(17));
+    }
+
+    #[test]
+    fn f0_rejects_zero_amplitude_curve() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0]);
+        let bad = Floor0Packet::Curve {
+            amplitude: 0,
+            booknumber: 0,
+            entries: vec![0],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert_eq!(err, WriteFloor0PacketError::ZeroAmplitudeCurve);
+    }
+
+    #[test]
+    fn f0_rejects_amplitude_overflow() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        // amplitude_bits = 4 → max value 15; 16 overflows.
+        let header = f0_header(2, 4, vec![0]);
+        let bad = Floor0Packet::Curve {
+            amplitude: 16,
+            booknumber: 0,
+            entries: vec![0],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFloor0PacketError::AmplitudeOverflow {
+                amplitude: 16,
+                amplitude_bits: 4
+            }
+        );
+    }
+
+    #[test]
+    fn f0_rejects_booknumber_out_of_range() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0]); // number_of_books = 1
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 1,
+            entries: vec![0],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFloor0PacketError::BooknumberOutOfRange {
+                booknumber: 1,
+                number_of_books: 1
+            }
+        );
+    }
+
+    #[test]
+    fn f0_rejects_value_book_out_of_range() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        // book_list points position 0 at codebook index 5 (only 1 exists).
+        let header = f0_header(2, 6, vec![5]);
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 0,
+            entries: vec![0],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFloor0PacketError::ValueBookOutOfRange {
+                position: 0,
+                book: 5,
+                codebook_count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn f0_rejects_scalar_value_book() {
+        // A lookup_type 0 book cannot serve in a VQ context (§3.3).
+        let scalar = VorbisCodebook {
+            dimensions: 2,
+            entries: 2,
+            codeword_lengths: vec![1, 1],
+            lookup: VqLookup::None,
+        };
+        let header = f0_header(2, 6, vec![0]);
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 0,
+            entries: vec![0],
+        };
+        let err = write_floor0_packet(&bad, &header, &[scalar]).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFloor0PacketError::ValueBookHasNoLookup {
+                position: 0,
+                book: 0
+            }
+        );
+    }
+
+    #[test]
+    fn f0_rejects_entry_count_mismatch() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0]); // expects 1 entry
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 0,
+            entries: vec![0, 1, 0],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFloor0PacketError::EntryCountMismatch {
+                expected: 1,
+                actual: 3
+            }
+        );
+    }
+
+    #[test]
+    fn f0_rejects_entry_out_of_range() {
+        let book = f0_vq_book(2, vec![1, 1], vec![0, 1, 2, 3]); // entries = 2
+        let header = f0_header(2, 6, vec![0]);
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 0,
+            entries: vec![7],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert_eq!(
+            err,
+            WriteFloor0PacketError::EntryOutOfRange {
+                index: 0,
+                entry: 7,
+                entries: 2
+            }
+        );
+    }
+
+    #[test]
+    fn f0_rejects_unencodable_entry() {
+        // Entry 1 is marked unused (length 0) → not a tree leaf.
+        let book = f0_vq_book(2, vec![1, 0], vec![0, 1, 2, 3]);
+        let header = f0_header(2, 6, vec![0]);
+        let bad = Floor0Packet::Curve {
+            amplitude: 1,
+            booknumber: 0,
+            entries: vec![1],
+        };
+        let err = write_floor0_packet(&bad, &header, &[book]).unwrap_err();
+        assert!(matches!(
+            err,
+            WriteFloor0PacketError::UnencodableEntry {
+                index: 0,
+                entry: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn f0_error_display_is_grepable() {
+        let cases: Vec<WriteFloor0PacketError> = vec![
+            WriteFloor0PacketError::ZeroAmplitudeBits,
+            WriteFloor0PacketError::AmplitudeBitsOverflow(64),
+            WriteFloor0PacketError::ZeroOrder,
+            WriteFloor0PacketError::EmptyBookList,
+            WriteFloor0PacketError::BookListTooLong(17),
+            WriteFloor0PacketError::ZeroAmplitudeCurve,
+            WriteFloor0PacketError::AmplitudeOverflow {
+                amplitude: 16,
+                amplitude_bits: 4,
+            },
+            WriteFloor0PacketError::BooknumberOutOfRange {
+                booknumber: 1,
+                number_of_books: 1,
+            },
+            WriteFloor0PacketError::ValueBookOutOfRange {
+                position: 0,
+                book: 5,
+                codebook_count: 1,
+            },
+            WriteFloor0PacketError::ValueBookHasNoLookup {
+                position: 0,
+                book: 0,
+            },
+            WriteFloor0PacketError::ZeroDimensionBook {
+                position: 0,
+                book: 0,
+            },
+            WriteFloor0PacketError::EntryCountMismatch {
+                expected: 1,
+                actual: 3,
+            },
+            WriteFloor0PacketError::EntryOutOfRange {
+                index: 0,
+                entry: 7,
+                entries: 2,
+            },
+            WriteFloor0PacketError::UnencodableEntry {
+                index: 0,
+                entry: 1,
+                used_count: 1,
+            },
+        ];
+        for c in &cases {
+            let s = c.to_string();
+            assert!(
+                s.contains("vorbis floor0 packet (write)"),
+                "Display must be grep-able: {s}"
+            );
         }
     }
 }
