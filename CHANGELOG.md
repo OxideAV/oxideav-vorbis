@@ -6,6 +6,45 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.3 + §4.3.4 residue-bundle planning primitive
+  (round 40, umbrella round 293).** `encoder::plan_residue_bundles`
+  builds the inverse-mapping layer a wrapping §4.3 audio-packet writer
+  needs to thread its per-submap residue bodies. Given a `MappingHeader`
+  and the per-channel `no_residue` vector the floor decode produced
+  (§4.3.2 step 6 — `true` where a channel's floor decoded `'unused'`),
+  it (1) applies §4.3.3 nonzero-vector propagation over the mapping's
+  coupling steps (the identical rule `packet::nonzero_propagate` runs
+  on decode: if either partner of a coupling step is used, both become
+  used), then (2) gathers, per submap in submap order, the channels
+  with that submap's mux index in ascending channel order plus their
+  propagated `no_residue` flags as the per-bundle `do_not_decode`
+  slice (§4.3.4 step 2). New public surface (re-exported at the crate
+  root):
+
+  - `encoder::ResidueBundlePlan { no_residue, bundles }` — the
+    post-§4.3.3 `no_residue` vector plus one `SubmapResidueBundle` per
+    submap.
+  - `encoder::SubmapResidueBundle { submap, channels, do_not_decode }`
+    — one submap's bundle: the channels (ascending; the §4.3.4 step-7
+    scatter map) and the matching `do_not_decode` flags the submap's
+    `write_residue_body` consumes. Empty submaps still get an
+    index-aligned empty bundle.
+  - `encoder::PlanResidueBundlesError` — `ZeroSubmaps`,
+    `CouplingChannelOutOfRange` (mirrors the §4.3.3 propagate bounds
+    gate), `SubmapOutOfRange`, and `MuxTooShort` (a multi-submap
+    mapping whose `mux` table is short or selects a nonexistent
+    submap). The single-submap case ignores `mux` entirely (the
+    implicit-zero path), matching the decoder's `submap_for_channel`.
+    Validation is all-or-nothing — every channel's submap resolves
+    before any bundle is built.
+
+  12 in-module unit tests bring the crate suite from **741 → 753
+  (+12)**: mono single-submap pass-through, stereo coupling pulling an
+  unused angle back in, two-submap interleaved-mux gather, empty-submap
+  retention, an independent cross-check against `nonzero_propagate`,
+  single-submap mux-ignoring, zero-channel degenerate, all four error
+  gates, and grep-able `Display` strings keyed by spec section.
+
 * **Vorbis I §6.2.2 floor 0 packet-body WRITE primitive (round 39,
   umbrella round 288).** The inverse of the floor 0 packet decode —
   the amplitude + value-book selector + per-vector VQ codeword run.

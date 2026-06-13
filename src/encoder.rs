@@ -43,6 +43,14 @@
 //!   checks the cached `(blockflag, n)` pair against the §4.3.1 step-3
 //!   blocksize selection so a malformed struct cannot silently
 //!   round-trip. Round 240 — the first audio-packet WRITE primitive.
+//! * [`plan_residue_bundles`] — the §4.3.3 + §4.3.4 residue-bundle
+//!   planning primitive: applies §4.3.3 nonzero-vector propagation to a
+//!   per-channel `no_residue` vector, then gathers the channels per
+//!   submap in ascending channel order with their per-bundle
+//!   `do_not_decode` flags ([`SubmapResidueBundle`]). This is the
+//!   inverse-mapping layer a wrapping §4.3 audio-packet writer threads
+//!   between its floor choices and the per-submap [`write_residue_body`]
+//!   calls. Round 293.
 //!
 //! Both functions validate the same spec-mandated invariants that the
 //! corresponding parser enforces on input, so a typo in the caller's
@@ -5729,6 +5737,257 @@ pub(crate) fn write_residue_body_into_writer(
         }
     }
     Ok(())
+}
+
+/// One submap's residue bundle — the §4.3.4 step-2/step-7 gather of the
+/// channels assigned to a submap, with the per-bundle `do_not_decode`
+/// flags the submap's residue decode (and the encoder-side
+/// [`write_residue_body`]) consumes.
+///
+/// The decoder builds this implicitly inside the §4.3.4 submap loop:
+/// "for each channel `j` in order `0 .. audio_channels-1`, if `mux[j] ==
+/// i` then `do_not_decode_flag[ch] = no_residue[j]`; increment `ch`".
+/// [`SubmapResidueBundle`] captures the same bundle so an encoder can
+/// build one `do_not_decode` slice per submap to feed
+/// [`write_residue_body`], and the §4.3.4 step-7 inverse scatter
+/// ("residue vector for channel `j` is set to decoded residue vector
+/// `ch`") is recoverable from [`Self::channels`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmapResidueBundle {
+    /// The submap index (`i` in §4.3.4) this bundle decodes.
+    pub submap: usize,
+    /// The channels assigned to this submap, in ascending channel
+    /// order (§4.3.4 step 2's `j` walk). Element `ch` of the bundle is
+    /// channel `channels[ch]`; this is the §4.3.4 step-7 scatter map.
+    pub channels: Vec<usize>,
+    /// `do_not_decode_flag[ch]` for the bundle — the post-§4.3.3
+    /// `no_residue` flag of channel `channels[ch]` (§4.3.4 step 2.i).
+    /// Same length as [`Self::channels`]; this is the slice the
+    /// submap's [`write_residue_body`] / residue decode receives.
+    pub do_not_decode: Vec<bool>,
+}
+
+/// The full §4.3.3 + §4.3.4 residue-bundle plan for one audio packet:
+/// the post-coupling `no_residue` vector and one
+/// [`SubmapResidueBundle`] per submap, in submap order.
+///
+/// This is the inverse-mapping layer between the per-channel floor
+/// decode (each channel's §4.3.2 step-6 `no_residue` flag, set when its
+/// floor decoded 'unused') and the per-submap residue body writer: a
+/// wrapping §4.3 audio-packet writer derives the raw `no_residue` flags
+/// from its floor choices, calls [`plan_residue_bundles`], then threads
+/// one [`write_residue_body`] per [`Self::bundles`] entry (in submap
+/// order, §4.3.4) using that bundle's [`SubmapResidueBundle::channels`]
+/// to gather the per-channel residue plans and
+/// [`SubmapResidueBundle::do_not_decode`] as the body's flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidueBundlePlan {
+    /// `no_residue` after §4.3.3 nonzero-vector propagation. Index `i`
+    /// is channel `i`; `true` means the channel's residue is not coded
+    /// in the stream (its floor was 'unused' and no coupling step
+    /// pulled it back in). Length equals the channel count passed in.
+    pub no_residue: Vec<bool>,
+    /// One bundle per submap, in submap order `0 .. submaps-1`
+    /// (§4.3.4's outer loop). A submap with no channels assigned still
+    /// gets an (empty) bundle so the index lines up with
+    /// `mapping.submap_configs`.
+    pub bundles: Vec<SubmapResidueBundle>,
+}
+
+/// Errors from [`plan_residue_bundles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanResidueBundlesError {
+    /// The mapping declared zero submaps. A well-formed Vorbis I
+    /// mapping has `submaps >= 1` (the `submaps_flag`-unset path pins
+    /// it to exactly 1), so a zero here cannot describe a real packet.
+    ZeroSubmaps,
+    /// A coupling step named a channel at or past the channel count.
+    /// Mirrors the §4.3.3 [`crate::packet::nonzero_propagate`] bounds
+    /// check.
+    CouplingChannelOutOfRange {
+        /// The §4.3.3 coupling-step index that named the channel.
+        step: usize,
+        /// The out-of-range channel index.
+        channel: usize,
+        /// The packet's channel count (`no_residue.len()`).
+        channels: usize,
+    },
+    /// A channel's `mux` entry selected a submap at or past
+    /// `mapping.submaps`. Mirrors the decoder's submap-bounds gate.
+    SubmapOutOfRange {
+        /// The channel whose `mux` entry was out of range.
+        channel: usize,
+        /// The out-of-range submap index `mux[channel]`.
+        submap: usize,
+        /// The mapping's declared submap count.
+        submaps: usize,
+    },
+    /// The mapping declared `submaps > 1` but its `mux` table is too
+    /// short to cover every channel. §4.2.4 writes one `mux` entry per
+    /// `audio_channels`; a multi-submap mapping with a short table
+    /// cannot route every channel to a submap.
+    MuxTooShort {
+        /// The channel with no `mux` entry.
+        channel: usize,
+        /// The length of `mapping.mux`.
+        mux_len: usize,
+    },
+}
+
+impl core::fmt::Display for PlanResidueBundlesError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PlanResidueBundlesError::ZeroSubmaps => {
+                write!(
+                    f,
+                    "vorbis §4.3.4 residue-bundle plan: mapping declared zero submaps"
+                )
+            }
+            PlanResidueBundlesError::CouplingChannelOutOfRange {
+                step,
+                channel,
+                channels,
+            } => write!(
+                f,
+                "vorbis §4.3.3 residue-bundle plan: coupling step {step} named channel \
+                 {channel} but the packet has {channels} channel(s)"
+            ),
+            PlanResidueBundlesError::SubmapOutOfRange {
+                channel,
+                submap,
+                submaps,
+            } => write!(
+                f,
+                "vorbis §4.3.4 residue-bundle plan: channel {channel} mux selected submap \
+                 {submap} but the mapping declares {submaps} submap(s)"
+            ),
+            PlanResidueBundlesError::MuxTooShort { channel, mux_len } => write!(
+                f,
+                "vorbis §4.3.4 residue-bundle plan: multi-submap mapping has no mux entry \
+                 for channel {channel} (mux table length {mux_len})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanResidueBundlesError {}
+
+/// Build the §4.3.3 + §4.3.4 residue-bundle plan for one audio packet.
+///
+/// `no_residue` is the per-channel §4.3.2 step-6 flag *before* §4.3.3
+/// propagation — i.e. exactly what the floor decode produced: element
+/// `i` is `true` when channel `i`'s floor decoded to 'unused'. Its
+/// length fixes the packet's channel count.
+///
+/// The function:
+///
+/// 1. Applies §4.3.3 nonzero-vector propagation over `mapping.coupling`
+///    (the identical rule [`crate::packet::nonzero_propagate`] runs on
+///    decode: if either partner of a coupling step is used, both become
+///    used),
+///    producing [`ResidueBundlePlan::no_residue`].
+/// 2. For each submap `i` in order (§4.3.4 outer loop), gathers the
+///    channels with `submap_for_channel == i` in ascending channel
+///    order and copies their propagated `no_residue` flags into the
+///    bundle's `do_not_decode` (§4.3.4 step 2). The single-submap case
+///    (`submaps == 1`) routes every channel to submap 0 regardless of
+///    `mux`, matching the decoder's implicit-zero path.
+///
+/// The result lets a wrapping §4.3 audio-packet writer thread one
+/// [`write_residue_body`] per bundle in submap order, then recover the
+/// §4.3.4 step-7 channel scatter from each
+/// [`SubmapResidueBundle::channels`].
+///
+/// # Errors
+///
+/// * [`PlanResidueBundlesError::ZeroSubmaps`] — `mapping.submaps == 0`.
+/// * [`PlanResidueBundlesError::CouplingChannelOutOfRange`] — a §4.3.3
+///   coupling step named a channel outside `0 .. no_residue.len()`.
+/// * [`PlanResidueBundlesError::SubmapOutOfRange`] /
+///   [`PlanResidueBundlesError::MuxTooShort`] — a multi-submap
+///   mapping's `mux` entry is missing or selects a submap `>= submaps`.
+///
+/// On any error nothing is returned; the function is pure (no side
+/// effects on its inputs — `no_residue` is taken by value and the
+/// propagated copy is returned inside the plan).
+pub fn plan_residue_bundles(
+    mapping: &MappingHeader,
+    no_residue: &[bool],
+) -> Result<ResidueBundlePlan, PlanResidueBundlesError> {
+    let submaps = mapping.submaps as usize;
+    if submaps == 0 {
+        return Err(PlanResidueBundlesError::ZeroSubmaps);
+    }
+    let channels = no_residue.len();
+
+    // §4.3.3 nonzero-vector propagate. Reuse the decoder's exact rule
+    // (over a local copy so the caller's slice is untouched) rather
+    // than re-deriving it; this keeps the encode/decode bit-for-bit
+    // agreement on which channels are coded.
+    let mut propagated = no_residue.to_vec();
+    crate::packet::nonzero_propagate(&mut propagated, &mapping.coupling).map_err(|e| match e {
+        crate::packet::PacketError::ChannelOutOfRange {
+            step,
+            channel,
+            channels,
+        } => PlanResidueBundlesError::CouplingChannelOutOfRange {
+            step,
+            channel,
+            channels,
+        },
+        // nonzero_propagate only emits ChannelOutOfRange; any other
+        // variant would be a contract break in that function.
+        _ => unreachable!("nonzero_propagate emits only ChannelOutOfRange"),
+    })?;
+
+    // §4.3.4 step 2 / step 7: bundle the channels per submap in
+    // ascending channel order. `submap_for(j)` mirrors the decoder's
+    // `submap_for_channel`: implicit zero when `submaps == 1`, else
+    // `mux[j]` with a bounds gate.
+    let submap_for = |channel: usize| -> Result<usize, PlanResidueBundlesError> {
+        if submaps <= 1 {
+            return Ok(0);
+        }
+        let raw = *mapping.mux.get(channel).ok_or({
+            PlanResidueBundlesError::MuxTooShort {
+                channel,
+                mux_len: mapping.mux.len(),
+            }
+        })? as usize;
+        if raw >= submaps {
+            return Err(PlanResidueBundlesError::SubmapOutOfRange {
+                channel,
+                submap: raw,
+                submaps,
+            });
+        }
+        Ok(raw)
+    };
+
+    // Resolve every channel's submap once (fail-closed before any
+    // bundle is built), so the plan is all-or-nothing.
+    let mut channel_submap = Vec::with_capacity(channels);
+    for channel in 0..channels {
+        channel_submap.push(submap_for(channel)?);
+    }
+
+    let mut bundles: Vec<SubmapResidueBundle> = (0..submaps)
+        .map(|submap| SubmapResidueBundle {
+            submap,
+            channels: Vec::new(),
+            do_not_decode: Vec::new(),
+        })
+        .collect();
+    for (channel, &submap) in channel_submap.iter().enumerate() {
+        let bundle = &mut bundles[submap];
+        bundle.channels.push(channel);
+        bundle.do_not_decode.push(propagated[channel]);
+    }
+
+    Ok(ResidueBundlePlan {
+        no_residue: propagated,
+        bundles,
+    })
 }
 
 #[cfg(test)]
@@ -13656,6 +13915,291 @@ mod tests {
             assert!(
                 s.contains("vorbis floor0 packet (write)"),
                 "Display must be grep-able: {s}"
+            );
+        }
+    }
+
+    // ---- §4.3.3 + §4.3.4 residue-bundle plan (plan_residue_bundles). ----
+
+    fn submap_cfg(floor: u8, residue: u8) -> crate::setup::MappingSubmap {
+        crate::setup::MappingSubmap {
+            time_placeholder: 0,
+            floor,
+            residue,
+        }
+    }
+
+    /// Mono, single submap, no coupling: one bundle holding channel 0,
+    /// flags pass through untouched.
+    #[test]
+    fn plan_bundles_mono_single_submap() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![submap_cfg(0, 0)],
+        };
+        // Used channel.
+        let plan = plan_residue_bundles(&mapping, &[false]).unwrap();
+        assert_eq!(plan.no_residue, vec![false]);
+        assert_eq!(plan.bundles.len(), 1);
+        assert_eq!(plan.bundles[0].submap, 0);
+        assert_eq!(plan.bundles[0].channels, vec![0]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![false]);
+
+        // Unused (floor 'unused') channel — no coupling, stays unused.
+        let plan = plan_residue_bundles(&mapping, &[true]).unwrap();
+        assert_eq!(plan.no_residue, vec![true]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![true]);
+    }
+
+    /// Stereo, single submap, coupling (mag=0, ang=1). §4.3.3: if either
+    /// partner is used, both become used. So an unused angle gets pulled
+    /// back in, and the single bundle holds both channels in ascending
+    /// order with the propagated flags.
+    #[test]
+    fn plan_bundles_stereo_coupling_propagates() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![submap_cfg(0, 0)],
+        };
+        // Channel 0 used, channel 1 'unused' → §4.3.3 pulls channel 1
+        // back in: both coded.
+        let plan = plan_residue_bundles(&mapping, &[false, true]).unwrap();
+        assert_eq!(plan.no_residue, vec![false, false]);
+        assert_eq!(plan.bundles.len(), 1);
+        assert_eq!(plan.bundles[0].channels, vec![0, 1]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![false, false]);
+
+        // Both 'unused' and no partner used → both stay unused.
+        let plan = plan_residue_bundles(&mapping, &[true, true]).unwrap();
+        assert_eq!(plan.no_residue, vec![true, true]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![true, true]);
+    }
+
+    /// Four channels, two submaps, mux = [0, 1, 0, 1]. §4.3.4 gathers
+    /// each submap's channels in ascending channel order; the bundle's
+    /// `do_not_decode` mirrors each gathered channel's flag.
+    #[test]
+    fn plan_bundles_two_submaps_interleaved_mux() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            mux: vec![0, 1, 0, 1],
+            submap_configs: vec![submap_cfg(0, 0), submap_cfg(0, 1)],
+        };
+        // Channels: 0 used, 1 unused, 2 unused, 3 used.
+        let no_residue = [false, true, true, false];
+        let plan = plan_residue_bundles(&mapping, &no_residue).unwrap();
+        assert_eq!(plan.no_residue, no_residue.to_vec());
+        assert_eq!(plan.bundles.len(), 2);
+
+        // Submap 0 gathers channels 0 and 2 (ascending).
+        assert_eq!(plan.bundles[0].submap, 0);
+        assert_eq!(plan.bundles[0].channels, vec![0, 2]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![false, true]);
+
+        // Submap 1 gathers channels 1 and 3 (ascending).
+        assert_eq!(plan.bundles[1].submap, 1);
+        assert_eq!(plan.bundles[1].channels, vec![1, 3]);
+        assert_eq!(plan.bundles[1].do_not_decode, vec![true, false]);
+    }
+
+    /// A submap with no channels assigned still gets an empty bundle so
+    /// the bundle index lines up with `submap_configs`.
+    #[test]
+    fn plan_bundles_empty_submap_kept() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            // Every channel routes to submap 0; submap 1 is unused.
+            mux: vec![0, 0],
+            submap_configs: vec![submap_cfg(0, 0), submap_cfg(0, 1)],
+        };
+        let plan = plan_residue_bundles(&mapping, &[false, false]).unwrap();
+        assert_eq!(plan.bundles.len(), 2);
+        assert_eq!(plan.bundles[0].channels, vec![0, 1]);
+        assert!(plan.bundles[1].channels.is_empty());
+        assert!(plan.bundles[1].do_not_decode.is_empty());
+    }
+
+    /// The plan's per-submap `do_not_decode` slice is the exact slice
+    /// the decoder's §4.3.4 step-2 loop builds. Cross-check against the
+    /// decoder helper [`crate::packet::nonzero_propagate`] applied
+    /// independently.
+    #[test]
+    fn plan_bundles_matches_independent_propagation() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![
+                MappingCouplingStep {
+                    magnitude_channel: 0,
+                    angle_channel: 1,
+                },
+                MappingCouplingStep {
+                    magnitude_channel: 2,
+                    angle_channel: 3,
+                },
+            ],
+            mux: Vec::new(),
+            submap_configs: vec![submap_cfg(0, 0)],
+        };
+        let raw = [true, false, true, true];
+        let plan = plan_residue_bundles(&mapping, &raw).unwrap();
+
+        let mut expected = raw.to_vec();
+        crate::packet::nonzero_propagate(&mut expected, &mapping.coupling).unwrap();
+        assert_eq!(plan.no_residue, expected);
+        // Single submap → all channels in one bundle, flags == expected.
+        assert_eq!(plan.bundles[0].do_not_decode, expected);
+        assert_eq!(plan.bundles[0].channels, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn plan_bundles_rejects_zero_submaps() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 0,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: Vec::new(),
+        };
+        assert_eq!(
+            plan_residue_bundles(&mapping, &[false]),
+            Err(PlanResidueBundlesError::ZeroSubmaps)
+        );
+    }
+
+    #[test]
+    fn plan_bundles_rejects_coupling_out_of_range() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: vec![MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 5,
+            }],
+            mux: Vec::new(),
+            submap_configs: vec![submap_cfg(0, 0)],
+        };
+        assert_eq!(
+            plan_residue_bundles(&mapping, &[false, true]),
+            Err(PlanResidueBundlesError::CouplingChannelOutOfRange {
+                step: 0,
+                channel: 5,
+                channels: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn plan_bundles_rejects_submap_out_of_range() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            // Channel 1 routes to submap 7, which does not exist.
+            mux: vec![0, 7],
+            submap_configs: vec![submap_cfg(0, 0), submap_cfg(0, 1)],
+        };
+        assert_eq!(
+            plan_residue_bundles(&mapping, &[false, false]),
+            Err(PlanResidueBundlesError::SubmapOutOfRange {
+                channel: 1,
+                submap: 7,
+                submaps: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn plan_bundles_rejects_short_mux() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 2,
+            coupling: Vec::new(),
+            // Two channels but only one mux entry.
+            mux: vec![0],
+            submap_configs: vec![submap_cfg(0, 0), submap_cfg(0, 1)],
+        };
+        assert_eq!(
+            plan_residue_bundles(&mapping, &[false, false]),
+            Err(PlanResidueBundlesError::MuxTooShort {
+                channel: 1,
+                mux_len: 1,
+            })
+        );
+    }
+
+    /// Single-submap mapping ignores `mux` entirely (implicit-zero
+    /// path), matching the decoder's `submap_for_channel`.
+    #[test]
+    fn plan_bundles_single_submap_ignores_mux() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            // A stray (out-of-range-looking) mux table that must be
+            // ignored because submaps == 1.
+            mux: vec![9, 9, 9],
+            submap_configs: vec![submap_cfg(0, 0)],
+        };
+        let plan = plan_residue_bundles(&mapping, &[false, true, false]).unwrap();
+        assert_eq!(plan.bundles.len(), 1);
+        assert_eq!(plan.bundles[0].channels, vec![0, 1, 2]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![false, true, false]);
+    }
+
+    /// Zero channels: every submap is empty, no propagation needed.
+    #[test]
+    fn plan_bundles_zero_channels() {
+        let mapping = MappingHeader {
+            mapping_type: 0,
+            submaps: 1,
+            coupling: Vec::new(),
+            mux: Vec::new(),
+            submap_configs: vec![submap_cfg(0, 0)],
+        };
+        let plan = plan_residue_bundles(&mapping, &[]).unwrap();
+        assert!(plan.no_residue.is_empty());
+        assert_eq!(plan.bundles.len(), 1);
+        assert!(plan.bundles[0].channels.is_empty());
+    }
+
+    #[test]
+    fn plan_bundles_error_display_grepable() {
+        let cases = [
+            PlanResidueBundlesError::ZeroSubmaps,
+            PlanResidueBundlesError::CouplingChannelOutOfRange {
+                step: 0,
+                channel: 5,
+                channels: 2,
+            },
+            PlanResidueBundlesError::SubmapOutOfRange {
+                channel: 1,
+                submap: 7,
+                submaps: 2,
+            },
+            PlanResidueBundlesError::MuxTooShort {
+                channel: 1,
+                mux_len: 1,
+            },
+        ];
+        for c in &cases {
+            let s = c.to_string();
+            assert!(
+                s.contains("vorbis §4.3"),
+                "Display must be grep-able by spec section: {s}"
             );
         }
     }

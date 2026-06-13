@@ -1,6 +1,70 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 39.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 40.
+
+## Status — 2026-06-14 (round 40, umbrella round 293)
+
+**Round 40 lands the §4.3.3 + §4.3.4 residue-bundle planning primitive
+— the inverse-mapping layer that turns the floor decode's per-channel
+`no_residue` flags into the per-submap `do_not_decode` bundles a
+wrapping §4.3 audio-packet writer threads into its residue bodies.**
+New public surface, re-exported at the crate root:
+
+* [`encoder::plan_residue_bundles(mapping, no_residue)`] takes a
+  [`MappingHeader`] and the per-channel `no_residue` vector the floor
+  decode produced (§4.3.2 step 6 — `true` where a channel's floor
+  decoded `'unused'`) and returns a [`encoder::ResidueBundlePlan`]. It
+  (1) applies §4.3.3 nonzero-vector propagation over the mapping's
+  coupling steps — the identical rule [`packet::nonzero_propagate`]
+  runs on decode (if either partner of a coupling step is used, both
+  become used) — then (2) gathers, per submap in submap order, the
+  channels with that submap's mux index in ascending channel order
+  along with their propagated `no_residue` flags as the per-bundle
+  `do_not_decode` slice (§4.3.4 step 2).
+
+* [`encoder::ResidueBundlePlan`] `{ no_residue, bundles }` carries the
+  post-§4.3.3 `no_residue` vector plus one
+  [`encoder::SubmapResidueBundle`] `{ submap, channels, do_not_decode }`
+  per submap. Each bundle's `channels` is the §4.3.4 step-7 scatter
+  map (ascending channel order); `do_not_decode` is the exact slice
+  the submap's [`encoder::write_residue_body`] consumes. Empty submaps
+  still get an index-aligned empty bundle so the bundle index lines up
+  with `mapping.submap_configs`.
+
+* [`encoder::PlanResidueBundlesError`] enumerates the four fail-closed
+  gates: `ZeroSubmaps`, `CouplingChannelOutOfRange` (mirrors the
+  §4.3.3 propagate bounds gate), `SubmapOutOfRange`, and `MuxTooShort`
+  (a multi-submap mapping whose `mux` table is short or selects a
+  nonexistent submap). The single-submap case ignores `mux` entirely
+  (the implicit-zero path), matching the decoder's
+  `submap_for_channel`. Resolution is all-or-nothing: every channel's
+  submap resolves before any bundle is built.
+
+12 new in-module unit tests bring the crate suite from **741 → 753
+(+12)**: mono single-submap pass-through, stereo coupling pulling an
+unused angle back in, two-submap interleaved-mux gather, empty-submap
+retention, an independent cross-check against `nonzero_propagate`,
+single-submap mux-ignoring, zero-channel degenerate, all four error
+gates, and grep-able `Display` strings keyed by spec section.
+
+Followups (explicit):
+
+* The wrapping §4.3 audio-packet writer that splices §4.3.1 prelude +
+  per-channel floor body ([`write_floor0_packet`] /
+  `write_floor1_packet`) + per-submap §8.6.2 residue body — now driven
+  by [`plan_residue_bundles`] for the `do_not_decode` bundles + the
+  §4.3.4 step-7 channel scatter — plus the §4.3.6 dot-product spectrum
+  and §4.3.7 forward MDCT.
+* The VQ-encode stage that maps a real target LSP / residue curve to
+  the entry indices the floor / residue packet writers carry.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.3 (nonzero
+vector propagate), §4.3.4 (residue decode — the submap gather of
+`do_not_decode_flag` and the channel scatter), §4.3.2 step 6 (the
+`no_residue` flag the floor decode sets).
 
 ## Status — 2026-06-13 (round 39, umbrella round 288)
 
