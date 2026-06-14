@@ -4,6 +4,36 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.10...v0.0.11) - 2026-06-14
+
+### Other
+
+- §4.3 wrapping audio-packet WRITE driver (round 41)
+- scrub pre-existing impl-naming from floor0 module header
+- §4.3.3/§4.3.4 residue-bundle planning primitive (round 40)
+- §6.2.2 floor 0 packet-body WRITE primitive (round 39)
+- §8.6.2 wrapping residue-body WRITE primitive (round 38)
+- §8.6.3/§8.6.4/§8.6.5 per-partition value-codeword WRITE primitive (round 37)
+- §8.6.2 residue classification grouping layer (pack_residue_classification_groups)
+- §8.6.2 residue classification packing primitive (round 35)
+- §4.3.6/§4.3.7 encoder window + forward-MDCT composition primitive (round 34)
+- §4.3.5 forward channel coupling primitives (round 33)
+- §4.3.8 encoder-side framing-inverse primitive (round 32)
+- §7.2.3 floor 1 audio-packet body WRITE primitive (round 31)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- §4.3.6 window pre-multiplication primitive (round 30)
+- §4.3.7 forward-MDCT cosine-summation kernel (round 29)
+- §4.3.1 audio-packet header WRITE primitive (round 28)
+- scrub rustdoc private-link warnings introduced by r27
+- §4.2.4 setup-header WRITE primitive (round 27)
+- §4.2.4 mode header WRITE primitive (round 26)
+- §4.2.4 mapping header WRITE primitive (round 25)
+- §8.6.1 residue header WRITE primitive (round 24)
+- §6.2.1 floor type 0 header WRITE primitive (round 23)
+- §7.2.2 floor type 1 header WRITE primitive (round 22)
+- §3.2.1 codebook WRITE primitive + §9.2.2 float32_pack (round 21)
+- write_identification_header + write_comment_header — first WRITE primitives (round 20)
+
 ### Added
 
 * **Vorbis I §4.3 wrapping audio-packet WRITE driver (round 41).**
