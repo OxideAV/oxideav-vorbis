@@ -1,6 +1,62 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 40.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 41.
+
+## Status — 2026-06-14 (round 41, umbrella round 301)
+
+**Round 41 lands the §4.3 wrapping audio-packet WRITE driver — the
+composition layer that splices the §4.3.1 prelude, the §4.3.2
+per-channel floor bodies, and the §4.3.4 per-submap residue bodies into
+one full audio packet.** This closes the last structural followup of the
+encode-side §4.3 stack: every constituent `_into_writer` splice
+primitive (prelude, floor 0 / floor 1 packet, residue body) and the
+§4.3.3/§4.3.4 inverse-mapping layer now exist, and `write_audio_packet`
+threads them in the exact inverse of the decode read order. New public
+surface, re-exported at the crate root:
+
+* [`encoder::write_audio_packet(header, setup, b0, b1, channels, floors,
+  residue_plans)`] serialises one §4.3 audio packet. It resolves the
+  §4.3.1 mode's mapping, derives each channel's `no_residue` flag from
+  its floor body (§4.3.2 step 6), runs [`encoder::plan_residue_bundles`]
+  (§4.3.3 coupling-propagation + §4.3.4 submap gather), then emits: the
+  §4.3.1 prelude, one floor body per channel in channel order (each
+  channel's floor type/header resolved through its submap's `floor`
+  index), and one residue body per submap in submap order (with the
+  bundle plan's `do_not_decode` flags, so a channel pulled back in by a
+  coupling partner is coded even though its own floor was `'unused'`).
+
+* [`encoder::AudioChannelFloor`] (`Type0(Floor0Packet)` /
+  `Type1(Floor1Packet)`) carries one channel's floor body; the variant
+  must match the resolved floor header's [`setup::FloorKind`].
+
+* [`encoder::WriteAudioPacketError`] enumerates the fail-closed gates:
+  `Header` (prelude), `FloorCountMismatch`, `ZeroAudioChannels`,
+  `BadModeMapping`, `SubmapFloorOutOfRange`, `SubmapResidueOutOfRange`,
+  `FloorTypeMismatch`, `Plan` (bundle-plan rejection),
+  `ResiduePlanCountMismatch`, and the per-stage `Floor0` / `Floor1` /
+  `Residue` body failures (each carried verbatim with `source()`
+  chaining). Validation precedes emission in full — a two-phase probe +
+  emit keeps the caller's writer bit-exactly untouched on every error
+  path, including a per-body gate failure.
+
+11 new in-module unit tests bring the crate suite from **753 → 764
+(+11)**: a mono used packet (byte-exact `[0x02, 0x00]` — 14 spec-
+explicit bits) and a mono unused packet (`[0x00]`) both round-trip
+through the real [`audio::decode_audio_packet_pre_imdct`]; a stereo
+coupled packet round-trips; a stereo packet with one `'unused'` floor
+proves §4.3.3 re-codes the coupled partner; plus the six error gates,
+the writer-untouched-on-error splice contract, and grep-able `Display`
+strings keyed by spec section.
+
+Followups (explicit):
+
+* The §4.3.6 dot-product spectrum + §4.3.7 forward MDCT encode stage
+  (the post-residue spectrum→PCM-inverse path), and the VQ-encode stage
+  that maps a real target LSP / residue curve to the entry indices the
+  floor / residue packet writers carry.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
 
 ## Status — 2026-06-14 (round 40, umbrella round 293)
 

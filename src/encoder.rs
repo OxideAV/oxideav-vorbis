@@ -5990,6 +5990,544 @@ pub fn plan_residue_bundles(
     })
 }
 
+/// A channel's floor header + supplied packet body, paired and
+/// type-checked, ready for emission. Internal to the §4.3 driver.
+enum ResolvedFloor<'a> {
+    Type0(&'a Floor0Header, &'a Floor0Packet),
+    Type1(&'a Floor1Header, &'a Floor1Packet),
+}
+
+/// One channel's floor audio-packet body for the wrapping §4.3 audio-
+/// packet writer ([`write_audio_packet`]).
+///
+/// §4.3.2 decodes one floor curve per channel in channel order, the
+/// channel's floor selected by its submap's `floor` index. The variant
+/// MUST match the [`FloorKind`] of that resolved floor header
+/// ([`FloorKind::Type0`] ↔ [`AudioChannelFloor::Type0`],
+/// [`FloorKind::Type1`] ↔ [`AudioChannelFloor::Type1`]); a mismatch is
+/// rejected with [`WriteAudioPacketError::FloorTypeMismatch`] before any
+/// bits are emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioChannelFloor {
+    /// A §6.2.2 floor 0 packet body, written by
+    /// [`write_floor0_packet_into_writer`].
+    Type0(Floor0Packet),
+    /// A §7.2.3 floor 1 packet body, written by
+    /// [`write_floor1_packet_into_writer`].
+    Type1(Floor1Packet),
+}
+
+impl AudioChannelFloor {
+    /// `true` when this channel's floor body round-trips to `'unused'`
+    /// (§4.3.2 step 6 sets the channel's `no_residue` flag). A floor 0
+    /// `Unused` packet and a floor 1 packet with `nonzero == false` both
+    /// decode to an unused curve.
+    fn is_unused(&self) -> bool {
+        match self {
+            AudioChannelFloor::Type0(p) => matches!(p, Floor0Packet::Unused),
+            AudioChannelFloor::Type1(p) => !p.nonzero,
+        }
+    }
+}
+
+/// Errors that may arise while writing a full §4.3 audio packet via
+/// [`write_audio_packet`].
+///
+/// The driver fails closed: it validates the prelude, every channel's
+/// floor body, the residue-bundle plan, and every submap's residue body
+/// before emitting a single bit, so a caller's `writer` is bit-exactly
+/// untouched on every error path.
+#[derive(Debug)]
+pub enum WriteAudioPacketError {
+    /// The §4.3.1 prelude failed a [`write_audio_packet_header`]
+    /// invariant.
+    Header(WriteAudioPacketHeaderError),
+    /// `floors.len()` did not match the channel count the caller
+    /// declared via `audio_channels`. §4.3.2 decodes exactly one floor
+    /// per channel.
+    FloorCountMismatch {
+        /// The declared `audio_channels`.
+        audio_channels: usize,
+        /// The number of supplied per-channel floor bodies.
+        floors: usize,
+    },
+    /// `audio_channels` was zero. A Vorbis I stream carries at least one
+    /// channel (§4.2.2 rejects a zero channel count); a zero-channel
+    /// audio packet has no floor or residue body to write.
+    ZeroAudioChannels,
+    /// The §4.3.1 mode selected a mapping index outside
+    /// `setup.mappings`. Mirrors the decoder's
+    /// [`AudioPacketError::BadModeMapping`](crate::audio::AudioPacketError).
+    BadModeMapping {
+        /// The selected `[mode_number]`.
+        mode_number: u32,
+        /// The mode's `mapping` index.
+        mapping: u8,
+        /// The number of mappings in the setup header.
+        mapping_count: usize,
+    },
+    /// A submap's `floor` index was outside `setup.floors`.
+    SubmapFloorOutOfRange {
+        /// The submap whose `floor` index was out of range.
+        submap: usize,
+        /// The out-of-range floor index.
+        floor: u8,
+        /// The number of floors in the setup header.
+        floor_count: usize,
+    },
+    /// A submap's `residue` index was outside `setup.residues`.
+    SubmapResidueOutOfRange {
+        /// The submap whose `residue` index was out of range.
+        submap: usize,
+        /// The out-of-range residue index.
+        residue: u8,
+        /// The number of residues in the setup header.
+        residue_count: usize,
+    },
+    /// A channel's [`AudioChannelFloor`] variant did not match the
+    /// [`FloorKind`] of the floor header its submap selected.
+    FloorTypeMismatch {
+        /// The channel whose floor body had the wrong type.
+        channel: usize,
+        /// The floor header's type (`0` or `1`).
+        header_type: u8,
+        /// The supplied packet's type (`0` or `1`).
+        packet_type: u8,
+    },
+    /// [`plan_residue_bundles`] rejected the mapping + `no_residue`
+    /// vector (carried verbatim).
+    Plan(PlanResidueBundlesError),
+    /// `residue_plans.len()` did not match `mapping.submaps`. §4.3.4
+    /// runs one residue body per submap, in submap order.
+    ResiduePlanCountMismatch {
+        /// The mapping's declared submap count.
+        submaps: usize,
+        /// The number of supplied per-submap residue-plan lists.
+        plans: usize,
+    },
+    /// Writing a channel's floor 0 body failed (carried verbatim).
+    Floor0 {
+        /// The channel whose floor 0 body failed.
+        channel: usize,
+        /// The underlying floor 0 packet-writer error.
+        source: WriteFloor0PacketError,
+    },
+    /// Writing a channel's floor 1 body failed (carried verbatim).
+    Floor1 {
+        /// The channel whose floor 1 body failed.
+        channel: usize,
+        /// The underlying floor 1 packet-writer error.
+        source: WriteFloor1PacketError,
+    },
+    /// Writing a submap's §8.6.2 residue body failed (carried verbatim).
+    Residue {
+        /// The submap whose residue body failed.
+        submap: usize,
+        /// The underlying residue-body-writer error.
+        source: WriteResidueBodyError,
+    },
+}
+
+impl fmt::Display for WriteAudioPacketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteAudioPacketError::Header(e) => {
+                write!(f, "vorbis §4.3 audio packet: prelude: {e}")
+            }
+            WriteAudioPacketError::FloorCountMismatch {
+                audio_channels,
+                floors,
+            } => write!(
+                f,
+                "vorbis §4.3.2 audio packet: floor body count {floors} != audio_channels \
+                 {audio_channels}"
+            ),
+            WriteAudioPacketError::ZeroAudioChannels => {
+                write!(f, "vorbis §4.3 audio packet: audio_channels is zero")
+            }
+            WriteAudioPacketError::BadModeMapping {
+                mode_number,
+                mapping,
+                mapping_count,
+            } => write!(
+                f,
+                "vorbis §4.3.1 audio packet: mode_number {mode_number} maps to mapping \
+                 {mapping} but only {mapping_count} mappings exist"
+            ),
+            WriteAudioPacketError::SubmapFloorOutOfRange {
+                submap,
+                floor,
+                floor_count,
+            } => write!(
+                f,
+                "vorbis §4.3.2 audio packet: submap {submap} floor index {floor} >= \
+                 {floor_count} floors"
+            ),
+            WriteAudioPacketError::SubmapResidueOutOfRange {
+                submap,
+                residue,
+                residue_count,
+            } => write!(
+                f,
+                "vorbis §4.3.4 audio packet: submap {submap} residue index {residue} >= \
+                 {residue_count} residues"
+            ),
+            WriteAudioPacketError::FloorTypeMismatch {
+                channel,
+                header_type,
+                packet_type,
+            } => write!(
+                f,
+                "vorbis §4.3.2 audio packet: channel {channel} floor packet type \
+                 {packet_type} != header floor type {header_type}"
+            ),
+            WriteAudioPacketError::Plan(e) => {
+                write!(f, "vorbis §4.3.3/§4.3.4 audio packet: {e}")
+            }
+            WriteAudioPacketError::ResiduePlanCountMismatch { submaps, plans } => write!(
+                f,
+                "vorbis §4.3.4 audio packet: residue plan list count {plans} != submaps \
+                 {submaps}"
+            ),
+            WriteAudioPacketError::Floor0 { channel, source } => {
+                write!(
+                    f,
+                    "vorbis §4.3.2 audio packet: channel {channel} floor 0: {source}"
+                )
+            }
+            WriteAudioPacketError::Floor1 { channel, source } => {
+                write!(
+                    f,
+                    "vorbis §4.3.2 audio packet: channel {channel} floor 1: {source}"
+                )
+            }
+            WriteAudioPacketError::Residue { submap, source } => {
+                write!(
+                    f,
+                    "vorbis §4.3.4 audio packet: submap {submap} residue: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for WriteAudioPacketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WriteAudioPacketError::Header(e) => Some(e),
+            WriteAudioPacketError::Plan(e) => Some(e),
+            WriteAudioPacketError::Floor0 { source, .. } => Some(source),
+            WriteAudioPacketError::Floor1 { source, .. } => Some(source),
+            WriteAudioPacketError::Residue { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Serialise one full §4.3 audio packet — the wrapping audio-packet
+/// WRITE driver that splices the §4.3.1 prelude, the §4.3.2 per-channel
+/// floor bodies (channel order), and the §4.3.4 per-submap residue
+/// bodies (submap order) into one byte-aligned packet.
+///
+/// This is the composition layer over the four `_into_writer` splice
+/// primitives ([`write_audio_packet_header_into_writer`],
+/// [`write_floor0_packet_into_writer`],
+/// [`write_floor1_packet_into_writer`],
+/// [`write_residue_body_into_writer`]) and the §4.3.3/§4.3.4
+/// inverse-mapping layer ([`plan_residue_bundles`]). The emission order
+/// is the exact inverse of [`crate::audio::decode_audio_packet_pre_imdct`]'s
+/// read order:
+///
+/// 1. **§4.3.1 prelude** — `packet_type`, `mode_number`, and (long
+///    blocks only) the two window flags.
+/// 2. **§4.3.2 floors** — one floor body per channel, in channel order.
+///    Each channel's floor type/header is resolved through its submap's
+///    `floor` index (`mux[ch]` when the mapping has `submaps > 1`, else
+///    submap 0).
+/// 3. **§4.3.4 residues** — one residue body per submap, in submap
+///    order. The per-submap `do_not_decode` flags come from
+///    [`plan_residue_bundles`] (which applies §4.3.3 nonzero-vector
+///    propagation over the mapping's coupling steps first), so a channel
+///    pulled back in by a coupling partner is coded even though its own
+///    floor was `'unused'`.
+///
+/// `floors` carries one [`AudioChannelFloor`] per channel in channel
+/// order; its variant must match each channel's resolved floor header
+/// type. `residue_plans` carries one `Vec<ResidueVectorPlan>` per submap
+/// in submap order — exactly the `plans` slice
+/// [`write_residue_body`] consumes for that submap, with the
+/// `do_not_decode` flags supplied by the bundle plan.
+///
+/// The round-trip property: feeding the returned bytes to
+/// [`crate::audio::decode_audio_packet_pre_imdct`] built from the same
+/// setup reproduces the floor curves and residue vectors implied by the
+/// inputs.
+///
+/// # Errors
+///
+/// Returns a [`WriteAudioPacketError`] for a prelude failure, a channel
+/// count or floor-type mismatch, an out-of-range mapping/floor/residue
+/// index, a bundle-plan rejection, a residue-plan count mismatch, or any
+/// per-channel floor / per-submap residue body failure (each carried
+/// verbatim). Validation precedes emission in full; on error nothing is
+/// written.
+#[allow(clippy::too_many_arguments)]
+pub fn write_audio_packet(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    audio_channels: u8,
+    floors: &[AudioChannelFloor],
+    residue_plans: &[Vec<ResidueVectorPlan>],
+) -> Result<Vec<u8>, WriteAudioPacketError> {
+    let mut writer = BitWriterLsb::with_capacity(64);
+    write_audio_packet_into_writer(
+        header,
+        setup,
+        blocksize_0,
+        blocksize_1,
+        audio_channels,
+        floors,
+        residue_plans,
+        &mut writer,
+    )?;
+    Ok(writer.finish())
+}
+
+/// Bit-level helper to splice a full §4.3 audio packet into a larger
+/// bit-packed stream. Writes the packet's bits into `writer` at its
+/// current bit position; on error no bits are emitted (validation
+/// precedes emission in full).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_audio_packet_into_writer(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    audio_channels: u8,
+    floors: &[AudioChannelFloor],
+    residue_plans: &[Vec<ResidueVectorPlan>],
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteAudioPacketError> {
+    // ---- fail-closed validation (no bits emitted on any error). ----
+    let channels = audio_channels as usize;
+    if channels == 0 {
+        return Err(WriteAudioPacketError::ZeroAudioChannels);
+    }
+    if floors.len() != channels {
+        return Err(WriteAudioPacketError::FloorCountMismatch {
+            audio_channels: channels,
+            floors: floors.len(),
+        });
+    }
+
+    // §4.3.1 prelude validation is delegated to the prelude writer's
+    // gate (mode number / blockflag / blocksize / window-flag checks).
+    // We validate it here (into a throwaway writer) so the whole packet
+    // is checked before any bits land in the caller's writer, then emit
+    // it for real once everything passes.
+
+    // §4.3.2 — resolve the mode's mapping.
+    let mode = setup.modes[header.mode_number as usize];
+    let mapping_index = mode.mapping as usize;
+    let mapping =
+        setup
+            .mappings
+            .get(mapping_index)
+            .ok_or(WriteAudioPacketError::BadModeMapping {
+                mode_number: header.mode_number,
+                mapping: mode.mapping,
+                mapping_count: setup.mappings.len(),
+            })?;
+
+    // §4.3.2 step 6: each channel's floor body sets its `no_residue`
+    // flag. Build the raw (pre-§4.3.3) flags + the residue-bundle plan,
+    // which range-checks the mux/coupling and bundles channels per
+    // submap (§4.3.3 propagate + §4.3.4 gather).
+    let no_residue: Vec<bool> = floors.iter().map(AudioChannelFloor::is_unused).collect();
+    let plan = plan_residue_bundles(mapping, &no_residue).map_err(WriteAudioPacketError::Plan)?;
+
+    if residue_plans.len() != mapping.submaps as usize {
+        return Err(WriteAudioPacketError::ResiduePlanCountMismatch {
+            submaps: mapping.submaps as usize,
+            plans: residue_plans.len(),
+        });
+    }
+
+    // Invert the bundle plan to a per-channel submap lookup so floor
+    // bodies emit in channel order (§4.3.2) while residue bodies emit in
+    // submap order (§4.3.4). The plan resolved every channel exactly
+    // once, so this covers `0..channels`.
+    let mut channel_submap = vec![0usize; channels];
+    for bundle in &plan.bundles {
+        for &ch in &bundle.channels {
+            channel_submap[ch] = bundle.submap;
+        }
+    }
+
+    // Pre-resolve each channel's floor header (via its submap) and
+    // cross-check the supplied floor-body variant matches the header's
+    // type, before any emission.
+    let mut resolved_floors: Vec<ResolvedFloor<'_>> = Vec::with_capacity(channels);
+    for (ch, chan_floor) in floors.iter().enumerate() {
+        let submap = channel_submap[ch];
+        // The bundle plan guarantees `submap < mapping.submaps`; the
+        // setup parser pins `submap_configs.len() == submaps`, so this
+        // index is in range, but resolve defensively.
+        let submap_config = mapping.submap_configs.get(submap).ok_or(
+            WriteAudioPacketError::SubmapFloorOutOfRange {
+                submap,
+                floor: 0,
+                floor_count: setup.floors.len(),
+            },
+        )?;
+        let floor_idx = submap_config.floor as usize;
+        let floor_header =
+            setup
+                .floors
+                .get(floor_idx)
+                .ok_or(WriteAudioPacketError::SubmapFloorOutOfRange {
+                    submap,
+                    floor: submap_config.floor,
+                    floor_count: setup.floors.len(),
+                })?;
+        let resolved = match (&floor_header.kind, chan_floor) {
+            (FloorKind::Type0(h), AudioChannelFloor::Type0(p)) => ResolvedFloor::Type0(h, p),
+            (FloorKind::Type1(h), AudioChannelFloor::Type1(p)) => ResolvedFloor::Type1(h, p),
+            (FloorKind::Type0(_), AudioChannelFloor::Type1(_)) => {
+                return Err(WriteAudioPacketError::FloorTypeMismatch {
+                    channel: ch,
+                    header_type: 0,
+                    packet_type: 1,
+                });
+            }
+            (FloorKind::Type1(_), AudioChannelFloor::Type0(_)) => {
+                return Err(WriteAudioPacketError::FloorTypeMismatch {
+                    channel: ch,
+                    header_type: 1,
+                    packet_type: 0,
+                });
+            }
+        };
+        resolved_floors.push(resolved);
+    }
+
+    // Pre-resolve each submap's residue header (via the bundle plan, in
+    // submap order) before emission.
+    let mut resolved_residues: Vec<(
+        &ResidueHeader,
+        &SubmapResidueBundle,
+        &Vec<ResidueVectorPlan>,
+    )> = Vec::with_capacity(plan.bundles.len());
+    for bundle in &plan.bundles {
+        let submap = bundle.submap;
+        let submap_config = &mapping.submap_configs[submap];
+        let residue_idx = submap_config.residue as usize;
+        let residue_header = setup.residues.get(residue_idx).ok_or(
+            WriteAudioPacketError::SubmapResidueOutOfRange {
+                submap,
+                residue: submap_config.residue,
+                residue_count: setup.residues.len(),
+            },
+        )?;
+        // residue_plans is index-aligned with submaps (count checked
+        // above); bundle.submap is in `0..submaps`.
+        resolved_residues.push((residue_header, bundle, &residue_plans[submap]));
+    }
+
+    // Probe pass: emit the whole packet into a throwaway writer so the
+    // floor- and residue-body writers' own fail-closed gates run BEFORE
+    // a single bit lands in the caller's writer. A body gate failing
+    // here leaves only the probe writer dirty; the caller's writer is
+    // untouched. The emit pass below is then guaranteed to succeed (the
+    // body writers are pure functions of the same inputs).
+    {
+        let mut probe = BitWriterLsb::with_capacity(64);
+        emit_audio_packet_bodies(
+            header,
+            setup,
+            blocksize_0,
+            blocksize_1,
+            &resolved_floors,
+            &resolved_residues,
+            &mut probe,
+        )?;
+    }
+
+    // ---- emit (validation complete). ----
+    emit_audio_packet_bodies(
+        header,
+        setup,
+        blocksize_0,
+        blocksize_1,
+        &resolved_floors,
+        &resolved_residues,
+        writer,
+    )
+}
+
+/// Emit the §4.3.1 prelude + §4.3.2 floor bodies + §4.3.4 residue bodies
+/// into `writer`, in spec order. Factored out of
+/// [`write_audio_packet_into_writer`] so the same emission runs once
+/// against a probe writer (gate check) and once against the real writer.
+#[allow(clippy::too_many_arguments)]
+fn emit_audio_packet_bodies(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    resolved_floors: &[ResolvedFloor<'_>],
+    resolved_residues: &[(
+        &ResidueHeader,
+        &SubmapResidueBundle,
+        &Vec<ResidueVectorPlan>,
+    )],
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteAudioPacketError> {
+    write_audio_packet_header_into_writer(header, setup, blocksize_0, blocksize_1, writer)
+        .map_err(WriteAudioPacketError::Header)?;
+
+    // §4.3.2 — floor bodies in channel order.
+    for (ch, resolved) in resolved_floors.iter().enumerate() {
+        match resolved {
+            ResolvedFloor::Type0(h, p) => {
+                write_floor0_packet_into_writer(p, h, &setup.codebooks, writer).map_err(
+                    |source| WriteAudioPacketError::Floor0 {
+                        channel: ch,
+                        source,
+                    },
+                )?;
+            }
+            ResolvedFloor::Type1(h, p) => {
+                write_floor1_packet_into_writer(p, h, &setup.codebooks, writer).map_err(
+                    |source| WriteAudioPacketError::Floor1 {
+                        channel: ch,
+                        source,
+                    },
+                )?;
+            }
+        }
+    }
+
+    // §4.3.4 — residue bodies in submap order.
+    for (residue_header, bundle, plans) in resolved_residues {
+        write_residue_body_into_writer(
+            plans,
+            residue_header,
+            &setup.codebooks,
+            header.n,
+            &bundle.do_not_decode,
+            writer,
+        )
+        .map_err(|source| WriteAudioPacketError::Residue {
+            submap: bundle.submap,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10046,9 +10584,7 @@ mod tests {
     // Setup header (round 27) — wrapping §4.2.4 packet writer.
     // ================================================================
 
-    use crate::setup::{
-        parse_setup_header, FloorHeader, MappingSubmap, ParseError as SetupParseError,
-    };
+    use crate::setup::{parse_setup_header, MappingSubmap, ParseError as SetupParseError};
 
     /// The smallest valid mono setup header that satisfies every
     /// §4.2.4 invariant: exactly one codebook, one zero
@@ -14201,6 +14737,426 @@ mod tests {
                 s.contains("vorbis §4.3"),
                 "Display must be grep-able by spec section: {s}"
             );
+        }
+    }
+
+    // ---- §4.3 wrapping audio-packet writer (`write_audio_packet`). ----
+    //
+    // These tests mirror the trivial all-zero setup the decoder-side
+    // tests in `audio.rs` use (a 0-partition floor 1 + a begin==end==0
+    // residue that decodes to all-zero), then prove the wrapping driver
+    // produces a byte-identical packet AND that the bytes round-trip
+    // back through the real `decode_audio_packet_pre_imdct`.
+
+    use crate::audio::{decode_audio_packet_pre_imdct, AudioDecoderState, AudioPacketOutcome};
+    use crate::setup::{FloorHeader, MappingCouplingStep as ApMappingCouplingStep};
+
+    fn ap_floor1_all_zero_header() -> Floor1Header {
+        // multiplier 4 → range 7 → amp_bits = ilog(6) = 3.
+        Floor1Header {
+            partitions: 0,
+            partition_class_list: Vec::new(),
+            classes: Vec::new(),
+            multiplier: 4,
+            rangebits: 4,
+            x_list: Vec::new(),
+        }
+    }
+
+    fn ap_floor_type1() -> FloorHeader {
+        FloorHeader {
+            floor_type: 1,
+            kind: FloorKind::Type1(ap_floor1_all_zero_header()),
+        }
+    }
+
+    fn ap_scalar_classbook() -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions: 1,
+            entries: 1,
+            codeword_lengths: vec![1],
+            lookup: VqLookup::None,
+        }
+    }
+
+    fn ap_zero_lookup_codebook() -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions: 1,
+            entries: 1,
+            codeword_lengths: vec![1],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 0.0,
+                value_bits: 1,
+                sequence_p: false,
+                multiplicands: vec![0],
+            },
+        }
+    }
+
+    fn ap_residue_zero_header() -> ResidueHeader {
+        ResidueHeader {
+            residue_type: 0,
+            residue_begin: 0,
+            residue_end: 0,
+            partition_size: 1,
+            classifications: 1,
+            classbook: 0,
+            cascade: vec![0],
+            books: vec![std::array::from_fn(|_| None)],
+        }
+    }
+
+    fn ap_mode_short() -> ModeHeader {
+        ModeHeader {
+            blockflag: false,
+            windowtype: 0,
+            transformtype: 0,
+            mapping: 0,
+        }
+    }
+
+    fn ap_mono_setup() -> VorbisSetupHeader {
+        VorbisSetupHeader {
+            codebooks: vec![ap_scalar_classbook(), ap_zero_lookup_codebook()],
+            time_placeholders: Vec::new(),
+            floors: vec![ap_floor_type1()],
+            residues: vec![ap_residue_zero_header()],
+            mappings: vec![MappingHeader {
+                mapping_type: 0,
+                submaps: 1,
+                coupling: Vec::new(),
+                mux: Vec::new(),
+                submap_configs: vec![MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                }],
+            }],
+            modes: vec![ap_mode_short()],
+            framing_flag: true,
+        }
+    }
+
+    fn ap_stereo_coupled_setup() -> VorbisSetupHeader {
+        VorbisSetupHeader {
+            codebooks: vec![ap_scalar_classbook(), ap_zero_lookup_codebook()],
+            time_placeholders: Vec::new(),
+            floors: vec![ap_floor_type1()],
+            residues: vec![ap_residue_zero_header()],
+            mappings: vec![MappingHeader {
+                mapping_type: 0,
+                submaps: 1,
+                coupling: vec![ApMappingCouplingStep {
+                    magnitude_channel: 0,
+                    angle_channel: 1,
+                }],
+                mux: Vec::new(),
+                submap_configs: vec![MappingSubmap {
+                    time_placeholder: 0,
+                    floor: 0,
+                    residue: 0,
+                }],
+            }],
+            modes: vec![ap_mode_short()],
+            framing_flag: true,
+        }
+    }
+
+    fn ap_header(n: usize) -> AudioPacketHeader {
+        AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n,
+            previous_window_flag: false,
+            next_window_flag: false,
+        }
+    }
+
+    /// A floor 1 "used" body carrying two zero endpoints (the
+    /// `floor1_all_zero` header has no partitions, so `floor1_y` is just
+    /// the two endpoints).
+    fn ap_floor1_used() -> AudioChannelFloor {
+        AudioChannelFloor::Type1(Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![0, 0],
+            partition_cvals: Vec::new(),
+        })
+    }
+
+    fn ap_floor1_unused() -> AudioChannelFloor {
+        AudioChannelFloor::Type1(Floor1Packet {
+            nonzero: false,
+            floor1_y: Vec::new(),
+            partition_cvals: Vec::new(),
+        })
+    }
+
+    /// One submap's residue plan for the begin==end==0 residue: zero
+    /// partitions → one empty `ResidueVectorPlan` per non-'do not decode'
+    /// vector. Format 0, so one plan per channel (decoded ones empty).
+    fn ap_residue_plans_for(do_not_decode: &[bool]) -> Vec<ResidueVectorPlan> {
+        do_not_decode
+            .iter()
+            .map(|_| ResidueVectorPlan {
+                classifications: Vec::new(),
+                partition_entries: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn write_audio_packet_mono_used_matches_handwritten_and_roundtrips() {
+        let setup = ap_mono_setup();
+        // §4.3.1 prelude (1 bit) + floor1 [nonzero]=1 (1 bit) + two
+        // endpoints. multiplier 4 → range 64 → amp_bits = ilog(63) = 6
+        // bits each (§7.2.3). Residue begin==end==0 → 0 bits. Total
+        // = 1 + 1 + 6 + 6 = 14 bits → 2 bytes. The packet is byte-exact
+        // and fully spec-explicit (unlike the EOF-padded hand-written
+        // fixture in audio.rs, which relies on end-of-packet zero-fill
+        // for the high endpoint bits).
+        let floors = vec![ap_floor1_used()];
+        // mono, single submap, channel 0 used → do_not_decode = [false].
+        let residue_plans = vec![ap_residue_plans_for(&[false])];
+        let bytes =
+            write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans)
+                .unwrap();
+        // bit 0: packet_type=0; bit 1: nonzero=1; bits 2..14: zero
+        // endpoints; bits 14..16: §2.1.8 zero pad. LSB-first byte 0 holds
+        // bits 0..8: 0b0000_0010 = 0x02; byte 1 holds bits 8..16 = 0x00.
+        assert_eq!(bytes, vec![0x02, 0x00], "byte-exact §4.3 packet");
+
+        // Round-trip through the real decoder.
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let outcome = decode_audio_packet_pre_imdct(&mut r, &setup, &state, 1, 64, 1024).unwrap();
+        match outcome {
+            AudioPacketOutcome::PreImdct { n, spectra, .. } => {
+                assert_eq!(n, 64);
+                assert_eq!(spectra.len(), 1);
+                assert_eq!(spectra[0].len(), 32);
+                for &s in &spectra[0] {
+                    assert_eq!(s, 0.0);
+                }
+            }
+            other => panic!("expected PreImdct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_mono_unused_matches_handwritten_and_roundtrips() {
+        let setup = ap_mono_setup();
+        // prelude (1) + floor1 [nonzero]=0 = 2 bits → one byte 0x00.
+        let floors = vec![ap_floor1_unused()];
+        // Channel unused → do_not_decode = [true].
+        let residue_plans = vec![ap_residue_plans_for(&[true])];
+        let bytes =
+            write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans)
+                .unwrap();
+        assert_eq!(bytes, vec![0x00]);
+
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let outcome = decode_audio_packet_pre_imdct(&mut r, &setup, &state, 1, 64, 1024).unwrap();
+        match outcome {
+            AudioPacketOutcome::PreImdct { spectra, .. } => {
+                assert_eq!(spectra.len(), 1);
+                for &s in &spectra[0] {
+                    assert_eq!(s, 0.0);
+                }
+            }
+            other => panic!("expected PreImdct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_stereo_coupled_roundtrips() {
+        let setup = ap_stereo_coupled_setup();
+        // Both channels used → §4.3.3 propagate keeps both used.
+        let floors = vec![ap_floor1_used(), ap_floor1_used()];
+        let residue_plans = vec![ap_residue_plans_for(&[false, false])];
+        let bytes =
+            write_audio_packet(&ap_header(64), &setup, 64, 1024, 2, &floors, &residue_plans)
+                .unwrap();
+        // prelude(1) + ch0(1+6+6) + ch1(1+6+6) = 27 bits → 4 bytes
+        // (amp_bits = 6 per the §7.2.3 range table for multiplier 4).
+        assert_eq!(bytes.len(), 4);
+
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let outcome = decode_audio_packet_pre_imdct(&mut r, &setup, &state, 2, 64, 1024).unwrap();
+        match outcome {
+            AudioPacketOutcome::PreImdct { spectra, .. } => {
+                assert_eq!(spectra.len(), 2);
+                for ch in &spectra {
+                    assert_eq!(ch.len(), 32);
+                    for &s in ch {
+                        assert_eq!(s, 0.0);
+                    }
+                }
+            }
+            other => panic!("expected PreImdct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_stereo_coupled_one_unused_floor_still_codes_both() {
+        // §4.3.3: channel 1's floor is 'unused' but the coupling step
+        // (0,1) pulls it back in, so the residue bundle's do_not_decode
+        // is [false, false] — both channels coded. We assert the bundle
+        // plan the driver derives matches that, and the packet
+        // round-trips.
+        let setup = ap_stereo_coupled_setup();
+        let floors = vec![ap_floor1_used(), ap_floor1_unused()];
+        // Both still coded after propagation.
+        let residue_plans = vec![ap_residue_plans_for(&[false, false])];
+        let bytes =
+            write_audio_packet(&ap_header(64), &setup, 64, 1024, 2, &floors, &residue_plans)
+                .unwrap();
+
+        // Cross-check: the propagated no_residue is [false, false].
+        let mapping = &setup.mappings[0];
+        let no_residue = vec![false, true]; // ch0 used, ch1 floor unused
+        let plan = plan_residue_bundles(mapping, &no_residue).unwrap();
+        assert_eq!(plan.no_residue, vec![false, false]);
+        assert_eq!(plan.bundles[0].do_not_decode, vec![false, false]);
+
+        let state = AudioDecoderState::new(&setup).unwrap();
+        let mut r = oxideav_core::bits::BitReaderLsb::new(&bytes);
+        let outcome = decode_audio_packet_pre_imdct(&mut r, &setup, &state, 2, 64, 1024).unwrap();
+        assert!(matches!(outcome, AudioPacketOutcome::PreImdct { .. }));
+    }
+
+    #[test]
+    fn write_audio_packet_rejects_floor_count_mismatch() {
+        let setup = ap_mono_setup();
+        let floors = vec![ap_floor1_used(), ap_floor1_used()]; // 2 != 1
+        let residue_plans = vec![ap_residue_plans_for(&[false])];
+        match write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans) {
+            Err(WriteAudioPacketError::FloorCountMismatch {
+                audio_channels,
+                floors,
+            }) => {
+                assert_eq!(audio_channels, 1);
+                assert_eq!(floors, 2);
+            }
+            other => panic!("expected FloorCountMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_rejects_zero_channels() {
+        let setup = ap_mono_setup();
+        match write_audio_packet(&ap_header(64), &setup, 64, 1024, 0, &[], &[]) {
+            Err(WriteAudioPacketError::ZeroAudioChannels) => {}
+            other => panic!("expected ZeroAudioChannels, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_rejects_floor_type_mismatch() {
+        let setup = ap_mono_setup(); // floor 0 in setup is Type1.
+                                     // Supply a Type0 body for a channel whose header is Type1.
+        let floors = vec![AudioChannelFloor::Type0(Floor0Packet::Unused)];
+        let residue_plans = vec![ap_residue_plans_for(&[true])];
+        match write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans) {
+            Err(WriteAudioPacketError::FloorTypeMismatch {
+                channel,
+                header_type,
+                packet_type,
+            }) => {
+                assert_eq!(channel, 0);
+                assert_eq!(header_type, 1);
+                assert_eq!(packet_type, 0);
+            }
+            other => panic!("expected FloorTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_rejects_residue_plan_count_mismatch() {
+        let setup = ap_mono_setup(); // submaps == 1
+        let floors = vec![ap_floor1_used()];
+        let residue_plans: Vec<Vec<ResidueVectorPlan>> = Vec::new(); // 0 != 1
+        match write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans) {
+            Err(WriteAudioPacketError::ResiduePlanCountMismatch { submaps, plans }) => {
+                assert_eq!(submaps, 1);
+                assert_eq!(plans, 0);
+            }
+            other => panic!("expected ResiduePlanCountMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_rejects_bad_mode_mapping() {
+        let mut setup = ap_mono_setup();
+        // Point the only mode at a nonexistent mapping.
+        setup.modes[0].mapping = 5;
+        let floors = vec![ap_floor1_used()];
+        let residue_plans = vec![ap_residue_plans_for(&[false])];
+        match write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans) {
+            Err(WriteAudioPacketError::BadModeMapping {
+                mode_number,
+                mapping,
+                mapping_count,
+            }) => {
+                assert_eq!(mode_number, 0);
+                assert_eq!(mapping, 5);
+                assert_eq!(mapping_count, 1);
+            }
+            other => panic!("expected BadModeMapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_audio_packet_into_writer_emits_no_bits_on_error() {
+        // A validation error must leave the caller's writer untouched.
+        let setup = ap_mono_setup();
+        let floors = vec![ap_floor1_used(), ap_floor1_used()]; // count mismatch
+        let residue_plans = vec![ap_residue_plans_for(&[false])];
+        let mut w = BitWriterLsb::new();
+        w.write_u32(0b101, 3); // three sentinel bits already in the writer
+        let before = w.bit_position();
+        let res = write_audio_packet_into_writer(
+            &ap_header(64),
+            &setup,
+            64,
+            1024,
+            1,
+            &floors,
+            &residue_plans,
+            &mut w,
+        );
+        assert!(res.is_err());
+        assert_eq!(w.bit_position(), before, "no bits emitted on error");
+    }
+
+    #[test]
+    fn write_audio_packet_error_display_is_grepable() {
+        let cases: Vec<WriteAudioPacketError> = vec![
+            WriteAudioPacketError::ZeroAudioChannels,
+            WriteAudioPacketError::FloorCountMismatch {
+                audio_channels: 1,
+                floors: 2,
+            },
+            WriteAudioPacketError::BadModeMapping {
+                mode_number: 0,
+                mapping: 5,
+                mapping_count: 1,
+            },
+            WriteAudioPacketError::FloorTypeMismatch {
+                channel: 0,
+                header_type: 1,
+                packet_type: 0,
+            },
+            WriteAudioPacketError::ResiduePlanCountMismatch {
+                submaps: 1,
+                plans: 0,
+            },
+        ];
+        for c in &cases {
+            let s = c.to_string();
+            assert!(s.contains("vorbis §4.3"), "grep-able by spec section: {s}");
         }
     }
 }

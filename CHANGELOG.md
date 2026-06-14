@@ -6,6 +6,36 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3 wrapping audio-packet WRITE driver (round 41).**
+  `encoder::write_audio_packet` is the composition layer over the four
+  per-stage `_into_writer` splice primitives (the §4.3.1 prelude, the
+  §6.2.2 floor 0 / §7.2.3 floor 1 packet bodies, and the §8.6.2 residue
+  body) plus the §4.3.3/§4.3.4 inverse-mapping layer
+  (`plan_residue_bundles`). It serialises one full audio packet in the
+  exact inverse of `audio::decode_audio_packet_pre_imdct`'s read order:
+  the §4.3.1 prelude, then one floor body per channel in channel order
+  (each channel's floor type/header resolved through its submap's
+  `floor` index), then one residue body per submap in submap order
+  (the per-submap `do_not_decode` flags derived from the bundle plan,
+  so §4.3.3 coupling-propagation re-codes a channel pulled back in by a
+  coupling partner even though its own floor was `'unused'`). New
+  public surface (re-exported at the crate root):
+
+  - `encoder::AudioChannelFloor` (`Type0(Floor0Packet)` /
+    `Type1(Floor1Packet)`) — one channel's floor body; the variant must
+    match the resolved floor header's `FloorKind`.
+  - `encoder::WriteAudioPacketError` — fail-closed gates: prelude
+    failure, floor/residue count or floor-type mismatch, out-of-range
+    mapping/floor/residue index, bundle-plan rejection, and per-channel
+    floor / per-submap residue body failures (each carried verbatim
+    with `source()` chaining). Validation precedes emission in full; the
+    caller's writer is bit-exactly untouched on every error path.
+
+  Round-trip proven: a mono used/unused packet, a stereo coupled
+  packet, and a stereo packet where one channel's floor is `'unused'`
+  but coupling re-codes it all decode cleanly through
+  `decode_audio_packet_pre_imdct` to the expected per-channel spectra.
+
 * **Vorbis I §4.3.3 + §4.3.4 residue-bundle planning primitive
   (round 40, umbrella round 293).** `encoder::plan_residue_bundles`
   builds the inverse-mapping layer a wrapping §4.3 audio-packet writer
