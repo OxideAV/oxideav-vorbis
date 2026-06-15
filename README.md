@@ -34,6 +34,17 @@ framing and `oxideav-core` registration are not yet wired —
   per-packet driver to per-channel overlap-add across consecutive
   packets, emitting finished `StreamingFrame::Pcm` samples per channel.
   It is the integrated bitstream → PCM path.
+- **Fixture-anchored silence decode** — an integration test
+  (`tests/silence_stream_decode.rs`) drives the
+  `docs/audio/vorbis/fixtures/silence-stream/` packet geometry (mono,
+  `blocksize_0 = 256`, `blocksize_1 = 2048`, two modes; every audio
+  packet `packet_bytes=1`) through the full public
+  `StreamingDecoder::push_packet` path and asserts pure-silence PCM. Per
+  §4.3.2 step 6 the `'unused'` floor short-circuits to the all-zero
+  spectrum, so the result is provably independent of the still-deferred
+  IMDCT normalization scalar (`0 · α = 0`) — making silence the one
+  end-to-end PCM target pinnable while the post-IMDCT trace point that
+  would fix the scalar is missing from the staged traces.
 
 ### Encode
 

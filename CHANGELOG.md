@@ -4,6 +4,17 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- §4.3 fixture-anchored end-to-end silence-decode integration test
+  (`tests/silence_stream_decode.rs`): drives the
+  `docs/audio/vorbis/fixtures/silence-stream/` packet geometry through
+  the full public `StreamingDecoder::push_packet` bitstream → PCM path
+  and asserts pure-silence output. Exercises the §4.3.2-step-6 unused-
+  floor short-circuit, which is provably invariant to the still-deferred
+  IMDCT normalization scalar (`0 · α = 0`), so it is the one end-to-end
+  PCM assertion available before the post-IMDCT trace point lands.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.10...v0.0.11) - 2026-06-15
 
 ### Other
