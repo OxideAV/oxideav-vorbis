@@ -92,7 +92,10 @@
 //!   driver having to thread per-stream state.
 //! * **Channel-order rearrangement (§4.3.9).** A presentation concern
 //!   for the consumer; the driver returns per-channel vectors in
-//!   bitstream order.
+//!   bitstream order. The §4.3.9 mapping-type-0 speaker layout (what
+//!   physical location each bitstream channel denotes) is exposed
+//!   separately via [`crate::channel_order`]; the consumer permutes if
+//!   it wants a non-Vorbis physical ordering.
 //! * **Ogg framing.** The driver is bring-your-own-packet, just like the
 //!   header parsers.
 

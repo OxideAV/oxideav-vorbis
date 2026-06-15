@@ -152,6 +152,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod audio;
+pub mod channel_order;
 pub mod codebook;
 pub mod comment;
 pub mod encoder;
@@ -176,6 +177,7 @@ pub use audio::{
     decode_one_packet, decode_one_packet_windowed, AudioDecoderState, AudioPacketError,
     AudioPacketOutcome, WindowedPacketOutcome,
 };
+pub use channel_order::{speaker_at, speaker_layout, Speaker};
 pub use codebook::{
     float32_pack, float32_unpack, ilog, lookup1_values, parse_codebook,
     ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,

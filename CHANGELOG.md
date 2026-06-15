@@ -6,6 +6,15 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §4.3.9 output channel order (`channel_order` module): `speaker_layout`
+  / `speaker_at` resolve each encoded-stream channel index to its
+  mapping-type-0 physical speaker location across the 1..=8-channel
+  layouts the Vorbis I spec fixes (mono; stereo L/R; 3..=5 surround; 5.1
+  / 6.1 / 7.1, with the rev-16781 side-pair + rear-center / rear-pair
+  forms for 6.1 and 7.1). Counts above eight report
+  `Speaker::Unspecified` (the spec leaves them application-defined) and a
+  zero count yields no layout. Decode still emits channels in bitstream
+  order; this is the documented layout for consumer-side reordering.
 - §4.3 fixture-anchored end-to-end silence-decode integration test
   (`tests/silence_stream_decode.rs`): drives the
   `docs/audio/vorbis/fixtures/silence-stream/` packet geometry through

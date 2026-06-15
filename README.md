@@ -30,6 +30,14 @@ framing and `oxideav-core` registration are not yet wired —
   cosine-summation kernel (`imdct`), the §4.3.1 / §1.3.2 Vorbis window
   (`synthesis::window_premultiply`), and the §4.3.8 overlap-add
   (`overlap::OverlapAdd`).
+- **§4.3.9 output channel order** — `channel_order::speaker_layout` /
+  `speaker_at` map each encoded-stream channel index to its mapping-type-0
+  physical speaker location for the 1..=8-channel layouts the spec fixes
+  (mono; stereo L/R; the 5.1 / 6.1 / 7.1 surround orderings, where 6.1
+  and 7.1 use the rev-16781 side-pair + rear-center / rear-pair forms).
+  Counts above eight report `Speaker::Unspecified` (application-defined).
+  Decode keeps emitting channels in bitstream order; this is the
+  documented layout a consumer uses to reorder.
 - **Streaming decoder** — `streaming::StreamingDecoder` stitches the
   per-packet driver to per-channel overlap-add across consecutive
   packets, emitting finished `StreamingFrame::Pcm` samples per channel.
