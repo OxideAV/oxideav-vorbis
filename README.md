@@ -1,6 +1,72 @@
 # oxideav-vorbis
 
-Pure-Rust Vorbis I audio codec — clean-room rebuild, round 41.
+Pure-Rust Vorbis I audio codec — clean-room rebuild, round 42.
+
+## Status — 2026-06-15 (round 42, umbrella round 308)
+
+**Round 42 lands the §4.3.6 spectrum-factoring primitive — the
+encoder-side algebraic inverse of the §4.3.6 dot product, the first piece
+of the post-residue spectrum→PCM-inverse path the prior rounds' followups
+called out.** The decode side multiplies, element by element, each
+channel's floor curve by its residue vector to produce the length-`n/2`
+audio spectrum ([`packet::dot_product`] / [`packet::dot_product_all`]);
+this round adds the inverse the encoder needs — given a target spectrum
+and the floor curve already chosen for the channel, recover the residue
+vector to quantise and emit. New public surface, re-exported at the crate
+root:
+
+* [`synthesis::factor_spectrum(spectrum, floor, residue)`] writes the
+  per-channel residue `residue[i] = spectrum[i] / floor[i]` into a
+  caller-allocated buffer, the algebraic inverse of [`packet::dot_product`].
+  The round-trip
+  `dot_product(floor, factor_spectrum(spectrum, floor)) == spectrum`
+  holds bit-exactly wherever the floor is finite and nonzero.
+
+* [`synthesis::factor_spectrum_all(spectra, floors)`] is the per-channel
+  driver mirroring [`packet::dot_product_all`]: it returns one factored
+  residue per channel, modelling an `'unused'` channel (§4.3.2 step 6 /
+  §4.3.3) as a [`None`] floor that yields an empty residue and requires
+  an all-zero target.
+
+* A zero floor bin is the one structural subtlety. The decode product
+  `floor[i] · residue[i]` is zero for *any* residue when `floor[i] == 0`,
+  so the residue is unconstrained there: the factoring emits the
+  canonical `0.0` (the natural quantiser choice) and rejects a target
+  whose spectrum is nonzero over a zero-floor bin — no finite residue
+  could reproduce it.
+
+* [`synthesis::FactorSpectrumError`] enumerates the four fail-closed
+  gates: `LengthMismatch` (spectrum / floor / residue length disagree),
+  `ChannelCountMismatch`, `NonFiniteFloor` (a `NaN`/`±∞` floor bin —
+  never produced by §4.3.2 synthesis, guarded against caller bugs), and
+  `NonzeroSpectrumOverZeroFloor` (carrying the channel index from the
+  per-channel driver).
+
+15 new in-module unit tests bring the crate suite from **764 → 779
+(+15)**: the scalar division and zero-floor / non-finite cases; two
+round-trips that factor a spectrum then run the real
+[`packet::dot_product`] back over `(floor, residue)` to recover the
+target (one with zero floor bins); the multi-channel round-trip through
+[`packet::dot_product_all`]; the unused-channel empty-residue case; both
+length-mismatch directions; the channel-count gate; the per-channel
+error-coordinate propagation; and grep-able `Display` strings keyed by
+"§4.3.6 inverse".
+
+Followups (explicit):
+
+* The VQ-encode stage that maps the real-valued residue curve this
+  factoring produces to the per-partition classifications + entry indices
+  a [`encoder::ResidueVectorPlan`] carries (nearest-entry quantisation
+  against the book's `unpack_vector` table), paired with the analogous
+  floor VQ-encode stage.
+* Pinning the Vorbis-specific MDCT normalization scalar once fixture
+  traces under `docs/audio/vorbis/fixtures/<case>/` extend through the
+  post-MDCT trace point.
+
+Spec source: `docs/audio/vorbis/Vorbis_I_spec.pdf` §4.3.6 (the dot
+product — "multiply each element of the floor curve by each element of
+that channel's residue vector"), §4.3.3 (the all-zero output vector of an
+'unused' channel), §4.3.2 step 6 (the `no_residue` flag).
 
 ## Status — 2026-06-14 (round 41, umbrella round 301)
 

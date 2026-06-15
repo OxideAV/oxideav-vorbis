@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+* **Vorbis I §4.3.6 spectrum-factoring primitive — the encoder-side
+  inverse of the §4.3.6 dot product (round 42).** `synthesis::factor_spectrum`
+  / `synthesis::factor_spectrum_all` recover the residue vector(s) a
+  target audio spectrum implies given the encoder's chosen floor curve,
+  the algebraic inverse of the decode-side `packet::dot_product` /
+  `packet::dot_product_all` element-wise floor × residue product:
+  `residue[i] = spectrum[i] / floor[i]`. The round-trip
+  `dot_product(floor, factor_spectrum(spectrum, floor)) == spectrum`
+  holds bit-exactly wherever the floor is finite and nonzero. A zero
+  floor bin is unconstrained (the decode product is zero for any
+  residue), so the canonical `0.0` residue is emitted there and a target
+  whose spectrum is nonzero over a zero-floor bin is rejected — no
+  finite residue could reproduce it. A `None` floor (an `'unused'`
+  channel, §4.3.2 step 6 / §4.3.3) yields an empty residue and requires
+  an all-zero target. New public surface (re-exported at the crate
+  root): `synthesis::factor_spectrum`, `synthesis::factor_spectrum_all`,
+  and `synthesis::FactorSpectrumError` (`LengthMismatch`,
+  `ChannelCountMismatch`, `NonFiniteFloor`,
+  `NonzeroSpectrumOverZeroFloor`). 15 new in-module unit tests bring the
+  crate suite from 764 → 779.
+
 * **Vorbis I §4.3 wrapping audio-packet WRITE driver (round 41).**
   `encoder::write_audio_packet` is the composition layer over the four
   per-stage `_into_writer` splice primitives (the §4.3.1 prelude, the

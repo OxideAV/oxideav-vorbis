@@ -90,6 +90,43 @@
 //! `forward_then_inverse_couple_is_identity_*` tests pin the
 //! round-trip property exhaustively on a grid of `(L, R)` values
 //! covering every quadrant and every boundary tie.
+//!
+//! # Spectrum factoring — the encoder counterpart of §4.3.6
+//!
+//! The §4.3.6 "dot product" step multiplies, element by element, each
+//! channel's floor curve by its residue vector to produce that channel's
+//! length-`n/2` audio spectrum (`spectrum[i] = floor[i] · residue[i]`,
+//! the element-wise product modelled by [`crate::packet::dot_product`] /
+//! [`crate::packet::dot_product_all`] on the decode side).
+//!
+//! [`factor_spectrum_scalar`] / [`factor_spectrum`] / [`factor_spectrum_all`]
+//! are the encoder-side inverse: given a target audio spectrum and the
+//! floor curve the encoder has already chosen for the channel, they
+//! recover the residue vector the encoder must quantise and emit so that
+//! the decoder's §4.3.6 product reproduces the target spectrum. The
+//! recovery is the algebraic inverse of the element-wise product,
+//!
+//! ```text
+//! residue[i] = spectrum[i] / floor[i]
+//! ```
+//!
+//! and the round-trip property
+//! `dot_product(floor, factor_spectrum(spectrum, floor)) == spectrum`
+//! holds bit-exactly wherever `floor[i]` is finite and nonzero.
+//!
+//! The one structural subtlety is a zero floor bin. The §4.3.2 floor
+//! synthesis can return a zero element (e.g. a floor-1 line at the curve
+//! minimum, or the all-zero curve of an `'unused'` channel, §4.3.3).
+//! Where `floor[i] == 0` the decode product `floor[i] · residue[i]` is
+//! zero for *any* residue value — the residue bin is unconstrained by the
+//! spectrum, so a target spectrum that is consistent with the floor must
+//! itself have `spectrum[i] == 0` there. The factoring emits the
+//! canonical residue `0.0` for such bins (the smallest-magnitude
+//! representative, the natural choice for a quantiser) and rejects a
+//! target whose `spectrum[i] != 0` over a zero floor bin, since no finite
+//! residue could reproduce it. A non-finite floor (`NaN`/`±∞`, never
+//! produced by the §4.3.2 synthesis but guarded against caller bugs) is
+//! likewise rejected rather than yielding a non-finite or NaN residue.
 
 use crate::setup::MappingCouplingStep;
 
@@ -667,6 +704,257 @@ pub fn forward_couple_all(
         }
     }
     Ok(())
+}
+
+/// Errors that can arise while factoring a target audio spectrum into a
+/// residue vector (the encoder-side inverse of the §4.3.6 dot product).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FactorSpectrumError {
+    /// `spectrum` and `floor` slices disagree on length. Both are the
+    /// per-channel §4.3.6 length `n/2`, so a mismatch indicates a caller
+    /// bug rather than stream data.
+    LengthMismatch {
+        /// Length of the target spectrum slice.
+        spectrum_len: usize,
+        /// Length of the floor curve slice.
+        floor_len: usize,
+    },
+    /// `floors` and `spectra` have a different number of channels. The
+    /// channel-driver [`factor_spectrum_all`] requires one floor curve
+    /// per spectrum.
+    ChannelCountMismatch {
+        /// Number of target spectrum vectors supplied.
+        spectra: usize,
+        /// Number of floor curves supplied.
+        floors: usize,
+    },
+    /// A floor element is not finite (`NaN` or `±∞`). The §4.3.2 floor
+    /// synthesis never produces such a value; a non-finite floor would
+    /// make the recovered residue non-finite, so the factoring refuses.
+    NonFiniteFloor {
+        /// The channel whose floor carried the non-finite element
+        /// (`0` for the single-vector [`factor_spectrum`]).
+        channel: usize,
+        /// The bin index of the offending floor element.
+        index: usize,
+    },
+    /// The target spectrum is nonzero at a bin where the floor is zero.
+    /// The §4.3.6 product `floor[i] · residue[i]` is zero for any
+    /// residue when `floor[i] == 0`, so no finite residue could
+    /// reproduce a nonzero spectrum there — the target is inconsistent
+    /// with the chosen floor.
+    NonzeroSpectrumOverZeroFloor {
+        /// The channel whose target was inconsistent (`0` for the
+        /// single-vector [`factor_spectrum`]).
+        channel: usize,
+        /// The bin index where the floor is zero but the spectrum is not.
+        index: usize,
+        /// The offending nonzero spectrum value.
+        spectrum: f32,
+    },
+}
+
+impl core::fmt::Display for FactorSpectrumError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FactorSpectrumError::LengthMismatch {
+                spectrum_len,
+                floor_len,
+            } => write!(
+                f,
+                "spectrum factoring (§4.3.6 inverse): spectrum length {spectrum_len} \
+                 does not match floor length {floor_len}"
+            ),
+            FactorSpectrumError::ChannelCountMismatch { spectra, floors } => write!(
+                f,
+                "spectrum factoring (§4.3.6 inverse): {spectra} spectrum channels \
+                 but {floors} floor curves"
+            ),
+            FactorSpectrumError::NonFiniteFloor { channel, index } => write!(
+                f,
+                "spectrum factoring (§4.3.6 inverse): channel {channel} floor \
+                 element at index {index} is not finite"
+            ),
+            FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                channel,
+                index,
+                spectrum,
+            } => write!(
+                f,
+                "spectrum factoring (§4.3.6 inverse): channel {channel} target \
+                 spectrum {spectrum} at index {index} is nonzero where the floor \
+                 is zero (no finite residue reproduces it)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FactorSpectrumError {}
+
+/// Recover one residue scalar from a target audio-spectrum scalar and
+/// the floor scalar the encoder chose for that bin — the scalar
+/// algebraic inverse of the §4.3.6 element-wise product
+/// `spectrum = floor · residue`.
+///
+/// Returns `residue = spectrum / floor` for a finite nonzero `floor`.
+/// When `floor == 0` the product is zero for any residue, so the bin is
+/// unconstrained: the function returns the canonical `0.0` if the target
+/// `spectrum` is also zero, and rejects a nonzero target (no finite
+/// residue could reproduce it). A non-finite `floor` is rejected.
+///
+/// The `channel`/`index` coordinates are carried into the error variants
+/// only; the math itself is per-scalar.
+fn factor_spectrum_scalar(
+    spectrum: f32,
+    floor: f32,
+    channel: usize,
+    index: usize,
+) -> Result<f32, FactorSpectrumError> {
+    if !floor.is_finite() {
+        return Err(FactorSpectrumError::NonFiniteFloor { channel, index });
+    }
+    if floor == 0.0 {
+        if spectrum != 0.0 {
+            return Err(FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                channel,
+                index,
+                spectrum,
+            });
+        }
+        return Ok(0.0);
+    }
+    Ok(spectrum / floor)
+}
+
+/// Factor one channel's target audio spectrum into its residue vector —
+/// the encoder-side inverse of [`crate::packet::dot_product`].
+///
+/// Given the length-`n/2` `spectrum` the encoder wants the decoder to
+/// reconstruct and the length-`n/2` `floor` curve the encoder has
+/// already chosen for the channel, this writes the residue vector
+/// `residue[i] = spectrum[i] / floor[i]` such that the decoder's §4.3.6
+/// product `floor ⊙ residue` reproduces `spectrum` bit-exactly wherever
+/// the floor is finite and nonzero. Where `floor[i] == 0` the residue is
+/// unconstrained and the canonical `0.0` is emitted (the target must
+/// itself be zero there — see the module header).
+///
+/// `residue` is a caller-allocated output buffer; it is overwritten in
+/// full on success and left in an unspecified partially-written state on
+/// error (the caller discards it).
+///
+/// # Errors
+///
+/// [`FactorSpectrumError::LengthMismatch`] if `spectrum`, `floor` and
+/// `residue` are not all the same length;
+/// [`FactorSpectrumError::NonFiniteFloor`] for a `NaN`/`±∞` floor bin;
+/// [`FactorSpectrumError::NonzeroSpectrumOverZeroFloor`] if the target
+/// is nonzero at a zero-floor bin. The `channel` coordinate in the
+/// latter two is `0` (use [`factor_spectrum_all`] for per-channel
+/// coordinates).
+pub fn factor_spectrum(
+    spectrum: &[f32],
+    floor: &[f32],
+    residue: &mut [f32],
+) -> Result<(), FactorSpectrumError> {
+    if spectrum.len() != floor.len() {
+        return Err(FactorSpectrumError::LengthMismatch {
+            spectrum_len: spectrum.len(),
+            floor_len: floor.len(),
+        });
+    }
+    if residue.len() != spectrum.len() {
+        return Err(FactorSpectrumError::LengthMismatch {
+            spectrum_len: spectrum.len(),
+            floor_len: residue.len(),
+        });
+    }
+    for (index, ((out, &s), &fl)) in residue
+        .iter_mut()
+        .zip(spectrum.iter())
+        .zip(floor.iter())
+        .enumerate()
+    {
+        *out = factor_spectrum_scalar(s, fl, 0, index)?;
+    }
+    Ok(())
+}
+
+/// Factor every channel's target audio spectrum into its residue vector
+/// — the encoder-side inverse of [`crate::packet::dot_product_all`].
+///
+/// * `spectra[channel]` is the channel's length-`half_n` target audio
+///   spectrum (the §4.3.6 output the encoder wants the decoder to
+///   reconstruct).
+/// * `floors[channel]` is the channel's chosen floor curve, or [`None`]
+///   for a channel the encoder is coding as `'unused'` (§4.3.2 step 6 /
+///   §4.3.3 — the decode-side counterpart [`crate::packet::dot_product_all`]
+///   models such a channel as a `None` floor and emits the all-zero
+///   spectrum). A `None` channel's target must therefore be all zero;
+///   the recovered residue is the empty vector (the channel carries no
+///   residue in the stream).
+///
+/// Returns one residue vector per channel, in channel order: the
+/// length-`half_n` factored residue for a `Some` floor, or an empty
+/// vector for a `None` (unused) floor.
+///
+/// # Errors
+///
+/// [`FactorSpectrumError::ChannelCountMismatch`] if `spectra` and
+/// `floors` differ in channel count; [`FactorSpectrumError::LengthMismatch`]
+/// if a `Some` floor curve and its paired spectrum disagree on length;
+/// [`FactorSpectrumError::NonFiniteFloor`] /
+/// [`FactorSpectrumError::NonzeroSpectrumOverZeroFloor`] (carrying the
+/// channel index) from the per-bin factoring, including a `None`
+/// channel whose target spectrum is not all zero (reported as a zero
+/// floor over the first nonzero bin).
+pub fn factor_spectrum_all(
+    spectra: &[Vec<f32>],
+    floors: &[Option<Vec<f32>>],
+) -> Result<Vec<Vec<f32>>, FactorSpectrumError> {
+    if spectra.len() != floors.len() {
+        return Err(FactorSpectrumError::ChannelCountMismatch {
+            spectra: spectra.len(),
+            floors: floors.len(),
+        });
+    }
+    let mut out = Vec::with_capacity(spectra.len());
+    for (channel, (spectrum, floor)) in spectra.iter().zip(floors.iter()).enumerate() {
+        match floor {
+            // An 'unused' channel carries no residue; its target spectrum
+            // must be all zero (the decoder emits zero for it regardless).
+            None => {
+                for (index, &s) in spectrum.iter().enumerate() {
+                    if s != 0.0 {
+                        return Err(FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                            channel,
+                            index,
+                            spectrum: s,
+                        });
+                    }
+                }
+                out.push(Vec::new());
+            }
+            Some(curve) => {
+                if curve.len() != spectrum.len() {
+                    return Err(FactorSpectrumError::LengthMismatch {
+                        spectrum_len: spectrum.len(),
+                        floor_len: curve.len(),
+                    });
+                }
+                let mut residue = vec![0.0f32; spectrum.len()];
+                for (index, ((out_bin, &s), &fl)) in residue
+                    .iter_mut()
+                    .zip(spectrum.iter())
+                    .zip(curve.iter())
+                    .enumerate()
+                {
+                    *out_bin = factor_spectrum_scalar(s, fl, channel, index)?;
+                }
+                out.push(residue);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1508,5 +1796,236 @@ mod tests {
         forward_couple_all(&mut spectra, &coupling).expect("forward couple succeeds");
         inverse_couple_all(&mut spectra, &coupling).expect("inverse couple succeeds");
         assert_eq!(spectra, original);
+    }
+
+    // ---- spectrum factoring (§4.3.6 inverse) ----
+
+    use crate::packet::{dot_product, dot_product_all};
+
+    #[test]
+    fn factor_spectrum_scalar_divides_for_nonzero_floor() {
+        // residue = spectrum / floor for a finite nonzero floor.
+        assert_eq!(factor_spectrum_scalar(6.0, 2.0, 0, 0).unwrap(), 3.0);
+        assert_eq!(factor_spectrum_scalar(-6.0, 2.0, 0, 0).unwrap(), -3.0);
+        assert_eq!(factor_spectrum_scalar(6.0, -2.0, 0, 0).unwrap(), -3.0);
+        assert_eq!(factor_spectrum_scalar(0.0, 4.0, 0, 0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn factor_spectrum_scalar_zero_floor_zero_spectrum_yields_zero() {
+        // floor == 0 with a zero target: residue is unconstrained, emit 0.
+        assert_eq!(factor_spectrum_scalar(0.0, 0.0, 0, 0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn factor_spectrum_scalar_zero_floor_nonzero_spectrum_rejected() {
+        // floor == 0 cannot reproduce a nonzero spectrum.
+        assert_eq!(
+            factor_spectrum_scalar(1.5, 0.0, 2, 7),
+            Err(FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                channel: 2,
+                index: 7,
+                spectrum: 1.5,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_scalar_non_finite_floor_rejected() {
+        assert_eq!(
+            factor_spectrum_scalar(1.0, f32::NAN, 1, 3),
+            Err(FactorSpectrumError::NonFiniteFloor {
+                channel: 1,
+                index: 3,
+            })
+        );
+        assert_eq!(
+            factor_spectrum_scalar(1.0, f32::INFINITY, 0, 0),
+            Err(FactorSpectrumError::NonFiniteFloor {
+                channel: 0,
+                index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_round_trips_through_dot_product() {
+        // The core property: factor a spectrum given a floor, then run
+        // the decode-side §4.3.6 dot product back over (floor, residue)
+        // and recover the original spectrum bit-exactly.
+        let floor = vec![2.0_f32, 0.5, -4.0, 8.0];
+        let spectrum = vec![6.0_f32, -1.0, 12.0, 2.0];
+        let mut residue = vec![0.0_f32; spectrum.len()];
+        factor_spectrum(&spectrum, &floor, &mut residue).unwrap();
+        // residue == spectrum / floor element-wise.
+        assert_eq!(residue, vec![3.0_f32, -2.0, -3.0, 0.25]);
+        let mut reconstructed = vec![0.0_f32; spectrum.len()];
+        dot_product(&floor, &residue, &mut reconstructed);
+        assert_eq!(reconstructed, spectrum);
+    }
+
+    #[test]
+    fn factor_spectrum_round_trips_with_zero_floor_bins() {
+        // Zero floor bins must carry a zero target; the recovered
+        // residue is 0 there and the dot product still reproduces 0.
+        let floor = vec![3.0_f32, 0.0, 5.0, 0.0];
+        let spectrum = vec![9.0_f32, 0.0, -10.0, 0.0];
+        let mut residue = vec![1.0_f32; spectrum.len()]; // garbage pre-fill
+        factor_spectrum(&spectrum, &floor, &mut residue).unwrap();
+        assert_eq!(residue, vec![3.0_f32, 0.0, -2.0, 0.0]);
+        let mut reconstructed = vec![0.0_f32; spectrum.len()];
+        dot_product(&floor, &residue, &mut reconstructed);
+        assert_eq!(reconstructed, spectrum);
+    }
+
+    #[test]
+    fn factor_spectrum_rejects_spectrum_floor_length_mismatch() {
+        let spectrum = vec![1.0_f32, 2.0];
+        let floor = vec![1.0_f32];
+        let mut residue = vec![0.0_f32; 2];
+        assert_eq!(
+            factor_spectrum(&spectrum, &floor, &mut residue),
+            Err(FactorSpectrumError::LengthMismatch {
+                spectrum_len: 2,
+                floor_len: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_rejects_residue_length_mismatch() {
+        let spectrum = vec![1.0_f32, 2.0];
+        let floor = vec![1.0_f32, 1.0];
+        let mut residue = vec![0.0_f32; 3];
+        assert_eq!(
+            factor_spectrum(&spectrum, &floor, &mut residue),
+            Err(FactorSpectrumError::LengthMismatch {
+                spectrum_len: 2,
+                floor_len: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_all_round_trips_through_dot_product_all() {
+        // Multi-channel: factor each channel, then dot_product_all back.
+        let floors = vec![Some(vec![2.0_f32, 4.0]), Some(vec![1.0_f32, -2.0])];
+        let spectra = vec![vec![6.0_f32, 8.0], vec![5.0_f32, 4.0]];
+        let residues = factor_spectrum_all(&spectra, &floors).unwrap();
+        assert_eq!(residues, vec![vec![3.0_f32, 2.0], vec![5.0_f32, -2.0]]);
+        let reconstructed = dot_product_all(&floors, &residues, 2).unwrap();
+        assert_eq!(reconstructed, spectra);
+    }
+
+    #[test]
+    fn factor_spectrum_all_unused_channel_yields_empty_residue() {
+        // A None floor (unused channel) with an all-zero target produces
+        // an empty residue and dot_product_all emits the zero spectrum.
+        let floors = vec![Some(vec![2.0_f32, 4.0]), None];
+        let spectra = vec![vec![6.0_f32, 8.0], vec![0.0_f32, 0.0]];
+        let residues = factor_spectrum_all(&spectra, &floors).unwrap();
+        assert_eq!(residues, vec![vec![3.0_f32, 2.0], Vec::<f32>::new()]);
+        // dot_product_all reads only the used channel's residue; the
+        // unused channel emits the all-zero spectrum.
+        let used_floors = vec![Some(vec![2.0_f32, 4.0]), None];
+        let used_residues = vec![vec![3.0_f32, 2.0], vec![0.0_f32, 0.0]];
+        let reconstructed = dot_product_all(&used_floors, &used_residues, 2).unwrap();
+        assert_eq!(reconstructed, spectra);
+    }
+
+    #[test]
+    fn factor_spectrum_all_unused_channel_nonzero_target_rejected() {
+        // An unused channel whose target spectrum is not all-zero is
+        // inconsistent (the decoder emits zero for it regardless).
+        let floors = vec![None];
+        let spectra = vec![vec![0.0_f32, 0.0, 2.5]];
+        assert_eq!(
+            factor_spectrum_all(&spectra, &floors),
+            Err(FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                channel: 0,
+                index: 2,
+                spectrum: 2.5,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_all_rejects_channel_count_mismatch() {
+        let spectra = vec![vec![1.0_f32], vec![2.0_f32]];
+        let floors = vec![Some(vec![1.0_f32])];
+        assert_eq!(
+            factor_spectrum_all(&spectra, &floors),
+            Err(FactorSpectrumError::ChannelCountMismatch {
+                spectra: 2,
+                floors: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_all_rejects_floor_spectrum_length_mismatch() {
+        let spectra = vec![vec![1.0_f32, 2.0]];
+        let floors = vec![Some(vec![1.0_f32])];
+        assert_eq!(
+            factor_spectrum_all(&spectra, &floors),
+            Err(FactorSpectrumError::LengthMismatch {
+                spectrum_len: 2,
+                floor_len: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_all_propagates_channel_coordinate_on_error() {
+        // The per-channel index must be carried into the error from the
+        // second channel, not reported as 0.
+        let floors = vec![Some(vec![2.0_f32]), Some(vec![0.0_f32])];
+        let spectra = vec![vec![4.0_f32], vec![1.0_f32]];
+        assert_eq!(
+            factor_spectrum_all(&spectra, &floors),
+            Err(FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                channel: 1,
+                index: 0,
+                spectrum: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn factor_spectrum_error_display_is_grep_friendly() {
+        // Every variant's Display mentions the §4.3.6 inverse and the
+        // offending values, so a log grep can find them.
+        let variants = [
+            FactorSpectrumError::LengthMismatch {
+                spectrum_len: 4,
+                floor_len: 5,
+            },
+            FactorSpectrumError::ChannelCountMismatch {
+                spectra: 2,
+                floors: 1,
+            },
+            FactorSpectrumError::NonFiniteFloor {
+                channel: 1,
+                index: 3,
+            },
+            FactorSpectrumError::NonzeroSpectrumOverZeroFloor {
+                channel: 2,
+                index: 7,
+                spectrum: 1.5,
+            },
+        ];
+        for v in &variants {
+            let s = v.to_string();
+            assert!(
+                s.contains("§4.3.6 inverse"),
+                "Display should cite §4.3.6 inverse, got: {s}"
+            );
+            assert!(!s.is_empty());
+        }
+        // source() is None for all variants (no wrapped error).
+        use std::error::Error as _;
+        for v in &variants {
+            assert!(v.source().is_none());
+        }
     }
 }
