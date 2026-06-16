@@ -167,6 +167,7 @@ pub mod overlap;
 pub mod packet;
 pub mod packet_kind;
 pub mod residue;
+pub mod residue_encode;
 pub mod setup;
 pub mod streaming;
 pub mod synthesis;
@@ -224,6 +225,9 @@ pub use packet_kind::{
     PacketKind,
 };
 pub use residue::{ResidueDecoder, ResidueError};
+pub use residue_encode::{
+    plan_partition_cascade, plan_vector_partition_entries, ResidueEncodeError,
+};
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
     FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap, ModeHeader,

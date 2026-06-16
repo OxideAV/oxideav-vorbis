@@ -73,6 +73,23 @@ the lowest index, sparse-codebook unused entries skipped) and returns the
 entry index plus its decoded reconstruction and the squared-distance
 residual for residue-stage (§8.6.2) cascading.
 
+The **residue VQ-encode cascade planner** (`residue_encode` module:
+`plan_partition_cascade` + `plan_vector_partition_entries`) is the glue
+that sits between `vq::quantize_vector` and the residue WRITE path. Given
+a partition's real spectral residual it walks the §8.6.2 cascade in the
+write direction — gathering each VQ read's sub-vector from the running
+residual at the exact positions the decoder scatters into (§8.6.3 strided
+for format 0, §8.6.4 contiguous for formats 1/2, format 2 reduced to
+format 1 per §8.6.5), quantising each via `quantize_vector`, then
+subtracting the chosen entry's reconstruction so the next cascade stage
+refines the leftover error (the inverse of §8.6.2 step 19's additive
+`+=` accumulation). It produces exactly the per-`(partition, pass)`
+entry-index lists `encoder::ResidueVectorPlan::partition_entries` /
+`write_residue_body` already consume; an independent decode-reconstruct
+oracle pins the round-trip across both addressing formats and multi-stage
+refinement. The encoder WRITE primitives no longer need the residue
+entry indices supplied by hand.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container
@@ -86,13 +103,11 @@ residual for residue-stage (§8.6.2) cascading.
   fixture traces" and the staged traces under
   `docs/audio/vorbis/fixtures/<case>/` do not yet log post-MDCT
   samples. Pinning it is the remaining gap before sample-exact PCM.
-- **The residue / floor-0 VQ-encode glue** — the nearest-entry
-  quantiser leaf (`vq::quantize_vector`) now turns a single target
-  vector into a codebook entry index, but the surrounding glue that
-  slices a residue partition (§8.6.2) into per-entry sub-vectors, walks
-  the cascade stages feeding each stage's residual to the next, and maps
-  real floor-0 LSP coefficients (§6.2.2) onto entry sequences is the
-  remaining encode followup. The WRITE primitives still take explicit
+- **The floor-0 VQ-encode glue** — the residue-side cascade glue now
+  exists (`residue_encode::plan_partition_cascade` /
+  `plan_vector_partition_entries`, see below), but mapping real floor-0
+  LSP coefficients (§6.2.2) onto entry sequences is the remaining
+  encode followup. The floor-0 WRITE primitive still takes explicit
   entry indices.
 
 ## Clean-room provenance

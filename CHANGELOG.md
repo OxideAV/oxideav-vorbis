@@ -6,6 +6,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §8.6.2 residue VQ-encode cascade planner (`residue_encode` module:
+  `plan_partition_cascade`, `plan_vector_partition_entries`,
+  `ResidueEncodeError`). The glue between the `vq::quantize_vector` leaf
+  and the residue WRITE path: given a partition's real spectral residual
+  it walks the §8.6.2 cascade in the write direction — gathering each VQ
+  read's sub-vector from the running residual at the positions the
+  decoder scatters into (§8.6.3 strided for format 0, §8.6.4 contiguous
+  for formats 1/2, format 2 reduced to format 1 per §8.6.5), quantising
+  each with `quantize_vector`, then subtracting the chosen entry's
+  reconstruction so the next cascade stage refines the leftover error
+  (the inverse of §8.6.2 step 19's additive accumulation). It produces
+  exactly the per-`(partition, pass)` entry-index lists
+  `encoder::ResidueVectorPlan::partition_entries` / `write_residue_body`
+  consume, so the residue WRITE primitives no longer need their entry
+  indices supplied by hand. An independent decode-reconstruct oracle
+  pins the round-trip across both addressing formats, the non-divisible
+  format-1 tail, and multi-stage cascade refinement.
 - §3.2.1 VQ-encode quantiser (`vq::quantize_vector` + `QuantizedEntry` /
   `QuantizeError`): the encode-side inverse of `unpack_vector`. Given a
   target vector it scans the codebook's **used** entries (skipping
