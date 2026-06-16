@@ -236,7 +236,10 @@ pub use synthesis::{
     forward_couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window,
     window_premultiply, CouplingError, FactorSpectrumError, WindowError, WindowPremultiplyError,
 };
-pub use vq::{unpack_vector, UnpackError as VqUnpackError};
+pub use vq::{
+    quantize_vector, unpack_vector, QuantizeError as VqQuantizeError, QuantizedEntry,
+    UnpackError as VqUnpackError,
+};
 
 /// Crate-local error type for the in-progress clean-room rebuild.
 #[derive(Debug, Clone, PartialEq)]

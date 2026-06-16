@@ -6,6 +6,19 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §3.2.1 VQ-encode quantiser (`vq::quantize_vector` + `QuantizedEntry` /
+  `QuantizeError`): the encode-side inverse of `unpack_vector`. Given a
+  target vector it scans the codebook's **used** entries (skipping
+  sparse-codebook entries with codeword length `0`, which the decoder
+  can never reach), decodes each through the same §3.2.1 lattice /
+  tessellation transform, and returns the entry minimising the
+  squared-Euclidean distance (ties → lowest index, deterministic). The
+  returned `vector` is bit-identical to `unpack_vector` for the chosen
+  entry, and `distance_sq` is the residual a cascaded residue stage
+  (§8.6.2) would quantise next. This is the leaf the residue / floor 0
+  WRITE primitives call to turn real scalars into the explicit entry
+  indices they already serialise — the previously-named remaining
+  residue-side encode followup.
 - §4.3.9 output channel order (`channel_order` module): `speaker_layout`
   / `speaker_at` resolve each encoded-stream channel index to its
   mapping-type-0 physical speaker location across the 1..=8-channel

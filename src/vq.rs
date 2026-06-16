@@ -64,8 +64,47 @@
 //! (§8.6) calls into this routine once per partition once per stage of
 //! the cascade; this module provides the leaf transformation only —
 //! the residue-side glue belongs in a future round.
+//!
+//! ## Encode direction: the VQ quantiser ([`quantize_vector`])
+//!
+//! Encode is the inverse of [`unpack_vector`]. The Vorbis I spec is a
+//! *decode* specification: §3.2.1 fixes, for each codebook entry, the
+//! one vector the decoder will reconstruct, but it leaves the encoder
+//! free to choose *which* entry to emit for a given input — any legal
+//! entry index produces a conformant bitstream. The natural,
+//! spec-grounded choice is the entry whose §3.2.1-decoded vector lies
+//! nearest the target, since that minimises the reconstruction error
+//! the decoder will incur. [`quantize_vector`] implements exactly that:
+//! it enumerates the codebook's entries, decodes each through the same
+//! §3.2.1 lattice / tessellation transform [`unpack_vector`] uses, and
+//! returns the entry index minimising the squared-Euclidean distance to
+//! the target (ties broken toward the lowest index for determinism).
+//!
+//! Two correctness fences distinguish the quantiser from a naive
+//! nearest-search:
+//!
+//! * **Unused entries are never selectable.** A sparse codebook
+//!   (§3.2.1) marks unused entries with a codeword length of
+//!   [`UNUSED_ENTRY`] (`0`). Those entries have no Huffman codeword, so
+//!   the decoder can never reach them — the encoder must not pick one
+//!   even if its multiplicand-table slot happens to decode nearest. The
+//!   quantiser skips every entry whose `codeword_lengths[i] == 0`.
+//! * **Round-trip exactness.** Because the quantiser decodes through
+//!   the same §3.2.1 transform, the vector it reports as the chosen
+//!   entry's reconstruction is bit-identical to
+//!   `unpack_vector(book, chosen_entry)` — the decoder reconstructs
+//!   precisely that vector. This is the property the encode/decode
+//!   round-trip tests pin.
+//!
+//! The quantiser is the leaf the residue VQ-codeword body writer
+//! (§8.6.3/§8.6.4/§8.6.5) and the floor 0 LSP-coefficient packer
+//! (§6.2.2) call to turn real residue / floor scalars into the explicit
+//! entry indices their WRITE primitives already serialise; this module
+//! provides that leaf only — the residue/floor-side glue that slices a
+//! partition into per-entry sub-vectors and walks the cascade stages
+//! belongs in a future round.
 
-use crate::codebook::{VorbisCodebook, VqLookup};
+use crate::codebook::{VorbisCodebook, VqLookup, UNUSED_ENTRY};
 
 /// Errors that can arise while unpacking a VQ vector from a codebook
 /// entry (Vorbis I §3.2.1 / §3.3).
@@ -315,6 +354,191 @@ fn unpack_tessellation(
         // to do per iteration).
     }
     Ok(value_vector)
+}
+
+/// Errors that can arise while quantising a target vector to a codebook
+/// entry (the encode-side inverse of [`unpack_vector`]; Vorbis I
+/// §3.2.1 / §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuantizeError {
+    /// The codebook's `codebook_lookup_type` is `0` (entropy-only) and
+    /// has no VQ vectors to quantise against. A type-0 codebook emits
+    /// scalar entry indices directly (its entry *is* the value), so
+    /// nearest-vector quantisation is undefined — the caller should
+    /// drive a type-0 book through the scalar entropy path, not this
+    /// routine. Mirrors [`UnpackError::NoVectorForType0`].
+    NoVectorForType0,
+    /// The codebook's `codebook_dimensions` is zero, so there is no
+    /// per-entry vector to compare against. Mirrors
+    /// [`UnpackError::ZeroDimensions`].
+    ZeroDimensions,
+    /// The supplied target vector's length does not equal the
+    /// codebook's `dimensions`. Quantisation compares element-by-element
+    /// over exactly `dimensions` coordinates; a length mismatch is a
+    /// caller bug.
+    TargetDimensionMismatch {
+        /// The supplied target length.
+        got: usize,
+        /// The codebook's `dimensions` field.
+        expected: usize,
+    },
+    /// Every entry of the codebook is marked unused (`codeword_length
+    /// == 0`), so the decoder can reach none of them and there is no
+    /// legal entry to emit. The spec rejects fully-unused codebooks at
+    /// tree-construction time (§3.2.1 "underspecified tree"); this
+    /// surfaces the same condition from the encode side.
+    NoUsableEntries,
+    /// A per-entry [`unpack_vector`] call failed while scanning the
+    /// codebook — almost always a [`UnpackError::MultiplicandShapeMismatch`]
+    /// from a hand-constructed [`VorbisCodebook`] whose multiplicand
+    /// table desyncs its declared shape. The inner error is carried for
+    /// context.
+    Unpack(UnpackError),
+}
+
+impl core::fmt::Display for QuantizeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            QuantizeError::NoVectorForType0 => write!(
+                f,
+                "vorbis VQ quantise: codebook_lookup_type = 0 has no vectors to quantise (§3.3)"
+            ),
+            QuantizeError::ZeroDimensions => {
+                write!(f, "vorbis VQ quantise: codebook_dimensions = 0 (§3.2.1)")
+            }
+            QuantizeError::TargetDimensionMismatch { got, expected } => write!(
+                f,
+                "vorbis VQ quantise: target length {got} != codebook_dimensions {expected} (§3.2.1)"
+            ),
+            QuantizeError::NoUsableEntries => write!(
+                f,
+                "vorbis VQ quantise: every codebook entry is unused (§3.2.1)"
+            ),
+            QuantizeError::Unpack(inner) => {
+                write!(f, "vorbis VQ quantise: entry unpack failed: {inner}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for QuantizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            QuantizeError::Unpack(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}
+
+impl From<UnpackError> for QuantizeError {
+    fn from(inner: UnpackError) -> Self {
+        QuantizeError::Unpack(inner)
+    }
+}
+
+/// The result of quantising a target vector to a codebook entry.
+///
+/// `entry` is the chosen codebook entry index — the value a residue /
+/// floor 0 WRITE primitive Huffman-codes. `vector` is that entry's
+/// §3.2.1-decoded reconstruction (bit-identical to
+/// `unpack_vector(book, entry)`), i.e. exactly what the decoder will
+/// reconstruct. `distance_sq` is the squared-Euclidean distance from
+/// the target to `vector` — the residual quantisation error, useful for
+/// a caller cascading multiple residue stages (§8.6.2) where stage
+/// `s + 1` quantises the leftover `target - vector`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantizedEntry {
+    /// The selected codebook entry index.
+    pub entry: u32,
+    /// The entry's §3.2.1-decoded vector (the decoder's reconstruction).
+    pub vector: Vec<f32>,
+    /// Squared-Euclidean distance from the target to `vector`.
+    pub distance_sq: f64,
+}
+
+/// Quantises `target` to the nearest codebook entry — the encode-side
+/// inverse of [`unpack_vector`] (Vorbis I §3.2.1 / §3.3).
+///
+/// Scans the codebook's **used** entries (those whose
+/// `codeword_lengths[i] != `[`UNUSED_ENTRY`]), decodes each through the
+/// same §3.2.1 lattice / tessellation transform [`unpack_vector`] uses,
+/// and returns the [`QuantizedEntry`] whose decoded vector minimises the
+/// squared-Euclidean distance to `target`. Ties are broken toward the
+/// lowest entry index, so the result is deterministic across runs.
+///
+/// Unused entries are never selected: a sparse codebook (§3.2.1) has no
+/// Huffman codeword for them, so the decoder can never reconstruct one,
+/// and emitting such an index would be a malformed stream. Because the
+/// scan decodes through the §3.2.1 transform, the returned `vector` is
+/// bit-identical to `unpack_vector(codebook, returned.entry)`.
+///
+/// # Errors
+///
+/// * [`QuantizeError::NoVectorForType0`] — the codebook is entropy-only
+///   (`lookup_type = 0`); use the scalar entropy path instead.
+/// * [`QuantizeError::ZeroDimensions`] — the codebook has no per-entry
+///   vector to compare against.
+/// * [`QuantizeError::TargetDimensionMismatch`] — `target.len()` is not
+///   the codebook's `dimensions`.
+/// * [`QuantizeError::NoUsableEntries`] — every entry is unused.
+/// * [`QuantizeError::Unpack`] — a per-entry unpack failed (e.g. a
+///   hand-constructed codebook with a desynced multiplicand table).
+pub fn quantize_vector(
+    codebook: &VorbisCodebook,
+    target: &[f32],
+) -> Result<QuantizedEntry, QuantizeError> {
+    if matches!(codebook.lookup, VqLookup::None) {
+        return Err(QuantizeError::NoVectorForType0);
+    }
+    let dims = codebook.dimensions as usize;
+    if dims == 0 {
+        return Err(QuantizeError::ZeroDimensions);
+    }
+    if target.len() != dims {
+        return Err(QuantizeError::TargetDimensionMismatch {
+            got: target.len(),
+            expected: dims,
+        });
+    }
+
+    let mut best: Option<QuantizedEntry> = None;
+    for entry in 0..codebook.entries {
+        // Sparse-codebook fence: the decoder can never emit an entry
+        // with no Huffman codeword, so the quantiser must not pick one.
+        // `codeword_lengths` is `entries`-long by construction; guard the
+        // index defensively for hand-built codebooks all the same.
+        match codebook.codeword_lengths.get(entry as usize) {
+            Some(&len) if len != UNUSED_ENTRY => {}
+            _ => continue,
+        }
+
+        let vector = unpack_vector(codebook, entry)?;
+        // Squared-Euclidean distance accumulated in f64: residue value
+        // books are 8-dimensional and a partition can chain many of
+        // them, so a wide accumulator keeps the tie-break stable against
+        // f32 rounding of near-equal candidates.
+        let mut distance_sq = 0.0f64;
+        for (t, v) in target.iter().zip(vector.iter()) {
+            let d = f64::from(*t) - f64::from(*v);
+            distance_sq += d * d;
+        }
+
+        let replace = match &best {
+            None => true,
+            // Strict `<` keeps the lowest index on an exact tie (the
+            // running best was found at a lower entry first).
+            Some(cur) => distance_sq < cur.distance_sq,
+        };
+        if replace {
+            best = Some(QuantizedEntry {
+                entry,
+                vector,
+                distance_sq,
+            });
+        }
+    }
+
+    best.ok_or(QuantizeError::NoUsableEntries)
 }
 
 #[cfg(test)]
@@ -733,5 +957,291 @@ mod tests {
         );
         // sequence_p=0 ⇒ last stays 0 ⇒ each step = 0*1 + 1 + 0 = 1.
         assert_eq!(unpack_vector(&cb, 0).unwrap(), vec![1.0, 1.0, 1.0]);
+    }
+
+    // ---------- encode: quantize_vector (§3.2.1 inverse) ----------
+
+    /// Builds a [`VorbisCodebook`] with explicit per-entry codeword
+    /// lengths, so quantiser tests can mark specific entries unused
+    /// ([`UNUSED_ENTRY`]) and assert they are never selected.
+    fn make_codebook_with_lengths(
+        dimensions: u16,
+        lengths: Vec<u8>,
+        lookup: VqLookup,
+    ) -> VorbisCodebook {
+        VorbisCodebook {
+            dimensions,
+            entries: lengths.len() as u32,
+            codeword_lengths: lengths,
+            lookup,
+        }
+    }
+
+    /// A type-0 codebook has no vectors; quantising against it is a
+    /// structured error (the scalar entropy path is the caller's job).
+    #[test]
+    fn quantize_type0_is_rejected() {
+        let cb = make_codebook(2, 4, VqLookup::None);
+        assert_eq!(
+            quantize_vector(&cb, &[0.0, 0.0]),
+            Err(QuantizeError::NoVectorForType0)
+        );
+    }
+
+    /// A target whose length differs from `dimensions` is a caller bug.
+    #[test]
+    fn quantize_target_dimension_mismatch_is_caught() {
+        let cb = make_codebook(
+            2,
+            2,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1],
+            },
+        );
+        assert_eq!(
+            quantize_vector(&cb, &[0.0, 0.0, 0.0]),
+            Err(QuantizeError::TargetDimensionMismatch {
+                got: 3,
+                expected: 2,
+            })
+        );
+    }
+
+    /// `dimensions = 0` is rejected before any scan.
+    #[test]
+    fn quantize_zero_dimensions_is_rejected() {
+        let cb = make_codebook(
+            0,
+            1,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![],
+            },
+        );
+        assert_eq!(
+            quantize_vector(&cb, &[]),
+            Err(QuantizeError::ZeroDimensions)
+        );
+    }
+
+    /// A codebook whose every entry is unused has no legal entry to
+    /// emit; the quantiser surfaces [`QuantizeError::NoUsableEntries`].
+    #[test]
+    fn quantize_all_unused_is_rejected() {
+        let cb = make_codebook_with_lengths(
+            2,
+            vec![UNUSED_ENTRY, UNUSED_ENTRY],
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 5, 5],
+            },
+        );
+        assert_eq!(
+            quantize_vector(&cb, &[5.0, 5.0]),
+            Err(QuantizeError::NoUsableEntries)
+        );
+    }
+
+    /// A desynced multiplicand table propagates the unpack error.
+    #[test]
+    fn quantize_propagates_unpack_error() {
+        let cb = make_codebook(
+            2,
+            3,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                // 3 entries × 2 dims = 6 expected, give 5.
+                multiplicands: vec![0, 1, 2, 3, 4],
+            },
+        );
+        assert!(matches!(
+            quantize_vector(&cb, &[0.0, 0.0]),
+            Err(QuantizeError::Unpack(
+                UnpackError::MultiplicandShapeMismatch { .. }
+            ))
+        ));
+    }
+
+    /// Exact-hit: when the target equals one entry's decoded vector, the
+    /// quantiser returns that entry with `distance_sq == 0`, and the
+    /// returned `vector` is bit-identical to `unpack_vector` for it.
+    #[test]
+    fn quantize_exact_hit_returns_zero_distance() {
+        // 4 entries, 2 dims, identity-ish tessellation:
+        //   e0 → [0,0]  e1 → [2,2]  e2 → [4,4]  e3 → [6,6]
+        let cb = make_codebook(
+            2,
+            4,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 2.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        );
+        let q = quantize_vector(&cb, &[4.0, 4.0]).unwrap();
+        assert_eq!(q.entry, 2);
+        assert_eq!(q.distance_sq, 0.0);
+        assert_eq!(q.vector, unpack_vector(&cb, 2).unwrap());
+        assert_eq!(q.vector, vec![4.0, 4.0]);
+    }
+
+    /// Nearest-not-equal: a target between two entries snaps to the
+    /// closer one by squared-Euclidean distance.
+    #[test]
+    fn quantize_picks_nearest_by_squared_distance() {
+        // Same book as above: entries at [0,0],[2,2],[4,4],[6,6].
+        let cb = make_codebook(
+            2,
+            4,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 2.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        );
+        // [3.4, 3.4] is closer to [4,4] (d²=0.72) than [2,2] (d²=3.92).
+        let q = quantize_vector(&cb, &[3.4, 3.4]).unwrap();
+        assert_eq!(q.entry, 2);
+        // [2.9, 2.9] is closer to [2,2] (d²=1.62) than [4,4] (d²=2.42).
+        let q2 = quantize_vector(&cb, &[2.9, 2.9]).unwrap();
+        assert_eq!(q2.entry, 1);
+    }
+
+    /// An entry that decodes nearest but is marked unused is skipped in
+    /// favour of the nearest *used* entry — the sparse-codebook fence.
+    #[test]
+    fn quantize_skips_unused_nearest_entry() {
+        // entries at [0,0],[2,2],[4,4],[6,6]; mark e2 ([4,4]) unused.
+        let cb = make_codebook_with_lengths(
+            2,
+            vec![1, 1, UNUSED_ENTRY, 1],
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 2.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        );
+        // [4,4] would be an exact hit on the unused e2; the nearest used
+        // entries are e1 ([2,2], d²=8) and e3 ([6,6], d²=8) — a tie, so
+        // the lower index e1 wins.
+        let q = quantize_vector(&cb, &[4.0, 4.0]).unwrap();
+        assert_eq!(q.entry, 1);
+        assert_eq!(q.distance_sq, 8.0);
+    }
+
+    /// Tie-break determinism: an exactly-equidistant target snaps to the
+    /// lower entry index.
+    #[test]
+    fn quantize_ties_break_to_lower_index() {
+        // entries at [0,0],[2,2],[4,4],[6,6]; [3,3] is equidistant from
+        // e1 ([2,2], d²=2) and e2 ([4,4], d²=2) → lower index e1.
+        let cb = make_codebook(
+            2,
+            4,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 2.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        );
+        let q = quantize_vector(&cb, &[3.0, 3.0]).unwrap();
+        assert_eq!(q.entry, 1);
+        assert_eq!(q.distance_sq, 2.0);
+    }
+
+    /// Lattice (lookup-1) books quantise through the same §3.2.1 mixed-
+    /// base transform: round-trip every entry of the 3×3 lattice from
+    /// the decode test and confirm each decoded vector quantises back to
+    /// its own entry with zero distance.
+    #[test]
+    fn quantize_lattice_round_trips_each_entry() {
+        let multiplicands = vec![7u32, 11, 13];
+        let cb = make_codebook(
+            2,
+            9,
+            VqLookup::Lattice {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands,
+            },
+        );
+        for e in 0u32..9 {
+            let vec = unpack_vector(&cb, e).unwrap();
+            let q = quantize_vector(&cb, &vec).unwrap();
+            assert_eq!(q.entry, e, "entry {e} should quantise back to itself");
+            assert_eq!(q.distance_sq, 0.0);
+            assert_eq!(q.vector, vec);
+        }
+    }
+
+    /// `sequence_p = 1` (prefix-sum) books quantise correctly: the
+    /// decoded vectors are still compared element-wise, so each entry
+    /// round-trips to itself.
+    #[test]
+    fn quantize_honours_sequence_p() {
+        // 3 entries, 2 dims, cumulative. Decoded:
+        //   e0 → [0+0, 0+0+0] ... compute via unpack to be safe.
+        let cb = make_codebook(
+            2,
+            3,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: true,
+                multiplicands: vec![1, 2, 3, 4, 5, 6],
+            },
+        );
+        for e in 0u32..3 {
+            let vec = unpack_vector(&cb, e).unwrap();
+            let q = quantize_vector(&cb, &vec).unwrap();
+            assert_eq!(q.entry, e);
+            assert_eq!(q.distance_sq, 0.0);
+        }
+    }
+
+    /// The cascade-residual contract: `distance_sq` is the squared error
+    /// the next residue stage (§8.6.2) would quantise. Check it equals a
+    /// hand-computed reference.
+    #[test]
+    fn quantize_distance_sq_is_the_residual() {
+        let cb = make_codebook(
+            2,
+            2,
+            VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 10, 10],
+            },
+        );
+        // target [1.0, 2.0] vs e0 [0,0] → 1+4 = 5; vs e1 [10,10] → far.
+        let q = quantize_vector(&cb, &[1.0, 2.0]).unwrap();
+        assert_eq!(q.entry, 0);
+        assert_eq!(q.distance_sq, 5.0);
     }
 }
