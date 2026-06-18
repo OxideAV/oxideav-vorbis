@@ -56,8 +56,12 @@
 //! * **Not a §4.3.9 channel-order rearrangement.** §4.3.9 is a
 //!   presentation concern handled by the consumer above this module;
 //!   the engine emits per-channel PCM in bitstream channel order.
-//! * **Not an IMDCT normalization pin.** `imdct_scale` is still a
-//!   caller-supplied knob (documented docs gap).
+//! * **Not an IMDCT normalization pin (any more).** `imdct_scale`
+//!   remains a caller-supplied knob, but the production value is now
+//!   pinned: pass `1.0` for sample-exact PCM. The bare §4.3.7 kernel +
+//!   §4.3.6 window + §4.3.8 overlap-add need no extra Vorbis-specific
+//!   scaling — `tests/fixture_pcm_decode.rs` reproduces eight reference
+//!   `expected.wav` dumps within ±1 s16 at `imdct_scale = 1.0`.
 
 use crate::audio::{
     decode_audio_packet_windowed, AudioDecoderState, AudioPacketError, WindowedPacketOutcome,

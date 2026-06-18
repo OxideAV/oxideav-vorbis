@@ -28,17 +28,23 @@
 //! 1. **A normalization factor.** The cross-reference document
 //!    (`imdct-cross-reference.md` §"Vorbis-specific parameters" item 5)
 //!    notes that the Vorbis-specific normalization scalar is "absorbed
-//!    into the floor and residue scaling and into the window" — it
-//!    falls out of matching the staged fixture traces, not from the
-//!    IMDCT formula in isolation. The fixture traces under
-//!    `docs/audio/vorbis/fixtures/<case>/trace.txt` do not yet log
-//!    post-IMDCT samples, so the constant scaling factor that maps this
-//!    module's bare kernel to oggdec-bit-equivalent PCM is **deliberately
-//!    deferred** to a follow-up round once those traces are extended.
-//!    [`imdct_naive`] returns the un-normalized kernel output; a
-//!    `scale` argument is provided so a future round can plug the
-//!    fixture-derived factor in at the call site without changing the
-//!    kernel signature.
+//!    into the floor and residue scaling and into the window" and "falls
+//!    out of matching the fixtures, not from the IMDCT formula in
+//!    isolation." That scalar is now **pinned to `1.0`**: the bare
+//!    cosine-summation kernel below, combined with the §4.3.6 window and
+//!    the §4.3.8 overlap-add whose §1.3.2 squared-overlap property
+//!    (`w[i]² + w[i+n/2]² == 1`) already carries the reconstruction
+//!    normalization, reproduces the reference PCM of every staged
+//!    `docs/audio/vorbis/fixtures/*/expected.wav` dump sample-for-sample
+//!    within the fixtures' documented ±1 s16 tolerance — see the
+//!    `tests/fixture_pcm_decode.rs` integration test, which drives eight
+//!    fixtures (mono / stereo, q−1..q10, CBR, all three residue formats)
+//!    through the full bitstream → PCM path at `imdct_scale = 1.0`. No
+//!    extra Vorbis-specific scaling is required. [`imdct_naive`] still
+//!    exposes a `scale` argument because it is a useful linear knob for
+//!    callers (and the kernel is, by linearity, invariant to it modulo a
+//!    multiplicative factor), but the production decode path passes
+//!    `1.0`.
 //!
 //! 2. **An FFT-decomposed fast path.** Production codecs decompose the
 //!    IMDCT into a pre-twiddle, an N/4-point IFFT, and a post-twiddle

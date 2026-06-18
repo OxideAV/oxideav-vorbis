@@ -26,6 +26,26 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §4.3 end-to-end sample-exact PCM decode + IMDCT normalization scalar
+  pinned (`tests/fixture_pcm_decode.rs`). Twelve staged fixtures
+  (`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1..q10, CBR,
+  22.05–96 kHz, floor-1-only, full-residue noise, all three residue
+  formats, and the short↔long transient block-size switch) decode through
+  the public `StreamingDecoder::push_packet` bitstream → PCM path and
+  match each fixture's `expected.wav` reference dump within the documented
+  ±1 s16 lossy tolerance. This pins the previously-deferred §4.3.7 IMDCT
+  normalization scalar to **1.0**: the bare cosine-summation kernel, the
+  §4.3.6 window, and the §4.3.8 overlap-add (whose §1.3.2 squared-overlap
+  property carries the reconstruction normalization) reproduce the
+  reference PCM with no extra Vorbis-specific scaling. The 5.1 fixture
+  additionally validates the §4.3.9 mapping-type-0 channel order
+  (bitstream `[FL,FC,FR,RL,RR,LFE]` reordered to the WAV interleave layout
+  before comparison). The `imdct.rs` / `streaming.rs` docs are updated to
+  record the pin. The test carries a minimal RFC-3533 Ogg page de-framer
+  as private test scaffolding (container framing belongs in `oxideav-ogg`;
+  this avoids a cross-crate dev-dependency) and consumes `expected.wav` as
+  opaque black-box-validator output — no reference decoder source is read.
+
 - §7.2.4 step-1 floor-1 amplitude-unwrap glue (`floor1_encode` module:
   `plan_floor1_y`, `Floor1EncodeError`). The floor-1 analogue of the
   floor-0 `plan_floor0_coefficients` glue: it inverts the §7.2.4 step-1

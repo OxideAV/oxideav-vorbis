@@ -8,10 +8,21 @@ Clean-room implementation against the Vorbis I Specification
 ## Status
 
 **Clean-room rebuild in progress.** The crate implements the full
-Vorbis I decode pipeline at the codec layer plus a growing set of
-encoder write-path primitives. It is codec-only: Ogg container
-framing and `oxideav-core` registration are not yet wired —
-`register()` is currently a no-op.
+Vorbis I decode pipeline at the codec layer — **decoding real Vorbis
+audio packets to sample-exact PCM** — plus a growing set of encoder
+write-path primitives. It is codec-only: Ogg container framing and
+`oxideav-core` registration are not yet wired — `register()` is
+currently a no-op.
+
+The §4.3 decode chain is sample-exact end to end: eight staged fixtures
+(`docs/audio/vorbis/fixtures/*` — mono / stereo, q−1 through q10, CBR,
+floor-1-only, full-residue noise, and all three residue formats) decode
+through the public `StreamingDecoder::push_packet` path to PCM that
+matches each fixture's `expected.wav` reference dump within the
+documented ±1 s16 lossy tolerance (`tests/fixture_pcm_decode.rs`). The
+§4.3.7 IMDCT normalization scalar — the last deferred decode unknown —
+is pinned to **1.0**: the bare cosine-summation kernel plus the §4.3.6
+window and §4.3.8 overlap-add need no extra Vorbis-specific scaling.
 
 ### Decode
 
@@ -132,16 +143,10 @@ degenerate floor. The floor-1 WRITE primitive no longer needs the
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container
-  layer — the crate exposes the codec primitives, not a wired codec.
-- **The Vorbis-specific MDCT normalization scalar** is a caller-supplied
-  `imdct_scale` knob, not yet pinned to a constant. The Vorbis I spec
-  defers the MDCT definition to an external reference barred by the
-  clean-room policy; the in-repo IMDCT cross-reference
-  (`docs/audio/vorbis/imdct-cross-reference.md`) reconstructs the
-  kernel, but the normalization scalar "falls out of matching the
-  fixture traces" and the staged traces under
-  `docs/audio/vorbis/fixtures/<case>/` do not yet log post-MDCT
-  samples. Pinning it is the remaining gap before sample-exact PCM.
+  layer — the crate exposes the codec primitives, not a wired codec. The
+  integration test carries a minimal RFC-3533 page de-framer as private
+  test scaffolding to feed real `input.ogg` packets to the decoder;
+  production Ogg demuxing belongs in `oxideav-ogg`.
 - **Deriving the target floor-0 LSP `[coefficients]`** — the VQ-encode
   glue mapping a target coefficient list onto the §6.2.2 entry run now
   exists (`floor0_encode::plan_floor0_coefficients`, see above), so the
