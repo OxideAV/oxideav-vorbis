@@ -30,14 +30,23 @@
 //! entry 7: length 3 codeword 111
 //! ```
 //!
-//! Construction maintains a deque of "open" tree positions in
-//! left-to-right order. Each used entry pops the leftmost open position
-//! and either places a leaf there (if it sits at the entry's depth) or
-//! splits it down to that depth — allocating a fresh internal node and
-//! pushing the new node's two children to the *front* of the deque so
-//! they remain leftmost. The deque-front-pop order matches the spec's
-//! "lowest valued unused canonical codeword" assignment one-to-one,
-//! so no codeword integers ever need to be materialised at build time.
+//! Construction places each used entry, in entry order, at the *lowest
+//! valued unused codeword* of that entry's length. The lowest free
+//! codeword of length `L` is found by descending the partially-built
+//! decision tree from the root, preferring the `0` (left) child at every
+//! level and falling back to `1` only when the `0` subtree can no longer
+//! host an `L`-deep leaf (because a shorter codeword already terminates
+//! there, or it is saturated). Interior nodes are materialised lazily
+//! along the chosen path. This realises the spec's MSb-first
+//! "lowest valued unused canonical codeword" rule directly against the
+//! tree, which is the unambiguous source of truth even when codeword
+//! lengths are *not* non-decreasing — e.g. `[2 3 3 3 3 4 3 4]`, where a
+//! shorter codeword follows a longer one. (An earlier left-to-right
+//! "open-slot deque" assigned the leftmost *tree* position at the target
+//! depth, which coincides with the lowest-valued codeword only for
+//! non-decreasing lengths; on the interleaved books libvorbis routinely
+//! emits for floor / residue classification it diverged and spuriously
+//! reported the book underspecified.)
 //!
 //! The convention used in this module: a node is a [`HuffmanNode`] enum
 //! that is either a `Leaf(entry_index)` or an `Internal { left, right }`.
@@ -64,12 +73,13 @@
 //!
 //! The construction algorithm detects both:
 //!
-//! * **Overspecified** — the deque empties before every used entry
-//!   has been placed; no open position remains to host the next leaf.
-//!   Surfaces as [`BuildError::OverspecifiedTree`].
-//! * **Underspecified** — the deque still has open positions after
-//!   every used entry is placed: the codeword-length list does not
-//!   fully populate the decision tree. Surfaces as
+//! * **Overspecified** — no free codeword of an entry's length remains
+//!   (the descent dead-ends); the length list demands more codewords
+//!   than the tree can host. Surfaces as
+//!   [`BuildError::OverspecifiedTree`].
+//! * **Underspecified** — after every used entry is placed, some
+//!   internal node still has a dangling child: the codeword-length list
+//!   does not fully populate the decision tree. Surfaces as
 //!   [`BuildError::UnderspecifiedTree`].
 //!
 //! ## Single-entry codebook (errata 20150226)
@@ -326,48 +336,37 @@ impl HuffmanTree {
             });
         }
 
-        // ---- general case: canonical-assignment greedy build ----
+        // ---- general case: canonical codeword assignment ----
         //
-        // We maintain a flat node arena `nodes` (root is node 0) plus a
-        // single deque of "open" leaf positions, in left-to-right tree
-        // order. Each open position carries (parent_idx, bit, depth):
-        // the parent arena index whose `left` (bit=0) or `right`
-        // (bit=1) pointer is the open position, and the depth of that
-        // pointer below the root.
+        // §3.2.1: "the first codeword entry is assigned, in order, the
+        // lowest valued unused binary Huffman codeword." That is the
+        // textbook *canonical* Huffman assignment: an entry of length
+        // `L` takes the numerically-lowest `L`-bit codeword that is
+        // neither already used nor a prefix-extension of (nor prefixed
+        // by) an already-assigned codeword.
         //
-        // Initially the root contributes two open positions, both at
-        // depth 1: (root, bit=0) and (root, bit=1).
+        // The earlier left-to-right "open-slot deque" build assigned the
+        // leftmost *tree* position at the target depth, which only
+        // coincides with the lowest-valued codeword when the codeword
+        // lengths are non-decreasing. Real codebooks (e.g. the floor /
+        // residue books libvorbis emits) interleave shorter codewords
+        // after longer ones — `[2,3,3,3,3,4,3,4]` — so the two orders
+        // diverge and the deque left dangling capacity, spuriously
+        // reporting `UnderspecifiedTree` on a perfectly-populated book.
         //
-        // For each used entry of length L:
-        //   1. Pop the front of the deque (the leftmost open
-        //      position). Call its depth D.
-        //   2. While D < L, split it: allocate a fresh internal node at
-        //      the popped position, push its two child positions to
-        //      the *front* of the deque (so they remain leftmost), and
-        //      pop the new front. D ← D + 1.
-        //   3. When D == L, place a `Leaf(entry)` at the popped
-        //      position and wire it into the parent's child slot.
-        //   4. If the deque empties before D == L, the tree is
-        //      overspecified.
+        // We assign each codeword directly against the partially-built
+        // decision tree, which is the unambiguous source of truth: the
+        // lowest free `L`-bit codeword is found by descending the tree
+        // from the root preferring the `0` child, treating any branch
+        // that already terminates in a leaf (a used shorter prefix) or
+        // is fully populated as unavailable. Codewords are MSb-first on
+        // the wire (the `decode_entry` walk reads the high bit first),
+        // so codeword `c` of length `L` is the root-to-leaf path whose
+        // bit `i` (`i = 0..L`) is `(c >> (L - 1 - i)) & 1`.
         //
-        // After all entries are placed, any remaining open position
-        // means the tree is underspecified.
-        //
-        // This realises the spec's canonical "lowest-valued unused
-        // codeword" without materialising codeword integers, because
-        // a deque popped front-to-back yields positions in the same
-        // left-to-right order in which canonical codewords are
-        // assigned. The §3.2.1 worked example follows directly:
-        // entry 0 at depth 2 picks `00`, entry 5 at depth 2 (after
-        // entries 1-4 burn the `01xx` subtree) picks `10`, etc.
-
-        #[derive(Clone, Copy)]
-        struct OpenSlot {
-            parent: u32,
-            // 0 = parent's `left`, 1 = parent's `right`.
-            bit: u8,
-            depth: u8,
-        }
+        // This is generic canonical-Huffman / entropy-coding bookkeeping
+        // (the construction the §3.2.1 worked example walks by hand), not
+        // specific to any implementation.
 
         let mut nodes: Vec<HuffmanNode> = Vec::with_capacity(used_count as usize * 2);
         nodes.push(HuffmanNode::Internal {
@@ -375,87 +374,44 @@ impl HuffmanTree {
             right: u32::MAX,
         });
 
-        // VecDeque-like usage via Vec — we push to front (`insert(0,..)`)
-        // and pop from front (`remove(0)`). The deque depth is bounded
-        // by ~2 * max_codeword_length (at most ~64), so the linear
-        // shifts are cheap; we'd reach for `VecDeque` if profiling
-        // showed it mattering.
-        let mut deque: Vec<OpenSlot> = Vec::with_capacity(64);
-        deque.push(OpenSlot {
-            parent: 0,
-            bit: 0,
-            depth: 1,
-        });
-        deque.push(OpenSlot {
-            parent: 0,
-            bit: 1,
-            depth: 1,
-        });
-
         for (idx, &len) in lengths.iter().enumerate() {
             if len == UNUSED_ENTRY {
                 continue;
             }
 
-            // Pop the leftmost open position; bail if empty.
-            if deque.is_empty() {
+            // Find the lowest free `len`-bit codeword by descending the
+            // partially-built tree, preferring the `0` (left) child at
+            // every level. A child is "free to descend into" if it is an
+            // existing internal node or an empty slot (`u32::MAX`); a
+            // leaf child means that prefix is already taken (try the `1`
+            // sibling instead). We materialise the path as we go.
+            //
+            // At each level we hold the current node index `cur` and the
+            // bit we must take. We greedily take `0` whenever its subtree
+            // still has room; otherwise `1`. "Has room" at the final
+            // level means the slot is empty; at an interior level it
+            // means the child is empty or an internal node (never a leaf,
+            // and never a fully-saturated subtree — but a subtree filled
+            // by exactly `2^(len-depth)` shorter+equal codewords cannot
+            // accept a new `len`-bit leaf). We detect saturation lazily:
+            // if the greedy `0`-then-`1` descent dead-ends, the tree is
+            // over-populated for this length.
+            let placed = place_lowest(&mut nodes, idx as u32, len);
+            if !placed {
                 return Err(BuildError::OverspecifiedTree {
                     entry: idx as u32,
                     length: len,
                 });
             }
-            let mut slot = deque.remove(0);
-
-            // Walk down by splitting until we reach the target depth.
-            while slot.depth < len {
-                // Allocate a fresh internal node at this position.
-                let new_idx = nodes.len() as u32;
-                nodes.push(HuffmanNode::Internal {
-                    left: u32::MAX,
-                    right: u32::MAX,
-                });
-                set_child(&mut nodes, slot.parent, slot.bit, new_idx);
-                // Push the new node's right child to the deque front
-                // first, then the left child — `insert(0, ..)` pushes
-                // to front, so the left ends up *before* the right
-                // (i.e. left is the new leftmost).
-                deque.insert(
-                    0,
-                    OpenSlot {
-                        parent: new_idx,
-                        bit: 1,
-                        depth: slot.depth + 1,
-                    },
-                );
-                deque.insert(
-                    0,
-                    OpenSlot {
-                        parent: new_idx,
-                        bit: 0,
-                        depth: slot.depth + 1,
-                    },
-                );
-                slot = deque.remove(0);
-            }
-
-            // slot.depth == len; place the leaf.
-            let leaf_idx = nodes.len() as u32;
-            nodes.push(HuffmanNode::Leaf(idx as u32));
-            set_child(&mut nodes, slot.parent, slot.bit, leaf_idx);
         }
 
-        // Underspecified check: any leftover open position means
-        // dangling capacity.
-        if !deque.is_empty() {
-            return Err(BuildError::UnderspecifiedTree);
-        }
-
-        // Defensive: every internal node now has both children
-        // populated.
+        // Underspecified check: any internal node with a dangling child
+        // (`u32::MAX`) means the length list leaves capacity unused.
         for n in &nodes {
             if let HuffmanNode::Internal { left, right } = *n {
-                debug_assert_ne!(left, u32::MAX);
-                debug_assert_ne!(right, u32::MAX);
+                if left == u32::MAX || right == u32::MAX {
+                    return Err(BuildError::UnderspecifiedTree);
+                }
             }
         }
 
@@ -617,6 +573,85 @@ impl HuffmanTree {
 /// Pulled out as a free function to side-step a borrow-checker conflict
 /// when the parent loop is iterating + mutating the arena in the same
 /// scope.
+/// Place a leaf for `entry` at the lowest free codeword of exactly
+/// `len` bits, descending from the root (node 0) and preferring the `0`
+/// (left) child at every level. Returns `true` on success, `false` if
+/// no `len`-bit codeword is free (the tree is over-populated for that
+/// length).
+///
+/// "Lowest valued unused binary Huffman codeword" (§3.2.1) is realised
+/// by always trying the `0` branch first and only falling back to `1`
+/// when the `0` subtree can no longer host a `len`-depth leaf. A subtree
+/// can host one iff some root-to-depth path through it ends in an empty
+/// slot at the target depth without passing through an existing leaf.
+fn place_lowest(nodes: &mut Vec<HuffmanNode>, entry: u32, len: u8) -> bool {
+    place_rec(nodes, 0, len)
+        .map(|leaf_slot| {
+            // `leaf_slot` is `(parent, bit)` of the empty position the
+            // descent chose; install the leaf there.
+            let leaf_idx = nodes.len() as u32;
+            nodes.push(HuffmanNode::Leaf(entry));
+            set_child(nodes, leaf_slot.0, leaf_slot.1, leaf_idx);
+        })
+        .is_some()
+}
+
+/// Recursive descent for [`place_lowest`]. `cur` is the current internal
+/// node index; `remaining` is how many more levels down the leaf must
+/// sit. Returns `Some((parent, bit))` naming the empty child slot to
+/// receive the leaf, materialising interior nodes along the chosen path,
+/// or `None` if this subtree cannot host a leaf at the target depth.
+fn place_rec(nodes: &mut Vec<HuffmanNode>, cur: u32, remaining: u8) -> Option<(u32, u8)> {
+    debug_assert!(remaining >= 1);
+    for bit in [0u8, 1u8] {
+        let child = match nodes[cur as usize] {
+            HuffmanNode::Internal { left, right } => {
+                if bit == 0 {
+                    left
+                } else {
+                    right
+                }
+            }
+            HuffmanNode::Leaf(_) => return None,
+        };
+        if remaining == 1 {
+            // We need an empty slot exactly here.
+            if child == u32::MAX {
+                return Some((cur, bit));
+            }
+            // Occupied (leaf or internal) → this bit is taken; try `1`.
+            continue;
+        }
+        // remaining > 1: descend into (or create) the child subtree.
+        let descend_idx = if child == u32::MAX {
+            // Empty slot: create a fresh internal node, descend into it.
+            let new_idx = nodes.len() as u32;
+            nodes.push(HuffmanNode::Internal {
+                left: u32::MAX,
+                right: u32::MAX,
+            });
+            set_child(nodes, cur, bit, new_idx);
+            new_idx
+        } else {
+            match nodes[child as usize] {
+                HuffmanNode::Internal { .. } => child,
+                // A leaf already terminates this prefix; the whole
+                // subtree is unavailable for a deeper codeword.
+                HuffmanNode::Leaf(_) => continue,
+            }
+        };
+        if let Some(slot) = place_rec(nodes, descend_idx, remaining - 1) {
+            return Some(slot);
+        }
+        // The descent into an *existing* child subtree failed (it is
+        // saturated for this depth); try the `1` sibling. A freshly
+        // created empty internal node can always host a leaf at any
+        // remaining depth, so `child == u32::MAX` never reaches this
+        // line — only a pre-existing internal subtree does.
+    }
+    None
+}
+
 fn set_child(nodes: &mut [HuffmanNode], cur: u32, bit: u8, child: u32) {
     if let HuffmanNode::Internal { left, right } = &mut nodes[cur as usize] {
         if bit == 0 {
@@ -1076,5 +1111,86 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("42"), "Display should contain entry index: {s}");
         assert!(s.contains('8'), "Display should contain used count: {s}");
+    }
+}
+
+#[cfg(test)]
+mod r338_regression {
+    use super::*;
+    use oxideav_core::bits::{BitReaderLsb, BitWriterLsb};
+
+    /// Regression: non-monotonic codeword lengths must still build a
+    /// fully-populated canonical tree. The previous left-to-right
+    /// open-slot deque assigned the leftmost *tree* position at the
+    /// target depth, which diverges from the §3.2.1 "lowest valued
+    /// unused codeword" rule once lengths are not non-decreasing — it
+    /// spuriously reported `UnderspecifiedTree` on these books (the
+    /// floor / residue class books libvorbis routinely emits).
+    ///
+    /// Lengths `[2,3,3,3,3,4,3,4]` (Kraft sum = 1/4 + 5·1/8 + 2·1/16 = 1,
+    /// exactly populated). Canonical assignment in entry order:
+    ///   e0 len2 → 00, e1 → 010, e2 → 011, e3 → 100, e4 → 101,
+    ///   e5 len4 → 1100, e6 len3 → 111, e7 len4 → 1101.
+    #[test]
+    fn builds_non_monotonic_length_book() {
+        let lengths = [2u8, 3, 3, 3, 3, 4, 3, 4];
+        let tree = HuffmanTree::from_lengths(&lengths).expect("fully populated book builds");
+        assert_eq!(tree.used_count(), 8);
+
+        // Pin the canonical codewords by encoding each entry and reading
+        // the emitted bits back MSb-first.
+        let expected: [(u32, u32, u8); 8] = [
+            (0, 0b00, 2),
+            (1, 0b010, 3),
+            (2, 0b011, 3),
+            (3, 0b100, 3),
+            (4, 0b101, 3),
+            (5, 0b1100, 4),
+            (6, 0b111, 3),
+            (7, 0b1101, 4),
+        ];
+        for (entry, code, len) in expected {
+            let mut w = BitWriterLsb::with_capacity(1);
+            tree.encode_entry(entry, &mut w).expect("entry encodes");
+            let bytes = w.finish();
+            // Re-decode the emitted codeword to confirm it round-trips to
+            // the same entry, and check the bit pattern matches `code`.
+            let mut r = BitReaderLsb::new(&bytes);
+            assert_eq!(
+                tree.decode_entry(&mut r).unwrap(),
+                entry,
+                "entry {entry} round-trips"
+            );
+            // Verify the on-wire bits equal the canonical codeword.
+            let mut r2 = BitReaderLsb::new(&bytes);
+            let mut got = 0u32;
+            for _ in 0..len {
+                got = (got << 1) | r2.read_bit().unwrap() as u32;
+            }
+            assert_eq!(
+                got,
+                code,
+                "entry {entry} codeword {got:0width$b} != expected {code:0width$b}",
+                width = len as usize
+            );
+        }
+    }
+
+    /// Every entry of a non-monotonic book round-trips through a
+    /// concatenated stream — exercises the decode walk on the tree built
+    /// from out-of-order lengths.
+    #[test]
+    fn non_monotonic_book_stream_round_trips() {
+        let lengths = [3u8, 2, 4, 3, 4, 2, 3]; // Kraft: 2·1/4 + 3·1/8 + 2·1/16 = 1
+        let tree = HuffmanTree::from_lengths(&lengths).expect("builds");
+        let mut w = BitWriterLsb::with_capacity(4);
+        for e in 0u32..7 {
+            tree.encode_entry(e, &mut w).expect("encode");
+        }
+        let bytes = w.finish();
+        let mut r = BitReaderLsb::new(&bytes);
+        for e in 0u32..7 {
+            assert_eq!(tree.decode_entry(&mut r).unwrap(), e, "entry {e}");
+        }
     }
 }

@@ -4,6 +4,26 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- §3.2.1 canonical Huffman tree construction now assigns codewords by the
+  spec's "lowest valued unused binary Huffman codeword" rule against the
+  tree directly, instead of by a left-to-right open-slot deque. The deque
+  assigned the leftmost *tree* position at each entry's depth, which only
+  matches the canonical lowest-valued codeword when codeword lengths are
+  non-decreasing. Real-world floor / residue classification books emit
+  interleaved lengths (e.g. `[2,3,3,3,3,4,3,4]`, a fully-populated Kraft-1
+  book), and the deque left dangling capacity on them — spuriously
+  rejecting the codebook as `UnderspecifiedTree` and blocking every
+  audio-packet decode against a real stream. Construction now descends the
+  partially-built tree preferring the `0` child, materialising the lowest
+  free codeword of each entry's length; over/under-specified detection is
+  preserved (dead-end descent → `OverspecifiedTree`; any dangling child
+  after all entries placed → `UnderspecifiedTree`). Regression tests pin
+  the canonical codewords for two non-monotonic books and a full
+  encode→decode round-trip. This was the last bug between the §4.3 decode
+  chain and sample-exact PCM against the staged fixtures.
+
 ### Added
 
 - §7.2.4 step-1 floor-1 amplitude-unwrap glue (`floor1_encode` module:
