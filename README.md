@@ -106,6 +106,29 @@ oracle pins the cumulative-`[last]` round-trip across single-vector,
 multi-vector, partial-final-vector, and lossy-quantisation cases. The
 floor-0 WRITE primitive no longer needs the entry indices supplied by hand.
 
+The **floor-1 amplitude-unwrap glue** (`floor1_encode` module:
+`plan_floor1_y`) is the floor-1 analogue. Given a target *reconstructed*
+post list (`[floor1_final_Y]`, the integer amplitudes the §7.2.4 step-2
+curve synthesis draws) and the floor's `[Floor1Header]`, it inverts the
+§7.2.4 step-1 amplitude synthesis to produce the always-non-negative
+packet-domain `[floor1_Y]` values `encoder::Floor1Packet::floor1_y` /
+`write_floor1_packet` already consume. It walks the same strict
+left-to-right schedule the decoder uses — for each post computing the
+identical `render_point` line prediction from the **already-reconstructed**
+neighbour posts (`low_neighbor` / `high_neighbor` only look backward), then
+the `highroom` / `lowroom` / `room` window — and selects the unique packet
+value whose decode reproduces the target: `val = 0` for an on-prediction
+(unflagged) post, the zig-zag even/odd candidate (`2·d` / `−2·d−1`) inside
+`room`, or the single linear extension (upper when `highroom > lowroom`,
+lower otherwise) past it. A target the §7.2.4 map cannot reach in
+`[0, range)` is rejected (`UnreachablePost`); everything reachable
+round-trips **losslessly** (floor-1 post coding is exact — the lossy choice
+is which posts to target). An independent from-spec decode oracle pins the
+round-trip across the zig-zag region, both linear extensions, a full
+`[0, range)` interior sweep over all four multipliers, and the endpoint-only
+degenerate floor. The floor-1 WRITE primitive no longer needs the
+`[floor1_Y]` values supplied by hand.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container
@@ -126,6 +149,15 @@ floor-0 WRITE primitive no longer needs the entry indices supplied by hand.
   Inverting §6.2.3 curve computation to *produce* that target coefficient
   list (and choosing the per-packet `amplitude` / `booknumber`) from a
   desired floor envelope is the remaining floor-0 encode followup.
+- **Deriving the target floor-1 `[floor1_final_Y]` posts** — the
+  amplitude-unwrap glue mapping a target reconstructed-post list onto the
+  §7.2.4 step-1 packet `[floor1_Y]` vector now exists
+  (`floor1_encode::plan_floor1_y`, see above), so the floor-1 WRITE
+  primitive no longer needs hand-supplied `[floor1_Y]` values. Fitting the
+  per-post integer amplitudes (and choosing the `partition_cvals`
+  master-selectors / class books that Huffman-pack them) from a desired
+  linear-domain floor envelope — the §7.2.4 step-2 / dB-table inverse — is
+  the remaining floor-1 encode followup.
 
 ## Clean-room provenance
 

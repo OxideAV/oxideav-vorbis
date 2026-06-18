@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §7.2.4 step-1 floor-1 amplitude-unwrap glue (`floor1_encode` module:
+  `plan_floor1_y`, `Floor1EncodeError`). The floor-1 analogue of the
+  floor-0 `plan_floor0_coefficients` glue: it inverts the §7.2.4 step-1
+  amplitude synthesis, turning a target reconstructed-post list
+  (`[floor1_final_Y]`) plus the floor's `Floor1Header` into the
+  always-non-negative packet-domain `[floor1_Y]` values
+  `encoder::Floor1Packet::floor1_y` / `write_floor1_packet` consume.
+  It walks the decoder's strict left-to-right schedule — recomputing
+  each post's `render_point` prediction from the already-reconstructed
+  backward neighbours, then the `highroom` / `lowroom` / `room` window —
+  and chooses the unique packet value whose decode reproduces the target
+  (`0` for an on-prediction post, the zig-zag even/odd candidate inside
+  `room`, or the single linear extension past it). Unreachable targets
+  (a deviation the geometry has no linear room for, or one outside
+  `[0, range)`) are rejected. An independent from-spec decode oracle
+  pins the lossless round-trip across the zig-zag region, both linear
+  extensions, a full `[0, range)` interior sweep over all four
+  multipliers, and the endpoint-only degenerate floor. The floor-1
+  WRITE primitive no longer needs its `[floor1_Y]` values supplied by
+  hand.
+
 - §8.6.2 residue VQ-encode cascade planner (`residue_encode` module:
   `plan_partition_cascade`, `plan_vector_partition_entries`,
   `ResidueEncodeError`). The glue between the `vq::quantize_vector` leaf
