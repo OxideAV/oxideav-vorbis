@@ -44,8 +44,8 @@
 //! shorter codeword follows a longer one. (An earlier left-to-right
 //! "open-slot deque" assigned the leftmost *tree* position at the target
 //! depth, which coincides with the lowest-valued codeword only for
-//! non-decreasing lengths; on the interleaved books libvorbis routinely
-//! emits for floor / residue classification it diverged and spuriously
+//! non-decreasing lengths; on the interleaved books that real-stream
+//! floor / residue classification produces it diverged and spuriously
 //! reported the book underspecified.)
 //!
 //! The convention used in this module: a node is a [`HuffmanNode`] enum
@@ -349,7 +349,7 @@ impl HuffmanTree {
         // leftmost *tree* position at the target depth, which only
         // coincides with the lowest-valued codeword when the codeword
         // lengths are non-decreasing. Real codebooks (e.g. the floor /
-        // residue books libvorbis emits) interleave shorter codewords
+        // residue books real streams emit) interleave shorter codewords
         // after longer ones — `[2,3,3,3,3,4,3,4]` — so the two orders
         // diverge and the deque left dangling capacity, spuriously
         // reporting `UnderspecifiedTree` on a perfectly-populated book.
@@ -1125,7 +1125,7 @@ mod r338_regression {
     /// target depth, which diverges from the §3.2.1 "lowest valued
     /// unused codeword" rule once lengths are not non-decreasing — it
     /// spuriously reported `UnderspecifiedTree` on these books (the
-    /// floor / residue class books libvorbis routinely emits).
+    /// floor / residue class books real streams routinely carry).
     ///
     /// Lengths `[2,3,3,3,3,4,3,4]` (Kraft sum = 1/4 + 5·1/8 + 2·1/16 = 1,
     /// exactly populated). Canonical assignment in entry order:

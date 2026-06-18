@@ -11,8 +11,8 @@
 //! samples, so the scalar could not be pinned from them.
 //!
 //! Each fixture directory now ships an `expected.wav`: the s16le PCM a
-//! black-box reference decoder (`ffmpeg`'s native Vorbis decoder, per the
-//! fixture `notes.md`) produced from `input.ogg`. That WAV is a
+//! black-box reference decoder (per the fixture `notes.md`) produced
+//! from `input.ogg`. That WAV is a
 //! validator *output*, consumed here as opaque ground-truth bytes — no
 //! reference *source* is read. Comparing our decode to it pins the scalar
 //! empirically: at `imdct_scale = 1.0` the bare §4.3.7 cosine-summation
