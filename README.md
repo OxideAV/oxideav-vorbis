@@ -90,6 +90,22 @@ oracle pins the round-trip across both addressing formats and multi-stage
 refinement. The encoder WRITE primitives no longer need the residue
 entry indices supplied by hand.
 
+The **floor-0 VQ-encode glue** (`floor0_encode` module:
+`plan_floor0_coefficients` + `floor0_vector_count`) is the analogous glue
+for floor 0. Given a target LSP `[coefficients]` list and the value book a
+packet's `[booknumber]` selects, it walks the §6.2.2 step-7..11 vector
+schedule in the write direction: for each of the `ceil(order / dimensions)`
+vectors the decoder reads, it **un-offsets** the target sub-vector by the
+running `[last]` accumulator (the inverse of step 8's additive offset),
+quantises the raw target via `vq::quantize_vector`, then advances `[last]`
+from the chosen entry's **reconstruction** (not the target) so every
+subsequent vector un-offsets against the value the decoder will carry. It
+produces exactly the entry run `encoder::Floor0Packet::Curve::entries` /
+`write_floor0_packet` already consume; an independent decode-reconstruct
+oracle pins the cumulative-`[last]` round-trip across single-vector,
+multi-vector, partial-final-vector, and lossy-quantisation cases. The
+floor-0 WRITE primitive no longer needs the entry indices supplied by hand.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container
@@ -103,12 +119,13 @@ entry indices supplied by hand.
   fixture traces" and the staged traces under
   `docs/audio/vorbis/fixtures/<case>/` do not yet log post-MDCT
   samples. Pinning it is the remaining gap before sample-exact PCM.
-- **The floor-0 VQ-encode glue** — the residue-side cascade glue now
-  exists (`residue_encode::plan_partition_cascade` /
-  `plan_vector_partition_entries`, see below), but mapping real floor-0
-  LSP coefficients (§6.2.2) onto entry sequences is the remaining
-  encode followup. The floor-0 WRITE primitive still takes explicit
-  entry indices.
+- **Deriving the target floor-0 LSP `[coefficients]`** — the VQ-encode
+  glue mapping a target coefficient list onto the §6.2.2 entry run now
+  exists (`floor0_encode::plan_floor0_coefficients`, see above), so the
+  floor-0 WRITE primitive no longer needs hand-supplied entry indices.
+  Inverting §6.2.3 curve computation to *produce* that target coefficient
+  list (and choosing the per-packet `amplitude` / `booknumber`) from a
+  desired floor envelope is the remaining floor-0 encode followup.
 
 ## Clean-room provenance
 
