@@ -26,6 +26,19 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Chained-Ogg decode coverage (`tests/chained_stream_decode.rs`). The
+  `chained-streams` fixture — two independent Ogg/Vorbis logical
+  bitstreams concatenated byte-for-byte (RFC 3533 §5), each with its own
+  `BOS`/`EOS` page flags and `bitstream_serial` cookie — is now decoded
+  end to end through the public `StreamingDecoder` path. A serial-aware
+  RFC-3533 page de-framer (private test scaffolding) splits the input into
+  its two logical bitstreams without cross-boundary packet bleed; the
+  first stream decodes sample-exact against `expected.wav` (the fixture's
+  reference is the first stream only, per its `notes.md`), and the second
+  stream re-parses its own three Vorbis headers and decodes independently,
+  validating the per-stream reset + re-parse + decode cycle across a
+  stream boundary. This was the one staged corpus member
+  `tests/fixture_pcm_decode.rs` explicitly did not consume.
 - §4.3 end-to-end sample-exact PCM decode + IMDCT normalization scalar
   pinned (`tests/fixture_pcm_decode.rs`). Twelve staged fixtures
   (`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1..q10, CBR,

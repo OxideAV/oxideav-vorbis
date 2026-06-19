@@ -14,15 +14,22 @@ write-path primitives. It is codec-only: Ogg container framing and
 `oxideav-core` registration are not yet wired — `register()` is
 currently a no-op.
 
-The §4.3 decode chain is sample-exact end to end: eight staged fixtures
-(`docs/audio/vorbis/fixtures/*` — mono / stereo, q−1 through q10, CBR,
-floor-1-only, full-residue noise, and all three residue formats) decode
-through the public `StreamingDecoder::push_packet` path to PCM that
-matches each fixture's `expected.wav` reference dump within the
-documented ±1 s16 lossy tolerance (`tests/fixture_pcm_decode.rs`). The
-§4.3.7 IMDCT normalization scalar — the last deferred decode unknown —
-is pinned to **1.0**: the bare cosine-summation kernel plus the §4.3.6
-window and §4.3.8 overlap-add need no extra Vorbis-specific scaling.
+The §4.3 decode chain is sample-exact end to end: twelve staged fixtures
+(`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1 through q10,
+CBR, 22.05–96 kHz, floor-1-only, full-residue noise, all three residue
+formats, and the short↔long transient block-size switch) decode through
+the public `StreamingDecoder::push_packet` path to PCM that matches each
+fixture's `expected.wav` reference dump within the documented ±1 s16
+lossy tolerance (`tests/fixture_pcm_decode.rs`). A separate
+`tests/chained_stream_decode.rs` drives the chained-Ogg fixture (two
+concatenated logical bitstreams, RFC 3533 §5): the first stream decodes
+sample-exact against `expected.wav`, and the second logical bitstream
+re-parses its own three Vorbis headers and decodes independently —
+exercising the per-stream reset + re-parse + decode cycle across a
+stream boundary. The §4.3.7 IMDCT normalization scalar — the last
+deferred decode unknown — is pinned to **1.0**: the bare cosine-summation
+kernel plus the §4.3.6 window and §4.3.8 overlap-add need no extra
+Vorbis-specific scaling.
 
 ### Decode
 
