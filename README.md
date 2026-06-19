@@ -79,6 +79,12 @@ Vorbis-specific scaling.
   IMDCT normalization scalar (`0 · α = 0`) — making silence the one
   end-to-end PCM target pinnable while the post-IMDCT trace point that
   would fix the scalar is missing from the staged traces.
+- **Decode robustness** — `tests/decode_robustness.rs` pins the §4.3.1
+  "discard this packet" recovery contract: a real fixture packet
+  truncated at every byte length, header-type packets (first bit set)
+  routed into the audio driver, and empty / single-byte / pseudo-random
+  packet bodies all return a typed `StreamingError` or decode cleanly —
+  never a panic.
 
 ### Encode
 

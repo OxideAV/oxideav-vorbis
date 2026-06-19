@@ -26,6 +26,15 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §4.3 decode-driver robustness coverage (`tests/decode_robustness.rs`).
+  The per-packet driver must reject malformed or truncated audio packets
+  with a typed `StreamingError` and never panic (the §4.3.1 closing note
+  makes an in-packet end-of-packet a recoverable "discard this packet"
+  condition, not a crash). The test sweeps a real fixture packet truncated
+  at every byte length, routes header-type packets (first bit set, §4.3.1
+  step 1) into the audio driver and asserts a `NonAudioPacketType`
+  rejection, and feeds empty / single-byte / 512 pseudo-random packet
+  bodies — confirming panic-freedom across every path.
 - Metadata-fixture parse + decode coverage
   (`tests/comment_header_decode.rs`). The two staged corpus members that
   carry a populated VORBIS_COMMENT header — `with-vorbis-comment-tags`
