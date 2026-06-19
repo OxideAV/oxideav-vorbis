@@ -26,6 +26,20 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Metadata-fixture parse + decode coverage
+  (`tests/comment_header_decode.rs`). The two staged corpus members that
+  carry a populated VORBIS_COMMENT header — `with-vorbis-comment-tags`
+  (canonical TITLE / ARTIST / ALBUM / DATE / GENRE / TRACKNUMBER fields)
+  and `with-attached-picture` (a >1 KB base64 `METADATA_BLOCK_PICTURE`
+  cover-art blob, the FLAC-borrowed convention Ogg/Vorbis uses) — are now
+  exercised end to end: `parse_comment_header` recovers the vendor string
+  and every `KEY=value` entry (looked up case-insensitively per §5.2.2),
+  the picture blob base64-decodes to a FLAC-PICTURE front-cover PNG
+  header, and each fixture's audio decodes sample-exact against its
+  `expected.wav`. A cross-check confirms the two fixtures — identical
+  audio, different metadata — decode bit-for-bit alike, proving a large
+  comment block does not shift the setup/audio packet boundaries or
+  perturb the §4.3 decode.
 - Chained-Ogg decode coverage (`tests/chained_stream_decode.rs`). The
   `chained-streams` fixture — two independent Ogg/Vorbis logical
   bitstreams concatenated byte-for-byte (RFC 3533 §5), each with its own

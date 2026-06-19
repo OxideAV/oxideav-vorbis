@@ -26,7 +26,15 @@ concatenated logical bitstreams, RFC 3533 §5): the first stream decodes
 sample-exact against `expected.wav`, and the second logical bitstream
 re-parses its own three Vorbis headers and decodes independently —
 exercising the per-stream reset + re-parse + decode cycle across a
-stream boundary. The §4.3.7 IMDCT normalization scalar — the last
+stream boundary. A third, `tests/comment_header_decode.rs`, drives the
+two metadata fixtures (`with-vorbis-comment-tags`,
+`with-attached-picture`): the §5.2 VORBIS_COMMENT parse recovers the
+canonical TITLE / ARTIST / ALBUM / DATE / GENRE / TRACKNUMBER tags
+(case-insensitively per §5.2.2) and the base64 `METADATA_BLOCK_PICTURE`
+cover-art blob, while the audio decodes sample-exact — proving a large
+comment block does not perturb the §4.3 decode (both fixtures carry the
+identical audio and decode bit-for-bit alike). The §4.3.7 IMDCT
+normalization scalar — the last
 deferred decode unknown — is pinned to **1.0**: the bare cosine-summation
 kernel plus the §4.3.6 window and §4.3.8 overlap-add need no extra
 Vorbis-specific scaling.
