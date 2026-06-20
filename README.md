@@ -161,6 +161,28 @@ round-trip across the zig-zag region, both linear extensions, a full
 degenerate floor. The floor-1 WRITE primitive no longer needs the
 `[floor1_Y]` values supplied by hand.
 
+The **floor-1 envelope-fit glue** (`floor1_envelope` module:
+`plan_floor1_envelope`, `invert_inverse_db`) closes the front of the chain:
+the §7.2.4 step-2 / §10.1 dB-table **inverse**. Given a desired
+linear-domain floor envelope — one magnitude per spectral bin, the domain
+the forward MDCT produces — it fits the integer `[floor1_final_Y]` post
+vector `plan_floor1_y` consumes. For each post it samples the envelope at
+the post's `x` (posts past the floor length sample the last bin, matching
+the decoder's flat tail render), inverts the strictly-increasing 256-entry
+`floor1_inverse_dB_table` to the nearest ladder index (monotone search,
+ties to the lower index), then divides by the multiplier (round-to-nearest)
+and clamps into `[0, range)`. `invert_inverse_db` is the standalone
+dB-table inverse, pinned to recover every exact table value to its own
+index. The whole floor-1 encode pipeline now runs end to end: a forward
+**windowed MDCT** analysis frame → smoothed magnitude envelope →
+`plan_floor1_envelope` → `plan_floor1_y` → `write_floor1_packet` → the
+crate's own decoder. The `tests/floor1_envelope_roundtrip.rs` integration
+test drives exactly that chain on a synthetic PCM block and pins both
+**post-exact reconstruction** (every rendered post returns the nearest
+representable envelope value) and a **23 dB log-domain (dB-index) SNR**
+across the whole reconstructed curve — the first end-to-end
+encode→decode spectral round-trip in the crate.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container
@@ -175,15 +197,17 @@ degenerate floor. The floor-1 WRITE primitive no longer needs the
   Inverting §6.2.3 curve computation to *produce* that target coefficient
   list (and choosing the per-packet `amplitude` / `booknumber`) from a
   desired floor envelope is the remaining floor-0 encode followup.
-- **Deriving the target floor-1 `[floor1_final_Y]` posts** — the
-  amplitude-unwrap glue mapping a target reconstructed-post list onto the
-  §7.2.4 step-1 packet `[floor1_Y]` vector now exists
-  (`floor1_encode::plan_floor1_y`, see above), so the floor-1 WRITE
-  primitive no longer needs hand-supplied `[floor1_Y]` values. Fitting the
-  per-post integer amplitudes (and choosing the `partition_cvals`
-  master-selectors / class books that Huffman-pack them) from a desired
-  linear-domain floor envelope — the §7.2.4 step-2 / dB-table inverse — is
-  the remaining floor-1 encode followup.
+- **Choosing floor-1 `partition_cvals` master-selectors / class books** —
+  fitting the per-post integer amplitudes from a linear-domain floor
+  envelope now exists end to end (`floor1_envelope::plan_floor1_envelope` →
+  `floor1_encode::plan_floor1_y`, see above), and the
+  `tests/floor1_envelope_roundtrip.rs` chain round-trips a forward-MDCT
+  envelope through encode + decode. The remaining floor-1 encode decision is
+  the **partition packing**: choosing the per-partition master-selector
+  `cval` values and the class / sub-book assignment that Huffman-pack the
+  fitted `[floor1_Y]` most compactly. The single-partition, `subclasses = 0`
+  path is exercised today (each post coded directly through one value book);
+  the multi-subclass master-book selection is the open optimisation.
 
 ## Clean-room provenance
 

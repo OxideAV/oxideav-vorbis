@@ -42,6 +42,15 @@ All notable changes to `oxideav-vorbis` are recorded here.
   `invert_inverse_db` helper is pinned to recover every exact table value
   to its own index and to break ties toward the lower (smaller-amplitude)
   index.
+- Forward-MDCT → floor-1 envelope-fit → encode → decode round-trip
+  integration test (`tests/floor1_envelope_roundtrip.rs`) — the first
+  end-to-end encode→decode spectral round-trip in the crate. A synthetic PCM
+  analysis frame is windowed and forward-MDCT'd (`apply_window_and_mdct_vec`)
+  to a magnitude spectrum; a smoothed envelope is fit to floor-1 posts
+  (`plan_floor1_envelope` → `plan_floor1_y`), serialised
+  (`write_floor1_packet`), and decoded (`Floor1Decoder`). The test pins
+  post-exact reconstruction at every rendered post and a 23 dB log-domain
+  (dB-index) SNR across the whole reconstructed curve.
 - §4.3 decode-driver robustness coverage (`tests/decode_robustness.rs`).
   The per-packet driver must reject malformed or truncated audio packets
   with a typed `StreamingError` and never panic (the §4.3.1 closing note
