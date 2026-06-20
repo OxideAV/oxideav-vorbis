@@ -184,9 +184,10 @@ impl std::error::Error for Floor1EncodeError {}
 /// Reconstruct the full `[floor1_X_list]` the §7.2.4 curve decoder uses —
 /// the two implicit endpoints (`0` and `2^rangebits`) at positions 0/1,
 /// then the header's explicit per-partition x-coordinates — exactly as
-/// [`crate::floor1::Floor1Decoder::new`] does. Kept private; the planner
-/// is the only caller.
-fn full_x_list(header: &Floor1Header) -> Vec<u32> {
+/// [`crate::floor1::Floor1Decoder::new`] does. Shared with
+/// [`crate::floor1_envelope::plan_floor1_envelope`], which fits posts at
+/// these same coordinates.
+pub fn full_x_list(header: &Floor1Header) -> Vec<u32> {
     let mut x_list = Vec::with_capacity(header.x_list.len() + 2);
     x_list.push(0);
     x_list.push(1u32 << header.rangebits);

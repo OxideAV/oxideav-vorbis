@@ -160,6 +160,7 @@ pub mod floor0;
 pub mod floor0_encode;
 pub mod floor1;
 pub mod floor1_encode;
+pub mod floor1_envelope;
 pub mod framing;
 pub mod huffman;
 pub mod identification;
@@ -206,7 +207,8 @@ pub use floor0_encode::{floor0_vector_count, plan_floor0_coefficients, Floor0Enc
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
-pub use floor1_encode::{plan_floor1_y, Floor1EncodeError};
+pub use floor1_encode::{full_x_list as floor1_full_x_list, plan_floor1_y, Floor1EncodeError};
+pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
 pub use framing::{FrameSplitter, FramingError};
 pub use huffman::{
     BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,

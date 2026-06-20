@@ -26,6 +26,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Floor-1 envelope-fit glue (`floor1_envelope` module:
+  `plan_floor1_envelope`, `invert_inverse_db`) — the §7.2.4 step-2 / §10.1
+  dB-table **inverse**, encode direction. Given a desired linear-domain
+  floor envelope (one magnitude per spectral bin, the domain the forward
+  MDCT magnitude lives in) it fits the integer `[floor1_final_Y]` post
+  vector `floor1_encode::plan_floor1_y` consumes: for each post it samples
+  the envelope at the post's `x`, inverts the strictly-increasing 256-entry
+  `floor1_inverse_dB_table` to the nearest ladder index, then divides by
+  the multiplier (round-to-nearest) and clamps into `[0, range)`. This was
+  the remaining floor-1 encode followup the README named — the
+  `plan_floor1_envelope → plan_floor1_y → write_floor1_packet → decode`
+  chain now reconstructs a floor matching the target envelope at every post
+  to within the multiplier-grid + dB-ladder quantisation. The standalone
+  `invert_inverse_db` helper is pinned to recover every exact table value
+  to its own index and to break ties toward the lower (smaller-amplitude)
+  index.
 - §4.3 decode-driver robustness coverage (`tests/decode_robustness.rs`).
   The per-packet driver must reject malformed or truncated audio packets
   with a typed `StreamingError` and never panic (the §4.3.1 closing note
