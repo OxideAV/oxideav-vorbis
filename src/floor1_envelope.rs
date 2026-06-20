@@ -83,16 +83,9 @@ pub enum Floor1EnvelopeError {
     /// `[range]` from a 2-bit field `+ 1`; the decoder rejects anything
     /// else, so the fitter mirrors that gate. Carries the bad value.
     IllegalMultiplier(u8),
-    /// The supplied envelope was shorter than the largest post `x`
-    /// coordinate the header places. Every post samples the envelope at
-    /// its `x` index, so the envelope must cover `0..=max_x`.
-    EnvelopeTooShort {
-        /// The largest post `x` coordinate (`2^rangebits`, the upper
-        /// endpoint, is the maximum the decoder ever injects).
-        max_x: usize,
-        /// The supplied envelope length.
-        actual: usize,
-    },
+    /// The supplied envelope was empty. The fitter samples one value per
+    /// post; with no bins there is nothing to fit.
+    EmptyEnvelope,
     /// The envelope carried a non-finite or negative sample. The §10.1
     /// table is a non-negative linear-amplitude ladder; a NaN/-∞/negative
     /// target has no nearest table index. Carries the offending bin.
@@ -111,9 +104,9 @@ impl core::fmt::Display for Floor1EnvelopeError {
                 f,
                 "vorbis floor1 envelope: multiplier {m} out of 1..=4 (§7.2.3 step 1)"
             ),
-            Floor1EnvelopeError::EnvelopeTooShort { max_x, actual } => write!(
+            Floor1EnvelopeError::EmptyEnvelope => write!(
                 f,
-                "vorbis floor1 envelope: envelope length {actual} < max post x {max_x} (§7.2.4 step 2)"
+                "vorbis floor1 envelope: envelope is empty (§7.2.4 step 2)"
             ),
             Floor1EnvelopeError::NonFiniteEnvelope { bin, value } => write!(
                 f,
@@ -191,12 +184,16 @@ pub fn invert_inverse_db(target: f32) -> u8 {
 /// reconstructs a floor whose value **at each post `x`** is the nearest
 /// representable approximation of `envelope[x]`.
 ///
+/// A post `x` at or beyond `envelope.len()` (the upper endpoint
+/// `2^rangebits` typically exceeds the `n/2`-bin floor) samples the **last**
+/// envelope bin — matching the decoder, which renders the curve flat from
+/// the last in-range post out to `n`.
+///
 /// # Errors
 ///
 /// Returns a [`Floor1EnvelopeError`] for a multiplier outside `1..=4`, an
-/// `envelope` shorter than the largest post `x`, or a non-finite/negative
-/// envelope sample. Validation precedes the per-post fit; on error no
-/// partial vector is returned.
+/// empty `envelope`, or a non-finite/negative envelope sample. Validation
+/// precedes the per-post fit; on error no partial vector is returned.
 pub fn plan_floor1_envelope(
     envelope: &[f32],
     header: &Floor1Header,
@@ -204,21 +201,20 @@ pub fn plan_floor1_envelope(
     if !(1..=4).contains(&header.multiplier) {
         return Err(Floor1EnvelopeError::IllegalMultiplier(header.multiplier));
     }
+    if envelope.is_empty() {
+        return Err(Floor1EnvelopeError::EmptyEnvelope);
+    }
     let range = RANGE_TABLE[(header.multiplier - 1) as usize] as i32;
     let multiplier = header.multiplier as i32;
 
     let x_list = full_x_list(header);
-    let max_x = x_list.iter().copied().max().unwrap_or(0) as usize;
-    if envelope.len() <= max_x {
-        return Err(Floor1EnvelopeError::EnvelopeTooShort {
-            max_x,
-            actual: envelope.len(),
-        });
-    }
+    let last_bin = envelope.len() - 1;
 
-    // Fail closed on any non-finite / negative sample the fit reads.
+    // Fail closed on any non-finite / negative sample the fit reads. Each
+    // post samples bin `min(x, last_bin)` (posts past the floor length read
+    // the final bin, as the decoder renders the tail flat).
     for &x in &x_list {
-        let bin = x as usize;
+        let bin = (x as usize).min(last_bin);
         let v = envelope[bin];
         if !v.is_finite() || v < 0.0 {
             return Err(Floor1EnvelopeError::NonFiniteEnvelope { bin, value: v });
@@ -227,7 +223,7 @@ pub fn plan_floor1_envelope(
 
     let mut posts: Vec<i32> = Vec::with_capacity(x_list.len());
     for &x in &x_list {
-        let target = envelope[x as usize];
+        let target = envelope[(x as usize).min(last_bin)];
         // §10.1 dB-table inverse: nearest 256-ladder index.
         let idx = invert_inverse_db(target) as i32;
         // §7.2.4 step-2 multiplier inverse: round-to-nearest division so
@@ -328,17 +324,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_envelope() {
-        // rangebits 4 → upper endpoint x = 16, so a length-16 envelope is
-        // one short (needs to cover index 16).
+    fn rejects_empty_envelope() {
         let h = header(vec![4, 8], 1, 4);
-        match plan_floor1_envelope(&[0.5; 16], &h) {
-            Err(Floor1EnvelopeError::EnvelopeTooShort { max_x, actual }) => {
-                assert_eq!(max_x, 16);
-                assert_eq!(actual, 16);
-            }
-            other => panic!("expected EnvelopeTooShort, got {other:?}"),
-        }
+        assert_eq!(
+            plan_floor1_envelope(&[], &h),
+            Err(Floor1EnvelopeError::EmptyEnvelope)
+        );
+    }
+
+    #[test]
+    fn upper_endpoint_past_floor_samples_last_bin() {
+        // rangebits 4 → upper endpoint x = 16; a length-16 envelope (bins
+        // 0..15) has no bin 16, so the upper endpoint samples bin 15. Build
+        // an envelope whose last bin is a known ladder value and confirm the
+        // upper-endpoint post (index 1) fits it.
+        let h = header(vec![4, 8], 1, 4);
+        let mut env = vec![INVERSE_DB_TABLE[10]; 16];
+        env[15] = INVERSE_DB_TABLE[200];
+        let posts = plan_floor1_envelope(&env, &h).unwrap();
+        // post[1] is the upper endpoint x=16 → samples bin 15 → index 200.
+        assert_eq!(posts[1], 200);
     }
 
     #[test]
