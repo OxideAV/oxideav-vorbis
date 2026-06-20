@@ -183,6 +183,30 @@ representable envelope value) and a **23 dB log-domain (dB-index) SNR**
 across the whole reconstructed curve — the first end-to-end
 encode→decode spectral round-trip in the crate.
 
+Two further integration tests close the encode→decode loop on the residue
+and the time domain. `tests/residue_cascade_roundtrip.rs` drives a real
+signed, non-flat spectral residual through the full residue encode chain
+(`plan_partition_cascade` → `write_residue_body`) and back through
+`ResidueDecoder`, pinning three §8.6.2 properties: the decoded residual is
+the nearest-entry ladder quantisation of the target, the decoded vector
+equals bin-for-bin the **sum of the chosen entries' reconstructions**
+(proving the entry-index ↔ codeword round-trip is exact), and a **two-stage
+cascade is strictly closer to the target than a one-stage cascade** (and
+lifts the spectral SNR by ≥6 dB) — the additive cascade-refinement the
+§8.6.2 `+=` accumulation provides. `tests/pcm_packet_roundtrip.rs` is the
+crate's first **full §4.3 PCM → encode → decode → PCM time-domain
+round-trip**: a synthetic analysis frame is windowed + forward-MDCT'd,
+fitted with a flat floor-1 (`F = 1.0` at post 255) plus a two-stage residue
+cascade carrying `X/F`, serialised by `write_audio_packet`, then decoded by
+`decode_audio_packet_windowed` (the §4.3.2–§4.3.6 driver + the §4.3.7 IMDCT
++ the §4.3.6 window) back to a length-`N` windowed frame. The decoded frame
+is compared against `window ⊙ IMDCT(X)` — the exact frame the decoder's own
+IMDCT+window produce from the un-quantised analysis spectrum — clearing a
+pinned **30 dB** PCM-domain SNR (≈44.7 dB measured), and the round-trip is
+shown geometry-robust across block sizes 64 / 256 / 1024. This jointly
+proves the floor render, §4.3.6 dot product, §4.3.7 IMDCT and §4.3.6 window
+are correct end to end.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container

@@ -172,34 +172,40 @@ fn mono_setup(
     }
 }
 
-#[test]
-fn pcm_analysis_packet_round_trips_to_time_domain() {
-    let n = 256usize;
-    let half_n = n / 2;
-    let window = vorbis_window(n);
-
-    // Synthetic PCM: three tones plus a slow tilt — a non-flat spectrum.
-    let mut pcm: Vec<f32> = (0..n)
+/// A synthetic length-`n` PCM analysis block: three tones plus a slow
+/// tilt, so the analysis spectrum has a non-flat magnitude shape worth
+/// coding a residue against.
+fn synthetic_pcm(n: usize) -> Vec<f32> {
+    (0..n)
         .map(|i| {
             let t = i as f32;
             0.55 * (2.0 * std::f32::consts::PI * 5.0 * t / n as f32).sin()
                 + 0.30 * (2.0 * std::f32::consts::PI * 13.0 * t / n as f32).sin()
                 + 0.12 * (2.0 * std::f32::consts::PI * 37.0 * t / n as f32).cos()
         })
-        .collect();
+        .collect()
+}
+
+/// Run the full PCM → encode → decode → PCM round-trip for one block size
+/// `n` and return the achieved PCM-domain SNR (dB) against the reference
+/// `window ⊙ IMDCT(X)` frame. `blocksize_1` is the long-block size the
+/// setup advertises; the packet always uses the short mode (`blockflag =
+/// false`, window length `n`).
+fn pcm_roundtrip_snr(n: usize, blocksize_1: usize) -> f32 {
+    let half_n = n / 2;
+    let window = vorbis_window(n);
 
     // Step 1: forward window + MDCT → analysis spectrum X. scale 1.0 (the
     // analysis scale this crate's IMDCT inverts to 1.0).
-    let pcm_for_mdct = &mut pcm;
-    let x = apply_window_and_mdct_vec(pcm_for_mdct, &window, 1.0)
-        .expect("forward MDCT of analysis block");
+    let mut pcm = synthetic_pcm(n);
+    let x =
+        apply_window_and_mdct_vec(&mut pcm, &window, 1.0).expect("forward MDCT of analysis block");
     assert_eq!(x.len(), half_n);
 
-    // Step 2: flat floor F. Pick a post value whose INVERSE_DB_TABLE entry
-    // is a moderate constant, then the residue carries X/F.
-    // The §10.1 INVERSE_DB_TABLE is exponential (≈1.06e-7 at index 0,
-    // exactly 1.0 at index 255). Index 255 → F = 1.0, so the residue
-    // target is X itself and the value books only need to span X's range.
+    // Step 2: flat floor F. The §10.1 INVERSE_DB_TABLE is exponential
+    // (≈1.06e-7 at index 0, exactly 1.0 at index 255). Index 255 → F = 1.0,
+    // so the residue target is X itself and the value books only need to
+    // span X's range.
     let floor_post = 255i32; // multiplier 1 → table index 255 → F = 1.0.
     let f = INVERSE_DB_TABLE[floor_post as usize];
     assert!(
@@ -249,14 +255,14 @@ fn pcm_analysis_packet_round_trips_to_time_domain() {
     };
 
     // Step 3 (cont.): serialise the full §4.3 audio packet.
-    let bytes = write_audio_packet(&header, &setup, n, 1024, 1, &floors, &residue_plans)
+    let bytes = write_audio_packet(&header, &setup, n, blocksize_1, 1, &floors, &residue_plans)
         .expect("audio packet serialises");
     assert!(!bytes.is_empty());
 
     // Step 4: decode the packet back to a windowed time-domain frame.
     let state = AudioDecoderState::new(&setup).expect("audio decoder state builds");
     let mut reader = BitReaderLsb::new(&bytes);
-    let outcome = decode_audio_packet_windowed(&mut reader, &setup, &state, 1, n, 1024, 1.0)
+    let outcome = decode_audio_packet_windowed(&mut reader, &setup, &state, 1, n, blocksize_1, 1.0)
         .expect("audio packet decodes to windowed frames");
     let decoded_frame = match &outcome {
         WindowedPacketOutcome::Windowed { frames, .. } => {
@@ -281,23 +287,46 @@ fn pcm_analysis_packet_round_trips_to_time_domain() {
         .map(|(&t, &w)| t * w)
         .collect();
 
-    // The two-stage residue cascade (coarse 1/24-of-range step refined at
-    // 1/8 that step) drives the reconstruction well above 40 dB in
-    // practice; pin a conservative 30 dB floor that still proves the whole
-    // path (floor render, §4.3.6 dot product, §4.3.7 IMDCT, §4.3.6 window)
-    // is correct end to end.
-    let snr = snr_db(&ref_frame, &decoded_frame);
-    assert!(
-        snr >= 30.0,
-        "PCM time-domain round-trip SNR {snr} dB below pinned 30 dB"
-    );
-
-    // The decoded frame must also carry real energy (a non-trivial signal,
-    // not silence) and be finite everywhere.
+    // The decoded frame must carry real energy (a non-trivial signal, not
+    // silence) and be finite everywhere.
     let energy: f64 = decoded_frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
     assert!(energy > 1e-6, "decoded frame is silent (energy {energy})");
     assert!(
         decoded_frame.iter().all(|s| s.is_finite()),
         "decoded frame has non-finite samples"
     );
+
+    snr_db(&ref_frame, &decoded_frame)
+}
+
+#[test]
+fn pcm_analysis_packet_round_trips_to_time_domain() {
+    // The two-stage residue cascade (coarse 1/24-of-range step refined at
+    // 1/8 that step) drives the reconstruction well above 40 dB in
+    // practice; pin a conservative 30 dB floor that still proves the whole
+    // path (floor render, §4.3.6 dot product, §4.3.7 IMDCT, §4.3.6 window)
+    // is correct end to end. The setup advertises a 1024 long block; this
+    // packet uses the 256 short block.
+    let snr = pcm_roundtrip_snr(256, 1024);
+    assert!(
+        snr >= 30.0,
+        "PCM time-domain round-trip SNR {snr} dB below pinned 30 dB"
+    );
+}
+
+#[test]
+fn pcm_round_trip_is_robust_across_block_sizes() {
+    // The §4.3 path must not be pinned to one geometry: sweep the smallest
+    // legal block (64), a typical short block (256), and a typical long
+    // block (1024). Each clears the same conservative SNR floor, proving
+    // the window build, IMDCT size dispatch, residue partitioning and dot
+    // product all scale with `n`.
+    for &n in &[64usize, 256, 1024] {
+        let blocksize_1 = (n * 4).max(1024);
+        let snr = pcm_roundtrip_snr(n, blocksize_1);
+        assert!(
+            snr >= 30.0,
+            "block size {n}: PCM round-trip SNR {snr} dB below pinned 30 dB"
+        );
+    }
 }

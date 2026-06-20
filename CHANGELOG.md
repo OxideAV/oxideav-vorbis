@@ -26,6 +26,29 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Full §4.3 PCM → encode → decode → PCM time-domain round-trip integration
+  test (`tests/pcm_packet_roundtrip.rs`) — the crate's first end-to-end
+  audio-packet round-trip that returns to the time domain. A synthetic PCM
+  analysis frame is windowed + forward-MDCT'd to an analysis spectrum `X`,
+  fitted with a flat floor-1 (`F = 1.0` at post 255) plus a two-stage
+  §8.6.2 residue cascade carrying `X/F`, serialised by `write_audio_packet`,
+  then decoded by `decode_audio_packet_windowed` (the §4.3.2–§4.3.6 driver
+  + the §4.3.7 IMDCT + the §4.3.6 window) back to a length-`N` windowed
+  frame. The decoded frame is compared against `window ⊙ IMDCT(X)` — the
+  exact frame the decoder's own IMDCT+window produce from the un-quantised
+  analysis spectrum — clearing a pinned 30 dB PCM-domain SNR (≈44.7 dB
+  measured) and shown geometry-robust across block sizes 64 / 256 / 1024.
+  Jointly proves the floor render, §4.3.6 dot product, §4.3.7 IMDCT and
+  §4.3.6 window are correct end to end.
+- Residue VQ-encode cascade → §8.6.2 body write → residue decode spectral
+  round-trip test (`tests/residue_cascade_roundtrip.rs`). Drives a real
+  signed, non-flat spectral residual through `plan_partition_cascade` →
+  `write_residue_body` and back through `ResidueDecoder`, pinning that the
+  decoded residual is the nearest-entry ladder quantisation of the target,
+  equals bin-for-bin the sum of the chosen entries' reconstructions (the
+  entry-index ↔ codeword round-trip is exact), and that a two-stage cascade
+  is strictly closer to the target than a one-stage cascade (and lifts the
+  spectral SNR by ≥6 dB) — the §8.6.2 additive cascade-refinement property.
 - Floor-1 envelope-fit glue (`floor1_envelope` module:
   `plan_floor1_envelope`, `invert_inverse_db`) — the §7.2.4 step-2 / §10.1
   dB-table **inverse**, encode direction. Given a desired linear-domain
