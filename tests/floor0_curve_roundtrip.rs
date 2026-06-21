@@ -4,8 +4,8 @@
 //! # Why this test exists
 //!
 //! Every staged `docs/audio/vorbis/fixtures/*` stream uses **floor type 1**
-//! — real `libvorbis`-class encoders emit floor 1 for these material types,
-//! so the §4.3 fixture PCM decode (`tests/fixture_pcm_decode.rs`) never
+//! — production encoders emit floor 1 for these material types, so the
+//! §4.3 fixture PCM decode (`tests/fixture_pcm_decode.rs`) never
 //! exercises the **floor 0** curve path even though it is wired into the
 //! decode driver (`audio::FloorDecoder::Type0`). The floor-0 §6.2.2 packet
 //! decode and §6.2.3 LSP→envelope synthesis therefore had only unit-level
