@@ -91,6 +91,20 @@ fn classbook(entries: u32, length: u8) -> VorbisCodebook {
 /// the cascade stages `stages` (each `Some(book_index)` for a populated
 /// pass). `classbook` is codebook index 0; value books follow.
 fn one_partition_header(partition_size: u32, stages: [Option<u8>; 8]) -> ResidueHeader {
+    one_partition_header_typed(1, partition_size, stages)
+}
+
+/// As [`one_partition_header`] but with an explicit `residue_type`
+/// (§8.6.1). Format 0 (§8.6.3) addresses each VQ read's elements with the
+/// `i + j*step` strided scatter; formats 1/2 (§8.6.4) append contiguously.
+/// The `cascade_roundtrip` driver threads `header.residue_type` through
+/// both the planner and the decoder, so the same helper exercises every
+/// format end to end.
+fn one_partition_header_typed(
+    residue_type: u16,
+    partition_size: u32,
+    stages: [Option<u8>; 8],
+) -> ResidueHeader {
     let mut cascade_bits = 0u8;
     for (j, slot) in stages.iter().enumerate() {
         if slot.is_some() {
@@ -98,7 +112,7 @@ fn one_partition_header(partition_size: u32, stages: [Option<u8>; 8]) -> Residue
         }
     }
     ResidueHeader {
-        residue_type: 1,
+        residue_type,
         residue_begin: 0,
         residue_end: partition_size,
         partition_size,
@@ -107,6 +121,45 @@ fn one_partition_header(partition_size: u32, stages: [Option<u8>; 8]) -> Residue
         cascade: vec![cascade_bits],
         books: vec![stages],
     }
+}
+
+/// A 2-D tessellation VQ value book over a signed integer ladder, for the
+/// format-0 strided scatter (its `dimensions = 2` must divide the
+/// partition size per §8.6.3 step 1). Entry `e` reconstructs to the pair
+/// `(minimum + m[2e]*step, minimum + m[2e+1]*step)`; the multiplicand
+/// table tessellates the `2^length` entries across a `2^(length/2)` per-
+/// axis grid so every (low, high) pair on the ladder is reachable.
+fn signed_value_book_2d(length: u8, step: f32) -> VorbisCodebook {
+    let entries: u32 = 1u32 << length;
+    // Per-axis cardinality so axis0 * axis1 == entries (length even here).
+    let axis: u32 = 1u32 << (length / 2);
+    let half = axis / 2;
+    let mut multiplicands: Vec<u32> = Vec::with_capacity(entries as usize * 2);
+    for e in 0..entries {
+        // lookup-type-2 unpacks entry e as multiplicands[e*dims .. +dims].
+        let lo = e % axis;
+        let hi = e / axis;
+        multiplicands.push(lo);
+        multiplicands.push(hi);
+    }
+    VorbisCodebook {
+        dimensions: 2,
+        entries,
+        codeword_lengths: vec![length; entries as usize],
+        lookup: VqLookup::Tessellation {
+            minimum_value: -(half as f32) * step,
+            delta_value: step,
+            value_bits: 8,
+            sequence_p: false,
+            multiplicands,
+        },
+    }
+}
+
+/// The per-axis `entries/2` offset for a [`signed_value_book_2d`]: maps a
+/// per-axis multiplicand `m` back to its value `(m − half)·step`.
+fn book_half_2d(length: u8) -> i32 {
+    (1i32 << (length / 2)) / 2
 }
 
 /// 10·log10 of the energy ratio between a target and the per-bin error.
@@ -337,4 +390,157 @@ fn cascade_reconstruction_equals_sum_of_chosen_entries() {
             "bin {bin}: decoded {g} != sum-of-entries {e}"
         );
     }
+}
+
+// ===================================================================
+// Residue format 0 (§8.6.3) — the strided-scatter layout no staged
+// fixture exercises (real encoders emit only formats 1 and 2). These
+// tests prove the encode-side strided *gather* (`gather_index` for
+// residue_type 0) inverts the decode-side strided *scatter* end to end,
+// the format-0 analog of the format-1 coverage above.
+// ===================================================================
+
+#[test]
+fn format0_cascade_roundtrips_through_strided_scatter() {
+    // dim-2 value book, partition size 32 → §8.6.3 step = 32/2 = 16.
+    let p = 32usize;
+    let residual = synthetic_residual(p);
+
+    // 2-D ladder, length 6 → 64 entries (8 per axis), step 0.5 →
+    // per-axis span [-2.0, +1.5]. Covers the synthetic residual's bulk
+    // and quantises each scalar onto the 0.5 ladder.
+    let vbook = signed_value_book_2d(6, 0.5);
+    let cbook = classbook(2, 1);
+    let codebooks = vec![cbook, vbook.clone()];
+
+    let mut stages: [Option<u8>; 8] = Default::default();
+    stages[0] = Some(1);
+    let header = one_partition_header_typed(0, p as u32, stages);
+
+    let mut refs: [Option<&VorbisCodebook>; 8] = Default::default();
+    refs[0] = Some(&vbook);
+
+    let got = cascade_roundtrip(&residual, &header, &codebooks, &refs);
+
+    // Every decoded scalar lands on the 0.5 ladder within the book span.
+    let lo = -(book_half_2d(6) as f32) * 0.5; // -2.0
+    let hi = (book_half_2d(6) as f32 - 1.0) * 0.5; // +1.5
+    for &v in &got {
+        let q = (v / 0.5).round() * 0.5;
+        assert!((v - q).abs() <= 1e-4, "decoded {v} off the 0.5 ladder");
+        assert!(
+            v >= lo - 1e-4 && v <= hi + 1e-4,
+            "decoded {v} outside book span [{lo}, {hi}]"
+        );
+    }
+}
+
+#[test]
+fn format0_decode_equals_strided_sum_of_entries() {
+    // The format-0 decoded residual must equal, bin for bin, the entries'
+    // reconstructions placed by the §8.6.3 scatter `read i, element j →
+    // position i + j*step` — *not* the format-1 contiguous mapping. This
+    // pins the encode gather as the exact inverse of the decode scatter.
+    let p = 32usize;
+    let step = p / 2; // §8.6.3 step 1: partition_size / dimensions = 32/2.
+    let residual = synthetic_residual(p);
+
+    let length = 6u8;
+    let ladder = 0.5f32;
+    let vbook = signed_value_book_2d(length, ladder);
+    let cbook = classbook(2, 1);
+    let codebooks = vec![cbook, vbook.clone()];
+
+    let mut stages: [Option<u8>; 8] = Default::default();
+    stages[0] = Some(1);
+    let header = one_partition_header_typed(0, p as u32, stages);
+
+    let mut refs: [Option<&VorbisCodebook>; 8] = Default::default();
+    refs[0] = Some(&vbook);
+
+    // Plan with residue_type 0 and rebuild the expected partition by hand,
+    // scattering each entry's 2-D reconstruction with the §8.6.3 rule.
+    let entries = plan_partition_cascade(&residual, &refs, 0, p as u32).unwrap();
+    let axis_half = book_half_2d(length) as f32;
+    let mut expected = vec![0.0f32; p];
+    for (i, &e) in entries[0].as_ref().unwrap().iter().enumerate() {
+        // unpack entry e → (lo, hi) per-axis multiplicands.
+        let axis = 1u32 << (length / 2);
+        let lo_m = (e % axis) as f32;
+        let hi_m = (e / axis) as f32;
+        let lo_val = (lo_m - axis_half) * ladder;
+        let hi_val = (hi_m - axis_half) * ladder;
+        // §8.6.3 scatter: element 0 → i, element 1 → i + step.
+        expected[i] += lo_val;
+        expected[i + step] += hi_val;
+    }
+
+    let got = cascade_roundtrip(&residual, &header, &codebooks, &refs);
+    for (bin, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (g - e).abs() <= 1e-4,
+            "bin {bin}: format-0 decoded {g} != strided sum-of-entries {e}"
+        );
+    }
+
+    // Cross-check: the same entry run interpreted with the *contiguous*
+    // (format-1) layout would generally NOT match — confirming the test
+    // actually exercises the strided addressing, not an accidental
+    // coincidence. (Skip the assertion if the two layouts happen to agree
+    // for this particular data, which they do not for a non-flat signal.)
+    let mut contiguous = vec![0.0f32; p];
+    for (k, &e) in entries[0].as_ref().unwrap().iter().enumerate() {
+        let axis = 1u32 << (length / 2);
+        let lo_val = ((e % axis) as f32 - axis_half) * ladder;
+        let hi_val = ((e / axis) as f32 - axis_half) * ladder;
+        contiguous[2 * k] += lo_val;
+        if 2 * k + 1 < p {
+            contiguous[2 * k + 1] += hi_val;
+        }
+    }
+    assert!(
+        expected != contiguous,
+        "strided and contiguous layouts coincided — test would not \
+         distinguish format 0 from format 1"
+    );
+}
+
+#[test]
+fn format0_two_stage_cascade_refines_strictly() {
+    // The §8.6.2 additive cascade refines under format 0's scatter exactly
+    // as it does under format 1: a second stage cannot increase the error
+    // and strictly decreases it on a non-ladder-aligned signal.
+    let p = 32usize;
+    let residual = synthetic_residual(p);
+
+    let coarse = signed_value_book_2d(6, 1.0); // span [-4, +3], step 1.0
+    let fine = signed_value_book_2d(6, 0.125); // refines within ±0.5
+    let cbook = classbook(2, 1);
+
+    // one-stage reference.
+    let codebooks_1 = vec![cbook.clone(), coarse.clone()];
+    let mut stages_1: [Option<u8>; 8] = Default::default();
+    stages_1[0] = Some(1);
+    let header_1 = one_partition_header_typed(0, p as u32, stages_1);
+    let mut refs_1: [Option<&VorbisCodebook>; 8] = Default::default();
+    refs_1[0] = Some(&coarse);
+    let got_1 = cascade_roundtrip(&residual, &header_1, &codebooks_1, &refs_1);
+
+    // two-stage: coarse then fine.
+    let codebooks_2 = vec![cbook, coarse.clone(), fine.clone()];
+    let mut stages_2: [Option<u8>; 8] = Default::default();
+    stages_2[0] = Some(1);
+    stages_2[1] = Some(2);
+    let header_2 = one_partition_header_typed(0, p as u32, stages_2);
+    let mut refs_2: [Option<&VorbisCodebook>; 8] = Default::default();
+    refs_2[0] = Some(&coarse);
+    refs_2[1] = Some(&fine);
+    let got_2 = cascade_roundtrip(&residual, &header_2, &codebooks_2, &refs_2);
+
+    let sse_1 = sse(&residual, &got_1);
+    let sse_2 = sse(&residual, &got_2);
+    assert!(
+        sse_2 < sse_1,
+        "format-0 two-stage SSE {sse_2} not strictly below one-stage {sse_1}"
+    );
 }
