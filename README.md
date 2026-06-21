@@ -207,6 +207,32 @@ shown geometry-robust across block sizes 64 / 256 / 1024. This jointly
 proves the floor render, §4.3.6 dot product, §4.3.7 IMDCT and §4.3.6 window
 are correct end to end.
 
+Three further integration suites cover decode paths that **no staged
+fixture exercises** — every `docs/audio/vorbis/fixtures/*` stream is floor
+type 1 with residue formats 1/2 only, so the floor-0 LSP path and the
+residue format-0 strided-scatter layout had no end-to-end coverage despite
+both being wired into the decode driver.
+`tests/floor0_curve_roundtrip.rs` drives the floor-0
+plan→write→decode→curve loop (`plan_floor0_coefficients` →
+`write_floor0_packet` → `Floor0Decoder::decode`) and asserts the §6.2.3
+LSP→envelope curve **bit-for-bit** against an independent in-test
+recomputation of the Bark-map + LSP-product + `exp` synthesis — covering
+both order parities, dim-1/dim-2 value books, a partial-final-vector
+surplus discard, the per-`n` Bark-map recompute across block sizes, and the
+§6.2.2 zero-amplitude unused short-circuit. `tests/floor0_audio_packet_decode.rs`
+then drives a real floor-0 audio packet through the **full
+`decode_audio_packet_pre_imdct` driver** (the §4.3.2 dispatch landing on
+`FloorDecoder::Type0`, the §6.2.2-body → §4.3.4-residue bit hand-off, the
+§4.3.6 dot product over a floor-0 curve), cross-checked against a
+standalone `Floor0Decoder` of the same body, plus the §4.3.2 step-6 unused
+path. `tests/residue_cascade_roundtrip.rs` gains **residue format-0**
+coverage: a §8.6.3 strided-scatter (`read i, element j → i + j·step`)
+encode→decode round-trip whose decoded residual is checked against the
+hand-scattered entry reconstructions — with a cross-check that the
+contiguous (format-1) interpretation of the same entry run would *not*
+match, proving the encode-side gather is the exact inverse of the decode
+scatter — plus a two-stage format-0 cascade refinement.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container

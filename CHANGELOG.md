@@ -4,6 +4,33 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Floor-0 (LSP) end-to-end coverage for the decode paths no staged fixture
+  exercises (every `docs/audio/vorbis/fixtures/*` stream is floor type 1):
+  - `tests/floor0_curve_roundtrip.rs` — the floor-0 plan→write→decode→curve
+    loop (`plan_floor0_coefficients` → `write_floor0_packet` →
+    `Floor0Decoder::decode`), asserting the §6.2.3 LSP→envelope curve
+    bit-for-bit against an independent in-test recomputation of the
+    Bark-map + LSP-product + `exp` synthesis. Covers both order parities,
+    dim-1/dim-2 value books, a partial-final-vector surplus discard, the
+    per-`n` Bark-map recompute across block sizes, and the §6.2.2
+    zero-amplitude unused short-circuit.
+  - `tests/floor0_audio_packet_decode.rs` — a real floor-0 audio packet
+    decoded through the full `decode_audio_packet_pre_imdct` driver (the
+    §4.3.2 dispatch landing on `FloorDecoder::Type0`, the §6.2.2-body →
+    §4.3.4-residue bit hand-off, the §4.3.6 dot product over a floor-0
+    curve), cross-checked against a standalone `Floor0Decoder` of the same
+    body, plus the §4.3.2 step-6 unused path.
+- Residue **format-0** (§8.6.3 strided scatter) encode→decode round-trip in
+  `tests/residue_cascade_roundtrip.rs` — real encoders emit only formats
+  1/2, so the `read i, element j → i + j·step` scatter had only a
+  unit-level decode test. The new tests prove the encode-side gather is the
+  exact inverse of the decode scatter (decoded residual == hand-scattered
+  entry reconstructions, with a cross-check that the contiguous format-1
+  interpretation of the same entry run would *not* match), and that the
+  §8.6.2 additive cascade refines strictly under the format-0 layout.
+
 ### Fixed
 
 - §3.2.1 canonical Huffman tree construction now assigns codewords by the
