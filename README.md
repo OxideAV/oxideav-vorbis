@@ -125,6 +125,20 @@ Vorbis-specific scaling.
   per-logical-stream. Together with the per-packet suite this pins the
   **entire** structural decode of every staged stream against the reference
   trace, leaving only the lossy sample values to the ±1-s16 PCM test.
+- **Overlap-add output geometry** — `tests/overlap_add_geometry.rs` pins the
+  §4.3.8 windowing / overlap-add-into-PCM *geometry* as it runs inside
+  `StreamingDecoder`. Driving every fixture's whole audio stream through the
+  public `push_packet` path, it asserts for every emitted frame that the
+  priming step lands only on the first packet, that each subsequent frame's
+  per-channel PCM length equals the §4.3.8 `prev_n/4 + cur_n/4` lap (with
+  `prev_n` from the previous packet's reported `n`, so the contract is
+  checked across **all** packets — including the ones the trace does not
+  log), that every channel of a frame has identical length, and that the
+  streaming path reports the same `mode_number` / `blockflag` /
+  `block_size` the trace logged. **654 PCM frames across all 16 staged
+  fixtures.** It is a geometry + dispatch oracle (no sample-value re-check),
+  isolating a §4.3.8 lap-length / priming / mode-dispatch regression from a
+  numeric IMDCT/floor/residue one.
 
 ### Encode
 

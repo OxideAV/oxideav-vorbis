@@ -6,6 +6,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §4.3.8 overlap-add output-geometry conformance over the full staged
+  fixture decode (`tests/overlap_add_geometry.rs`). The PCM fixture test
+  validates the decoded sample *values*; this suite pins the windowing /
+  overlap-add-into-PCM *geometry* as it runs inside `StreamingDecoder`.
+  Driving every fixture's whole audio stream through the public
+  `push_packet` path, it asserts for every emitted frame: the priming step
+  lands only on the first packet; each subsequent frame's per-channel PCM
+  length equals the §4.3.8 `prev_n/4 + cur_n/4` lap (with `prev_n` from the
+  previous packet's reported `n`, so the contract is checked across **all**
+  packets, including the ones the trace does not log); every channel of a
+  frame has identical length; and the streaming path reports the same
+  `mode_number` / `blockflag` / `block_size` the trace logged (indexed by
+  the trace's true bitstream `packet_idx`). 654 PCM frames across the 16
+  staged fixtures (17 logical streams). It is a geometry + dispatch oracle
+  (no sample-value re-check), isolating a §4.3.8 lap-length / priming /
+  mode-dispatch regression from a numeric IMDCT/floor/residue one.
 - Setup-/identification-header structural conformance against the staged
   fixture traces (`tests/setup_header_trace_conformance.rs`). Each
   `trace.txt` logs structured `VORBIS_HEADER_ID`, `VORBIS_HEADER_SETUP`,
