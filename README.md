@@ -85,6 +85,26 @@ Vorbis-specific scaling.
   routed into the audio driver, and empty / single-byte / pseudo-random
   packet bodies all return a typed `StreamingError` or decode cleanly —
   never a panic.
+- **Per-packet trace conformance** — `tests/audio_packet_trace_conformance.rs`
+  validates the §4.3.1 *structural decisions* the PCM-level fixture test
+  doesn't reach. Each fixture's `trace.txt` is the documented load-bearing
+  reference for the per-packet `mode_number` / `blockflag` / `prev_window`
+  / `next_window` / `block_size` selections every conformant decoder must
+  reproduce; the suite drives every fixture's audio packets through the
+  public §4.3.1 parser (`read_packet_header`) and asserts each parsed
+  header matches the trace **line-for-line** — **505 audio-packet decisions
+  across all 16 staged fixtures**, the chained two-stream fixture included
+  (a serial-aware de-framer separates its logical streams so each is
+  validated against its own `stream_idx` trace records, proving the §4.3.1
+  decode is per-stream independent across the chaining boundary). It is a
+  pure header-decision oracle (no floor / residue / IMDCT runs), isolating
+  a regression in the mode-bit width, the short-vs-long window-flag gating,
+  or the blocksize resolution from the PCM-level test where such a bug would
+  surface only as garbled audio. The trace's `packet_idx` is honoured as the
+  true bitstream index — long streams log packets 0..=31 then the final
+  end-trim packet at its real index, so the granule-position end-trim packet
+  is validated too — and each de-framed packet body length is cross-checked
+  against the trace's `packet_bytes`.
 
 ### Encode
 

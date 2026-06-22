@@ -6,6 +6,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Per-packet §4.3.1 header-decision conformance against the staged
+  fixture traces (`tests/audio_packet_trace_conformance.rs`). Each
+  `docs/audio/vorbis/fixtures/*/trace.txt` logs, per audio packet, the
+  load-bearing structural decisions every conformant decoder must
+  reproduce (`mode_number` / `blockflag` / `prev_window` / `next_window` /
+  `block_size`). The PCM-level fixture test only validated the *final*
+  bytes; this new suite drives every fixture's audio packets through the
+  public §4.3.1 parser (`read_packet_header`) and asserts each parsed
+  header matches the trace **line-for-line** — 505 audio-packet decisions
+  across all 16 staged fixtures (including the chained two-stream fixture,
+  walked per-logical-stream by a serial-aware de-framer). It is a pure
+  header-decision oracle (no floor/residue/IMDCT), so a regression in the
+  mode-bit width, the short-vs-long window-flag gating, or the blocksize
+  resolution is caught in isolation. The trace's `packet_idx` is honoured
+  as the true bitstream index (long streams log packets 0..=31 then the
+  final end-trim packet at its real index), and each de-framed packet's
+  body length is cross-checked against the trace's `packet_bytes`.
 - Floor-0 (LSP) end-to-end coverage for the decode paths no staged fixture
   exercises (every `docs/audio/vorbis/fixtures/*` stream is floor type 1):
   - `tests/floor0_curve_roundtrip.rs` — the floor-0 plan→write→decode→curve
