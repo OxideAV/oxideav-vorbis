@@ -105,6 +105,26 @@ Vorbis-specific scaling.
   end-trim packet at its real index, so the granule-position end-trim packet
   is validated too — and each de-framed packet body length is cross-checked
   against the trace's `packet_bytes`.
+- **Setup-header structural conformance** —
+  `tests/setup_header_trace_conformance.rs` validates the *setup-time*
+  structural configuration the headers establish (the "same setup-header
+  counts" the fixture notes list as load-bearing). It parses each fixture's
+  identification (§4.2.2) and setup (§4.2.4) headers and asserts the parsed
+  structures reproduce, field-for-field, every `VORBIS_HEADER_ID` /
+  `VORBIS_HEADER_SETUP` / `CODEBOOK` / `FLOOR_CONFIG` / `RESIDUE_CONFIG` /
+  `MAPPING_CONFIG` / `MODE_CONFIG` trace event: identification
+  channels/rate/bitrates/blocksizes; the five setup counts; per-codebook
+  dimensions/entries/lookup-type/value-bits/sequence-p; per-floor type and
+  (floor-1) partitions/multiplier/rangebits/x-list-count (with the two
+  implicit endpoint posts); per-residue
+  type/begin/end/partition-size/classifications/classbook; per-mapping
+  type/submaps/coupling-steps and the magnitude/angle/per-submap
+  floor/residue index arrays; and per-mode
+  blockflag/windowtype/transformtype/mapping — **842 structural events
+  across all 16 staged fixtures**, the chained two-stream fixture validated
+  per-logical-stream. Together with the per-packet suite this pins the
+  **entire** structural decode of every staged stream against the reference
+  trace, leaving only the lossy sample values to the ±1-s16 PCM test.
 
 ### Encode
 

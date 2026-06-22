@@ -6,6 +6,28 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Setup-/identification-header structural conformance against the staged
+  fixture traces (`tests/setup_header_trace_conformance.rs`). Each
+  `trace.txt` logs structured `VORBIS_HEADER_ID`, `VORBIS_HEADER_SETUP`,
+  `CODEBOOK`, `FLOOR_CONFIG`, `RESIDUE_CONFIG`, `MAPPING_CONFIG` and
+  `MODE_CONFIG` events — the "same setup-header counts" the fixture notes
+  list as load-bearing reference data. The new suite parses each fixture's
+  identification (§4.2.2) and setup (§4.2.4) headers and asserts the parsed
+  structures reproduce, field-for-field, every one of those events:
+  identification channels / sample-rate / bitrates / blocksizes; the five
+  setup counts; per-codebook `dimensions` / `entries` / `lookup_type`
+  (None=0 / Lattice=1 / Tessellation=2) / `value_bits` / `sequence_p`;
+  per-floor type and (floor-1) `partitions` / `multiplier` / `rangebits` /
+  `x_list_count` (honouring the two implicit endpoint posts); per-residue
+  type / `begin` / `end` / `partition_size` / `classifications` /
+  `classbook`; per-mapping type / `submaps` / `coupling_steps` and the
+  `magnitude` / `angle` / per-submap `floor` / `residue` index arrays; and
+  per-mode `blockflag` / `windowtype` / `transformtype` / `mapping`. 842
+  structural events across the 16 staged fixtures (chained two-stream
+  fixture validated per-logical-stream). Together with the audio-packet
+  suite this pins the **entire** structural decode of every staged stream —
+  every setup decision and every per-packet decision — against the trace,
+  leaving only the lossy sample values to the ±1-s16 PCM test.
 - Per-packet §4.3.1 header-decision conformance against the staged
   fixture traces (`tests/audio_packet_trace_conformance.rs`). Each
   `docs/audio/vorbis/fixtures/*/trace.txt` logs, per audio packet, the
