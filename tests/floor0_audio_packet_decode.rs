@@ -300,3 +300,84 @@ fn floor0_unused_packet_zeroes_spectrum_through_driver() {
         other => panic!("expected PreImdct, got {other:?}"),
     }
 }
+
+#[test]
+fn render_curve_reproduces_the_full_driver_floor0_curve() {
+    // Tie the encoder-side `Floor0Decoder::render_curve` primitive to the
+    // exact §6.2.3 curve the *decode* path computes inside the §4.3.6
+    // product. An encoder planning residue against `X / render_curve(...)`
+    // must use the same per-bin floor the decoder reconstructs, so this
+    // cross-check pins that the primitive matches the driver-side curve
+    // bin-for-bin.
+    let setup = floor0_mono_setup();
+    let header = floor0_header();
+    let codebooks = &setup.codebooks;
+
+    // The same non-degenerate LSP run the full-driver test decodes.
+    let entries = [1u32, 3, 5, 2];
+    let n = 64usize;
+    let half_n = n / 2;
+
+    // Decode the floor body standalone (the curve the driver also sees).
+    let packet = assemble_packet(&header, codebooks, &entries);
+    let mut prelude_reader = BitReaderLsb::new(&packet);
+    let _ = prelude_reader.read_u32(1).unwrap(); // discard packet_type bit
+    let body_bits = floor0_body_bit_len(&header, entries.len());
+    let mut bw = BitWriterLsb::new();
+    for _ in 0..body_bits {
+        let b = prelude_reader.read_u32(1).unwrap();
+        bw.write_u32(b, 1);
+    }
+    let body_only = bw.finish();
+    let floor_dec = Floor0Decoder::new(&header, codebooks).expect("standalone floor-0 builds");
+    let mut br = BitReaderLsb::new(&body_only);
+    let decoded = match floor_dec.decode(&mut br, half_n) {
+        Floor0Curve::Curve(c) => c,
+        Floor0Curve::Unused => panic!("nonzero amplitude must decode as Curve"),
+    };
+
+    // Reconstruct the §6.2.2 coefficient run from the entries + value book
+    // (book index 1 is the dim-1 floor0_value_book(3, 8): entry e → value e,
+    // with the [last] accumulation across the 4 entries → [1, 4, 9, 11]).
+    let order = header.order as usize;
+    let book = &codebooks[1];
+    let dims = book.dimensions as usize;
+    let VqLookup::Tessellation {
+        minimum_value,
+        delta_value,
+        multiplicands,
+        ..
+    } = &book.lookup
+    else {
+        panic!("floor-0 value book must be a tessellation book");
+    };
+    let mut coeffs = Vec::new();
+    let mut last = 0.0f32;
+    for &entry in &entries {
+        let base = entry as usize * dims;
+        let mut temp: Vec<f32> = (0..dims)
+            .map(|j| multiplicands[base + j] as f32 * delta_value + minimum_value)
+            .collect();
+        for x in &mut temp {
+            *x += last;
+        }
+        last = *temp.last().unwrap();
+        coeffs.extend_from_slice(&temp);
+        if coeffs.len() >= order {
+            break;
+        }
+    }
+    assert_eq!(coeffs, vec![1.0, 4.0, 9.0, 11.0]);
+
+    // render_curve(amplitude, coefficients, n) must equal the decode-path
+    // curve bin-for-bin. assemble_packet writes amplitude = 42.
+    let rendered = floor_dec.render_curve(42, &coeffs, half_n);
+    assert_eq!(rendered.len(), decoded.len());
+    for (k, (&r, &d)) in rendered.iter().zip(&decoded).enumerate() {
+        assert_eq!(
+            r.to_bits(),
+            d.to_bits(),
+            "bin {k}: render_curve {r} != decode-path {d}"
+        );
+    }
+}

@@ -15,7 +15,10 @@ All notable changes to `oxideav-vorbis` are recorded here.
   render_curve(...)[k]`, the §4.3.6 per-bin multiplier) on a non-flat
   floor-0. Returns the nominal all-zero `'unused'` curve for `amplitude ==
   0` or a coefficients vector shorter than `floor0_order`. Unit-tested
-  bit-identical to the decode-path curve.
+  bit-identical to the decode-path curve, and cross-checked in
+  `tests/floor0_audio_packet_decode.rs` against the §6.2.3 curve the
+  **full §4.3 driver** reconstructs inside the §4.3.6 product — proving the
+  encoder-side primitive matches the per-bin floor the decoder reapplies.
 - Non-flat floor-1 PCM round-trip fidelity suite
   (`tests/nonflat_floor_pcm_roundtrip.rs`). The existing
   `tests/pcm_packet_roundtrip.rs` round-trip used a *flat* floor (constant
