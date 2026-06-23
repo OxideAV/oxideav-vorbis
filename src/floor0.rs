@@ -276,6 +276,34 @@ impl Floor0Decoder {
         }
     }
 
+    /// Render the §6.2.3 linear-domain floor curve a given `amplitude` and
+    /// LSP `coefficients` vector reconstruct, **without** reading a
+    /// bitstream — the encoder-side analogue of [`Self::decode`]'s
+    /// curve-computation half (the floor-0 twin of
+    /// [`crate::floor1::Floor1Decoder::render_curve`]).
+    ///
+    /// A faithful encoder needs this to plan residue against a **non-flat**
+    /// floor-0 curve: the decoder forms the final spectrum as `floor[k] ·
+    /// residue[k]` (§4.3.6), so the residue target must be `X[k] /
+    /// render_curve(amplitude, coefficients)[k]` — the exact per-bin LSP
+    /// envelope the decoder will multiply back in, not an idealised target.
+    /// `coefficients` is the post-§6.2.2 LSP vector (the `[last]`-offset
+    /// accumulation already applied, e.g. the
+    /// [`crate::floor0_encode::plan_floor0_coefficients`] reconstruction);
+    /// only its first `floor0_order` scalars are read, matching the decode
+    /// path. `n` is the bin count (`blocksize/2`).
+    ///
+    /// Returns the all-zero `'unused'` curve when `amplitude == 0` (the
+    /// §6.2.2 nominal short-circuit) or when `coefficients` is shorter than
+    /// `floor0_order` (the only way §6.2.3's LSP product is well-defined).
+    #[must_use]
+    pub fn render_curve(&self, amplitude: u32, coefficients: &[f32], n: usize) -> Vec<f32> {
+        if amplitude == 0 || coefficients.len() < self.order {
+            return vec![0.0; n];
+        }
+        self.curve_computation(amplitude, coefficients, n)
+    }
+
     /// §6.2.2 packet decode. Returns `Some((amplitude, coefficients))`
     /// on a nonzero-amplitude success, or `None` if the amplitude read
     /// zero or any end-of-packet occurred (both map to 'unused' status
@@ -839,6 +867,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- render_curve (encoder-side §6.2.3) ----
+
+    #[test]
+    fn render_curve_matches_decode_path_curve() {
+        // The encoder-side render_curve(amplitude, coefficients, n) must
+        // equal the curve the decode path produces from a packet encoding
+        // the same amplitude + coefficients.
+        let header = Floor0Header {
+            order: 4,
+            rate: 44_100,
+            bark_map_size: 256,
+            amplitude_bits: 6,
+            amplitude_offset: 100,
+            book_list: vec![0],
+        };
+        let dec = Floor0Decoder::new(&header, &[two_entry_dim2_book(2.0, 5.0)]).unwrap();
+
+        // Decode a packet whose two dim-2 entry-0 reads yield, with the
+        // §6.2.2 [last] accumulation, coefficients [2, 5, 7, 10].
+        let mut w = BitWriterLsb::with_capacity(8);
+        w.write_u32(25, 6); // amplitude
+        w.write_u32(0, 1); // booknumber
+        w.write_bit(false); // entry 0 → [2, 5]
+        w.write_bit(false); // entry 0 → [2, 5] + last 5 → [7, 10]
+        let packet = w.finish();
+        let mut r = BitReaderLsb::new(&packet);
+        let n = 32;
+        let decoded = match dec.decode(&mut r, n) {
+            Floor0Curve::Curve(c) => c,
+            Floor0Curve::Unused => panic!("expected a Curve"),
+        };
+
+        // render_curve from the same amplitude + reconstructed coefficients.
+        let rendered = dec.render_curve(25, &[2.0, 5.0, 7.0, 10.0], n);
+        assert_eq!(rendered, decoded);
+    }
+
+    #[test]
+    fn render_curve_zero_amplitude_is_all_zero() {
+        let header = Floor0Header {
+            order: 4,
+            rate: 44_100,
+            bark_map_size: 256,
+            amplitude_bits: 6,
+            amplitude_offset: 100,
+            book_list: vec![0],
+        };
+        let dec = Floor0Decoder::new(&header, &[two_entry_dim2_book(2.0, 5.0)]).unwrap();
+        assert_eq!(
+            dec.render_curve(0, &[2.0, 5.0, 7.0, 10.0], 16),
+            vec![0.0; 16]
+        );
+    }
+
+    #[test]
+    fn render_curve_short_coefficients_is_all_zero() {
+        // order is 4; fewer than 4 coefficients cannot drive the §6.2.3 LSP
+        // product → nominal all-zero curve.
+        let header = Floor0Header {
+            order: 4,
+            rate: 44_100,
+            bark_map_size: 256,
+            amplitude_bits: 6,
+            amplitude_offset: 100,
+            book_list: vec![0],
+        };
+        let dec = Floor0Decoder::new(&header, &[two_entry_dim2_book(2.0, 5.0)]).unwrap();
+        assert_eq!(dec.render_curve(25, &[2.0, 5.0, 7.0], 16), vec![0.0; 16]);
     }
 
     #[test]

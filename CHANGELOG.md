@@ -6,6 +6,16 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- `Floor0Decoder::render_curve` — the encoder-side §6.2.3 floor-0
+  LSP-curve-synthesis primitive (the floor-0 twin of
+  `Floor1Decoder::render_curve`). Given a per-packet `amplitude` and the
+  post-§6.2.2 LSP `coefficients` vector, it renders the exact linear-domain
+  floor the decoder reconstructs without reading a bitstream, so an encoder
+  can plan residue against the rendered floor-0 envelope (`X[k] /
+  render_curve(...)[k]`, the §4.3.6 per-bin multiplier) on a non-flat
+  floor-0. Returns the nominal all-zero `'unused'` curve for `amplitude ==
+  0` or a coefficients vector shorter than `floor0_order`. Unit-tested
+  bit-identical to the decode-path curve.
 - Non-flat floor-1 PCM round-trip fidelity suite
   (`tests/nonflat_floor_pcm_roundtrip.rs`). The existing
   `tests/pcm_packet_roundtrip.rs` round-trip used a *flat* floor (constant
