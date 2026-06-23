@@ -261,6 +261,26 @@ shown geometry-robust across block sizes 64 / 256 / 1024. This jointly
 proves the floor render, §4.3.6 dot product, §4.3.7 IMDCT and §4.3.6 window
 are correct end to end.
 
+`tests/nonflat_floor_pcm_roundtrip.rs` closes the harder, more
+representative encode case the flat-floor round-trip leaves open: a
+**non-flat** floor-1 (seven interior posts) fitted to a smoothed `|X|`
+magnitude envelope. The fidelity hinge is the encoder-side
+`Floor1Decoder::render_curve` primitive (§7.2.4): because §7.2.4 step 2
+draws **integer line segments** between posts, the reconstructed floor bows
+away from the desired envelope *between* posts, so a faithful encoder must
+carry residue against `X[k] / render_curve(floor1_y)[k]` — the exact per-bin
+floor the decoder multiplies back in (§4.3.6) — not against the envelope
+sampled at posts. The suite drives PCM → forward MDCT → envelope fit →
+render → residue-against-the-rendered-floor → `write_audio_packet` →
+`decode_audio_packet_windowed` and clears **≥35 dB** PCM-domain SNR (≈44 dB
+measured) across short and long blocks. A control variant pins *why* the
+rendered-floor divide is the correct one: dividing by the desired envelope
+instead collapses the reconstruction to **<1 dB** SNR (a ≥10 dB gap is
+asserted). A third assertion confirms the fitted floor is genuinely
+non-flat (≥2× dynamic range across the band), so the test is no easier than
+the flat-floor case. `render_curve` itself is unit-tested bit-identical to
+both the private curve-computation and the decode-path curve.
+
 Three further integration suites cover decode paths that **no staged
 fixture exercises** — every `docs/audio/vorbis/fixtures/*` stream is floor
 type 1 with residue formats 1/2 only, so the floor-0 LSP path and the

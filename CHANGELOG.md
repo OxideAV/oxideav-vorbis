@@ -6,6 +6,25 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Non-flat floor-1 PCM round-trip fidelity suite
+  (`tests/nonflat_floor_pcm_roundtrip.rs`). The existing
+  `tests/pcm_packet_roundtrip.rs` round-trip used a *flat* floor (constant
+  `F = 1.0`) so residue carried the analysis spectrum directly; this suite
+  closes the representative case of a **non-flat** floor-1 fitted to the
+  spectral shape. It drives synthetic PCM → §4.3.7 forward MDCT → smoothed
+  magnitude-envelope fit → seven-interior-post floor-1 →
+  `Floor1Decoder::render_curve` → residue-against-the-rendered-floor cascade
+  → `write_audio_packet` → `decode_audio_packet_windowed` → IMDCT+window,
+  and pins the decoded frame to `window ⊙ IMDCT(X)` at ≥ 35 dB PCM-domain
+  SNR (≈ 44 dB achieved) across short and long blocks. A control variant
+  proves the fidelity hinge: dividing the spectrum by the *desired envelope*
+  (sampled at posts) instead of the **rendered** floor collapses the
+  reconstruction to < 1 dB SNR — because §7.2.4 step 2 draws integer line
+  segments between posts, so the rendered floor bows away from the envelope
+  between them and only the rendered-floor divide hands residue the per-bin
+  floor the decoder reapplies. A third assertion confirms the fitted floor
+  is genuinely non-flat (≥ 2× dynamic range across the band), so the test is
+  no easier than the flat-floor case.
 - `Floor1Decoder::render_curve` — the encoder-side §7.2.4 floor-1
   curve-synthesis primitive. Given a packet-domain `[floor1_Y]` post
   vector (the same vector `plan_floor1_y` produces and `write_floor1_packet`
