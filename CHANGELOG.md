@@ -6,6 +6,19 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- `Floor1Decoder::render_curve` — the encoder-side §7.2.4 floor-1
+  curve-synthesis primitive. Given a packet-domain `[floor1_Y]` post
+  vector (the same vector `plan_floor1_y` produces and `write_floor1_packet`
+  serialises) it renders the exact linear-domain floor the decoder will
+  reconstruct, without reading a bitstream. This is the floor a faithful
+  encoder must plan residue against on a **non-flat** floor: the decoder
+  computes the final spectrum as `floor[k] · residue[k]` (§4.3.6), and
+  §7.2.4 step 2 draws integer line segments between posts, so the rendered
+  floor bows away from a curved target between posts. Dividing the target
+  spectrum by `render_curve` output (rather than by the desired envelope
+  sampled at posts) gives residue the exact per-bin floor the decoder
+  multiplies back in. Unit-tested bit-identical to both the private
+  curve-computation and the decode-path curve.
 - §4.3.8 overlap-add output-geometry conformance over the full staged
   fixture decode (`tests/overlap_add_geometry.rs`). The PCM fixture test
   validates the decoded sample *values*; this suite pins the windowing /

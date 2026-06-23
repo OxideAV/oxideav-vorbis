@@ -297,6 +297,43 @@ impl Floor1Decoder {
         }
     }
 
+    /// Render the §7.2.4 linear-domain floor curve a packet-domain
+    /// `[floor1_Y]` post vector would reconstruct, **without** reading a
+    /// bitstream — the encoder-side analogue of [`Self::decode`]'s
+    /// curve-synthesis half.
+    ///
+    /// This is the floor-1 primitive an encoder needs to plan residue
+    /// against a **non-flat** floor: the decoder computes the final
+    /// spectrum as `floor[k] · residue[k]` (§4.3.6), so to reconstruct a
+    /// target spectrum `X` the residue target must be `X[k] /
+    /// render_curve(floor1_y)[k]`. Sampling the *desired* envelope at the
+    /// posts (as [`crate::floor1_envelope::plan_floor1_envelope`] does) is
+    /// not enough on its own, because §7.2.4 step 2 draws **integer line
+    /// segments** between posts — the rendered floor bows away from a
+    /// curved target between posts. Dividing by this rendered curve (rather
+    /// than the target envelope) gives the residue stage the exact per-bin
+    /// floor the decoder will multiply back in, keeping the round-trip
+    /// faithful across the whole band.
+    ///
+    /// `floor1_y` is the packet-domain post vector
+    /// ([`crate::floor1_encode::plan_floor1_y`] output / the
+    /// [`crate::encoder::Floor1Packet::floor1_y`] field): length
+    /// [`Self::floor1_values`], the two implicit endpoints first, in
+    /// `x_list` order (the same order [`Self::decode`] reads them). `n` is
+    /// the bin count (`blocksize/2`).
+    ///
+    /// Returns the all-zero `'unused'` curve when `floor1_y` does not have
+    /// exactly [`Self::floor1_values`] entries (the only way the §7.2.4
+    /// step-1/step-2 indexing can be well-defined), matching the decoder's
+    /// nominal short-circuit for a malformed body.
+    #[must_use]
+    pub fn render_curve(&self, floor1_y: &[u32], n: usize) -> Vec<f32> {
+        if floor1_y.len() != self.x_list.len() {
+            return vec![0.0; n];
+        }
+        self.curve_computation(floor1_y, n)
+    }
+
     /// §7.2.3 packet decode. Returns `Some([floor1_Y])` on success or
     /// `None` for the 'unused' status (either `[nonzero]` was clear or
     /// an end-of-packet condition occurred mid-decode).
@@ -1019,6 +1056,50 @@ mod tests {
         ];
         let expected: Vec<f32> = expected_int.iter().map(|&i| INVERSE_DB_TABLE[i]).collect();
         assert_eq!(curve, expected);
+    }
+
+    // ---- render_curve (encoder-side §7.2.4) ----
+
+    #[test]
+    fn render_curve_equals_private_curve_computation() {
+        // render_curve is the public encoder-side entry into the exact
+        // §7.2.4 step-1/step-2 the decode path runs; for a well-formed
+        // post vector it must be bit-identical.
+        let dec = Floor1Decoder::new(&header_one_partition(), &[scalar_book(2)]).unwrap();
+        let floor1_y = [40u32, 20, 1, 0];
+        let rendered = dec.render_curve(&floor1_y, 16);
+        let via_private = dec.curve_computation(&floor1_y, 16);
+        assert_eq!(rendered, via_private);
+    }
+
+    #[test]
+    fn render_curve_matches_decode_path_curve() {
+        // Decoding a packet whose body encodes the same posts must produce
+        // exactly what render_curve produces from those posts directly —
+        // the encoder-side primitive mirrors the decode-side curve.
+        let dec = Floor1Decoder::new(&header_one_partition(), &[scalar_book(2)]).unwrap();
+        // endpoints 40,20; interior wrapped Y [1,0] → posts [40,20,1,0].
+        let packet = pack_packet(true, 40, 20, &[true, false]);
+        let mut r = BitReaderLsb::new(&packet);
+        let decoded = match dec.decode(&mut r, 16) {
+            FloorCurve::Curve(c) => c,
+            FloorCurve::Unused => panic!("expected a curve"),
+        };
+        let rendered = dec.render_curve(&[40, 20, 1, 0], 16);
+        assert_eq!(rendered, decoded);
+    }
+
+    #[test]
+    fn render_curve_wrong_length_is_all_zero() {
+        // floor1_values is 4 here; a 3-element post vector cannot index the
+        // §7.2.4 loop → nominal all-zero 'unused' curve.
+        let dec = Floor1Decoder::new(&header_one_partition(), &[scalar_book(2)]).unwrap();
+        assert_eq!(dec.floor1_values(), 4);
+        let rendered = dec.render_curve(&[40, 20, 1], 16);
+        assert_eq!(rendered, vec![0.0; 16]);
+        // An over-long vector is likewise rejected.
+        let rendered = dec.render_curve(&[40, 20, 1, 0, 5], 16);
+        assert_eq!(rendered, vec![0.0; 16]);
     }
 
     // ---- packet decode (§7.2.3) ----
