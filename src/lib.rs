@@ -207,7 +207,10 @@ pub use floor0_encode::{floor0_vector_count, plan_floor0_coefficients, Floor0Enc
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
-pub use floor1_encode::{full_x_list as floor1_full_x_list, plan_floor1_y, Floor1EncodeError};
+pub use floor1_encode::{
+    full_x_list as floor1_full_x_list, plan_floor1_partition_cvals, plan_floor1_y, Floor1CvalError,
+    Floor1EncodeError,
+};
 pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
 pub use framing::{FrameSplitter, FramingError};
 pub use huffman::{

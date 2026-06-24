@@ -181,6 +181,95 @@ impl core::fmt::Display for Floor1EncodeError {
 
 impl std::error::Error for Floor1EncodeError {}
 
+/// Errors that can arise while planning a floor-1 packet's per-partition
+/// master-selector `partition_cvals` (Vorbis I §7.2.3 steps 5..19, encode
+/// direction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Floor1CvalError {
+    /// `floor1_y.len()` did not match `[floor1_values]` (`x_list.len() +
+    /// 2`). The planner needs one packet value per post — the two
+    /// endpoints first (which it skips, they carry no class/sub-book
+    /// codeword), then one per explicit x-coordinate in header order.
+    YLengthMismatch {
+        /// `[floor1_values]` = `header.x_list.len() + 2`.
+        expected: usize,
+        /// The supplied `floor1_y.len()`.
+        actual: usize,
+    },
+    /// `header.partition_class_list[partition]` named a class index past
+    /// the end of `header.classes`. §7.2.2 step 6 declares
+    /// `max(partition_class_list) + 1` classes; a dangling index is an
+    /// inconsistent header.
+    BadClassIndex {
+        /// The partition whose class index was out of range.
+        partition: usize,
+        /// The offending class index.
+        class: u8,
+        /// `header.classes.len()`.
+        class_count: usize,
+    },
+    /// A class's master- or sub-book index referenced a codebook past the
+    /// end of the supplied `codebooks` slice, or that codebook could not
+    /// be built into a Huffman tree. §7.2.3 steps 12/14 read these books;
+    /// the planner must build the same trees to test encodability.
+    BookResolution {
+        /// The partition whose class held the bad book.
+        partition: usize,
+        /// The class index.
+        class: usize,
+    },
+    /// No `cval` reachable through the class's master book slices into
+    /// sub-books that can encode every one of the partition's `cdim`
+    /// target `[floor1_Y]` values. Either the fitted amplitudes do not lie
+    /// in any sub-book's used set, or a dimension's only reachable sub-book
+    /// is the §7.2.3-step-18 "negative book" (forces `Y = 0`) while the
+    /// target is non-zero. The partition is unencodable for this class
+    /// configuration — the caller must refit the amplitudes or choose a
+    /// class whose sub-books span them.
+    NoEncodableCval {
+        /// The partition index (`0..partitions`).
+        partition: usize,
+        /// The class index the partition selected.
+        class: usize,
+        /// The partition's target `[floor1_Y]` slice (the `cdim` values
+        /// after the offset), for diagnosis.
+        targets: Vec<u32>,
+    },
+}
+
+impl core::fmt::Display for Floor1CvalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Floor1CvalError::YLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis floor1 cval-plan: floor1_y.len()={actual} != floor1_values={expected} (§7.2.3)"
+            ),
+            Floor1CvalError::BadClassIndex {
+                partition,
+                class,
+                class_count,
+            } => write!(
+                f,
+                "vorbis floor1 cval-plan: partition {partition} class index {class} >= classes.len()={class_count} (§7.2.2 step 6)"
+            ),
+            Floor1CvalError::BookResolution { partition, class } => write!(
+                f,
+                "vorbis floor1 cval-plan: partition {partition} class {class} master/sub-book could not be resolved into a Huffman tree (§7.2.3 steps 12/14)"
+            ),
+            Floor1CvalError::NoEncodableCval {
+                partition,
+                class,
+                targets,
+            } => write!(
+                f,
+                "vorbis floor1 cval-plan: partition {partition} class {class} has no master-book cval slicing into sub-books that encode targets {targets:?} (§7.2.3 steps 5..19)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Floor1CvalError {}
+
 /// Reconstruct the full `[floor1_X_list]` the §7.2.4 curve decoder uses —
 /// the two implicit endpoints (`0` and `2^rangebits`) at positions 0/1,
 /// then the header's explicit per-partition x-coordinates — exactly as
@@ -384,6 +473,231 @@ fn decode_post(val: i32, predicted: i32, highroom: i32, lowroom: i32, room: i32)
     } else {
         predicted + val / 2
     }
+}
+
+/// A single partition class's codebooks resolved into Huffman trees, plus
+/// the slice geometry the §7.2.3 packet decode replays. Built once per
+/// partition by [`plan_floor1_partition_cvals`] so the per-`cval`
+/// encodability search does not rebuild trees.
+struct PartitionClassEnc {
+    /// `[floor1_class_dimensions]` — the number of `[floor1_Y]` posts this
+    /// partition contributes (one sub-book codeword each).
+    dimensions: usize,
+    /// `[cbits]` = `[floor1_class_subclasses]`: bits consumed per dimension
+    /// from `cval`. `0` means no master book and a single sub-book slot.
+    cbits: u8,
+    /// Per-subclass codebook trees, length `1 << cbits`. `None` is the
+    /// §7.2.3-step-18 "negative book": the sub-book forces `Y = 0`.
+    subclass_trees: Vec<Option<crate::huffman::HuffmanTree>>,
+    /// The master book's used entry indices, ascending — the only `cval`
+    /// values §7.2.3 step 12 can decode in scalar context. Empty when
+    /// `cbits == 0` (no master book is read; the single sub-book slot 0 is
+    /// used for every dimension and the written cval is irrelevant).
+    master_leaves: Vec<u32>,
+}
+
+/// Test whether sub-book slot `sub_idx` of a resolved class can carry the
+/// target packet value `y`. A `None` slot (§7.2.3 step 18 "negative book")
+/// is only consistent with `y == 0`; a present tree must hold `y` as a
+/// leaf (the encode-side used-set test, via a throw-away `encode_entry`).
+fn subbook_accepts(class: &PartitionClassEnc, sub_idx: usize, y: u32) -> bool {
+    match class.subclass_trees.get(sub_idx) {
+        // Out-of-range slot index can never round-trip.
+        None => false,
+        Some(None) => y == 0,
+        Some(Some(tree)) => {
+            let mut dummy = oxideav_core::bits::BitWriterLsb::new();
+            tree.encode_entry(y, &mut dummy).is_ok()
+        }
+    }
+}
+
+/// Plan one floor-1 packet's per-partition master-selector `cval` values
+/// (Vorbis I §7.2.3 steps 5..19, encode direction): the `partition_cvals`
+/// field of a [`crate::encoder::Floor1Packet`].
+///
+/// `floor1_y` is the fitted packet-domain `[floor1_Y]` vector — exactly
+/// `[floor1_values]` values (`header.x_list.len() + 2`), the two endpoints
+/// first then one per explicit x-coordinate — as produced by
+/// [`plan_floor1_y`]. `codebooks` is the stream's codebook list (the master
+/// and sub-book indices in `header.classes` index into it).
+///
+/// For every partition the planner replays the §7.2.3 decode slicing in the
+/// write direction. A class with `[cbits] == 0` reads no master book: every
+/// dimension uses sub-book slot 0 and the written `cval` is irrelevant
+/// (`cval & 0 == 0`, `cval >> 0 == cval`), so it emits `0` after verifying
+/// slot 0 can carry each of the partition's `cdim` targets. A class with
+/// `[cbits] > 0` searches the master book's used entries in ascending order
+/// for the **smallest** `cval` whose per-dimension slices
+/// (`(cval >> (j*cbits)) & csub`) all land on sub-books that can encode the
+/// corresponding target — the inverse of §7.2.3 steps 14/15. Smallest-first
+/// keeps the master-book codeword short where the canonical assignment makes
+/// low entries the shorter codewords, and makes the choice deterministic.
+///
+/// The returned `Vec<u32>` is `partition_cvals`: one value per partition, in
+/// `partition_class_list` order. Threaded into a [`crate::encoder::Floor1Packet`]
+/// with the same `floor1_y`, [`crate::encoder::write_floor1_packet`] emits a
+/// body that decodes back to `floor1_y` — the planner closes the last
+/// hand-supplied floor-1 packet knob.
+///
+/// # Errors
+///
+/// Returns a [`Floor1CvalError`] for a `floor1_y` length that does not match
+/// `[floor1_values]`, a dangling class index, an unresolvable master/sub
+/// book, or a partition no reachable `cval` can encode (the targets do not
+/// lie in any reachable sub-book's used set). Validation precedes building
+/// any output; on error no partial vector is returned.
+pub fn plan_floor1_partition_cvals(
+    floor1_y: &[u32],
+    header: &Floor1Header,
+    codebooks: &[crate::codebook::VorbisCodebook],
+) -> Result<Vec<u32>, Floor1CvalError> {
+    let expected_y_len = header.x_list.len() + 2;
+    if floor1_y.len() != expected_y_len {
+        return Err(Floor1CvalError::YLengthMismatch {
+            expected: expected_y_len,
+            actual: floor1_y.len(),
+        });
+    }
+
+    let partitions = header.partition_class_list.len();
+    let mut cvals: Vec<u32> = Vec::with_capacity(partitions);
+
+    // §7.2.3 step 4: [offset] = 2 (the two endpoints carry no class
+    // codeword).
+    let mut offset = 2usize;
+
+    for (partition_idx, &class_no) in header.partition_class_list.iter().enumerate() {
+        let class =
+            header
+                .classes
+                .get(class_no as usize)
+                .ok_or(Floor1CvalError::BadClassIndex {
+                    partition: partition_idx,
+                    class: class_no,
+                    class_count: header.classes.len(),
+                })?;
+
+        // Resolve master + sub-book trees once for this partition.
+        let cbits = class.subclasses;
+        let master_leaves = if cbits > 0 {
+            match class.masterbook {
+                Some(book) => {
+                    let cb =
+                        codebooks
+                            .get(book as usize)
+                            .ok_or(Floor1CvalError::BookResolution {
+                                partition: partition_idx,
+                                class: class_no as usize,
+                            })?;
+                    // The master book's used entries are the only cval
+                    // values §7.2.3 step 12 can decode; collect them
+                    // ascending. Also build the tree so an unbuildable book
+                    // surfaces as a BookResolution error here.
+                    crate::huffman::HuffmanTree::from_codebook(cb).map_err(|_| {
+                        Floor1CvalError::BookResolution {
+                            partition: partition_idx,
+                            class: class_no as usize,
+                        }
+                    })?;
+                    cb.codeword_lengths
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &l)| l != crate::codebook::UNUSED_ENTRY)
+                        .map(|(e, _)| e as u32)
+                        .collect::<Vec<u32>>()
+                }
+                // subclasses > 0 with no master book is a malformed header;
+                // the decoder would fail to read step 12. Treat as no
+                // reachable cval (only cval 0, with no master read).
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        let mut subclass_trees: Vec<Option<crate::huffman::HuffmanTree>> =
+            Vec::with_capacity(class.subclass_books.len());
+        for slot in &class.subclass_books {
+            match slot {
+                None => subclass_trees.push(None),
+                Some(book) => {
+                    let cb =
+                        codebooks
+                            .get(*book as usize)
+                            .ok_or(Floor1CvalError::BookResolution {
+                                partition: partition_idx,
+                                class: class_no as usize,
+                            })?;
+                    let tree = crate::huffman::HuffmanTree::from_codebook(cb).map_err(|_| {
+                        Floor1CvalError::BookResolution {
+                            partition: partition_idx,
+                            class: class_no as usize,
+                        }
+                    })?;
+                    subclass_trees.push(Some(tree));
+                }
+            }
+        }
+
+        let enc = PartitionClassEnc {
+            dimensions: class.dimensions as usize,
+            cbits,
+            subclass_trees,
+            master_leaves,
+        };
+
+        let targets: Vec<u32> = floor1_y[offset..offset + enc.dimensions].to_vec();
+
+        let cval = choose_cval(&enc, &targets).ok_or_else(|| Floor1CvalError::NoEncodableCval {
+            partition: partition_idx,
+            class: class_no as usize,
+            targets: targets.clone(),
+        })?;
+
+        cvals.push(cval);
+        offset += enc.dimensions;
+    }
+
+    Ok(cvals)
+}
+
+/// Find the smallest `cval` whose §7.2.3 step-14/15 slices select sub-books
+/// that can encode every target in `targets`, or `None` if no reachable
+/// `cval` works.
+///
+/// With `cbits == 0` there is no master book: every dimension uses sub-book
+/// slot 0 regardless of `cval`, so the answer is `0` iff slot 0 carries
+/// every target. With `cbits > 0` only the master book's used entries are
+/// reachable; they are tried ascending and the first that satisfies every
+/// dimension wins.
+fn choose_cval(class: &PartitionClassEnc, targets: &[u32]) -> Option<u32> {
+    let cbits = class.cbits;
+    if cbits == 0 {
+        // cval is irrelevant to the decode (sub_idx is always 0); just
+        // confirm slot 0 encodes every target.
+        if targets.iter().all(|&y| subbook_accepts(class, 0, y)) {
+            return Some(0);
+        }
+        return None;
+    }
+
+    let csub: u32 = (1u32 << cbits) - 1;
+    // master_leaves is ascending, so the first match is the smallest cval.
+    for &cval in &class.master_leaves {
+        let mut ok = true;
+        for (j, &y) in targets.iter().enumerate() {
+            let sub_idx = ((cval >> (j as u32 * cbits as u32)) & csub) as usize;
+            if !subbook_accepts(class, sub_idx, y) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Some(cval);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -683,5 +997,332 @@ mod tests {
             };
             assert_eq!(got, want, "decode_post({val}, {predicted})");
         }
+    }
+
+    // ---- plan_floor1_partition_cvals tests (§7.2.3 steps 5..19, encode) ----
+
+    use crate::codebook::{VorbisCodebook, VqLookup};
+
+    /// A scalar value book with `entries` used entries each length 1-bit-
+    /// ranked canonically; entry index == decoded Y value, so it can
+    /// encode Y values `0..entries`.
+    fn scalar_book(entries: u32) -> VorbisCodebook {
+        // Canonical lengths: a balanced tree needs ceil(log2(entries))
+        // depth. Use per-entry lengths that admit a valid canonical tree:
+        // give each entry a length large enough that all fit. ilog-based
+        // uniform length works for power-of-two entry counts; for the
+        // small counts the tests use, a uniform length = bits suffices.
+        let bits = (32 - (entries.max(1) - 1).leading_zeros()).max(1) as u8;
+        VorbisCodebook {
+            dimensions: 1,
+            entries,
+            codeword_lengths: vec![bits; entries as usize],
+            lookup: VqLookup::None,
+        }
+    }
+
+    /// Decode-side oracle: replay §7.2.3 steps 5..19 slicing for one
+    /// partition. Given the chosen `cval`, the class config, and the
+    /// resolved per-subclass "max encodable Y" (or `None` for a negative
+    /// book), return the sequence of (sub_idx, accepts) the decoder would
+    /// hit per dimension. Used to assert the planner's cval slices into
+    /// books that carry the targets.
+    fn slice_subindices(cval: u32, cbits: u8, dims: usize) -> Vec<usize> {
+        let csub = (1u32 << cbits) - 1;
+        let mut out = Vec::with_capacity(dims);
+        let mut c = cval;
+        for _ in 0..dims {
+            out.push((c & csub) as usize);
+            c >>= cbits;
+        }
+        out
+    }
+
+    /// cbits == 0: the planner emits cval 0 and only needs sub-book slot 0
+    /// to carry every target.
+    #[test]
+    fn cval_plan_cbits_zero_emits_zero() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        // Slot-0 book holds Y in 0..8.
+        let codebooks = vec![scalar_book(8)];
+        // floor1_y: 2 endpoints + 2 interior posts (3, 5) both < 8.
+        let floor1_y = vec![40, 20, 3, 5];
+        let cvals = plan_floor1_partition_cvals(&floor1_y, &header, &codebooks).unwrap();
+        assert_eq!(cvals, vec![0]);
+    }
+
+    /// cbits == 0 with a target a sub-book slot 0 cannot carry → error.
+    #[test]
+    fn cval_plan_cbits_zero_unencodable() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks = vec![scalar_book(4)]; // Y in 0..4
+        let floor1_y = vec![40, 20, 3, 5]; // 5 >= 4 → unencodable
+        let err = plan_floor1_partition_cvals(&floor1_y, &header, &codebooks).unwrap_err();
+        assert!(matches!(
+            err,
+            Floor1CvalError::NoEncodableCval { partition: 0, .. }
+        ));
+    }
+
+    /// cbits == 0 with a `None` (negative) sub-book accepts only Y == 0.
+    #[test]
+    fn cval_plan_negative_book_requires_zero() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![None], // forces Y = 0
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks: Vec<VorbisCodebook> = vec![];
+        // Both interior posts 0: encodable, cval 0.
+        let ok = plan_floor1_partition_cvals(&[40, 20, 0, 0], &header, &codebooks).unwrap();
+        assert_eq!(ok, vec![0]);
+        // Non-zero interior post: no reachable cval.
+        let err = plan_floor1_partition_cvals(&[40, 20, 1, 0], &header, &codebooks).unwrap_err();
+        assert!(matches!(err, Floor1CvalError::NoEncodableCval { .. }));
+    }
+
+    /// cbits > 0: the planner picks a cval whose per-dim slices land on
+    /// sub-books that carry the targets. Two sub-books with disjoint
+    /// ranges force a specific cval, verified by replaying the slice.
+    #[test]
+    fn cval_plan_master_subclass_selects_correct_books() {
+        // 1 partition, dim 2, subclasses 1 → csub = 1, two sub-books.
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        // master: 4 entries (cval 0..4). subbook A (idx 1) holds Y 0..2;
+        // subbook B (idx 2) holds Y 0..8.
+        let master = scalar_book(4);
+        let sub_a = scalar_book(2);
+        let sub_b = scalar_book(8);
+        let codebooks = vec![master, sub_a, sub_b];
+
+        // Targets: dim0 = 5 (needs sub B), dim1 = 1 (sub A or B).
+        // dim0 sub_idx must be 1 (B); dim1 sub_idx may be 0 or 1.
+        // cval bit0 = dim0 sub_idx = 1; cval bit1 = dim1 sub_idx.
+        // smallest cval satisfying: bit0=1 → cval in {1,3}; dim1 sub_idx
+        // = bit1 ∈ {0,1}; both A(idx0) and B(idx1) carry Y=1 → smallest
+        // is cval=1.
+        let floor1_y = vec![40, 20, 5, 1];
+        let cvals = plan_floor1_partition_cvals(&floor1_y, &header, &codebooks).unwrap();
+        assert_eq!(cvals, vec![1]);
+
+        // Verify the slice lands dim0 on sub B.
+        let idxs = slice_subindices(cvals[0], 1, 2);
+        assert_eq!(idxs[0], 1, "dim0 must select sub-book B (idx 1) for Y=5");
+    }
+
+    /// cbits > 0: target that needs sub A on dim0 forces an even cval.
+    #[test]
+    fn cval_plan_master_subclass_even_cval() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let master = scalar_book(4);
+        let sub_a = scalar_book(2); // Y 0..2
+        let sub_b = scalar_book(8); // Y 0..8
+        let codebooks = vec![master, sub_a, sub_b];
+
+        // dim0 = 1 (A or B), dim1 = 5 (needs B). bit0 ∈ {0,1}, bit1 must
+        // be 1 (B). smallest cval with bit1=1 → cval=2.
+        let floor1_y = vec![40, 20, 1, 5];
+        let cvals = plan_floor1_partition_cvals(&floor1_y, &header, &codebooks).unwrap();
+        assert_eq!(cvals, vec![2]);
+        let idxs = slice_subindices(cvals[0], 1, 2);
+        assert_eq!(idxs[1], 1, "dim1 must select sub-book B for Y=5");
+    }
+
+    /// No reachable cval: dim0 needs sub B and dim1 needs sub B, but only
+    /// cval values present in the master book are reachable. Restrict the
+    /// master book so the required cval is unused → error.
+    #[test]
+    fn cval_plan_no_reachable_cval_when_master_sparse() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        // Sparse master: only entries 0 and 1 used (cval ∈ {0,1}); cval=3
+        // (both bits set, needed for dim0=B & dim1=B) is unreachable.
+        let master = VorbisCodebook {
+            dimensions: 1,
+            entries: 4,
+            codeword_lengths: vec![
+                1,
+                1,
+                crate::codebook::UNUSED_ENTRY,
+                crate::codebook::UNUSED_ENTRY,
+            ],
+            lookup: VqLookup::None,
+        };
+        let sub_a = scalar_book(2); // Y 0..2
+        let sub_b = scalar_book(8); // Y 0..8
+        let codebooks = vec![master, sub_a, sub_b];
+
+        // dim0 = 5 (B only), dim1 = 5 (B only) → needs cval bit0=1, bit1=1
+        // → cval=3, which is unused in the master → error.
+        let floor1_y = vec![40, 20, 5, 5];
+        let err = plan_floor1_partition_cvals(&floor1_y, &header, &codebooks).unwrap_err();
+        assert!(matches!(err, Floor1CvalError::NoEncodableCval { .. }));
+    }
+
+    /// Length / class-index validation.
+    #[test]
+    fn cval_plan_rejects_bad_lengths_and_class() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![Some(0)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks = vec![scalar_book(8)];
+        // Wrong floor1_y length (need 4).
+        let err = plan_floor1_partition_cvals(&[40, 20, 3], &header, &codebooks).unwrap_err();
+        assert!(matches!(
+            err,
+            Floor1CvalError::YLengthMismatch {
+                expected: 4,
+                actual: 3
+            }
+        ));
+
+        // Dangling class index.
+        let bad = Floor1Header {
+            partition_class_list: vec![5],
+            ..header.clone()
+        };
+        let err = plan_floor1_partition_cvals(&[40, 20, 3, 1], &bad, &codebooks).unwrap_err();
+        assert!(matches!(
+            err,
+            Floor1CvalError::BadClassIndex {
+                partition: 0,
+                class: 5,
+                ..
+            }
+        ));
+    }
+
+    /// End-to-end: plan_floor1_y → plan_floor1_partition_cvals →
+    /// write_floor1_packet → decode reproduces the fitted curve. This
+    /// proves the two planners compose into a fully self-driven floor-1
+    /// packet (no hand-supplied floor1_y, no hand-supplied cvals).
+    #[test]
+    fn cval_plan_end_to_end_packet_roundtrip() {
+        use crate::encoder::{write_floor1_packet, Floor1Packet};
+        use crate::floor1::Floor1Decoder;
+        use oxideav_core::bits::BitReaderLsb;
+
+        // 2 partitions, each dim 2, subclasses 1. A single class shared.
+        let header = Floor1Header {
+            partitions: 2,
+            partition_class_list: vec![0, 0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4, // endpoint x = 16
+            x_list: vec![4, 8, 12, 2],
+        };
+        let master = scalar_book(4);
+        let sub_a = scalar_book(64); // wide books so any fitted Y fits
+        let sub_b = scalar_book(64);
+        let codebooks = vec![master, sub_a, sub_b];
+
+        // Fit a smooth target envelope → floor1_y via plan_floor1_y, then
+        // derive cvals, then write + decode.
+        let target_final = vec![60i32, 30, 45, 38, 50, 25];
+        let floor1_y = plan_floor1_y(&target_final, &header).unwrap();
+        let cvals = plan_floor1_partition_cvals(&floor1_y, &header, &codebooks).unwrap();
+
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: floor1_y.clone(),
+            partition_cvals: cvals,
+        };
+        let bytes = write_floor1_packet(&packet, &header, &codebooks).unwrap();
+
+        // Decode and compare against an independent §7.2.3 decode of the
+        // same floor1_y (the curve the planner targeted).
+        let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let n = 32;
+        let got = match dec.decode(&mut r, n) {
+            crate::floor1::FloorCurve::Curve(c) => c,
+            crate::floor1::FloorCurve::Unused => panic!("expected a curve"),
+        };
+        // The decoded curve must equal render_curve over the fitted
+        // floor1_y (the curve the planner targeted, reproduced exactly).
+        let want = dec.render_curve(&floor1_y, n);
+        assert_eq!(got, want);
     }
 }
