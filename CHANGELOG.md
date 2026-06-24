@@ -6,6 +6,43 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- §8.6.2 residue **classification-selection** layer (`residue_encode`
+  module: `plan_vector_classifications`, `plan_vector_residue`,
+  `PartitionClassChoice`, plus the scored cascade primitive
+  `plan_partition_cascade_scored` / `ScoredPartitionCascade`). The
+  residue encode stack already turned a vector's residual into the
+  per-partition value-codeword entry lists *given the classifications*
+  (`plan_vector_partition_entries`); choosing those classifications was
+  the open optimisation the README named. This closes it from the
+  distortion side. For each partition `plan_vector_classifications` tries
+  **every** candidate classification in the `value_books` table, plans
+  its cascade with the new `plan_partition_cascade_scored` (which keeps
+  the leftover residual and reports its squared norm as `error_sq` plus a
+  `populated_stages` bit-cost proxy), and keeps the classification whose
+  cascade reconstructs the partition's target most closely — ties broken
+  toward fewer populated stages (cheaper encoding) then the lower
+  classification index (deterministic). `plan_vector_residue` is the
+  top-of-stack splitter: raw spectral residual in, the index-aligned
+  `classifications` + `partition_entries` arrays a `ResidueVectorPlan`
+  holds out, with **no hand-supplied classifications**. A new
+  `ResidueEncodeError::NoClassifications` rejects an empty `value_books`.
+  The residue WRITE path no longer needs the per-partition
+  classifications supplied by hand — the residue encoder now plans both
+  the classification and the cascade from spectrum. `plan_partition_cascade`
+  is unchanged on the wire (it delegates to the scored primitive and
+  discards the score). 18 new in-module unit tests (crate lib suite
+  **850 → 878**): the scored cascade's exact-hit zero error /
+  quantisation residual / unused-cascade target-norm /
+  entries-match-unscored properties; classification selection picking the
+  lower-distortion class, both tie-breaks (fewer stages, lower index),
+  per-partition independence, the empty-table + non-multiple-length +
+  cascade-error-propagation rejections, a full `plan_vector_residue`
+  round-trip through the independent decode-reconstruct oracle, and an
+  exhaustive 121-point target sweep asserting the chosen class's
+  distortion is `<=` every other class's. Spec source:
+  `docs/audio/vorbis/Vorbis_I_spec.pdf` §8.6.2 (the cascade /
+  classification decode loop), §8.6.1 (`residue_classifications`),
+  §8.6.3 / §8.6.4 / §8.6.5 (the format addressing).
 - `Floor0Decoder::render_curve` — the encoder-side §6.2.3 floor-0
   LSP-curve-synthesis primitive (the floor-0 twin of
   `Floor1Decoder::render_curve`). Given a per-packet `amplitude` and the

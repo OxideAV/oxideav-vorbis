@@ -120,6 +120,11 @@ pub enum ResidueEncodeError {
         /// The supplied slice length.
         actual: usize,
     },
+    /// [`plan_vector_classifications`] was given an empty `value_books`
+    /// table, so there was no classification to choose from. §8.6.1
+    /// stores `residue_classifications` as `read 6 bits + 1`, so a real
+    /// residue always has at least one classification.
+    NoClassifications,
     /// A per-read [`quantize_vector`] call failed — almost always a
     /// fully-unused value book ([`QuantizeError::NoUsableEntries`]) or a
     /// hand-constructed book whose multiplicand table desyncs its
@@ -165,6 +170,10 @@ impl core::fmt::Display for ResidueEncodeError {
             ResidueEncodeError::ResidualLengthMismatch { expected, actual } => write!(
                 f,
                 "vorbis residue encode: residual length {actual} != partition_size {expected} (§8.6.2)"
+            ),
+            ResidueEncodeError::NoClassifications => write!(
+                f,
+                "vorbis residue encode: empty value_books — no classification to choose from (§8.6.1: residue_classifications >= 1)"
             ),
             ResidueEncodeError::Quantize { pass, read, source } => write!(
                 f,
@@ -289,6 +298,51 @@ pub fn plan_partition_cascade(
     residue_type: u16,
     partition_size: u32,
 ) -> Result<[Option<Vec<u32>>; 8], ResidueEncodeError> {
+    plan_partition_cascade_scored(residual, stage_books, residue_type, partition_size)
+        .map(|scored| scored.entries)
+}
+
+/// A planned partition cascade together with the residual error it leaves.
+///
+/// [`plan_partition_cascade`] discards the leftover residual once it has
+/// the entry lists. The classification chooser
+/// ([`plan_vector_classifications`]) needs that leftover to compare
+/// candidate classifications, so [`plan_partition_cascade_scored`]
+/// returns it: `error_sq` is the squared-Euclidean norm of the residual
+/// remaining after every cascade stage has subtracted its
+/// reconstruction — exactly the distortion the decoder will reconstruct
+/// (`target − Σ reconstructions`). A smaller `error_sq` means a closer
+/// approximation of the partition's target scalars.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredPartitionCascade {
+    /// The per-stage value-codebook entry-index lists, identical to what
+    /// [`plan_partition_cascade`] returns.
+    pub entries: [Option<Vec<u32>>; 8],
+    /// The squared-Euclidean norm of the residual left after the cascade
+    /// — the partition's reconstruction distortion. `0.0` for an
+    /// all-'unused' cascade only when the target itself is all-zero.
+    pub error_sq: f64,
+    /// The number of populated cascade stages — a proxy for the bit cost
+    /// (every populated stage emits at least one value codeword). Used as
+    /// the chooser's tie-break: at equal distortion, prefer the cheaper
+    /// classification.
+    pub populated_stages: usize,
+}
+
+/// [`plan_partition_cascade`] but additionally reporting the residual
+/// distortion the cascade leaves (see [`ScoredPartitionCascade`]). The
+/// entry lists are bit-identical to the unscored routine; this variant
+/// just keeps the leftover residual instead of discarding it.
+///
+/// # Errors
+///
+/// Identical to [`plan_partition_cascade`].
+pub fn plan_partition_cascade_scored(
+    residual: &[f32],
+    stage_books: &[Option<&VorbisCodebook>; 8],
+    residue_type: u16,
+    partition_size: u32,
+) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
     if residue_type > 2 {
         return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
     }
@@ -306,6 +360,7 @@ pub fn plan_partition_cascade(
     // The running residual the cascade refines — starts as the target.
     let mut work = residual.to_vec();
     let mut out: [Option<Vec<u32>>; 8] = Default::default();
+    let mut populated_stages = 0usize;
 
     for (pass, slot) in stage_books.iter().enumerate() {
         // §8.6.2 step 18: 'unused' stages read and write nothing.
@@ -352,9 +407,23 @@ pub fn plan_partition_cascade(
             entries.push(q.entry);
         }
         out[pass] = Some(entries);
+        populated_stages += 1;
     }
 
-    Ok(out)
+    // The residual remaining after every stage has subtracted its
+    // reconstruction is the decoder's reconstruction error (the format-1/2
+    // surplus tail elements are decoder-discarded, so they never appear in
+    // `work` past `n` — `work` is length `n` throughout).
+    let mut error_sq = 0.0f64;
+    for &w in &work {
+        error_sq += f64::from(w) * f64::from(w);
+    }
+
+    Ok(ScoredPartitionCascade {
+        entries: out,
+        error_sq,
+        populated_stages,
+    })
 }
 
 /// Plan the `partition_entries` field of a full decode vector's
@@ -428,6 +497,178 @@ pub fn plan_vector_partition_entries(
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// One partition's chosen classification together with the cascade plan
+/// and the distortion that choice achieves — the output unit of
+/// [`plan_vector_classifications`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionClassChoice {
+    /// The classification index chosen for this partition — the value
+    /// that goes into the matching
+    /// [`crate::encoder::ResidueVectorPlan::classifications`] slot.
+    pub classification: u32,
+    /// The cascade entry-index lists for the chosen classification — the
+    /// matching [`crate::encoder::ResidueVectorPlan::partition_entries`]
+    /// row.
+    pub entries: [Option<Vec<u32>>; 8],
+    /// The squared reconstruction distortion the chosen classification
+    /// leaves on this partition.
+    pub error_sq: f64,
+}
+
+/// Choose the per-partition classification *and* plan its cascade for one
+/// residue decode vector (Vorbis I §8.6.2, encode direction) — the
+/// classification-selection layer that sat open above
+/// [`plan_vector_partition_entries`].
+///
+/// [`plan_vector_partition_entries`] takes the per-partition
+/// classifications as a *given* (the caller's psychoacoustic choice) and
+/// fills in the entry lists. This routine closes that gap from the
+/// distortion side: for every partition it tries **each candidate
+/// classification** in `value_books`, plans its cascade with
+/// [`plan_partition_cascade_scored`], and keeps the classification whose
+/// cascade reconstructs the partition's target scalars most closely
+/// (minimum squared error). Ties in distortion are broken toward the
+/// classification with **fewer populated cascade stages** (the cheaper
+/// encoding — every populated stage emits value codewords), and then
+/// toward the **lower classification index** (deterministic).
+///
+/// `scalars` is the decode vector's spectral residual over the residue
+/// window, partition-major (partition `p` occupies
+/// `scalars[p*ps .. (p+1)*ps]`); its length must be a multiple of
+/// `partition_size`, and the number of partitions it implies is the
+/// returned `Vec`'s length. `value_books[class][pass]` is the resolved
+/// value codebook for classification `class` at cascade stage `pass`
+/// (`None` for an unused stage) — the same `[[Option<&VorbisCodebook>; 8]]`
+/// table [`plan_vector_partition_entries`] consumes, one row per
+/// classification the residue header configures. `residue_type` selects
+/// the §8.6.3 strided or §8.6.4 contiguous addressing.
+///
+/// The returned `Vec` is one [`PartitionClassChoice`] per partition, in
+/// partition order. Splitting it into the parallel `classifications` /
+/// `entries` arrays yields a ready-to-serialise
+/// [`crate::encoder::ResidueVectorPlan`]; the convenience splitter is
+/// [`plan_vector_residue`].
+///
+/// Every classification a partition could take is feasible by
+/// construction: a classification whose cascade is all-'unused' (or whose
+/// row is shorter than the configured count) reconstructs the partition
+/// as all-zero, leaving `error_sq == ‖target‖²`. So the chooser always
+/// finds at least one usable classification when `value_books` is
+/// non-empty.
+///
+/// # Errors
+///
+/// Returns a [`ResidueEncodeError`] for an unsupported `residue_type`, a
+/// zero `partition_size`, a `scalars` length that is not a multiple of
+/// `partition_size`, an empty `value_books` (no classification to choose
+/// from), or any per-classification cascade failure carried verbatim from
+/// [`plan_partition_cascade_scored`] (e.g. a stage book with zero
+/// dimensions or no vector lookup — a malformed header the chooser cannot
+/// silently skip past).
+pub fn plan_vector_classifications(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    if residue_type > 2 {
+        return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
+    }
+    if partition_size == 0 {
+        return Err(ResidueEncodeError::ZeroPartitionSize);
+    }
+    if value_books.is_empty() {
+        return Err(ResidueEncodeError::NoClassifications);
+    }
+    let ps = partition_size as usize;
+    if scalars.len() % ps != 0 {
+        return Err(ResidueEncodeError::ResidualLengthMismatch {
+            // The expected length is the nearest multiple at or below the
+            // supplied length; report the supplied length's remainder via
+            // the canonical "not a partition multiple" framing.
+            expected: (scalars.len() / ps) * ps,
+            actual: scalars.len(),
+        });
+    }
+    let num_partitions = scalars.len() / ps;
+
+    let mut choices = Vec::with_capacity(num_partitions);
+    for p in 0..num_partitions {
+        let partition_scalars = &scalars[p * ps..(p + 1) * ps];
+
+        let mut best: Option<PartitionClassChoice> = None;
+        let mut best_stages = usize::MAX;
+        for (class, stage_books) in value_books.iter().enumerate() {
+            let scored = plan_partition_cascade_scored(
+                partition_scalars,
+                stage_books,
+                residue_type,
+                partition_size,
+            )?;
+
+            // Lexicographic preference: (distortion ↑, populated stages ↑,
+            // classification index ↑). `<` on f64 keeps the first-seen
+            // (lower-index) candidate on an exact distortion-and-stage tie.
+            let replace = match &best {
+                None => true,
+                Some(cur) => {
+                    scored.error_sq < cur.error_sq
+                        || (scored.error_sq == cur.error_sq
+                            && scored.populated_stages < best_stages)
+                }
+            };
+            if replace {
+                best_stages = scored.populated_stages;
+                best = Some(PartitionClassChoice {
+                    classification: class as u32,
+                    entries: scored.entries,
+                    error_sq: scored.error_sq,
+                });
+            }
+        }
+
+        // `value_books` is non-empty, so at least one classification was
+        // scored; `best` is `Some`.
+        choices.push(best.expect("value_books non-empty ⇒ a classification was chosen"));
+    }
+
+    Ok(choices)
+}
+
+/// Plan a complete residue decode vector from raw spectral residual
+/// (Vorbis I §8.6.2, encode direction): choose each partition's
+/// classification via [`plan_vector_classifications`] and assemble the
+/// result into the [`crate::encoder::ResidueVectorPlan`]-shaped parallel
+/// arrays the residue WRITE path consumes.
+///
+/// This is the top of the residue-encode stack: it turns a vector's
+/// target spectral residual directly into the `classifications` +
+/// `partition_entries` a [`crate::encoder::ResidueVectorPlan`] holds, with
+/// no hand-supplied classifications. The two returned `Vec`s are
+/// index-aligned (partition `p`'s classification is `classifications[p]`
+/// and its cascade is `partition_entries[p]`), so a caller builds the
+/// plan as `ResidueVectorPlan { classifications, partition_entries }`.
+///
+/// # Errors
+///
+/// Identical to [`plan_vector_classifications`].
+#[allow(clippy::type_complexity)]
+pub fn plan_vector_residue(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+) -> Result<(Vec<u32>, Vec<[Option<Vec<u32>>; 8]>), ResidueEncodeError> {
+    let choices = plan_vector_classifications(scalars, value_books, residue_type, partition_size)?;
+    let mut classifications = Vec::with_capacity(choices.len());
+    let mut partition_entries = Vec::with_capacity(choices.len());
+    for choice in choices {
+        classifications.push(choice.classification);
+        partition_entries.push(choice.entries);
+    }
+    Ok((classifications, partition_entries))
 }
 
 #[cfg(test)]
@@ -761,6 +1002,283 @@ mod tests {
         let row1 = plan_partition_cascade(&[3.4, 3.4, 1.9, 1.9], &stages, 1, 4).unwrap();
         let row2 = plan_partition_cascade(&[3.4, 3.4, 1.9, 1.9], &stages, 2, 4).unwrap();
         assert_eq!(row1, row2);
+    }
+
+    // ---------- scored cascade ----------
+
+    #[test]
+    fn scored_cascade_reports_exact_hit_zero_error() {
+        // Book entries (delta=1/min=0): [0,0],[1,1],[2,2],[3,3].
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut stages: [Option<&VorbisCodebook>; 8] = [None; 8];
+        stages[0] = Some(&book);
+        // target [3,3] is an exact entry hit → zero residual.
+        let scored = plan_partition_cascade_scored(&[3.0, 3.0], &stages, 1, 2).unwrap();
+        assert_eq!(scored.error_sq, 0.0);
+        assert_eq!(scored.populated_stages, 1);
+        assert_eq!(scored.entries[0].as_ref().unwrap(), &vec![3u32]);
+    }
+
+    #[test]
+    fn scored_cascade_reports_quantisation_residual() {
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut stages: [Option<&VorbisCodebook>; 8] = [None; 8];
+        stages[0] = Some(&book);
+        // target [3.5, 3.5] → nearest [3,3], residual [0.5, 0.5], ‖·‖²=0.5.
+        let scored = plan_partition_cascade_scored(&[3.5, 3.5], &stages, 1, 2).unwrap();
+        assert!((scored.error_sq - 0.5).abs() < 1e-9);
+        assert_eq!(scored.populated_stages, 1);
+    }
+
+    #[test]
+    fn scored_unused_cascade_error_is_target_norm() {
+        // No stages populated → reconstruction is all-zero, so the error
+        // is the squared norm of the target itself.
+        let stages: [Option<&VorbisCodebook>; 8] = [None; 8];
+        let scored = plan_partition_cascade_scored(&[1.0, 2.0, 2.0], &stages, 1, 3).unwrap();
+        assert_eq!(scored.error_sq, 9.0); // 1 + 4 + 4
+        assert_eq!(scored.populated_stages, 0);
+    }
+
+    #[test]
+    fn scored_entries_match_unscored() {
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut stages: [Option<&VorbisCodebook>; 8] = [None; 8];
+        stages[0] = Some(&book);
+        let unscored = plan_partition_cascade(&[3.4, 3.4, 1.9, 1.9], &stages, 1, 4).unwrap();
+        let scored = plan_partition_cascade_scored(&[3.4, 3.4, 1.9, 1.9], &stages, 1, 4).unwrap();
+        assert_eq!(unscored, scored.entries);
+    }
+
+    // ---------- classification selection ----------
+
+    #[test]
+    fn classify_picks_lower_distortion_class() {
+        // Class 0: coarse book entries [0,0],[4,4],[8,8],[12,12] (delta 4).
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 4.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        // Class 1: fine book entries [0,0],[1,1],[2,2],[3,3] (delta 1).
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&fine);
+        let value_books = vec![row0, row1];
+        // target [3,3]: coarse nearest [4,4] err 2; fine nearest [3,3] err 0.
+        // → class 1 wins on distortion.
+        let choices = plan_vector_classifications(&[3.0, 3.0], &value_books, 1, 2).unwrap();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].classification, 1);
+        assert_eq!(choices[0].error_sq, 0.0);
+        assert_eq!(choices[0].entries[0].as_ref().unwrap(), &vec![3u32]);
+    }
+
+    #[test]
+    fn classify_ties_break_toward_fewer_stages() {
+        // Two classifications both reconstruct the target exactly, but one
+        // uses one stage and the other uses two. Equal distortion (0) →
+        // the cheaper (single-stage) class must win.
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        // class 0: single stage on `book`.
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&book);
+        // class 1: two stages, both on `book` — also reaches [3,3] exactly
+        // (stage 0 picks [3,3], stage 1 picks [0,0]) but costs an extra
+        // codeword.
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&book);
+        row1[1] = Some(&book);
+        let value_books = vec![row0, row1];
+        let choices = plan_vector_classifications(&[3.0, 3.0], &value_books, 1, 2).unwrap();
+        assert_eq!(choices[0].classification, 0);
+        assert_eq!(choices[0].error_sq, 0.0);
+    }
+
+    #[test]
+    fn classify_ties_break_toward_lower_index() {
+        // Two identical classifications → equal distortion + equal stage
+        // count → the lower index wins (deterministic).
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let value_books = vec![row, row];
+        let choices = plan_vector_classifications(&[3.5, 3.5], &value_books, 1, 2).unwrap();
+        assert_eq!(choices[0].classification, 0);
+    }
+
+    #[test]
+    fn classify_per_partition_independent() {
+        // Coarse vs fine class; two partitions whose ideal class differs.
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 4.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&fine);
+        let value_books = vec![row0, row1];
+        // partition 0 target [8,8] → exact coarse hit (class 0).
+        // partition 1 target [2,2] → exact fine hit (class 1).
+        let scalars = vec![8.0, 8.0, 2.0, 2.0];
+        let choices = plan_vector_classifications(&scalars, &value_books, 1, 2).unwrap();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].classification, 0);
+        assert_eq!(choices[1].classification, 1);
+        assert_eq!(choices[0].error_sq, 0.0);
+        assert_eq!(choices[1].error_sq, 0.0);
+    }
+
+    #[test]
+    fn classify_empty_value_books_is_rejected() {
+        let value_books: Vec<[Option<&VorbisCodebook>; 8]> = vec![];
+        assert_eq!(
+            plan_vector_classifications(&[1.0, 2.0], &value_books, 1, 2),
+            Err(ResidueEncodeError::NoClassifications)
+        );
+    }
+
+    #[test]
+    fn classify_non_multiple_length_is_rejected() {
+        let book = tess_book(2, 2, vec![0, 0, 1, 1]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let value_books = vec![row];
+        // 5 scalars, partition_size 2 → not a multiple.
+        assert_eq!(
+            plan_vector_classifications(&[1.0, 2.0, 3.0, 4.0, 5.0], &value_books, 1, 2),
+            Err(ResidueEncodeError::ResidualLengthMismatch {
+                expected: 4,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_propagates_cascade_error() {
+        // A stage book with no vector lookup must surface, not be skipped.
+        let bad = VorbisCodebook {
+            dimensions: 2,
+            entries: 2,
+            codeword_lengths: vec![1, 1],
+            lookup: VqLookup::None,
+        };
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&bad);
+        let value_books = vec![row];
+        assert_eq!(
+            plan_vector_classifications(&[0.0, 0.0], &value_books, 1, 2),
+            Err(ResidueEncodeError::ScalarValueBook { pass: 0 })
+        );
+    }
+
+    #[test]
+    fn plan_vector_residue_round_trips_against_decode() {
+        // Full top-of-stack: raw scalars → chosen classifications + entries
+        // → decode_reconstruct must equal the per-partition nearest snap of
+        // whichever class the chooser selected.
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 4.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![8.0, 8.0, 2.0, 2.0, 0.3, 0.3];
+        let (classifications, entries) = plan_vector_residue(&scalars, &value_books, 1, 2).unwrap();
+        assert_eq!(classifications.len(), 3);
+        assert_eq!(entries.len(), 3);
+        // Reconstruct via the independent decode oracle and confirm each
+        // partition equals the chosen class's nearest-entry snap.
+        let recon = decode_reconstruct(&entries, &classifications, &value_books, 1, 2);
+        let mut expected = Vec::new();
+        for (p, chunk) in scalars.chunks(2).enumerate() {
+            let class = classifications[p] as usize;
+            let book = value_books[class][0].unwrap();
+            let q = quantize_vector(book, chunk).unwrap();
+            expected.extend_from_slice(&q.vector);
+        }
+        assert_eq!(recon, expected);
+    }
+
+    #[test]
+    fn classify_chooses_class_minimising_distortion_over_grid() {
+        // Sweep targets; the chosen class must always have distortion <=
+        // every other class's distortion for that partition.
+        let coarse = VorbisCodebook {
+            dimensions: 1,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 4.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2, 3],
+            },
+        };
+        let fine = VorbisCodebook {
+            dimensions: 1,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2, 3],
+            },
+        };
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&fine);
+        let value_books = vec![row0, row1];
+        for t in 0..=120u32 {
+            let target = t as f32 * 0.1;
+            let scalars = vec![target];
+            let choices = plan_vector_classifications(&scalars, &value_books, 1, 1).unwrap();
+            let chosen = &choices[0];
+            for stage_books in &value_books {
+                let s = plan_partition_cascade_scored(&scalars, stage_books, 1, 1).unwrap();
+                assert!(
+                    chosen.error_sq <= s.error_sq + 1e-9,
+                    "target {target}: chosen class error {} > {}",
+                    chosen.error_sq,
+                    s.error_sq
+                );
+            }
+        }
     }
 
     #[test]
