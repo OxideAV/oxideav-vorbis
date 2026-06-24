@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-1 partition-packing planner** (`floor1_encode::plan_floor1_partition_cvals`)
+  — derives each partition's master-selector `cval`
+  (`encoder::Floor1Packet::partition_cvals`) from the fitted packet-domain
+  `[floor1_Y]` vector, walking §7.2.3 steps 5..19 in the write direction.
+  `subclasses == 0` classes emit `cval = 0` (every dimension uses sub-book
+  slot 0); `subclasses > 0` classes search the master book's used entries
+  ascending for the smallest selector whose per-dimension slices
+  (`(cval >> j·cbits) & csub`) all land on sub-books that can encode the
+  targets — the inverse of the decoder's steps 14/15. New `Floor1CvalError`
+  covers length / class-index / book-resolution / no-reachable-cval
+  failures. Closes the last hand-supplied floor-1 packet knob.
+- **One-call floor-1 packet planner** (`floor1_encode::plan_floor1_packet`)
+  — composes `plan_floor1_envelope` → `plan_floor1_y` →
+  `plan_floor1_partition_cvals` to turn a desired linear-domain floor
+  envelope directly into a write-ready `Floor1Packet` (no hand-supplied
+  `floor1_y` or `partition_cvals`). New `Floor1PacketPlanError` unions the
+  three stages. Unit coverage: cbits-0 emit/reject, negative-book Y=0
+  constraint, master/subclass selection (even & odd cval, sparse master),
+  validation gates, a `plan_floor1_y` → cval → `write_floor1_packet` →
+  decode roundtrip, and an envelope → packet → decode roundtrip pinning the
+  decoded curve against `render_curve` over the planned `[floor1_Y]`.
 - Adaptive-classification **PCM → encode → decode → PCM** round-trip
   (`tests/pcm_adaptive_residue_roundtrip.rs`) — the first full §4.3
   time-domain round-trip whose residue classifications are chosen **from

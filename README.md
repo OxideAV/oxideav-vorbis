@@ -256,6 +256,32 @@ representable envelope value) and a **23 dB log-domain (dB-index) SNR**
 across the whole reconstructed curve — the first end-to-end
 encode→decode spectral round-trip in the crate.
 
+The **floor-1 partition-packing planner** (`floor1_encode` module:
+`plan_floor1_partition_cvals`) closes the last hand-supplied floor-1 packet
+knob: the per-partition master-selector `cval` values
+(`encoder::Floor1Packet::partition_cvals`). Given the fitted packet-domain
+`[floor1_Y]` vector and the stream codebooks, it walks §7.2.3 steps 5..19 in
+the **write** direction. For a `subclasses == 0` class no master book is read,
+so every dimension uses sub-book slot 0 and it emits `cval = 0` after
+verifying slot 0 carries each target (a §7.2.3-step-18 negative book accepts
+only `Y = 0`). For `subclasses > 0` it searches the master book's **used**
+entries ascending for the smallest `cval` whose per-dimension slices
+(`(cval >> j·cbits) & csub`) all land on sub-books that can encode the
+corresponding target — the exact inverse of the decoder's steps 14/15
+`cval & csub → cval >>= cbits` walk; smallest-first keeps the master codeword
+short and the choice deterministic. `NoEncodableCval` is returned when no
+reachable selector covers the partition's targets. With this in place,
+`plan_floor1_packet` is the **one-call** floor-1 encode: a desired
+linear-domain envelope → a write-ready `Floor1Packet`, composing
+`plan_floor1_envelope` → `plan_floor1_y` → `plan_floor1_partition_cvals`
+(its `Floor1PacketPlanError` unions the three stages). An envelope → packet →
+`write_floor1_packet` → decode round-trip pins the decoded curve bit-for-bit
+against `render_curve` over the planned `[floor1_Y]`, and a master/subclass
+selection suite proves the chosen `cval` slices into the books that carry
+each fitted amplitude (even/odd selectors, sparse master books, and the
+unreachable-cval refusal). The floor-1 WRITE path now needs **neither**
+`floor1_y` **nor** `partition_cvals` supplied by hand.
+
 Two further integration tests close the encode→decode loop on the residue
 and the time domain. `tests/residue_cascade_roundtrip.rs` drives a real
 signed, non-flat spectral residual through the full residue encode chain
@@ -340,17 +366,19 @@ scatter — plus a two-stage format-0 cascade refinement.
   Inverting §6.2.3 curve computation to *produce* that target coefficient
   list (and choosing the per-packet `amplitude` / `booknumber`) from a
   desired floor envelope is the remaining floor-0 encode followup.
-- **Choosing floor-1 `partition_cvals` master-selectors / class books** —
-  fitting the per-post integer amplitudes from a linear-domain floor
-  envelope now exists end to end (`floor1_envelope::plan_floor1_envelope` →
-  `floor1_encode::plan_floor1_y`, see above), and the
-  `tests/floor1_envelope_roundtrip.rs` chain round-trips a forward-MDCT
-  envelope through encode + decode. The remaining floor-1 encode decision is
-  the **partition packing**: choosing the per-partition master-selector
-  `cval` values and the class / sub-book assignment that Huffman-pack the
-  fitted `[floor1_Y]` most compactly. The single-partition, `subclasses = 0`
-  path is exercised today (each post coded directly through one value book);
-  the multi-subclass master-book selection is the open optimisation.
+- **Optimal floor-1 class / sub-book *layout* selection** — the floor-1
+  encode chain is now closed end to end: `floor1_envelope::plan_floor1_envelope`
+  → `floor1_encode::plan_floor1_y` → `floor1_encode::plan_floor1_partition_cvals`
+  (composed by `plan_floor1_packet`) plans a complete write-ready
+  `Floor1Packet` from a linear-domain envelope, with neither `floor1_y` nor
+  `partition_cvals` supplied by hand (see above). What remains is the
+  *setup-header* optimisation upstream of the per-packet plan: choosing the
+  partition count, the class dimensions / sub-book **assignments**, and the
+  master/sub codebook *contents* that pack a given amplitude distribution
+  most compactly. `plan_floor1_partition_cvals` selects the smallest valid
+  master-selector for a **given** class layout; deriving the layout itself
+  (a rate-distortion codebook-design problem) is the open floor-1 encode
+  followup.
 
 ## Clean-room provenance
 
