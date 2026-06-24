@@ -700,6 +700,98 @@ fn choose_cval(class: &PartitionClassEnc, targets: &[u32]) -> Option<u32> {
     None
 }
 
+/// Error from the end-to-end [`plan_floor1_packet`] convenience, unioning
+/// the three planner stages it composes.
+///
+/// Not `Eq`: the envelope stage's [`crate::floor1_envelope::Floor1EnvelopeError`]
+/// carries a float sample, so only `PartialEq` is derived.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Floor1PacketPlanError {
+    /// The linear-envelope → `final_Y` fit (§10.1 dB inverse + §7.2.4
+    /// multiplier inverse) failed.
+    Envelope(crate::floor1_envelope::Floor1EnvelopeError),
+    /// The `final_Y` → packet-domain `[floor1_Y]` unwrap (§7.2.4 step 1)
+    /// failed — a target post the map cannot reach.
+    Unwrap(Floor1EncodeError),
+    /// The `[floor1_Y]` → `partition_cvals` master-selector derivation
+    /// (§7.2.3 steps 5..19) failed — no reachable cval encodes the fitted
+    /// amplitudes through the class's sub-books.
+    Cval(Floor1CvalError),
+}
+
+impl core::fmt::Display for Floor1PacketPlanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Floor1PacketPlanError::Envelope(e) => write!(f, "vorbis floor1 packet-plan: {e}"),
+            Floor1PacketPlanError::Unwrap(e) => write!(f, "vorbis floor1 packet-plan: {e}"),
+            Floor1PacketPlanError::Cval(e) => write!(f, "vorbis floor1 packet-plan: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Floor1PacketPlanError {}
+
+impl From<crate::floor1_envelope::Floor1EnvelopeError> for Floor1PacketPlanError {
+    fn from(e: crate::floor1_envelope::Floor1EnvelopeError) -> Self {
+        Floor1PacketPlanError::Envelope(e)
+    }
+}
+impl From<Floor1EncodeError> for Floor1PacketPlanError {
+    fn from(e: Floor1EncodeError) -> Self {
+        Floor1PacketPlanError::Unwrap(e)
+    }
+}
+impl From<Floor1CvalError> for Floor1PacketPlanError {
+    fn from(e: Floor1CvalError) -> Self {
+        Floor1PacketPlanError::Cval(e)
+    }
+}
+
+/// Plan a complete floor-1 audio-packet body from a desired linear-domain
+/// floor `envelope` — the full encode chain in one call.
+///
+/// This composes the three floor-1 encode planners that previously had to
+/// be called and assembled by hand:
+///
+/// 1. [`crate::floor1_envelope::plan_floor1_envelope`] fits the envelope to
+///    the integer `[floor1_final_Y]` posts (§10.1 dB inverse + §7.2.4
+///    multiplier inverse, nearest representable per post);
+/// 2. [`plan_floor1_y`] unwraps those posts into the always-non-negative
+///    packet-domain `[floor1_Y]` vector (§7.2.4 step 1 inverse);
+/// 3. [`plan_floor1_partition_cvals`] derives each partition's master-
+///    selector `cval` so the fitted Y values pack through the class /
+///    sub-book Huffman codewords (§7.2.3 steps 5..19 inverse).
+///
+/// The returned [`crate::encoder::Floor1Packet`] (always `nonzero = true`)
+/// is ready for [`crate::encoder::write_floor1_packet`]; the emitted body
+/// decodes to a floor whose value at each post `x` is the nearest
+/// representable approximation of `envelope[x]` that the stream's sub-books
+/// can carry. The caller no longer supplies `floor1_y` or `partition_cvals`
+/// by hand for the supported class configurations — only the desired
+/// envelope and the stream's floor header + codebooks.
+///
+/// # Errors
+///
+/// Returns a [`Floor1PacketPlanError`] unioning the three stages: an
+/// envelope-fit failure (bad multiplier / empty / non-finite envelope), an
+/// unwrap failure (a fitted post the §7.2.4 map cannot reach), or a cval
+/// failure (no reachable master-selector slices into sub-books that carry
+/// the fitted amplitudes). On error no partial packet is returned.
+pub fn plan_floor1_packet(
+    envelope: &[f32],
+    header: &Floor1Header,
+    codebooks: &[crate::codebook::VorbisCodebook],
+) -> Result<crate::encoder::Floor1Packet, Floor1PacketPlanError> {
+    let target_final = crate::floor1_envelope::plan_floor1_envelope(envelope, header)?;
+    let floor1_y = plan_floor1_y(&target_final, header)?;
+    let partition_cvals = plan_floor1_partition_cvals(&floor1_y, header, codebooks)?;
+    Ok(crate::encoder::Floor1Packet {
+        nonzero: true,
+        floor1_y,
+        partition_cvals,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,5 +1416,89 @@ mod tests {
         // floor1_y (the curve the planner targeted, reproduced exactly).
         let want = dec.render_curve(&floor1_y, n);
         assert_eq!(got, want);
+    }
+
+    /// End-to-end one-call planner: a linear-domain envelope in,
+    /// a write-ready Floor1Packet out, whose emitted body decodes to a
+    /// floor approximating the envelope. Proves plan_floor1_packet
+    /// composes the three stages correctly.
+    #[test]
+    fn plan_floor1_packet_envelope_to_decoded_curve() {
+        use crate::encoder::write_floor1_packet;
+        use crate::floor1::Floor1Decoder;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let header = Floor1Header {
+            partitions: 2,
+            partition_class_list: vec![0, 0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 1,
+                masterbook: Some(0),
+                subclass_books: vec![Some(1), Some(2)],
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8, 12, 2],
+        };
+        let master = scalar_book(4);
+        let sub_a = scalar_book(64);
+        let sub_b = scalar_book(64);
+        let codebooks = vec![master, sub_a, sub_b];
+
+        // A smooth descending linear envelope over the n/2 bins. n = 32 →
+        // 16 floor bins; the upper endpoint x = 16 samples the last bin.
+        let envelope: Vec<f32> = (0..16).map(|b| 1.0_f32 - 0.04 * b as f32).collect();
+
+        let packet = plan_floor1_packet(&envelope, &header, &codebooks).unwrap();
+        assert!(packet.nonzero);
+        assert_eq!(packet.floor1_y.len(), header.x_list.len() + 2);
+        assert_eq!(
+            packet.partition_cvals.len(),
+            header.partition_class_list.len()
+        );
+
+        // The packet must write and decode to render_curve over its own
+        // floor1_y — i.e. the chain is internally consistent.
+        let bytes = write_floor1_packet(&packet, &header, &codebooks).unwrap();
+        let dec = Floor1Decoder::new(&header, &codebooks).unwrap();
+        let mut r = BitReaderLsb::new(&bytes);
+        let n = 32;
+        let got = match dec.decode(&mut r, n) {
+            crate::floor1::FloorCurve::Curve(c) => c,
+            crate::floor1::FloorCurve::Unused => panic!("expected a curve"),
+        };
+        let want = dec.render_curve(&packet.floor1_y, n);
+        assert_eq!(got, want);
+
+        // And the decoded floor must be monotonically non-increasing at
+        // the sampled posts, tracking the descending envelope's shape
+        // (a sanity check that the fit followed the envelope, not noise).
+        assert!(got[0] >= got[n - 1], "descending envelope → falling floor");
+    }
+
+    /// plan_floor1_packet surfaces a cval-stage failure (a fitted post the
+    /// sub-books cannot carry) as Floor1PacketPlanError::Cval.
+    #[test]
+    fn plan_floor1_packet_propagates_cval_error() {
+        let header = Floor1Header {
+            partitions: 1,
+            partition_class_list: vec![0],
+            classes: vec![Floor1Class {
+                dimensions: 2,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![None], // negative book: forces Y = 0
+            }],
+            multiplier: 2,
+            rangebits: 4,
+            x_list: vec![4, 8],
+        };
+        let codebooks: Vec<VorbisCodebook> = vec![];
+        // A non-flat envelope forces non-zero interior Y, which a negative
+        // book cannot carry → cval stage fails.
+        let envelope = vec![1.0_f32, 0.5, 0.25, 0.1, 0.05, 0.02, 0.01, 0.005];
+        let err = plan_floor1_packet(&envelope, &header, &codebooks).unwrap_err();
+        assert!(matches!(err, Floor1PacketPlanError::Cval(_)));
     }
 }

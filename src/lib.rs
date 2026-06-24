@@ -208,8 +208,8 @@ pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
 pub use floor1_encode::{
-    full_x_list as floor1_full_x_list, plan_floor1_partition_cvals, plan_floor1_y, Floor1CvalError,
-    Floor1EncodeError,
+    full_x_list as floor1_full_x_list, plan_floor1_packet, plan_floor1_partition_cvals,
+    plan_floor1_y, Floor1CvalError, Floor1EncodeError, Floor1PacketPlanError,
 };
 pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
 pub use framing::{FrameSplitter, FramingError};
