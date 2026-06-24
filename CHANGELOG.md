@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- Adaptive-classification **PCM → encode → decode → PCM** round-trip
+  (`tests/pcm_adaptive_residue_roundtrip.rs`) — the first full §4.3
+  time-domain round-trip whose residue classifications are chosen **from
+  the spectrum** rather than hand-supplied. The existing
+  `tests/nonflat_floor_pcm_roundtrip.rs` codes the whole spectrum as one
+  residue partition with `classifications: vec![0]`; this suite splits the
+  residue window into many partitions and lets `plan_vector_residue` pick
+  each partition's classification (unused / coarse single-stage /
+  coarse+fine two-stage) before `write_audio_packet` serialises the §4.3
+  packet and `decode_audio_packet_windowed` decodes it back to a windowed
+  frame. The chain is PCM → §4.3.1 window → §4.3.7 forward MDCT → non-flat
+  floor-1 fit → `X / rendered_floor` residue target → **adaptive
+  per-partition plan** → packet → decode → IMDCT+window, asserting the
+  decoded frame tracks `window ⊙ IMDCT(X)` to ≥ 20 dB PCM-domain SNR, that
+  the adaptive plan matches an explicit-classification replan
+  **bit-for-bit** (selection ↔ entry round-trip exact), that the chosen
+  classifications are content-adaptive (not constant on a tilted
+  spectrum), and that adaptive selection clears a fixed single-coarse-class
+  baseline by **≥ 2 dB** (≈ 46.7 dB adaptive vs ≈ 29.2 dB fixed measured —
+  an ≈ 17.5 dB PCM-domain gain). A robustness case sweeps partition counts
+  4 / 8 / 16 / 32, each round-tripping above a 15 dB floor.
 - From-spectrum residue classification-selection integration coverage
   (`tests/residue_cascade_roundtrip.rs`). Two new end-to-end tests drive
   a **multi-classification** format-1 residue body through the

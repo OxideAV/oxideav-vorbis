@@ -176,6 +176,25 @@ oracle pins the round-trip across both addressing formats and multi-stage
 refinement. The encoder WRITE primitives no longer need the residue
 entry indices supplied by hand.
 
+The **residue classification-selection layer** (`residue_encode` module:
+`plan_vector_classifications` + `plan_vector_residue`, over the scored
+primitive `plan_partition_cascade_scored`) sits above the cascade planner
+and closes the last hand-supplied residue knob. `plan_vector_partition_entries`
+takes the per-partition classifications as a given; the chooser instead
+*derives* them from the spectrum. For each partition it tries **every**
+candidate classification, plans its cascade, and keeps the one whose
+reconstruction minimises the squared distortion (`plan_partition_cascade_scored`
+reports the leftover residual's norm plus a populated-stage bit-cost
+proxy) — ties broken toward fewer stages (cheaper) then the lower index.
+`plan_vector_residue` is the top of the stack: raw spectral residual in,
+the index-aligned `classifications` + `partition_entries` a
+`ResidueVectorPlan` holds out, with **no hand-supplied classifications**.
+A full PCM→encode→decode round-trip (`tests/pcm_adaptive_residue_roundtrip.rs`)
+splits a real `X / rendered_floor` residue into many partitions, lets the
+chooser pick each partition's classification, and clears a fixed
+single-coarse-class baseline by ≈ 17.5 dB PCM-domain SNR — the encoder
+now plans both the residue classification and the cascade from spectrum.
+
 The **floor-0 VQ-encode glue** (`floor0_encode` module:
 `plan_floor0_coefficients` + `floor0_vector_count`) is the analogous glue
 for floor 0. Given a target LSP `[coefficients]` list and the value book a

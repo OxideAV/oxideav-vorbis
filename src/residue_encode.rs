@@ -62,14 +62,20 @@
 //!
 //! ## Scope
 //!
-//! This module plans the value-codeword entry lists only — the
-//! `partition_entries` field of a [`crate::encoder::ResidueVectorPlan`].
-//! Choosing the per-partition *classification* (which cascade column a
-//! partition takes, hence its bit cost) is a separate psychoacoustic
-//! decision the caller still owns; [`plan_vector_partition_entries`]
-//! takes the classifications as given and fills in the entry lists for
-//! them. Threading the resulting plans into a full packet is the
-//! existing [`crate::encoder::write_residue_body`] /
+//! Two layers live here. The lower one plans the value-codeword entry
+//! lists *given the classifications* — the `partition_entries` field of a
+//! [`crate::encoder::ResidueVectorPlan`]: [`plan_partition_cascade`] for
+//! one partition, [`plan_vector_partition_entries`] for a whole vector's
+//! pre-chosen classification row. The upper one **chooses** the
+//! per-partition classification (which cascade column a partition takes,
+//! hence its bit cost) directly from the spectrum:
+//! [`plan_vector_classifications`] scores every candidate classification's
+//! reconstruction distortion (via [`plan_partition_cascade_scored`]) and
+//! keeps the closest, and [`plan_vector_residue`] is the top-of-stack
+//! splitter producing the index-aligned `classifications` +
+//! `partition_entries` a [`crate::encoder::ResidueVectorPlan`] holds with
+//! no hand-supplied classifications. Threading the resulting plans into a
+//! full packet is the existing [`crate::encoder::write_residue_body`] /
 //! [`crate::encoder::write_audio_packet`] path.
 
 use crate::codebook::{VorbisCodebook, VqLookup};
