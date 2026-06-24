@@ -35,7 +35,8 @@
 use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup};
 use oxideav_vorbis::setup::ResidueHeader;
 use oxideav_vorbis::{
-    plan_partition_cascade, write_residue_body, ResidueDecoder, ResidueVectorPlan,
+    plan_partition_cascade, plan_vector_partition_entries, plan_vector_residue, write_residue_body,
+    ResidueDecoder, ResidueVectorPlan,
 };
 
 use oxideav_core::bits::BitReaderLsb;
@@ -542,5 +543,248 @@ fn format0_two_stage_cascade_refines_strictly() {
     assert!(
         sse_2 < sse_1,
         "format-0 two-stage SSE {sse_2} not strictly below one-stage {sse_1}"
+    );
+}
+
+/// A multi-classification format-1 residue header covering
+/// `[0, partition_size * partitions)` of one decode vector, where each
+/// classification `c` has the cascade `class_stages[c]` (each entry a
+/// per-pass `Some(book_index)`). `classbook` is codebook index 0; value
+/// books follow. This is the header a from-spectrum residue encode plans
+/// against: the encoder picks, per partition, which of these
+/// classifications to code it as.
+fn multiclass_header(
+    partition_size: u32,
+    partitions: u32,
+    class_stages: &[[Option<u8>; 8]],
+) -> ResidueHeader {
+    let classifications = class_stages.len() as u8;
+    let cascade: Vec<u8> = class_stages
+        .iter()
+        .map(|stages| {
+            let mut bits = 0u8;
+            for (j, slot) in stages.iter().enumerate() {
+                if slot.is_some() {
+                    bits |= 1 << j;
+                }
+            }
+            bits
+        })
+        .collect();
+    ResidueHeader {
+        residue_type: 1,
+        residue_begin: 0,
+        residue_end: partition_size * partitions,
+        partition_size,
+        classifications,
+        classbook: 0,
+        cascade,
+        books: class_stages.to_vec(),
+    }
+}
+
+/// A signed residual whose energy varies sharply per partition: the first
+/// half of the partitions are near-silent (small amplitude), the second
+/// half are loud. A from-spectrum encoder should code the quiet partitions
+/// with a cheap/coarse classification and the loud ones with the fine
+/// multi-stage cascade — the adaptive selection this test pins.
+fn block_varying_residual(partition_size: usize, partitions: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(partition_size * partitions);
+    for p in 0..partitions {
+        let loud = p >= partitions / 2;
+        let amp = if loud { 9.0f32 } else { 0.6f32 };
+        for i in 0..partition_size {
+            let t = i as f32;
+            let v = amp
+                * ((2.0 * std::f32::consts::PI * 3.0 * t / partition_size as f32).sin()
+                    + 0.4 * (2.0 * std::f32::consts::PI * 11.0 * t / partition_size as f32).cos());
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Decode a full residue body of one decode vector back to its residual,
+/// driving the real `ResidueDecoder` against the serialised body.
+fn decode_one_vector(
+    plan: &ResidueVectorPlan,
+    header: &ResidueHeader,
+    codebooks: &[VorbisCodebook],
+    n_scalars: usize,
+) -> Vec<f32> {
+    let blocksize = 2 * n_scalars;
+    let body = write_residue_body(
+        std::slice::from_ref(plan),
+        header,
+        codebooks,
+        blocksize,
+        &[false],
+    )
+    .expect("multiclass residue body serialises");
+    let dec = ResidueDecoder::new(header, codebooks).expect("residue decoder builds");
+    let mut reader = BitReaderLsb::new(&body);
+    let out = dec
+        .decode(&mut reader, blocksize, &[false])
+        .expect("multiclass residue body decodes");
+    assert_eq!(out.len(), 1);
+    out.into_iter().next().unwrap()
+}
+
+#[test]
+fn from_spectrum_classification_selection_round_trips_and_beats_fixed_class() {
+    // A residue with three classifications:
+    //   class 0 — 'unused' (empty cascade): codes a partition as all-zero.
+    //   class 1 — coarse single stage (step 1.0): cheap, low fidelity.
+    //   class 2 — coarse + fine two-stage cascade: dearer, high fidelity.
+    // The from-spectrum planner (`plan_vector_residue`) must pick, per
+    // partition, the classification minimising reconstruction distortion.
+    let partition_size = 16usize;
+    let partitions = 8usize;
+    let n = partition_size * partitions;
+    let residual = block_varying_residual(partition_size, partitions);
+
+    let coarse = signed_value_book(5, 1.0); // ladder [-16,+15] step 1.0
+    let fine = signed_value_book(5, 0.125); // refines within ±2 at 0.125
+    let cbook = classbook(4, 2); // 4 reachable classbook entries
+    let codebooks = vec![cbook, coarse.clone(), fine.clone()];
+
+    // class_stages: index 0 unused, 1 → book 1, 2 → books 1 then 2.
+    let mut s_unused: [Option<u8>; 8] = Default::default();
+    let _ = &mut s_unused; // all None
+    let mut s_coarse: [Option<u8>; 8] = Default::default();
+    s_coarse[0] = Some(1);
+    let mut s_fine: [Option<u8>; 8] = Default::default();
+    s_fine[0] = Some(1);
+    s_fine[1] = Some(2);
+    let class_stages = [s_unused, s_coarse, s_fine];
+    let header = multiclass_header(partition_size as u32, partitions as u32, &class_stages);
+
+    // The value_books table the planner scores against (one row per class).
+    let empty: [Option<&VorbisCodebook>; 8] = Default::default();
+    let mut row_coarse: [Option<&VorbisCodebook>; 8] = Default::default();
+    row_coarse[0] = Some(&coarse);
+    let mut row_fine: [Option<&VorbisCodebook>; 8] = Default::default();
+    row_fine[0] = Some(&coarse);
+    row_fine[1] = Some(&fine);
+    let value_books = vec![empty, row_coarse, row_fine];
+
+    // ---- Adaptive: let the planner choose classifications from spectrum.
+    let (classifications, partition_entries) =
+        plan_vector_residue(&residual, &value_books, 1, partition_size as u32)
+            .expect("from-spectrum residue plans");
+    assert_eq!(classifications.len(), partitions);
+    let adaptive_plan = ResidueVectorPlan {
+        classifications: classifications.clone(),
+        partition_entries,
+    };
+    let adaptive = decode_one_vector(&adaptive_plan, &header, &codebooks, n);
+
+    // The loud partitions (second half) carry far more energy, so the
+    // planner must reach for the high-fidelity (two-stage, class 2)
+    // cascade on at least one of them; the quiet partitions should never
+    // need the dearest class. This proves the selection is genuinely
+    // content-adaptive, not a constant.
+    let loud_classes: Vec<u32> = classifications[partitions / 2..].to_vec();
+    assert!(
+        loud_classes.contains(&2),
+        "no loud partition chose the high-fidelity class: {classifications:?}"
+    );
+
+    // ---- Exact bitstream round-trip: decode == sum of chosen entries'
+    // reconstructions. Rebuild the expected reconstruction independently
+    // via plan_vector_partition_entries on the SAME classifications.
+    let expected_rows = plan_vector_partition_entries(
+        &residual,
+        &classifications,
+        &value_books,
+        1,
+        partition_size as u32,
+    )
+    .expect("entries replan");
+    let expected_plan = ResidueVectorPlan {
+        classifications: classifications.clone(),
+        partition_entries: expected_rows,
+    };
+    let expected = decode_one_vector(&expected_plan, &header, &codebooks, n);
+    assert_eq!(
+        adaptive, expected,
+        "from-spectrum plan and explicit-classification plan must reconstruct identically"
+    );
+
+    // ---- Baseline: force every partition to the coarse single-stage
+    // class (1). Adaptive selection must not be worse, and on this
+    // sharply-varying signal it is strictly better (the loud partitions
+    // gain the fine refinement stage the fixed coarse class can't reach).
+    let fixed_classes = vec![1u32; partitions];
+    let fixed_rows = plan_vector_partition_entries(
+        &residual,
+        &fixed_classes,
+        &value_books,
+        1,
+        partition_size as u32,
+    )
+    .expect("fixed-class entries plan");
+    let fixed_plan = ResidueVectorPlan {
+        classifications: fixed_classes,
+        partition_entries: fixed_rows,
+    };
+    let fixed = decode_one_vector(&fixed_plan, &header, &codebooks, n);
+
+    let snr_adaptive = snr_db(&residual, &adaptive);
+    let snr_fixed = snr_db(&residual, &fixed);
+    assert!(
+        snr_adaptive >= snr_fixed - 1e-3,
+        "adaptive SNR {snr_adaptive} dB worse than fixed-coarse {snr_fixed} dB"
+    );
+    assert!(
+        snr_adaptive >= snr_fixed + 3.0,
+        "adaptive SNR {snr_adaptive} dB only marginally above fixed-coarse {snr_fixed} dB (expected >=3 dB gain)"
+    );
+}
+
+#[test]
+fn from_spectrum_silent_partitions_choose_unused_class() {
+    // A vector whose partitions are exactly zero must be coded with the
+    // 'unused' (empty-cascade) classification — zero distortion at zero
+    // bit cost, the cheapest classification on a distortion tie.
+    let partition_size = 8usize;
+    let partitions = 4usize;
+    let residual = vec![0.0f32; partition_size * partitions];
+
+    let coarse = signed_value_book(4, 1.0);
+    let cbook = classbook(2, 1);
+    let codebooks = vec![cbook, coarse.clone()];
+
+    let s_unused: [Option<u8>; 8] = Default::default();
+    let mut s_coarse: [Option<u8>; 8] = Default::default();
+    s_coarse[0] = Some(1);
+    let class_stages = [s_unused, s_coarse];
+    let header = multiclass_header(partition_size as u32, partitions as u32, &class_stages);
+
+    let empty: [Option<&VorbisCodebook>; 8] = Default::default();
+    let mut row_coarse: [Option<&VorbisCodebook>; 8] = Default::default();
+    row_coarse[0] = Some(&coarse);
+    let value_books = vec![empty, row_coarse];
+
+    let (classifications, partition_entries) =
+        plan_vector_residue(&residual, &value_books, 1, partition_size as u32)
+            .expect("silent residue plans");
+    // Every partition is zero → the 'unused' class (0) wins on the
+    // fewer-stages tie-break (both reach zero distortion).
+    assert!(
+        classifications.iter().all(|&c| c == 0),
+        "silent partitions did not all choose the unused class: {classifications:?}"
+    );
+
+    // And the all-'unused' plan round-trips back to exact silence through
+    // the real encode + decode path.
+    let plan = ResidueVectorPlan {
+        classifications,
+        partition_entries,
+    };
+    let decoded = decode_one_vector(&plan, &header, &codebooks, partition_size * partitions);
+    assert!(
+        decoded.iter().all(|&v| v == 0.0),
+        "silent residue did not decode to all-zero"
     );
 }

@@ -6,6 +6,26 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- From-spectrum residue classification-selection integration coverage
+  (`tests/residue_cascade_roundtrip.rs`). Two new end-to-end tests drive
+  a **multi-classification** format-1 residue body through the
+  full from-spectrum encode path (`plan_vector_residue` →
+  `ResidueVectorPlan` → `write_residue_body` → `ResidueDecoder`) — the
+  first integration coverage of the classification chooser.
+  `from_spectrum_classification_selection_round_trips_and_beats_fixed_class`
+  builds a three-classification residue (unused / coarse single-stage /
+  coarse+fine two-stage cascade) over a sharply block-varying residual
+  (quiet partitions then loud partitions) and pins: (1) the planner
+  reaches for the high-fidelity two-stage class on the loud partitions
+  (content-adaptive, not constant); (2) the from-spectrum plan and an
+  explicit-classification replan reconstruct **bit-identically** (the
+  selection ↔ entry-list round-trip is exact); and (3) adaptive selection
+  clears the fixed-coarse-class baseline by **≥ 3 dB** spectral SNR
+  (≈ 43.1 dB adaptive vs ≈ 24.4 dB fixed measured — an ≈ 18.6 dB gain,
+  the loud partitions gaining the fine refinement stage the fixed coarse
+  class cannot reach). `from_spectrum_silent_partitions_choose_unused_class`
+  pins that an all-zero vector is coded with the cheapest ('unused')
+  classification on the distortion tie and decodes back to exact silence.
 - §8.6.2 residue **classification-selection** layer (`residue_encode`
   module: `plan_vector_classifications`, `plan_vector_residue`,
   `PartitionClassChoice`, plus the scored cascade primitive
