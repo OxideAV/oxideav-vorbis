@@ -467,6 +467,164 @@ pub fn plan_floor0_lsp(
     Ok(lsp.into_iter().map(|w| w as f32).collect())
 }
 
+/// Errors that can arise composing a full floor-0 packet from a target
+/// envelope ([`plan_floor0_packet`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Floor0PacketPlanError {
+    /// The `booknumber` indexed outside the header's `book_list`. §6.2.2
+    /// step 4 reads a position in `floor0_book_list`; this is its encode
+    /// gate. Carries the bad index and the list length.
+    BooknumberOutOfRange {
+        /// The supplied `booknumber`.
+        booknumber: usize,
+        /// `header.book_list.len()`.
+        book_count: usize,
+    },
+    /// The `book_list[booknumber]` entry indexed outside the codebook table.
+    BookOutOfRange {
+        /// The `floor0_book_list` value (a codebook-table index).
+        book: usize,
+        /// `codebooks.len()`.
+        codebook_count: usize,
+    },
+    /// The envelope→LSP→amplitude stage failed. Carries the inner
+    /// [`Floor0EnvelopeError`].
+    Envelope(Floor0EnvelopeError),
+    /// The LSP→entry-run stage ([`crate::floor0_encode::plan_floor0_coefficients`])
+    /// failed. Carries the inner [`crate::floor0_encode::Floor0EncodeError`].
+    Encode(crate::floor0_encode::Floor0EncodeError),
+}
+
+impl core::fmt::Display for Floor0PacketPlanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Floor0PacketPlanError::BooknumberOutOfRange {
+                booknumber,
+                book_count,
+            } => write!(
+                f,
+                "vorbis floor0 packet plan: booknumber {booknumber} >= book_list.len()={book_count}"
+            ),
+            Floor0PacketPlanError::BookOutOfRange {
+                book,
+                codebook_count,
+            } => write!(
+                f,
+                "vorbis floor0 packet plan: book_list entry {book} >= codebooks.len()={codebook_count}"
+            ),
+            Floor0PacketPlanError::Envelope(e) => write!(f, "vorbis floor0 packet plan: {e}"),
+            Floor0PacketPlanError::Encode(e) => write!(f, "vorbis floor0 packet plan: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Floor0PacketPlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Floor0PacketPlanError::Envelope(e) => Some(e),
+            Floor0PacketPlanError::Encode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// One-call floor-0 packet planner (Vorbis I §6.2.2 / §6.2.3, encode
+/// direction): turn a desired linear-domain floor envelope directly into a
+/// write-ready [`crate::encoder::Floor0Packet::Curve`].
+///
+/// This composes the whole floor-0 encode chain — the floor-0 analogue of
+/// [`crate::floor1_encode::plan_floor1_packet`]:
+///
+/// 1. [`plan_floor0_lsp`] — envelope → LSP `[coefficients]` (the
+///    autocorrelation → Levinson-Durbin → LSP all-pole fit);
+/// 2. [`fit_floor0_amplitude`] — fit the per-packet `[amplitude]` to the
+///    target gain over those coefficients;
+/// 3. [`crate::floor0_encode::plan_floor0_coefficients`] — quantise the LSP
+///    coefficients into the value-book entry run the §6.2.2 step-7 loop
+///    reads back.
+///
+/// `header` is the parsed [`crate::setup::Floor0Header`]; `codebooks` is the
+/// stream codebook table; `booknumber` selects which value book (a position
+/// in `floor0_book_list`) the packet uses; `envelope` is the desired
+/// linear-amplitude floor, one value per spectral bin. The returned
+/// [`crate::encoder::Floor0Packet`] feeds straight into
+/// [`crate::encoder::write_floor0_packet`] (with neither the LSP
+/// `coefficients`, the `amplitude`, nor the entry run supplied by hand).
+///
+/// The chain is **lossy** (an order-`floor0_order` all-pole model of the
+/// envelope shape, plus integer-amplitude and VQ quantisation), but the
+/// emitted packet is self-consistent: decoding it reproduces the planner's
+/// own approximation bit-for-bit.
+///
+/// # Errors
+///
+/// [`Floor0PacketPlanError::BooknumberOutOfRange`] /
+/// [`Floor0PacketPlanError::BookOutOfRange`] for an out-of-range book
+/// selector; [`Floor0PacketPlanError::Envelope`] wrapping a fit failure
+/// (silent / degenerate target); [`Floor0PacketPlanError::Encode`] wrapping
+/// a value-book quantiser failure.
+pub fn plan_floor0_packet(
+    header: &crate::setup::Floor0Header,
+    codebooks: &[crate::codebook::VorbisCodebook],
+    booknumber: u32,
+    envelope: &[f32],
+) -> Result<crate::encoder::Floor0Packet, Floor0PacketPlanError> {
+    let book_count = header.book_list.len();
+    if booknumber as usize >= book_count {
+        return Err(Floor0PacketPlanError::BooknumberOutOfRange {
+            booknumber: booknumber as usize,
+            book_count,
+        });
+    }
+    let book_idx = header.book_list[booknumber as usize] as usize;
+    let book = codebooks
+        .get(book_idx)
+        .ok_or(Floor0PacketPlanError::BookOutOfRange {
+            book: book_idx,
+            codebook_count: codebooks.len(),
+        })?;
+
+    let params = Floor0ShapeParams {
+        order: header.order as usize,
+        rate: header.rate as u32,
+        bark_map_size: header.bark_map_size as u32,
+        amplitude_bits: header.amplitude_bits,
+        amplitude_offset: header.amplitude_offset,
+    };
+
+    // 1. envelope → LSP coefficients.
+    let lsp = plan_floor0_lsp(envelope, &params).map_err(Floor0PacketPlanError::Envelope)?;
+    // 2. fit the amplitude over those coefficients.
+    let amplitude =
+        fit_floor0_amplitude(&lsp, envelope, &params).map_err(Floor0PacketPlanError::Envelope)?;
+    // 3. quantise the LSP coefficients into the value-book entry run. The
+    //    entry planner reads `ceil(order/dims)*dims` coefficients (a partial
+    //    final vector is read in full); pad the order-length LSP list out to
+    //    that width by holding the last coefficient (the surplus the §6.2.3
+    //    curve discards). The decoder over-reads but never uses past `order`,
+    //    so the held tail is harmless and keeps the cross-vector `last`
+    //    accumulator well-conditioned.
+    let dims = book.dimensions as usize;
+    let padded_len = if dims == 0 {
+        lsp.len()
+    } else {
+        crate::floor0_encode::floor0_vector_count(params.order, dims) * dims
+    };
+    let mut coeffs = lsp;
+    if coeffs.len() < padded_len {
+        let tail = *coeffs.last().unwrap_or(&0.0);
+        coeffs.resize(padded_len, tail);
+    }
+    let entries = crate::floor0_encode::plan_floor0_coefficients(&coeffs, book, params.order)
+        .map_err(Floor0PacketPlanError::Encode)?;
+
+    Ok(crate::encoder::Floor0Packet::Curve {
+        amplitude,
+        booknumber,
+        entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

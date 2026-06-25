@@ -240,18 +240,28 @@ pub fn lpc_to_lsp(a: &[f64], order: usize) -> Result<Vec<f64>, Floor0LspError> {
         pp[i] = ai + arev;
         qq[i] = ai - arev;
     }
-    // Remove the known trivial roots: P always has a root at ω=π (z=−1) for
-    // the (1 + z^-1) factor when p is even / ω=0 etc. The standard reduction
-    // divides P by (1 + z^-1) and Q by (1 - z^-1) (each removes one trivial
-    // root), yielding two even-symmetric polynomials of degree p whose
-    // unit-circle roots are the LSP pairs. Synthetic-divide:
-    let pr = deflate_symmetric(&pp, true); // P / (1 + z^-1)
-    let qr = deflate_symmetric(&qq, false); // Q / (1 - z^-1)
+    // Remove the known trivial roots, which depend on the parity of `order`:
+    //
+    // * `order` **even**: P has a root at z=−1 (ω=π), Q at z=1 (ω=0). Divide
+    //   P by (1 + z⁻¹) and Q by (1 − z⁻¹); each quotient is a degree-`order`
+    //   palindrome carrying `order/2` non-trivial LSP roots.
+    // * `order` **odd**: Q has roots at *both* z=1 and z=−1 (antisymmetric,
+    //   (order+1) even), while P has none. Leave P intact (degree order+1,
+    //   carrying (order+1)/2 roots) and divide Q by (1 − z⁻²) =
+    //   (1 − z⁻¹)(1 + z⁻¹) (degree order−1, carrying (order−1)/2 roots).
+    //
+    // Either way the two reduced polynomials carry exactly `order` roots.
+    let (pr, qr) = if order % 2 == 0 {
+        (deflate_symmetric(&pp, true), deflate_symmetric(&qq, false))
+    } else {
+        let q1 = deflate_symmetric(&qq, false); // Q / (1 - z^-1)
+        let q2 = deflate_symmetric(&q1, true); // (Q / (1 - z^-1)) / (1 + z^-1)
+        (pp.clone(), q2)
+    };
 
-    // Each reduced polynomial is palindromic of degree p; its unit-circle
-    // roots come in conjugate pairs, so it reduces to a degree-⌈p/2⌉
-    // Chebyshev polynomial in x = cos ω. Evaluate both on a dense grid in
-    // x ∈ [-1, 1] (ω ∈ [0, π]) and isolate sign changes.
+    // Each reduced polynomial is palindromic; its unit-circle roots come in
+    // conjugate pairs. Evaluate both as a function of ω on a dense grid in
+    // (0, π) and isolate sign changes.
     let mut roots = Vec::with_capacity(order);
     collect_palindromic_roots(&pr, &mut roots);
     collect_palindromic_roots(&qr, &mut roots);
