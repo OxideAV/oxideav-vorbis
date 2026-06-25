@@ -158,6 +158,7 @@ pub mod comment;
 pub mod encoder;
 pub mod floor0;
 pub mod floor0_encode;
+pub mod floor0_envelope;
 pub mod floor1;
 pub mod floor1_encode;
 pub mod floor1_envelope;
