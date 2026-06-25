@@ -393,6 +393,19 @@ control proving the coupling transform actually ran — the encoder's forward
 coupling and the decoder's inverse coupling are proven to compose to the
 identity on the L/R signal.
 
+`tests/residue_format2_roundtrip.rs` closes the §8.6.5 **residue format-2**
+encode→decode gap (previously only the decoder's interleave/de-interleave
+was unit-tested; every packet round-trip used a per-channel format-1
+residue). Two-channel PCM → two windowed MDCTs → flat floor → the two
+per-channel residue targets **interleaved** into one virtual vector
+(`interleaved[i·ch + j] = channel[j][i]`, the exact inverse of the §8.6.5
+step-3 de-interleave) → `plan_partition_cascade` over the single interleaved
+vector → `write_audio_packet` with a `residue_type: 2` header (one residue
+plan) → `decode_audio_packet_windowed` (which interleaves, format-1-decodes,
+and de-interleaves) → two channels, each clearing **≥30 dB** PCM-domain SNR
+(≥25 dB across a 128/256/512 block-size sweep) — the §8.6.5 interleave is
+proven the exact inverse of the decode-side de-interleave end to end.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container

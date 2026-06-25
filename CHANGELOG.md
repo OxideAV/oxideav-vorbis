@@ -6,6 +6,18 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Residue format-2 multi-channel PCM round-trip**
+  (`tests/residue_format2_roundtrip.rs`) — the first *encode→decode* exercise
+  of §8.6.5 (the "interleave all channels into one virtual vector,
+  format-1-decode, de-interleave" residue mode); previously only the
+  decoder's interleave/de-interleave was unit-tested, and every packet
+  round-trip used a per-channel format-1 residue. Two-channel PCM → two
+  windowed MDCTs → flat floor → **interleave** the per-channel targets
+  (`interleaved[i·ch + j] = channel[j][i]`, the inverse of the §8.6.5 step-3
+  de-interleave) → `plan_partition_cascade` the single interleaved vector →
+  `write_audio_packet` (`residue_type: 2`, one residue plan) →
+  `decode_audio_packet_windowed`, with each decoded channel clearing ≥30 dB
+  PCM-domain SNR (≥25 dB across a 128/256/512 block-size sweep).
 - **Stereo channel-coupling PCM round-trip** (`tests/stereo_coupling_roundtrip.rs`)
   — the first *encode→decode* exercise of §4.3.5 channel coupling (every
   prior encode round-trip is mono with empty coupling; §4.3.5 was only
