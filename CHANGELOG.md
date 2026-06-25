@@ -6,6 +6,18 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Stereo channel-coupling PCM round-trip** (`tests/stereo_coupling_roundtrip.rs`)
+  — the first *encode→decode* exercise of §4.3.5 channel coupling (every
+  prior encode round-trip is mono with empty coupling; §4.3.5 was only
+  decode-tested). Stereo PCM → two windowed forward MDCTs →
+  `forward_couple_all` (square-polar magnitude/angle) → residue against a
+  flat floor → `write_audio_packet` (one submap, the coupled pair) →
+  `decode_audio_packet_windowed` (which runs the §4.3.5 inverse coupling) →
+  two channels, each clearing ≥25 dB PCM-domain SNR against its own
+  `window ⊙ IMDCT(X*)` reference, plus a 128/256/512 block-size sweep and a
+  control proving the coupling transform actually ran. Proves the encoder's
+  forward coupling and the decoder's inverse coupling compose to reproduce
+  the original L/R signal.
 - **Floor-0 envelope-fit chain** (`floor0_envelope` + `floor0_lsp` modules)
   — the §6.2.3 curve **inverse**, the floor-0 analogue of
   `plan_floor1_envelope`. `floor0_lsp` carries the generic DSP:

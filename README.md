@@ -380,6 +380,19 @@ contiguous (format-1) interpretation of the same entry run would *not*
 match, proving the encode-side gather is the exact inverse of the decode
 scatter — plus a two-stage format-0 cascade refinement.
 
+`tests/stereo_coupling_roundtrip.rs` is the first **encode→decode** exercise
+of §4.3.5 channel coupling (every other encode round-trip is mono with empty
+coupling; §4.3.5 was previously only decode-tested via the `mode-stereo`
+fixture). Stereo PCM → two windowed forward MDCTs → `forward_couple_all`
+(the §4.3.5 square-polar magnitude/angle transform) → residue against a flat
+floor → `write_audio_packet` (one submap carrying the coupled pair) →
+`decode_audio_packet_windowed` (which runs the §4.3.5 inverse coupling) →
+two channels, each clearing **≥25 dB** PCM-domain SNR against its own
+`window ⊙ IMDCT(X*)` reference across a 128/256/512 block-size sweep, with a
+control proving the coupling transform actually ran — the encoder's forward
+coupling and the decoder's inverse coupling are proven to compose to the
+identity on the L/R signal.
+
 ### Not yet supported / known gaps
 
 - **No `Decoder` / `Encoder` registration** and no Ogg container
