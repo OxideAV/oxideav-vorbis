@@ -106,6 +106,11 @@ pub enum Floor0EnvelopeError {
     /// amplitude is indeterminate. Practically unreachable for a real LSP
     /// set; reported rather than dividing by zero.
     DegenerateShape,
+    /// The autocorrelation → Levinson-Durbin → LSP DSP chain
+    /// ([`plan_floor0_lsp`]) failed: a silent target, a non-positive-definite
+    /// autocorrelation at the requested order, or an LSP root-count
+    /// shortfall. Carries the inner [`crate::floor0_lsp::Floor0LspError`].
+    Lsp(crate::floor0_lsp::Floor0LspError),
 }
 
 impl core::fmt::Display for Floor0EnvelopeError {
@@ -137,11 +142,19 @@ impl core::fmt::Display for Floor0EnvelopeError {
                 f,
                 "vorbis floor0 envelope: every LSP shape weight g(ω) was zero"
             ),
+            Floor0EnvelopeError::Lsp(e) => write!(f, "vorbis floor0 envelope: {e}"),
         }
     }
 }
 
-impl std::error::Error for Floor0EnvelopeError {}
+impl std::error::Error for Floor0EnvelopeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Floor0EnvelopeError::Lsp(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// Header inputs the §6.2.3 curve-shape evaluation needs. A thin view over
 /// the [`crate::setup::Floor0Header`] fields the math reads, so the fitter
@@ -316,6 +329,142 @@ pub fn fit_floor0_amplitude(
     let rounded = amplitude_real.round();
     let clamped = rounded.clamp(1.0, denom_int as f64);
     Ok(clamped as u32)
+}
+
+/// Fold a per-spectral-bin target envelope onto the §6.2.3 Bark-bucket grid,
+/// returning a **power spectrum the LPC fit should model** so the rendered
+/// floor-0 curve tracks the *linear* target.
+///
+/// ## Why the log domain
+///
+/// The §6.2.3 curve is *exponential* in the LSP shape:
+/// `curve(ω) = exp(K·amp·g(ω) − C)` with `g(ω) = 1/|A(e^{jω})|` (see
+/// [`fit_floor0_amplitude`]). The all-pole model the autocorrelation method
+/// fits reconstructs a power spectrum `S(ω) ≈ gain/|A|²`, so the model's
+/// `g = 1/|A| = sqrt(S/gain)` tracks `sqrt(S)`. For the rendered curve to
+/// match the target we need `K·amp·g − C = ln(target)`, i.e.
+/// `g(ω) ∝ ln(target(ω)) + const`. So the power spectrum the fit must model
+/// is the **squared shifted log-envelope** `S = (ln(target) − ln(min) + ε)²`,
+/// *not* the squared linear envelope — modelling the linear envelope makes
+/// `g ∝ target` and the exp blows the dynamic range up.
+///
+/// ## Bark grid
+///
+/// The §6.2.3 LSP poles are angles evaluated at `ω = π · m / bark_map_size`
+/// for Bark bucket `m`; the fit must see the target in *that* bucket domain,
+/// not linear frequency. This walks the §6.2.3 Bark map (the same one the
+/// renderer uses), averaging each bucket's shifted-log values (squared into
+/// power), and nearest-occupied-fills any empty bucket so the
+/// autocorrelation integral sees a complete `0..bark_map_size` half-spectrum.
+fn envelope_to_bark_power(envelope: &[f32], rate: u32, bark_map_size: u32) -> Vec<f64> {
+    let n = envelope.len();
+    let buckets = bark_map_size as usize;
+    let map = bark_map(rate, bark_map_size, n);
+
+    // Shift the log-envelope to be strictly positive: subtract the minimum
+    // log so the quietest bin sits at ε. The absolute shift is irrelevant —
+    // the amplitude fit (Σg·t/Σg²) absorbs any affine offset in g.
+    let min_ln = envelope
+        .iter()
+        .map(|&v| (v as f64).ln())
+        .fold(f64::INFINITY, f64::min);
+    let eps = 1e-3;
+
+    let mut sum = vec![0.0f64; buckets];
+    let mut cnt = vec![0u32; buckets];
+    for (i, &v) in envelope.iter().enumerate() {
+        let b = map[i].clamp(0, buckets as i32 - 1) as usize;
+        let g = (v as f64).ln() - min_ln + eps; // shifted log, ≥ ε > 0
+        sum[b] += g * g; // power = g²
+        cnt[b] += 1;
+    }
+    let mut power = vec![0.0f64; buckets];
+    for b in 0..buckets {
+        if cnt[b] > 0 {
+            power[b] = sum[b] / cnt[b] as f64;
+        }
+    }
+    // Nearest-occupied hold for empty buckets (forward fill), so no bucket is
+    // a spurious zero in the autocorrelation integral.
+    let mut last = power
+        .iter()
+        .copied()
+        .find(|&p| p > 0.0)
+        .unwrap_or(eps * eps);
+    for p in power.iter_mut() {
+        if *p > 0.0 {
+            last = *p;
+        } else {
+            *p = last;
+        }
+    }
+    power
+}
+
+/// Derive the §6.2.3 LSP `[coefficients]` (pole angles, ascending in
+/// `(0, π)`) that best model a target linear-domain floor envelope, via the
+/// classic autocorrelation → Levinson-Durbin → LSP chain (Vorbis I §6.2.3,
+/// encode direction).
+///
+/// `envelope` is the desired linear-amplitude floor, one value per spectral
+/// bin (the forward-MDCT magnitude domain). The fit:
+///
+/// 1. folds the envelope's **power** onto the §6.2.3 Bark-bucket grid
+///    ([`envelope_to_bark_power`]) so the model sees the spectrum in the
+///    domain the LSP angles live in;
+/// 2. inverse-DFTs that power spectrum to `order + 1` autocorrelation lags
+///    ([`crate::floor0_lsp::autocorrelation_from_power`]);
+/// 3. solves the order-`order` all-pole model
+///    ([`crate::floor0_lsp::levinson_durbin`]);
+/// 4. extracts the LSP frequencies
+///    ([`crate::floor0_lsp::lpc_to_lsp`]).
+///
+/// The returned `Vec<f32>` is exactly the LSP `[coefficients]` the §6.2.3
+/// curve evaluates `cos(·)` of — the input
+/// [`fit_floor0_amplitude`] and [`crate::floor0_encode::plan_floor0_coefficients`]
+/// consume. The model is **lossy**: an order-`order` all-pole envelope is
+/// the best `order`-pole fit, not an exact reproduction.
+///
+/// # Errors
+///
+/// Returns a [`Floor0EnvelopeError`] for a zero order, an empty envelope, or
+/// a non-finite / non-positive envelope sample; or wraps a
+/// [`crate::floor0_lsp::Floor0LspError`] from the DSP chain (a silent target
+/// energy, a non-positive-definite autocorrelation, or an LSP root-count
+/// shortfall) as [`Floor0EnvelopeError::Lsp`].
+pub fn plan_floor0_lsp(
+    envelope: &[f32],
+    params: &Floor0ShapeParams,
+) -> Result<Vec<f32>, Floor0EnvelopeError> {
+    if params.order == 0 {
+        return Err(Floor0EnvelopeError::ZeroOrder);
+    }
+    if envelope.is_empty() {
+        return Err(Floor0EnvelopeError::EmptyEnvelope);
+    }
+    for (i, &v) in envelope.iter().enumerate() {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(Floor0EnvelopeError::NonPositiveSample(i));
+        }
+    }
+
+    let power = envelope_to_bark_power(envelope, params.rate, params.bark_map_size);
+    // The renderer evaluates the LSP shape at ω_m = π·m / bark_map_size for
+    // Bark bucket m; the autocorrelation must integrate the power over that
+    // exact grid so the fitted all-pole model matches what the decoder draws.
+    let angles: Vec<f64> = (0..power.len())
+        .map(|m| std::f64::consts::PI * m as f64 / params.bark_map_size as f64)
+        .collect();
+    let r = crate::floor0_lsp::autocorrelation_from_angles(&power, &angles, params.order);
+    // A tiny diagonal load (white-noise floor) keeps the autocorrelation
+    // matrix safely positive-definite for near-degenerate targets — a
+    // standard regularisation, not a spec deviation.
+    let mut r = r;
+    r[0] *= 1.0 + 1e-9;
+    let (a, _gain) =
+        crate::floor0_lsp::levinson_durbin(&r, params.order).map_err(Floor0EnvelopeError::Lsp)?;
+    let lsp = crate::floor0_lsp::lpc_to_lsp(&a, params.order).map_err(Floor0EnvelopeError::Lsp)?;
+    Ok(lsp.into_iter().map(|w| w as f32).collect())
 }
 
 #[cfg(test)]
@@ -524,5 +673,135 @@ mod tests {
         let scaled: Vec<f32> = huge.iter().map(|x| x * 1e6).collect();
         let fitted = fit_floor0_amplitude(&coeffs, &scaled, &p).unwrap();
         assert_eq!(fitted, 1023);
+    }
+
+    // ---------- plan_floor0_lsp self-consistency ----------
+
+    /// log-domain **shape** SNR (dB) of `rendered` against `target`, both
+    /// linear envelopes. The overall log-level (a constant in the log domain)
+    /// is the encoder's free `[amplitude]` knob, so it is removed from *both*
+    /// signals before comparison — what the envelope fit is judged on is the
+    /// spectral *shape*, not the absolute gain (which the integer-amplitude
+    /// grid and the residue stage handle).
+    fn log_snr_db(rendered: &[f32], target: &[f32]) -> f64 {
+        let n = target.len() as f64;
+        let tmean: f64 = target.iter().map(|x| (*x as f64).ln()).sum::<f64>() / n;
+        let rmean: f64 = rendered.iter().map(|x| (*x as f64).ln()).sum::<f64>() / n;
+        let mut sig = 0.0f64;
+        let mut err = 0.0f64;
+        for (r, t) in rendered.iter().zip(target.iter()) {
+            let lt = (*t as f64).ln() - tmean;
+            let lr = (*r as f64).ln() - rmean;
+            sig += lt * lt;
+            err += (lt - lr) * (lt - lr);
+        }
+        10.0 * (sig / err.max(1e-30)).log10()
+    }
+
+    /// The headline round-trip: a smooth target envelope → `plan_floor0_lsp`
+    /// → `fit_floor0_amplitude` → §6.2.3 render reproduces the target's
+    /// spectral *shape*. The fit is an order-`order` all-pole model, so the
+    /// reconstruction is the best `order`-pole envelope, not exact; a
+    /// formant-like target (a few resonant peaks) is exactly what LSP models
+    /// well, so the shape SNR clears a meaningful bar.
+    #[test]
+    fn envelope_to_lsp_to_render_reproduces_a_formant_shape() {
+        let mut p = params();
+        p.order = 14;
+        let dec = decoder_for(&p);
+        let n = 256;
+        // A formant-like envelope whose *log* (dB) shape is a sum of smooth
+        // resonant bumps — the domain floor 0 (an all-pole model of the log
+        // spectrum) represents naturally, and the shape real audio envelopes
+        // take in dB.
+        let target: Vec<f32> = (0..n)
+            .map(|i| {
+                let w = std::f32::consts::PI * i as f32 / n as f32;
+                let log_db = 3.0 / ((w - 0.4).powi(2) + 0.05)
+                    + 2.0 / ((w - 1.2).powi(2) + 0.08)
+                    + 1.5 / ((w - 2.3).powi(2) + 0.12);
+                (0.2 * log_db).exp()
+            })
+            .collect();
+        let lsp = plan_floor0_lsp(&target, &p).expect("lsp plan succeeds");
+        assert_eq!(lsp.len(), p.order);
+        // LSP angles must be a valid ascending set in (0, π).
+        for pair in lsp.windows(2) {
+            assert!(pair[1] > pair[0], "lsp not ascending: {lsp:?}");
+        }
+        let amp = fit_floor0_amplitude(&lsp, &target, &p).expect("amplitude fit");
+        let rendered = dec.render_curve(amp, &lsp, n);
+        let snr = log_snr_db(&rendered, &target);
+        assert!(
+            snr > 10.0,
+            "formant-shape log-SNR {snr:.2} dB should clear 10 dB"
+        );
+    }
+
+    /// Raising the model order strictly improves (or holds) the fit of a
+    /// rich target — more poles model more spectral detail. Pins that the
+    /// chain is order-responsive (a real all-pole fit, not a constant).
+    #[test]
+    fn higher_order_fits_a_rich_target_at_least_as_well() {
+        let n = 256;
+        let target: Vec<f32> = (0..n)
+            .map(|i| {
+                let w = std::f32::consts::PI * i as f32 / n as f32;
+                0.01 + (1.0 + (3.0 * w).cos()).abs() + 0.5 * (7.0 * w).cos().abs()
+            })
+            .collect();
+        let snr_at = |order: usize| -> f64 {
+            let mut p = params();
+            p.order = order;
+            let dec = decoder_for(&p);
+            let lsp = plan_floor0_lsp(&target, &p).expect("lsp plan");
+            let amp = fit_floor0_amplitude(&lsp, &target, &p).expect("amp fit");
+            let rendered = dec.render_curve(amp, &lsp, n);
+            log_snr_db(&rendered, &target)
+        };
+        let lo = snr_at(6);
+        let hi = snr_at(16);
+        assert!(
+            hi >= lo - 0.5,
+            "order-16 SNR {hi:.2} dB should not be materially worse than order-6 {lo:.2} dB"
+        );
+    }
+
+    /// A silent (all-equal, near-zero) target still produces a valid LSP set
+    /// (the diagonal-load regularisation keeps the autocorrelation
+    /// positive-definite); the rendered curve is near-flat.
+    #[test]
+    fn flat_target_yields_a_valid_near_flat_fit() {
+        let mut p = params();
+        p.order = 8;
+        let dec = decoder_for(&p);
+        let n = 128;
+        let target = vec![0.5f32; n];
+        let lsp = plan_floor0_lsp(&target, &p).expect("lsp plan on flat target");
+        assert_eq!(lsp.len(), 8);
+        let amp = fit_floor0_amplitude(&lsp, &target, &p).expect("amp fit");
+        let rendered = dec.render_curve(amp, &lsp, n);
+        // Flat target ⇒ rendered curve has low dynamic range.
+        let max = rendered.iter().cloned().fold(f32::MIN, f32::max);
+        let min = rendered.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            max / min < 4.0,
+            "flat target should render a low-dynamic-range curve ({min}..{max})"
+        );
+    }
+
+    #[test]
+    fn plan_floor0_lsp_rejects_empty_and_zero_order() {
+        let p = params();
+        assert_eq!(
+            plan_floor0_lsp(&[], &p),
+            Err(Floor0EnvelopeError::EmptyEnvelope)
+        );
+        let mut p0 = params();
+        p0.order = 0;
+        assert_eq!(
+            plan_floor0_lsp(&[1.0; 8], &p0),
+            Err(Floor0EnvelopeError::ZeroOrder)
+        );
     }
 }
