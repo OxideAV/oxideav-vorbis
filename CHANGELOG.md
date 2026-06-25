@@ -6,6 +6,16 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Residue format-0 strided-scatter PCM round-trip**
+  (`tests/residue_format0_roundtrip.rs`) — the first *audio-packet-level*
+  exercise of §8.6.3 (read `i`, element `j` → `i + j·step`); format 0 had
+  only isolated residue-body coverage, and every packet round-trip used a
+  contiguous format-1/2 residue. Mono PCM → windowed MDCT → flat floor →
+  `plan_partition_cascade` with `residue_type = 0` (the encode-side strided
+  **gather** that inverts the §8.6.3 scatter) over a 2-D value book (its
+  `dimensions = 2` divides the partition) → `write_audio_packet`
+  (`residue_type: 0`) → `decode_audio_packet_windowed` → PCM, clearing
+  ≥25 dB PCM-domain SNR (≥20 dB across a 128/256/512 block-size sweep).
 - **Residue format-2 multi-channel PCM round-trip**
   (`tests/residue_format2_roundtrip.rs`) — the first *encode→decode* exercise
   of §8.6.5 (the "interleave all channels into one virtual vector,

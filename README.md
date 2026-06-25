@@ -405,6 +405,14 @@ plan) → `decode_audio_packet_windowed` (which interleaves, format-1-decodes,
 and de-interleaves) → two channels, each clearing **≥30 dB** PCM-domain SNR
 (≥25 dB across a 128/256/512 block-size sweep) — the §8.6.5 interleave is
 proven the exact inverse of the decode-side de-interleave end to end.
+`tests/residue_format0_roundtrip.rs` does the same for **format 0** (§8.6.3
+strided scatter, `read i, element j → i + j·step`): mono PCM → flat floor →
+`plan_partition_cascade` with `residue_type = 0` (the encode-side strided
+**gather**) over a 2-D value book → `write_audio_packet` (`residue_type: 0`)
+→ `decode_audio_packet_windowed` (the strided scatter) → PCM, clearing
+**≥25 dB** PCM-domain SNR — the first audio-packet-level format-0 round-trip
+(format 0 previously had only isolated residue-body coverage). All three
+residue formats now have an end-to-end §4.3 packet round-trip.
 
 ### Not yet supported / known gaps
 
