@@ -211,6 +211,34 @@ oracle pins the cumulative-`[last]` round-trip across single-vector,
 multi-vector, partial-final-vector, and lossy-quantisation cases. The
 floor-0 WRITE primitive no longer needs the entry indices supplied by hand.
 
+The **floor-0 envelope-fit chain** (`floor0_envelope` + `floor0_lsp`
+modules) closes the front of the floor-0 encode path — the §6.2.3 curve
+**inverse**, the floor-0 analogue of `plan_floor1_envelope`. The §6.2.3
+curve is `exp(K·amplitude·g(ω) − C)` with `g(ω) = 1/sqrt(p+q)` (the
+amplitude-independent LSP **shape**, identical to `1/|A(e^jω)|` for an
+all-pole LPC model whose Line-Spectral-Pair frequencies are the §6.2.3
+`coefficients` — pinned to 1e-6). So fitting a desired linear-domain
+envelope is the classic speech-coding chain, derived purely from the
+§6.2.3 curve definition plus standard DSP identities:
+`plan_floor0_lsp` folds the target's *shifted-log* envelope (the curve is
+exponential in `g`, so `g` must track `ln(envelope)`, not the envelope)
+onto the §6.2.3 Bark-bucket grid, inverse-DFTs it to autocorrelation lags
+over the renderer's exact `ω = π·m/bark_map_size` grid, Levinson-Durbin
+solves the all-pole model, and a parity-aware P/Q deflation + dense-grid
+root bracketing extracts the LSP angles. `fit_floor0_amplitude` then solves
+the integer per-packet `[amplitude]` in closed form (`Σ(g·t)/Σ(g²)`,
+clamped into `[1, 2^bits−1]`). `plan_floor0_packet` is the **one-call**
+composition — a desired envelope → `plan_floor0_lsp` → `fit_floor0_amplitude`
+→ `plan_floor0_coefficients` → a write-ready `Floor0Packet::Curve`, with
+neither LSP `coefficients`, `amplitude`, nor entry run supplied by hand.
+`tests/floor0_envelope_roundtrip.rs` pins the planned packet round-trips
+bit-for-bit through `write_floor0_packet` → `Floor0Decoder` (even and odd
+order) and clears a log-domain shape SNR bar, and
+`tests/floor0_pcm_roundtrip.rs` drives the whole §4.3 audio packet with an
+LSP floor-0 floor end to end (PCM → encode → decode → PCM, ≥30 dB at order
+14). No reference encoder emits floor 0, so self-consistency against the
+crate's own decoder is the ground truth.
+
 The **floor-1 amplitude-unwrap glue** (`floor1_encode` module:
 `plan_floor1_y`) is the floor-1 analogue. Given a target *reconstructed*
 post list (`[floor1_final_Y]`, the integer amplitudes the §7.2.4 step-2
@@ -359,13 +387,19 @@ scatter — plus a two-stage format-0 cascade refinement.
   integration test carries a minimal RFC-3533 page de-framer as private
   test scaffolding to feed real `input.ogg` packets to the decoder;
   production Ogg demuxing belongs in `oxideav-ogg`.
-- **Deriving the target floor-0 LSP `[coefficients]`** — the VQ-encode
-  glue mapping a target coefficient list onto the §6.2.2 entry run now
-  exists (`floor0_encode::plan_floor0_coefficients`, see above), so the
-  floor-0 WRITE primitive no longer needs hand-supplied entry indices.
-  Inverting §6.2.3 curve computation to *produce* that target coefficient
-  list (and choosing the per-packet `amplitude` / `booknumber`) from a
-  desired floor envelope is the remaining floor-0 encode followup.
+- **Optimal floor-0 setup-header design** — the floor-0 *per-packet* encode
+  chain is now closed end to end (`floor0_envelope::plan_floor0_lsp` →
+  `fit_floor0_amplitude` → `floor0_encode::plan_floor0_coefficients`,
+  composed by `floor0_envelope::plan_floor0_packet`): a desired
+  linear-domain envelope plans a complete write-ready `Floor0Packet`, with
+  neither the LSP `[coefficients]`, the `[amplitude]`, nor the entry run
+  supplied by hand (see above). What remains is the *setup-header*
+  optimisation upstream of the per-packet plan: choosing `floor0_order`, the
+  `bark_map_size`, the `amplitude_bits` / `amplitude_offset`, and the value
+  codebook *contents* that pack a given spectrum most compactly (a
+  rate-distortion codebook-design problem). Note no reference encoder emits
+  floor 0 (every libvorbis stream is floor 1), so this path has no fixture —
+  its fidelity is pinned by self-consistency against the crate's own decoder.
 - **Optimal floor-1 class / sub-book *layout* selection** — the floor-1
   encode chain is now closed end to end: `floor1_envelope::plan_floor1_envelope`
   → `floor1_encode::plan_floor1_y` → `floor1_encode::plan_floor1_partition_cvals`

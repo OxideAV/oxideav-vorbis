@@ -6,6 +6,39 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-0 envelope-fit chain** (`floor0_envelope` + `floor0_lsp` modules)
+  — the §6.2.3 curve **inverse**, the floor-0 analogue of
+  `plan_floor1_envelope`. `floor0_lsp` carries the generic DSP:
+  `autocorrelation_from_angles` (midpoint-quadrature inverse-DFT over a
+  non-uniform Bark grid), `levinson_durbin` (all-pole Yule-Walker solve),
+  and `lpc_to_lsp` (parity-aware symmetric/antisymmetric P/Q deflation +
+  dense-grid root bracketing for the LSP angles). The identity
+  `1/sqrt(p+q) == 1/|A(e^jω)|` is pinned to 1e-6. `floor0_envelope` carries
+  the Vorbis composition: `plan_floor0_lsp` (fold the target's *shifted-log*
+  envelope onto the §6.2.3 Bark-bucket grid — the curve is exponential in
+  the LSP shape, so `g` must track `ln(envelope)` — then run the DSP chain),
+  `fit_floor0_amplitude` (closed-form integer `[amplitude]` via
+  `Σ(g·t)/Σ(g²)`), and the one-call `plan_floor0_packet` (envelope →
+  write-ready `Floor0Packet::Curve`, neither LSP coefficients nor amplitude
+  nor entry run supplied by hand). New `Floor0EnvelopeError`,
+  `Floor0LspError`, `Floor0PacketPlanError`. Closes the floor-0 per-packet
+  encode chain end to end.
+- **Floor-0 envelope → packet → decode round-trip**
+  (`tests/floor0_envelope_roundtrip.rs`) — a desired envelope →
+  `plan_floor0_packet` → `write_floor0_packet` → `Floor0Decoder` round-trips
+  bit-for-bit against an independent §6.2.3 render of the rebuilt
+  coefficients (even order 14 and odd order 13), clears a log-domain shape
+  SNR bar, and rejects out-of-range book selectors.
+- **Floor-0 PCM → encode → decode → PCM full-packet round-trip**
+  (`tests/floor0_pcm_roundtrip.rs`) — the first audio-packet-level floor-0
+  round-trip, the floor-0 analogue of `nonflat_floor_pcm_roundtrip`: PCM →
+  window+MDCT → |X| envelope → `plan_floor0_packet` → residue against the
+  rendered §6.2.3 curve → `write_audio_packet` (`AudioChannelFloor::Type0`)
+  → `decode_audio_packet_windowed`, clearing ≥30 dB PCM-domain SNR at order
+  14, a 128/256/512 block-size sweep, and the odd-parity order-13 LSP
+  branch. No reference encoder emits floor 0, so self-consistency against
+  the crate's own decoder is the ground truth.
+
 - **Floor-1 partition-packing planner** (`floor1_encode::plan_floor1_partition_cvals`)
   — derives each partition's master-selector `cval`
   (`encoder::Floor1Packet::partition_cvals`) from the fitted packet-domain
