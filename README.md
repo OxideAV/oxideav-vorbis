@@ -432,7 +432,7 @@ residue formats now have an end-to-end §4.3 packet round-trip.
   `bark_map_size`, the `amplitude_bits` / `amplitude_offset`, and the value
   codebook *contents* that pack a given spectrum most compactly (a
   rate-distortion codebook-design problem). Note no reference encoder emits
-  floor 0 (every libvorbis stream is floor 1), so this path has no fixture —
+  floor 0 (real-world Vorbis streams use floor 1 exclusively), so this path has no fixture —
   its fidelity is pinned by self-consistency against the crate's own decoder.
 - **Optimal floor-1 class / sub-book *layout* selection** — the floor-1
   encode chain is now closed end to end: `floor1_envelope::plan_floor1_envelope`
