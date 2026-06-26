@@ -6,6 +6,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Long/short block-size decision (`blocksize` module: `detect_transient`,
+  `choose_blocksize`)** — the encode-side §1.3.2 / §4.3.1 block-size
+  selection that drives a mode's `blockflag`. The spec fixes the bitstream
+  mechanics of block switching but leaves the *analysis* to the encoder;
+  this is a clean-room energy-envelope transient detector. `detect_transient`
+  splits a time-domain PCM block into equal sub-frames (the final one
+  absorbs a non-dividing remainder, conserving energy), measures each
+  sub-frame's `Σ x²`, and reports the envelope with its peak-to-mean
+  concentration ratio (`≈ 1.0` flat, large for a single attack).
+  `choose_blocksize` turns that into the `blockflag`: a ratio above the
+  caller's threshold means a transient → **short** block (`blockflag false`,
+  confining quantisation noise around the attack to avoid pre-echo);
+  otherwise the **long** block (`blockflag true`) for finer frequency
+  resolution. The threshold is the caller's quality/bit-rate lever. Error
+  surface guards empty blocks, zero/over-count sub-frames, and non-finite
+  samples. Re-exported at the crate root.
 - **Stereo coupling decision heuristic (`coupling_energy`, `should_couple`,
   `CouplingEnergy`)** — an encoder-side §4.3.5 lever that decides whether a
   Cartesian `(left, right)` channel pair is worth square-polar coupling.
