@@ -195,6 +195,49 @@ chooser pick each partition's classification, and clears a fixed
 single-coarse-class baseline by ≈ 17.5 dB PCM-domain SNR — the encoder
 now plans both the residue classification and the cascade from spectrum.
 
+The **rate-distortion residue stack** (`residue_encode` module:
+`plan_vector_classifications_rd`, `plan_vector_residue_rd`,
+`select_residue_config`) makes the residue choice *bit-budget aware*. The
+distortion-only chooser always prefers the densest cascade that
+reconstructs best; the scored primitive now also reports the exact
+value-codeword bit cost (`ScoredPartitionCascade::bit_cost`, the sum of the
+chosen entries' codeword lengths), and the rate-distortion chooser
+minimises the Lagrangian `error_sq + lambda · bit_cost` per partition —
+`lambda == 0` reduces exactly to the distortion chooser, larger `lambda`
+trades distortion for fewer bits. `select_residue_config` lifts this to the
+whole-vector configuration choice: given several candidate residue configs
+(differing residue type, partition size, value-book table, classbook
+width) it scores each candidate's rate-distortion plan and keeps the one
+minimising `total_error_sq + lambda · (value_bits + classword_bits)`, the
+§8.6.2 classword cost folded in at the config level. A PCM round-trip
+(`tests/rate_distortion_residue_roundtrip.rs`) proves the `lambda` sweep
+monotonically reduces bit cost, every rate point still decodes to finite
+PCM, and the config selector flips from the fine to the cheap config as
+`lambda` rises.
+
+The **stereo coupling decision** (`synthesis` module: `coupling_energy`,
+`should_couple`, `prune_coupling_steps`) gives the encoder the §4.3.5
+*whether-to-couple* choice the unconditional `forward_couple*` path lacked.
+`coupling_energy` measures the square-polar magnitude/angle energy split a
+forward coupling would produce **without** mutating the channels;
+`CouplingEnergy::angle_ratio` (`angle_energy / magnitude_energy`) is low for
+a correlated pair (coupling pays off — the angle residue quantises toward
+zero) and high for an anti-correlated one (ratio 4 — coupling buys nothing).
+`prune_coupling_steps` drives that gate over a candidate coupling-step list
+in `forward_couple_all` order, returning the subset worth applying; the
+kept set round-trips cleanly through `forward_couple_all` →
+`inverse_couple_all`.
+
+The **long/short block-size decision** (`blocksize` module:
+`detect_transient`, `choose_blocksize`) is the §1.3.2 / §4.3.1 encode-side
+selection that drives a mode's `blockflag`. A clean-room energy-envelope
+transient detector splits a PCM block into sub-frames, measures each
+sub-frame's energy, and flags a transient by the peak-to-mean concentration
+ratio; `choose_blocksize` picks the **short** block for a transient (to
+confine quantisation noise around the attack and avoid pre-echo) and the
+**long** block otherwise, with the ratio threshold as the caller's
+quality/bit-rate lever.
+
 The **floor-0 VQ-encode glue** (`floor0_encode` module:
 `plan_floor0_coefficients` + `floor0_vector_count`) is the analogous glue
 for floor 0. Given a target LSP `[coefficients]` list and the value book a
