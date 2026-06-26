@@ -706,6 +706,121 @@ pub fn forward_couple_all(
     Ok(())
 }
 
+/// The square-polar coupling energy split for one Cartesian channel pair
+/// (Vorbis I §4.3.5, encode direction) — the figures a coupling-decision
+/// heuristic reads. Computed by *measuring* the forward-coupling output
+/// without committing it: the inputs are left untouched.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CouplingEnergy {
+    /// `Σ M²` — the energy of the magnitude vector the coupling produces
+    /// (the per-position larger-channel value, §4.3.5).
+    pub magnitude_energy: f64,
+    /// `Σ A²` — the energy of the angle vector the coupling produces (the
+    /// signed `L − R` / `R − L` difference, §4.3.5). When the two channels
+    /// are highly correlated this is small relative to `magnitude_energy`,
+    /// which is exactly when coupling concentrates the stereo image into
+    /// the magnitude channel and the angle quantises cheaply.
+    pub angle_energy: f64,
+    /// `Σ L² + Σ R²` — the energy that would be coded if the two channels
+    /// were left **uncoupled** (each residue-coded independently). The
+    /// square-polar transform is energy-preserving per position
+    /// (`M² + A² = max² + (L−R)²`, which is *not* `L² + R²` in general),
+    /// so comparing `magnitude_energy + angle_energy` against this is the
+    /// honest before/after the decision weighs.
+    pub uncoupled_energy: f64,
+}
+
+impl CouplingEnergy {
+    /// `angle_energy / magnitude_energy` — the coupling "angle ratio".
+    /// A small ratio means the angle vector is low-energy relative to the
+    /// magnitude vector, i.e. the channels are strongly correlated and
+    /// coupling pays off (the angle residue codes cheaply). Returns
+    /// `0.0` when both energies are zero (a silent pair: coupling is
+    /// trivially neutral), and `f64::INFINITY` when the magnitude energy
+    /// is zero but the angle energy is not (which the §4.3.5 `M = max`
+    /// construction cannot actually produce, but is defined defensively).
+    pub fn angle_ratio(&self) -> f64 {
+        if self.magnitude_energy == 0.0 {
+            if self.angle_energy == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            self.angle_energy / self.magnitude_energy
+        }
+    }
+}
+
+/// Measure the §4.3.5 square-polar coupling energy split for a Cartesian
+/// `(left, right)` channel pair **without** mutating either channel — the
+/// non-committing analogue of [`forward_couple`] a coupling-decision
+/// heuristic uses to weigh whether to actually couple the pair.
+///
+/// Each position is forward-coupled with the same [`forward_couple_scalar`]
+/// rule the real transform applies, and the resulting magnitude/angle
+/// energies (plus the uncoupled `L² + R²` baseline) are accumulated in
+/// `f64`. No quantisation is modelled — this is the pre-quantisation
+/// energy picture, the cheapest signal a per-region coupling gate can key
+/// off.
+///
+/// # Panics
+///
+/// Panics if `left` and `right` differ in length, matching
+/// [`forward_couple`]'s contract (the §4.3.5 loop pairs `n/2`-long
+/// Cartesian vectors).
+pub fn coupling_energy(left: &[f32], right: &[f32]) -> CouplingEnergy {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "coupling_energy: left/right length mismatch"
+    );
+    let mut magnitude_energy = 0.0f64;
+    let mut angle_energy = 0.0f64;
+    let mut uncoupled_energy = 0.0f64;
+    for (&l, &r) in left.iter().zip(right.iter()) {
+        let (m, a) = forward_couple_scalar(l, r);
+        magnitude_energy += f64::from(m) * f64::from(m);
+        angle_energy += f64::from(a) * f64::from(a);
+        uncoupled_energy += f64::from(l) * f64::from(l) + f64::from(r) * f64::from(r);
+    }
+    CouplingEnergy {
+        magnitude_energy,
+        angle_energy,
+        uncoupled_energy,
+    }
+}
+
+/// Decide whether a Cartesian channel pair is worth coupling (Vorbis I
+/// §4.3.5, encode direction), by the [`CouplingEnergy::angle_ratio`]
+/// heuristic: couple when the angle vector's energy is at most
+/// `max_angle_ratio` times the magnitude vector's energy.
+///
+/// A correlated stereo pair forward-couples to a small angle vector (the
+/// `L − R` difference is near zero where the channels agree), so its angle
+/// ratio is low — coupling concentrates the energy into the magnitude
+/// channel and the angle residue quantises toward zero. An anti-correlated
+/// or independent pair forward-couples to a large angle vector, so coupling
+/// would buy nothing (it would just move energy from `R` into `A`). The
+/// `max_angle_ratio` threshold is the exchange the caller picks: a larger
+/// threshold couples more aggressively.
+///
+/// `max_angle_ratio` must be finite and non-negative; the function returns
+/// `false` for a non-finite or negative threshold (a malformed gate never
+/// couples). A silent pair (both energies zero) has angle ratio `0.0`, so
+/// it couples for any non-negative threshold — harmless, since coupling a
+/// zero pair is the identity.
+///
+/// # Panics
+///
+/// Panics on a `left`/`right` length mismatch (see [`coupling_energy`]).
+pub fn should_couple(left: &[f32], right: &[f32], max_angle_ratio: f64) -> bool {
+    if !max_angle_ratio.is_finite() || max_angle_ratio < 0.0 {
+        return false;
+    }
+    coupling_energy(left, right).angle_ratio() <= max_angle_ratio
+}
+
 /// Errors that can arise while factoring a target audio spectrum into a
 /// residue vector (the encoder-side inverse of the §4.3.6 dot product).
 #[derive(Debug, Clone, PartialEq)]
@@ -1796,6 +1911,97 @@ mod tests {
         forward_couple_all(&mut spectra, &coupling).expect("forward couple succeeds");
         inverse_couple_all(&mut spectra, &coupling).expect("inverse couple succeeds");
         assert_eq!(spectra, original);
+    }
+
+    // ---- coupling-decision energy heuristic (§4.3.5 encode) ----
+
+    #[test]
+    fn coupling_energy_does_not_mutate_inputs() {
+        // The measuring routine must leave both channels untouched (it is
+        // the non-committing analogue of forward_couple).
+        let left = vec![3.0_f32, -1.0, 2.5, 0.0];
+        let right = vec![2.0_f32, -1.5, 2.0, 4.0];
+        let l0 = left.clone();
+        let r0 = right.clone();
+        let _ = coupling_energy(&left, &right);
+        assert_eq!(left, l0);
+        assert_eq!(right, r0);
+    }
+
+    #[test]
+    fn coupling_energy_matches_committed_forward_couple() {
+        // The measured magnitude/angle energies must equal the energies of
+        // the vectors a real forward_couple would leave behind.
+        let mut left = vec![5.0_f32, -2.0, 3.0, 1.0, -4.0];
+        let mut right = vec![4.0_f32, -2.5, 1.0, 1.0, -1.0];
+        let pre_uncoupled: f64 = left
+            .iter()
+            .zip(right.iter())
+            .map(|(&l, &r)| f64::from(l) * f64::from(l) + f64::from(r) * f64::from(r))
+            .sum();
+        let measured = coupling_energy(&left, &right);
+
+        forward_couple(&mut left, &mut right); // left ← M, right ← A
+        let m_energy: f64 = left.iter().map(|&m| f64::from(m) * f64::from(m)).sum();
+        let a_energy: f64 = right.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
+
+        assert!((measured.magnitude_energy - m_energy).abs() < 1e-9);
+        assert!((measured.angle_energy - a_energy).abs() < 1e-9);
+        assert!((measured.uncoupled_energy - pre_uncoupled).abs() < 1e-9);
+    }
+
+    #[test]
+    fn correlated_pair_has_low_angle_ratio_anti_correlated_high() {
+        // L == R (perfectly correlated): A = L − R = 0 everywhere → angle
+        // ratio 0. L == −R (anti-correlated): the angle carries the full
+        // difference → a large ratio.
+        let l = vec![3.0_f32, 1.0, -2.0, 4.0];
+        let same = l.clone();
+        let opposite: Vec<f32> = l.iter().map(|&v| -v).collect();
+
+        let corr = coupling_energy(&l, &same);
+        assert_eq!(corr.angle_energy, 0.0);
+        assert_eq!(corr.angle_ratio(), 0.0);
+
+        let anti = coupling_energy(&l, &opposite);
+        assert!(anti.angle_ratio() > corr.angle_ratio());
+        // For L == −R the magnitude is |L| and the angle is 2|L| in
+        // magnitude, so the energy ratio is exactly 4.
+        assert!((anti.angle_ratio() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn should_couple_gates_on_threshold() {
+        let l = vec![3.0_f32, 1.0, -2.0, 4.0];
+        let same = l.clone();
+        let opposite: Vec<f32> = l.iter().map(|&v| -v).collect();
+
+        // Correlated pair (ratio 0) couples for any non-negative threshold.
+        assert!(should_couple(&l, &same, 0.0));
+        assert!(should_couple(&l, &same, 1.0));
+        // Anti-correlated pair (ratio 4) couples only above the threshold.
+        assert!(!should_couple(&l, &opposite, 1.0));
+        assert!(!should_couple(&l, &opposite, 3.9));
+        assert!(should_couple(&l, &opposite, 4.0));
+        assert!(should_couple(&l, &opposite, 10.0));
+    }
+
+    #[test]
+    fn should_couple_rejects_bad_threshold_and_handles_silence() {
+        let l = vec![1.0_f32, 2.0];
+        let r = vec![1.0_f32, 2.0];
+        // A non-finite or negative gate never couples.
+        assert!(!should_couple(&l, &r, -1.0));
+        assert!(!should_couple(&l, &r, f64::NAN));
+        // INFINITY is non-finite → the gate refuses it.
+        assert!(!should_couple(&l, &r, f64::INFINITY));
+        // A silent pair has angle ratio 0 and couples (the identity).
+        let z = vec![0.0_f32; 4];
+        let e = coupling_energy(&z, &z);
+        assert_eq!(e.magnitude_energy, 0.0);
+        assert_eq!(e.angle_energy, 0.0);
+        assert_eq!(e.angle_ratio(), 0.0);
+        assert!(should_couple(&z, &z, 0.0));
     }
 
     // ---- spectrum factoring (§4.3.6 inverse) ----

@@ -250,9 +250,10 @@ pub use setup::{
 };
 pub use streaming::{StreamingDecoder, StreamingError, StreamingFrame};
 pub use synthesis::{
-    couple_scalar, factor_spectrum, factor_spectrum_all, forward_couple, forward_couple_all,
-    forward_couple_scalar, inverse_couple, inverse_couple_all, slope, vorbis_window,
-    window_premultiply, CouplingError, FactorSpectrumError, WindowError, WindowPremultiplyError,
+    couple_scalar, coupling_energy, factor_spectrum, factor_spectrum_all, forward_couple,
+    forward_couple_all, forward_couple_scalar, inverse_couple, inverse_couple_all, should_couple,
+    slope, vorbis_window, window_premultiply, CouplingEnergy, CouplingError, FactorSpectrumError,
+    WindowError, WindowPremultiplyError,
 };
 pub use vq::{
     quantize_vector, unpack_vector, QuantizeError as VqQuantizeError, QuantizedEntry,

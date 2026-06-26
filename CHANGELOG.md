@@ -6,6 +6,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Stereo coupling decision heuristic (`coupling_energy`, `should_couple`,
+  `CouplingEnergy`)** — an encoder-side §4.3.5 lever that decides whether a
+  Cartesian `(left, right)` channel pair is worth square-polar coupling.
+  `coupling_energy` measures the magnitude/angle energy split the forward
+  coupling would produce **without** mutating either channel (the
+  non-committing analogue of `forward_couple`), and reports it alongside the
+  uncoupled `L² + R²` baseline. `CouplingEnergy::angle_ratio` is the
+  `angle_energy / magnitude_energy` figure a per-region gate keys off: a
+  correlated pair (`L ≈ R`) couples to a near-zero angle vector (low ratio,
+  coupling pays off — the angle residue quantises toward zero), while an
+  anti-correlated pair (`L ≈ −R`) couples to a large angle vector (ratio 4,
+  coupling buys nothing). `should_couple` gates on a caller-chosen
+  `max_angle_ratio` threshold, refusing a non-finite or negative gate. All
+  re-exported at the crate root. Tests prove the measurement matches a
+  committed `forward_couple`, leaves inputs untouched, and that the ratio
+  separates correlated from anti-correlated pairs (exactly 0 vs 4).
 - **Residue cascade rate term (`ScoredPartitionCascade::bit_cost`)** — the
   scored cascade planner (`plan_partition_cascade_scored`) now reports the
   exact value-codeword bit cost it emits for a partition: the sum of
