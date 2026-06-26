@@ -32,6 +32,25 @@ All notable changes to `oxideav-vorbis` are recorded here.
   cost, populated by both choosers. A NaN or negative `lambda` is rejected
   with the new `ResidueEncodeError::NonFiniteLambda`. Re-exported at the
   crate root.
+- **Whole-vector rate-distortion residue planning + configuration selection
+  (`plan_vector_residue_rd`, `select_residue_config`)** — the top of the
+  rate-aware residue stack. `plan_vector_residue_rd` chooses every
+  partition's classification by the Lagrangian criterion and returns the
+  assembled `classifications` + `partition_entries` together with the
+  aggregate figures (`ScoredVectorResidue { total_error_sq,
+  total_value_bits }`). `select_residue_config` sits one level up: given the
+  same target residual and several candidate residue *configurations*
+  (`ResidueConfigCandidate` — differing `residue_type`, `partition_size`,
+  value-book table, and classbook width), it scores each candidate's
+  rate-distortion plan and keeps the one minimising `total_error_sq +
+  lambda · (value_bits + classword_bits)`. The §8.6.2 classword cost — one
+  classword per `partitions_per_classword` partitions — is folded in here
+  because it is a property of the residue header (its classbook), constant
+  across a candidate's partitions but different between candidates.
+  Tie-break on cheaper total bits then lower index. `SelectedResidueConfig`
+  reports the winning index, plan, classword bits, and Lagrangian cost. New
+  `ResidueEncodeError::ZeroPartitionsPerClassword` guards a malformed
+  classbook dimension. All re-exported at the crate root.
 - **Residue format-0 strided-scatter PCM round-trip**
   (`tests/residue_format0_roundtrip.rs`) — the first *audio-packet-level*
   exercise of §8.6.3 (read `i`, element `j` → `i + j·step`); format 0 had

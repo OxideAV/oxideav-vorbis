@@ -137,6 +137,15 @@ pub enum ResidueEncodeError {
     /// negative value would reward spending bits, and NaN poisons every
     /// comparison.
     NonFiniteLambda(f64),
+    /// A [`ResidueConfigCandidate`] declared `partitions_per_classword
+    /// == 0`. §8.6.2 packs one classword per `classbook`-dimension
+    /// partitions, a count that is always `>= 1`; a zero cannot describe a
+    /// real residue header and would divide by zero in the classword
+    /// accounting.
+    ZeroPartitionsPerClassword {
+        /// The candidate index whose `partitions_per_classword` was zero.
+        config: usize,
+    },
     /// A per-read [`quantize_vector`] call failed — almost always a
     /// fully-unused value book ([`QuantizeError::NoUsableEntries`]) or a
     /// hand-constructed book whose multiplicand table desyncs its
@@ -190,6 +199,10 @@ impl core::fmt::Display for ResidueEncodeError {
             ResidueEncodeError::NonFiniteLambda(lambda) => write!(
                 f,
                 "vorbis residue encode: rate-distortion lambda {lambda} is not a finite non-negative exchange rate"
+            ),
+            ResidueEncodeError::ZeroPartitionsPerClassword { config } => write!(
+                f,
+                "vorbis residue encode: candidate {config} has partitions_per_classword=0 (§8.6.2 classbook dimension is >= 1)"
             ),
             ResidueEncodeError::Quantize { pass, read, source } => write!(
                 f,
@@ -844,6 +857,218 @@ pub fn plan_vector_residue(
         partition_entries.push(choice.entries);
     }
     Ok((classifications, partition_entries))
+}
+
+/// A residue decode-vector plan together with the aggregate
+/// rate-distortion figures it achieves — the scored output of
+/// [`plan_vector_residue_rd`] and the unit
+/// [`select_residue_config`] compares candidates by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredVectorResidue {
+    /// The per-partition classification indices, partition order — the
+    /// `classifications` field of a [`crate::encoder::ResidueVectorPlan`].
+    pub classifications: Vec<u32>,
+    /// The per-partition cascade entry-index lists, partition order — the
+    /// `partition_entries` field of a [`crate::encoder::ResidueVectorPlan`].
+    pub partition_entries: Vec<[Option<Vec<u32>>; 8]>,
+    /// Total reconstruction distortion summed over every partition: the
+    /// `Σ error_sq` the chosen plan leaves. This is the §8.6.6 decode
+    /// vector's squared reconstruction error against the target residual.
+    pub total_error_sq: f64,
+    /// Total value-codeword bit cost summed over every partition: the
+    /// `Σ bit_cost`. Excludes the classword bits (one classword per
+    /// `partitions_per_classword` partitions, charged separately by
+    /// [`select_residue_config`] because it depends on the residue
+    /// header's classbook, not the value cascade).
+    pub total_value_bits: u64,
+}
+
+/// Plan a complete residue decode vector by the rate-distortion
+/// criterion and report its aggregate figures (Vorbis I §8.6.2, encode
+/// direction) — the scored, rate-aware top of the residue-encode stack.
+///
+/// This is to [`plan_vector_residue`] what
+/// [`plan_vector_classifications_rd`] is to
+/// [`plan_vector_classifications`]: it chooses each partition's
+/// classification by minimising `error_sq + lambda · bit_cost`, then
+/// assembles the index-aligned `classifications` + `partition_entries`
+/// the WRITE path consumes — and additionally returns the summed
+/// distortion and value-bit cost so a caller can compare whole-vector
+/// candidates.
+///
+/// `lambda == 0` recovers the pure-distortion plan
+/// ([`plan_vector_residue`] augmented with the aggregate figures).
+///
+/// # Errors
+///
+/// Identical to [`plan_vector_classifications_rd`].
+pub fn plan_vector_residue_rd(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+) -> Result<ScoredVectorResidue, ResidueEncodeError> {
+    let choices =
+        plan_vector_classifications_rd(scalars, value_books, residue_type, partition_size, lambda)?;
+    let mut classifications = Vec::with_capacity(choices.len());
+    let mut partition_entries = Vec::with_capacity(choices.len());
+    let mut total_error_sq = 0.0f64;
+    let mut total_value_bits = 0u64;
+    for choice in choices {
+        total_error_sq += choice.error_sq;
+        total_value_bits += choice.bit_cost;
+        classifications.push(choice.classification);
+        partition_entries.push(choice.entries);
+    }
+    Ok(ScoredVectorResidue {
+        classifications,
+        partition_entries,
+        total_error_sq,
+        total_value_bits,
+    })
+}
+
+/// One candidate residue configuration for [`select_residue_config`].
+///
+/// A Vorbis stream's setup can offer several residue configurations the
+/// encoder may route a submap's spectrum through — differing in
+/// `residue_type` (the §8.6.3/§8.6.4/§8.6.5 addressing), in
+/// `partition_size` (the §8.6.1 `residue_partition_size`), and in the
+/// value-codebook table (`value_books`, the cascade columns each
+/// classification offers). Coarser partitions and cheaper books spend
+/// fewer bits at higher distortion; this struct bundles one such
+/// candidate so the selector can score them on equal footing.
+#[derive(Debug)]
+pub struct ResidueConfigCandidate<'a> {
+    /// The residue format (§8.6) this candidate uses.
+    pub residue_type: u16,
+    /// The §8.6.1 `residue_partition_size` this candidate uses. The
+    /// target `scalars` length must be a multiple of it.
+    pub partition_size: u32,
+    /// The candidate's classification → cascade-column value-book table,
+    /// one row per classification (`value_books[class][pass]`).
+    pub value_books: &'a [[Option<&'a VorbisCodebook>; 8]],
+    /// The classbook codeword length, in bits, charged once per
+    /// classword. §8.6.2 packs one classword per `classwords_per_codeword`
+    /// partitions (formats 1 / 2) or one per partition (format 0);
+    /// `select_residue_config` multiplies this by the classword count to
+    /// charge the classification side of the rate, which differs by
+    /// candidate (a candidate with more classifications needs a wider
+    /// classbook). Pass `0` to ignore the classword cost (value-bits-only
+    /// comparison).
+    pub classword_bits: u8,
+    /// How many partitions one classword covers — the residue header's
+    /// `classbook` dimension (§8.6.2). `1` for the per-partition format-0
+    /// classword; the configured group size for formats 1 / 2. Must be
+    /// `>= 1`.
+    pub partitions_per_classword: u32,
+}
+
+/// The result of [`select_residue_config`]: the index of the winning
+/// candidate plus its scored plan and the total Lagrangian cost it
+/// achieved (value bits + classword bits folded into the rate term).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedResidueConfig {
+    /// The index into the candidate slice that won.
+    pub config_index: usize,
+    /// The winning candidate's scored plan.
+    pub plan: ScoredVectorResidue,
+    /// The total classword bits charged for the winning candidate
+    /// (`classword_bits × ⌈partitions / partitions_per_classword⌉`).
+    pub classword_bits_total: u64,
+    /// The winning Lagrangian cost
+    /// `total_error_sq + lambda · (total_value_bits + classword_bits_total)`.
+    pub cost: f64,
+}
+
+/// Choose the best whole-vector residue *configuration* by rate-distortion
+/// (Vorbis I §8.6, encode direction): score every candidate's
+/// rate-distortion plan and keep the one minimising
+/// `total_error_sq + lambda · total_bits`, where `total_bits` is the
+/// candidate's value-codeword bits **plus** its classword bits.
+///
+/// [`plan_vector_residue_rd`] picks the best classification *within* a
+/// fixed configuration (one residue type, one partition size, one book
+/// table). This routine sits one level up: it picks the best
+/// *configuration* among several the setup offers. The classword cost is
+/// folded in here — not inside [`plan_vector_residue_rd`] — because it is
+/// a property of the residue header (its classbook), constant across the
+/// partitions of a given candidate but different between candidates
+/// (a candidate with a denser partitioning emits more classwords; one
+/// with more classifications needs a wider classbook).
+///
+/// Tie-break on an exact Lagrangian cost: lower total bits (cheaper),
+/// then lower candidate index (deterministic).
+///
+/// `scalars` is the target residual for the whole decode vector; every
+/// candidate plans the *same* target through its own configuration, so
+/// the distortions are directly comparable. `lambda` is the shared
+/// bits→distortion exchange rate (`>= 0`, finite).
+///
+/// # Errors
+///
+/// * [`ResidueEncodeError::NoClassifications`] if `candidates` is empty.
+/// * [`ResidueEncodeError::NonFiniteLambda`] if `lambda` is NaN or
+///   negative.
+/// * Any error [`plan_vector_residue_rd`] would surface for a candidate
+///   (an unsupported residue type, a `scalars` length not a multiple of
+///   that candidate's `partition_size`, an empty `value_books`, a bad
+///   cascade book, or a candidate with `partitions_per_classword == 0`,
+///   reported as [`ResidueEncodeError::ZeroPartitionSize`]'s sibling
+///   [`ResidueEncodeError::ZeroPartitionsPerClassword`]).
+pub fn select_residue_config(
+    scalars: &[f32],
+    candidates: &[ResidueConfigCandidate<'_>],
+    lambda: f64,
+) -> Result<SelectedResidueConfig, ResidueEncodeError> {
+    if candidates.is_empty() {
+        return Err(ResidueEncodeError::NoClassifications);
+    }
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err(ResidueEncodeError::NonFiniteLambda(lambda));
+    }
+
+    let mut best: Option<SelectedResidueConfig> = None;
+    let mut best_cost = f64::INFINITY;
+    let mut best_bits = u64::MAX;
+    for (i, cand) in candidates.iter().enumerate() {
+        if cand.partitions_per_classword == 0 {
+            return Err(ResidueEncodeError::ZeroPartitionsPerClassword { config: i });
+        }
+        let plan = plan_vector_residue_rd(
+            scalars,
+            cand.value_books,
+            cand.residue_type,
+            cand.partition_size,
+            lambda,
+        )?;
+        let num_partitions = plan.classifications.len();
+        // §8.6.2 packs one classword per `partitions_per_classword`
+        // partitions; the final group is padded, so round up.
+        let classword_count =
+            (num_partitions as u64).div_ceil(u64::from(cand.partitions_per_classword));
+        let classword_bits_total = classword_count * u64::from(cand.classword_bits);
+        let total_bits = plan.total_value_bits + classword_bits_total;
+        let cost = plan.total_error_sq + lambda * total_bits as f64;
+
+        let replace = match &best {
+            None => true,
+            Some(_) => cost < best_cost || (cost == best_cost && total_bits < best_bits),
+        };
+        if replace {
+            best_cost = cost;
+            best_bits = total_bits;
+            best = Some(SelectedResidueConfig {
+                config_index: i,
+                plan,
+                classword_bits_total,
+                cost,
+            });
+        }
+    }
+
+    Ok(best.expect("candidates non-empty ⇒ a config was chosen"))
 }
 
 #[cfg(test)]
@@ -1626,5 +1851,181 @@ mod tests {
         // read 1 [2, 0] (tail padded to 0.0) → distances:
         //   e0 [0,0]: 4+0=4; e1 [1,1]: 1+1=2; e2 [2,2]: 0+4=4 → e1.
         assert_eq!(entries[1], 1);
+    }
+
+    // ---------- scored whole-vector plan + config selection ----------
+
+    #[test]
+    fn vector_rd_aggregates_distortion_and_bits() {
+        // Single fine book (lengths all 1), 2 partitions of size 2.
+        // partition 0 target [3,3] exact hit (err 0, 1 bit);
+        // partition 1 target [1.5,1.5] → nearest [2,2] or [1,1] (err 0.5, 1 bit).
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let value_books = vec![row];
+        let scalars = vec![3.0, 3.0, 1.5, 1.5];
+        let scored = plan_vector_residue_rd(&scalars, &value_books, 1, 2, 0.0).unwrap();
+        assert_eq!(scored.classifications, vec![0, 0]);
+        assert_eq!(scored.partition_entries.len(), 2);
+        // Σ distortion = 0 + 0.5 = 0.5; Σ value bits = 1 + 1 = 2.
+        assert!((scored.total_error_sq - 0.5).abs() < 1e-9);
+        assert_eq!(scored.total_value_bits, 2);
+
+        // lambda 0 must agree with the unscored splitter on the plan.
+        let (cls, ent) = plan_vector_residue(&scalars, &value_books, 1, 2).unwrap();
+        assert_eq!(scored.classifications, cls);
+        assert_eq!(scored.partition_entries, ent);
+    }
+
+    #[test]
+    fn select_config_prefers_cheaper_config_at_high_lambda() {
+        // Two candidate configs over the SAME target, both format 1, ps 2.
+        // Config A: a single fine book → reconstructs exactly (err 0) but
+        //   spends 1 value bit/partition.
+        // Config B: a single coarse book → leaves distortion but the same
+        //   bit count here; to make rate load-bearing we instead vary the
+        //   classword charge: A has a wide classbook, B a narrow one.
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]); // delta 1, len 1
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 3.0, // entries [0,0],[3,3],[6,6],[9,9]
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let mut fine_row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        fine_row[0] = Some(&fine);
+        let fine_books = vec![fine_row];
+        let mut coarse_row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        coarse_row[0] = Some(&coarse);
+        let coarse_books = vec![coarse_row];
+
+        // Target where fine reconstructs exactly and coarse leaves a little
+        // error: [3,3] is an exact entry for BOTH (coarse e1, fine e3), so
+        // pick [2,2] instead — fine exact (err 0), coarse nearest [3,3]
+        // (err 2).
+        let scalars = vec![2.0, 2.0];
+
+        let candidates = vec![
+            ResidueConfigCandidate {
+                residue_type: 1,
+                partition_size: 2,
+                value_books: &fine_books,
+                classword_bits: 0,
+                partitions_per_classword: 1,
+            },
+            ResidueConfigCandidate {
+                residue_type: 1,
+                partition_size: 2,
+                value_books: &coarse_books,
+                classword_bits: 0,
+                partitions_per_classword: 1,
+            },
+        ];
+
+        // At any lambda the fine config has lower distortion AND equal bits
+        // (1 value codeword each), so it always wins. Confirm config 0.
+        let sel = select_residue_config(&scalars, &candidates, 1.0).unwrap();
+        assert_eq!(sel.config_index, 0);
+        assert_eq!(sel.plan.total_error_sq, 0.0);
+    }
+
+    #[test]
+    fn select_config_classword_cost_flips_choice() {
+        // Same target reconstructed exactly by both candidates (err 0,
+        // equal value bits), but candidate 0 carries an expensive classword
+        // and candidate 1 a free one. With lambda > 0 the classword charge
+        // must flip the winner to candidate 1.
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let books = vec![row];
+        let scalars = vec![3.0, 3.0]; // exact hit, err 0, 1 value bit.
+
+        let candidates = vec![
+            ResidueConfigCandidate {
+                residue_type: 1,
+                partition_size: 2,
+                value_books: &books,
+                classword_bits: 8, // expensive classword
+                partitions_per_classword: 1,
+            },
+            ResidueConfigCandidate {
+                residue_type: 1,
+                partition_size: 2,
+                value_books: &books,
+                classword_bits: 0, // free classword
+                partitions_per_classword: 1,
+            },
+        ];
+        let sel = select_residue_config(&scalars, &candidates, 1.0).unwrap();
+        assert_eq!(sel.config_index, 1);
+        assert_eq!(sel.classword_bits_total, 0);
+        // total cost = error(0) + lambda(1) * (value 1 + classword 0) = 1.
+        assert!((sel.cost - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn select_config_charges_one_classword_per_group() {
+        // 4 partitions, partitions_per_classword = 2 → 2 classwords.
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let books = vec![row];
+        // 4 partitions of size 2 = 8 scalars, all exact hits.
+        let scalars = vec![3.0, 3.0, 1.0, 1.0, 2.0, 2.0, 0.0, 0.0];
+        let candidates = vec![ResidueConfigCandidate {
+            residue_type: 1,
+            partition_size: 2,
+            value_books: &books,
+            classword_bits: 5,
+            partitions_per_classword: 2,
+        }];
+        let sel = select_residue_config(&scalars, &candidates, 0.5).unwrap();
+        // 4 partitions / 2 per classword = 2 classwords × 5 bits = 10 bits.
+        assert_eq!(sel.classword_bits_total, 10);
+        // value bits: 4 partitions × 1 bit = 4.
+        assert_eq!(sel.plan.total_value_bits, 4);
+    }
+
+    #[test]
+    fn select_config_rejects_empty_and_bad_lambda_and_zero_group() {
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let books = vec![row];
+        let empty: Vec<ResidueConfigCandidate<'_>> = vec![];
+        assert_eq!(
+            select_residue_config(&[3.0, 3.0], &empty, 1.0),
+            Err(ResidueEncodeError::NoClassifications)
+        );
+        let cands = vec![ResidueConfigCandidate {
+            residue_type: 1,
+            partition_size: 2,
+            value_books: &books,
+            classword_bits: 0,
+            partitions_per_classword: 0,
+        }];
+        assert_eq!(
+            select_residue_config(&[3.0, 3.0], &cands, 1.0),
+            Err(ResidueEncodeError::ZeroPartitionsPerClassword { config: 0 })
+        );
+        let ok_cands = vec![ResidueConfigCandidate {
+            residue_type: 1,
+            partition_size: 2,
+            value_books: &books,
+            classword_bits: 0,
+            partitions_per_classword: 1,
+        }];
+        assert_eq!(
+            select_residue_config(&[3.0, 3.0], &ok_cands, -1.0),
+            Err(ResidueEncodeError::NonFiniteLambda(-1.0))
+        );
     }
 }
