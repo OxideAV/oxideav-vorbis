@@ -131,6 +131,12 @@ pub enum ResidueEncodeError {
     /// stores `residue_classifications` as `read 6 bits + 1`, so a real
     /// residue always has at least one classification.
     NoClassifications,
+    /// [`plan_vector_classifications_rd`] was given a `lambda` that was
+    /// NaN or negative. The Lagrange multiplier is a bits→distortion
+    /// exchange rate, which must be a non-negative finite number; a
+    /// negative value would reward spending bits, and NaN poisons every
+    /// comparison.
+    NonFiniteLambda(f64),
     /// A per-read [`quantize_vector`] call failed — almost always a
     /// fully-unused value book ([`QuantizeError::NoUsableEntries`]) or a
     /// hand-constructed book whose multiplicand table desyncs its
@@ -180,6 +186,10 @@ impl core::fmt::Display for ResidueEncodeError {
             ResidueEncodeError::NoClassifications => write!(
                 f,
                 "vorbis residue encode: empty value_books — no classification to choose from (§8.6.1: residue_classifications >= 1)"
+            ),
+            ResidueEncodeError::NonFiniteLambda(lambda) => write!(
+                f,
+                "vorbis residue encode: rate-distortion lambda {lambda} is not a finite non-negative exchange rate"
             ),
             ResidueEncodeError::Quantize { pass, read, source } => write!(
                 f,
@@ -551,6 +561,14 @@ pub struct PartitionClassChoice {
     /// The squared reconstruction distortion the chosen classification
     /// leaves on this partition.
     pub error_sq: f64,
+    /// The value-codeword bit cost of the chosen classification's cascade
+    /// for this partition — [`ScoredPartitionCascade::bit_cost`] of the
+    /// winning candidate. The pure-distortion chooser
+    /// ([`plan_vector_classifications`]) records it for downstream
+    /// rate accounting; the rate-distortion chooser
+    /// ([`plan_vector_classifications_rd`]) actively trades it against
+    /// `error_sq`.
+    pub bit_cost: u64,
 }
 
 /// Choose the per-partition classification *and* plan its cascade for one
@@ -661,12 +679,133 @@ pub fn plan_vector_classifications(
                     classification: class as u32,
                     entries: scored.entries,
                     error_sq: scored.error_sq,
+                    bit_cost: scored.bit_cost,
                 });
             }
         }
 
         // `value_books` is non-empty, so at least one classification was
         // scored; `best` is `Some`.
+        choices.push(best.expect("value_books non-empty ⇒ a classification was chosen"));
+    }
+
+    Ok(choices)
+}
+
+/// Choose the per-partition classification by a **rate-distortion**
+/// criterion (Vorbis I §8.6.2, encode direction): for every partition,
+/// try each candidate classification, plan its cascade with
+/// [`plan_partition_cascade_scored`], and keep the one minimising the
+/// Lagrangian cost `error_sq + lambda · bit_cost`.
+///
+/// This is the rate-aware sibling of [`plan_vector_classifications`].
+/// That routine minimises reconstruction distortion alone (with a
+/// stage-count tie-break), which always prefers the densest cascade that
+/// happens to reconstruct best — it never trades a little distortion for
+/// a cheaper encoding. A real encoder operating to a bit budget must make
+/// that trade: a partition that is *almost* as well reconstructed by a
+/// short, cheap cascade should take the cheap one. The classic lever is
+/// the Lagrange multiplier `lambda` (bits-to-distortion exchange rate):
+///
+/// * `lambda == 0.0` reduces *exactly* to [`plan_vector_classifications`]
+///   — pure distortion, with the same `(distortion ↑, populated stages ↑,
+///   classification index ↑)` tie-break. (At `lambda == 0` the cost is
+///   `error_sq`; ties on cost fall through to the same secondary keys.)
+/// * Larger `lambda` weights rate more heavily, pulling the choice toward
+///   cheaper (fewer-bit) classifications even at some distortion cost — a
+///   higher-`lambda` pass is the encoder's response to a tighter bit
+///   budget.
+///
+/// The `bit_cost` charged is the per-partition value-codeword cost
+/// ([`ScoredPartitionCascade::bit_cost`]); the §8.6.2 classword is
+/// amortised across partitions at the vector level and so is not part of
+/// the per-partition trade here.
+///
+/// Tie-break, applied to the Lagrangian cost: lower cost wins; on an
+/// exact cost tie, fewer populated stages (cheaper); then lower
+/// classification index (deterministic). The returned
+/// [`PartitionClassChoice`]s carry the chosen `error_sq` and `bit_cost`
+/// unchanged, so a caller can recompute or audit the trade.
+///
+/// `scalars`, `value_books`, `residue_type`, and `partition_size` have
+/// the identical meaning and validation as [`plan_vector_classifications`].
+///
+/// # Errors
+///
+/// Identical to [`plan_vector_classifications`], plus
+/// [`ResidueEncodeError::NonFiniteLambda`] if `lambda` is NaN or negative
+/// (a negative exchange rate would reward *spending* bits, which is never
+/// the intended trade).
+pub fn plan_vector_classifications_rd(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    if residue_type > 2 {
+        return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
+    }
+    if partition_size == 0 {
+        return Err(ResidueEncodeError::ZeroPartitionSize);
+    }
+    if value_books.is_empty() {
+        return Err(ResidueEncodeError::NoClassifications);
+    }
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err(ResidueEncodeError::NonFiniteLambda(lambda));
+    }
+    let ps = partition_size as usize;
+    if scalars.len() % ps != 0 {
+        return Err(ResidueEncodeError::ResidualLengthMismatch {
+            expected: (scalars.len() / ps) * ps,
+            actual: scalars.len(),
+        });
+    }
+    let num_partitions = scalars.len() / ps;
+
+    let mut choices = Vec::with_capacity(num_partitions);
+    for p in 0..num_partitions {
+        let partition_scalars = &scalars[p * ps..(p + 1) * ps];
+
+        let mut best: Option<PartitionClassChoice> = None;
+        let mut best_cost = f64::INFINITY;
+        let mut best_stages = usize::MAX;
+        for (class, stage_books) in value_books.iter().enumerate() {
+            let scored = plan_partition_cascade_scored(
+                partition_scalars,
+                stage_books,
+                residue_type,
+                partition_size,
+            )?;
+
+            // Lagrangian rate-distortion cost. `bit_cost` is exact bits;
+            // `error_sq` is squared sample distortion; `lambda` is the
+            // bits→distortion exchange rate. The accumulation is in f64
+            // to keep the comparison stable across a wide dynamic range.
+            let cost = scored.error_sq + lambda * scored.bit_cost as f64;
+
+            // Lexicographic preference: (cost ↑, populated stages ↑,
+            // classification index ↑). `<` keeps the first-seen
+            // (lower-index) candidate on an exact cost-and-stage tie.
+            let replace = match &best {
+                None => true,
+                Some(_) => {
+                    cost < best_cost || (cost == best_cost && scored.populated_stages < best_stages)
+                }
+            };
+            if replace {
+                best_cost = cost;
+                best_stages = scored.populated_stages;
+                best = Some(PartitionClassChoice {
+                    classification: class as u32,
+                    entries: scored.entries,
+                    error_sq: scored.error_sq,
+                    bit_cost: scored.bit_cost,
+                });
+            }
+        }
+
         choices.push(best.expect("value_books non-empty ⇒ a classification was chosen"));
     }
 
@@ -1186,6 +1325,111 @@ mod tests {
         let choices = plan_vector_classifications(&[3.0, 3.0], &value_books, 1, 2).unwrap();
         assert_eq!(choices[0].classification, 0);
         assert_eq!(choices[0].error_sq, 0.0);
+    }
+
+    // ---------- rate-distortion classification selection ----------
+
+    /// `lambda == 0` must reduce the RD chooser to the pure-distortion
+    /// chooser bit-for-bit: same classifications, same entries, same
+    /// per-partition distortion. Uses the per-partition-independent
+    /// fixture so both partitions exercise a real choice.
+    #[test]
+    fn rd_lambda_zero_matches_distortion_chooser() {
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 4.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![8.0, 8.0, 2.0, 2.0];
+
+        let dist = plan_vector_classifications(&scalars, &value_books, 1, 2).unwrap();
+        let rd = plan_vector_classifications_rd(&scalars, &value_books, 1, 2, 0.0).unwrap();
+        assert_eq!(dist, rd);
+    }
+
+    /// A large `lambda` must flip the choice from a dense, lower-distortion
+    /// cascade to a cheaper one when the extra bits aren't worth their
+    /// small distortion gain. Class 1 reconstructs the target *slightly*
+    /// better but costs an extra codeword; with `lambda` large the cheap
+    /// single-stage class 0 wins.
+    #[test]
+    fn rd_large_lambda_prefers_cheaper_class() {
+        // Single book, lengths all 1. Target [3.0, 3.0].
+        // class 0: one stage  → picks [3,3], error 0, cost 1 bit.
+        // class 1: two stages → picks [3,3] then [0,0], error 0, cost 2 bits.
+        // Pure distortion ties (both error 0) → fewer-stages tie-break
+        // already prefers class 0; to make the *rate* term load-bearing we
+        // give class 1 a strictly lower distortion that a big lambda
+        // overrides. Use a finer second stage so class 1 wins on distortion
+        // at lambda 0 but loses at large lambda.
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 2.0, // entries [0,0],[2,2],[4,4],[6,6]
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]); // delta 1
+                                                                  // class 0: coarse alone → nearest to [3,3] is [2,2] or [4,4], err 2.
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        // class 1: coarse then fine → coarse [2,2] (or [4,4]) leaves ±1, fine
+        // refines to error 0, but costs 2 codewords.
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0];
+
+        // lambda 0: class 1 wins (lower distortion).
+        let rd0 = plan_vector_classifications_rd(&scalars, &value_books, 1, 2, 0.0).unwrap();
+        assert_eq!(rd0[0].classification, 1);
+        assert_eq!(rd0[0].error_sq, 0.0);
+        assert_eq!(rd0[0].bit_cost, 2);
+
+        // Large lambda: the extra bit of class 1 outweighs its distortion
+        // gain (class 0 leaves error 2 for 1 bit; class 1 error 0 for 2
+        // bits; cost_0 = 2 + λ·1, cost_1 = 0 + λ·2; class 0 wins once
+        // 2 + λ < 2λ ⇒ λ > 2). Pick λ = 10.
+        let rd_hi = plan_vector_classifications_rd(&scalars, &value_books, 1, 2, 10.0).unwrap();
+        assert_eq!(rd_hi[0].classification, 0);
+        assert_eq!(rd_hi[0].bit_cost, 1);
+        assert!(rd_hi[0].error_sq > 0.0);
+    }
+
+    #[test]
+    fn rd_rejects_negative_and_nan_lambda() {
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let value_books = vec![row];
+        assert_eq!(
+            plan_vector_classifications_rd(&[3.0, 3.0], &value_books, 1, 2, -1.0),
+            Err(ResidueEncodeError::NonFiniteLambda(-1.0))
+        );
+        let nan = plan_vector_classifications_rd(&[3.0, 3.0], &value_books, 1, 2, f64::NAN);
+        assert!(matches!(
+            nan,
+            Err(ResidueEncodeError::NonFiniteLambda(l)) if l.is_nan()
+        ));
     }
 
     #[test]

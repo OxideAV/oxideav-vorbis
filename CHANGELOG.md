@@ -17,6 +17,21 @@ All notable changes to `oxideav-vorbis` are recorded here.
   against `error_sq`. The §8.6.2 classword is amortised at the vector level
   (one classword can cover several partitions in formats 1 / 2) and is
   therefore scored separately, not charged here.
+- **Rate-distortion residue classification chooser
+  (`plan_vector_classifications_rd`)** — the rate-aware sibling of
+  `plan_vector_classifications`. The existing chooser minimises
+  reconstruction distortion alone (with a stage-count tie-break), which
+  always prefers the densest cascade that reconstructs best and never
+  trades a little distortion for a cheaper encoding. The new chooser
+  minimises the Lagrangian cost `error_sq + lambda · bit_cost` per
+  partition: `lambda == 0` reduces *exactly* to the distortion chooser
+  (proven by a bit-for-bit equality test), and a larger `lambda` pulls the
+  choice toward cheaper (fewer-bit) classifications — the encoder's
+  response to a tighter bit budget (Vorbis I §8.6.2). `PartitionClassChoice`
+  gains a `bit_cost` field carrying the chosen cascade's value-codeword
+  cost, populated by both choosers. A NaN or negative `lambda` is rejected
+  with the new `ResidueEncodeError::NonFiniteLambda`. Re-exported at the
+  crate root.
 - **Residue format-0 strided-scatter PCM round-trip**
   (`tests/residue_format0_roundtrip.rs`) — the first *audio-packet-level*
   exercise of §8.6.3 (read `i`, element `j` → `i + j·step`); format 0 had
