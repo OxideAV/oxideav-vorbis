@@ -333,6 +333,22 @@ pub struct ScoredPartitionCascade {
     /// the chooser's tie-break: at equal distortion, prefer the cheaper
     /// classification.
     pub populated_stages: usize,
+    /// The exact value-codeword bit cost the cascade emits for this
+    /// partition: the sum of `book.codeword_lengths[entry]` over every
+    /// entry the cascade chose, across all populated stages. This is the
+    /// *value-codeword* contribution only — the §8.6.2 classword (the
+    /// per-partition classification index packed through the residue's
+    /// classbook) is amortised at the vector level (one classword can
+    /// cover several partitions in formats 1 / 2), so it is scored
+    /// separately by the rate-aware vector chooser rather than charged
+    /// here. `0` for an all-'unused' cascade (no value codewords emitted).
+    ///
+    /// Because [`crate::vq::quantize_vector`] never selects a sparse
+    /// (`UNUSED_ENTRY`) entry, every charged length is in `1..=32`, so the
+    /// sum is the precise number of bits the §8.6.2 write path packs for
+    /// this partition's value codewords — the rate term a rate-distortion
+    /// classification chooser trades against `error_sq`.
+    pub bit_cost: u64,
 }
 
 /// [`plan_partition_cascade`] but additionally reporting the residual
@@ -367,6 +383,7 @@ pub fn plan_partition_cascade_scored(
     let mut work = residual.to_vec();
     let mut out: [Option<Vec<u32>>; 8] = Default::default();
     let mut populated_stages = 0usize;
+    let mut bit_cost = 0u64;
 
     for (pass, slot) in stage_books.iter().enumerate() {
         // §8.6.2 step 18: 'unused' stages read and write nothing.
@@ -410,6 +427,18 @@ pub fn plan_partition_cascade_scored(
                     work[idx] -= recon;
                 }
             }
+            // Charge the chosen entry's value-codeword length. The
+            // quantiser only returns 'used' entries, so the length is in
+            // `1..=32`; a defensive `.get` keeps a malformed hand-built
+            // book (a too-short `codeword_lengths`) from panicking — such an
+            // entry contributes `0` bits, which can only *under*-charge,
+            // never over-charge, the rate estimate.
+            let len = book
+                .codeword_lengths
+                .get(q.entry as usize)
+                .copied()
+                .unwrap_or(0);
+            bit_cost += u64::from(len);
             entries.push(q.entry);
         }
         out[pass] = Some(entries);
@@ -429,6 +458,7 @@ pub fn plan_partition_cascade_scored(
         entries: out,
         error_sq,
         populated_stages,
+        bit_cost,
     })
 }
 
@@ -1023,6 +1053,9 @@ mod tests {
         assert_eq!(scored.error_sq, 0.0);
         assert_eq!(scored.populated_stages, 1);
         assert_eq!(scored.entries[0].as_ref().unwrap(), &vec![3u32]);
+        // One value codeword emitted; `tess_book` gives every entry a
+        // codeword length of 1, so the charged rate is exactly 1 bit.
+        assert_eq!(scored.bit_cost, 1);
     }
 
     #[test]
@@ -1044,6 +1077,51 @@ mod tests {
         let scored = plan_partition_cascade_scored(&[1.0, 2.0, 2.0], &stages, 1, 3).unwrap();
         assert_eq!(scored.error_sq, 9.0); // 1 + 4 + 4
         assert_eq!(scored.populated_stages, 0);
+        // No value codewords emitted by an all-'unused' cascade.
+        assert_eq!(scored.bit_cost, 0);
+    }
+
+    #[test]
+    fn scored_cascade_bit_cost_sums_value_codeword_lengths() {
+        // A book whose per-entry codeword lengths vary by entry, so the
+        // charged rate is genuinely entry-dependent (not just `reads × 1`).
+        // Entries [0,0],[1,1],[2,2],[3,3] with lengths {2, 5, 3, 4}.
+        let book = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![2, 5, 3, 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let mut stages: [Option<&VorbisCodebook>; 8] = [None; 8];
+        stages[0] = Some(&book);
+        // partition_size 4, format 1 → 2 reads of 2 dims.
+        // read 0 target [3,3] → entry 3 (len 4); read 1 target [1,1] → entry 1 (len 5).
+        let scored = plan_partition_cascade_scored(&[3.0, 3.0, 1.0, 1.0], &stages, 1, 4).unwrap();
+        assert_eq!(scored.entries[0].as_ref().unwrap(), &vec![3u32, 1]);
+        assert_eq!(scored.bit_cost, 4 + 5); // sum of the two chosen lengths
+        assert_eq!(scored.populated_stages, 1);
+        assert_eq!(scored.error_sq, 0.0);
+    }
+
+    #[test]
+    fn scored_cascade_bit_cost_accumulates_across_stages() {
+        // Two stages on the same book → both stages emit a codeword for the
+        // single read; the rate is the sum across stages, even when stage 2
+        // adds nothing to the reconstruction (it still costs its codeword).
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]); // lengths all 1
+        let mut stages: [Option<&VorbisCodebook>; 8] = [None; 8];
+        stages[0] = Some(&book);
+        stages[2] = Some(&book); // a non-adjacent stage to exercise pass order
+        let scored = plan_partition_cascade_scored(&[3.0, 3.0], &stages, 1, 2).unwrap();
+        // Two populated stages, one read each, every length 1 → 2 bits.
+        assert_eq!(scored.populated_stages, 2);
+        assert_eq!(scored.bit_cost, 2);
     }
 
     #[test]

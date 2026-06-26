@@ -6,6 +6,17 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Residue cascade rate term (`ScoredPartitionCascade::bit_cost`)** — the
+  scored cascade planner (`plan_partition_cascade_scored`) now reports the
+  exact value-codeword bit cost it emits for a partition: the sum of
+  `book.codeword_lengths[entry]` over every entry the cascade chose, across
+  all populated stages (Vorbis I §8.6.2). The quantiser only ever selects a
+  'used' entry, so every charged length is in `1..=32` and the sum is the
+  precise number of bits the write path packs for the partition's value
+  codewords — the rate term a rate-distortion classification chooser trades
+  against `error_sq`. The §8.6.2 classword is amortised at the vector level
+  (one classword can cover several partitions in formats 1 / 2) and is
+  therefore scored separately, not charged here.
 - **Residue format-0 strided-scatter PCM round-trip**
   (`tests/residue_format0_roundtrip.rs`) — the first *audio-packet-level*
   exercise of §8.6.3 (read `i`, element `j` → `i + j·step`); format 0 had
