@@ -821,6 +821,95 @@ pub fn should_couple(left: &[f32], right: &[f32], max_angle_ratio: f64) -> bool 
     coupling_energy(left, right).angle_ratio() <= max_angle_ratio
 }
 
+/// Prune a candidate §4.3.5 coupling-step list down to the steps worth
+/// applying, by the [`should_couple`] angle-ratio gate — the encoder's
+/// "which channel pairs to actually couple" decision.
+///
+/// A mapping may *offer* a coupling step list (e.g. couple every adjacent
+/// channel pair); this routine decides which of those steps pay off on the
+/// **actual** spectra and returns the kept subset (a sub-list of the input,
+/// in the same ascending order). The decision is sequential and
+/// order-faithful to [`forward_couple_all`]: the steps are visited in
+/// ascending order on a *working copy* of the spectra, and a **kept** step
+/// forward-couples its pair in the working copy so later steps that
+/// reference the same channel see its square-polar magnitude/angle (exactly
+/// what the real transform would feed them). A **dropped** step leaves its
+/// channels Cartesian in the working copy, so a later step referencing the
+/// dropped angle channel still sees the original spectrum. The input
+/// `channels` slice is **not** mutated — only an internal copy is.
+///
+/// Each kept step is the original [`MappingCouplingStep`]; threading the
+/// returned list back through [`forward_couple_all`] (and recording it as
+/// the mapping's coupling for the matching decode-side
+/// [`inverse_couple_all`]) yields a self-consistent encode.
+///
+/// `max_angle_ratio` is the shared [`should_couple`] threshold; a
+/// non-finite or negative value drops every step (the gate never couples).
+///
+/// # Errors
+///
+/// [`CouplingError::ChannelOutOfRange`] if a step names a channel index
+/// `>= channels.len()`, or [`CouplingError::SameChannel`] if a step names
+/// the same channel for both magnitude and angle — the identical
+/// validation [`forward_couple_all`] performs, applied to every candidate
+/// step (including dropped ones, so a malformed list is rejected rather
+/// than silently pruned).
+pub fn prune_coupling_steps(
+    channels: &[Vec<f32>],
+    coupling: &[MappingCouplingStep],
+    max_angle_ratio: f64,
+) -> Result<Vec<MappingCouplingStep>, CouplingError> {
+    let n_channels = channels.len();
+    // Validate every candidate step up front so a malformed list is
+    // rejected regardless of which steps would be kept.
+    for (step, cs) in coupling.iter().enumerate() {
+        let mag = cs.magnitude_channel as usize;
+        let ang = cs.angle_channel as usize;
+        if mag >= n_channels {
+            return Err(CouplingError::ChannelOutOfRange {
+                step,
+                channel: mag,
+                channels: n_channels,
+            });
+        }
+        if ang >= n_channels {
+            return Err(CouplingError::ChannelOutOfRange {
+                step,
+                channel: ang,
+                channels: n_channels,
+            });
+        }
+        if mag == ang {
+            return Err(CouplingError::SameChannel { step, channel: mag });
+        }
+    }
+
+    // Work on a copy so the decision can model the cumulative effect of the
+    // steps it keeps without disturbing the caller's spectra.
+    let mut work: Vec<Vec<f32>> = channels.to_vec();
+    let mut kept = Vec::new();
+    for cs in coupling {
+        let mag = cs.magnitude_channel as usize;
+        let ang = cs.angle_channel as usize;
+        // Decide on the working copy's *current* spectra (post any prior
+        // kept couplings), then — if kept — commit the coupling so later
+        // steps referencing these channels see the square-polar result.
+        let couple = should_couple(&work[mag], &work[ang], max_angle_ratio);
+        if couple {
+            let (lo, hi) = (mag.min(ang), mag.max(ang));
+            let (head, tail) = work.split_at_mut(hi);
+            let (a, b) = (&mut head[lo], &mut tail[0]);
+            if mag < ang {
+                forward_couple(a, b);
+            } else {
+                forward_couple(b, a);
+            }
+            kept.push(*cs);
+        }
+    }
+    Ok(kept)
+}
+
 /// Errors that can arise while factoring a target audio spectrum into a
 /// residue vector (the encoder-side inverse of the §4.3.6 dot product).
 #[derive(Debug, Clone, PartialEq)]
@@ -2002,6 +2091,135 @@ mod tests {
         assert_eq!(e.angle_energy, 0.0);
         assert_eq!(e.angle_ratio(), 0.0);
         assert!(should_couple(&z, &z, 0.0));
+    }
+
+    #[test]
+    fn prune_keeps_correlated_drops_anti_correlated() {
+        // 4 channels: (0,1) correlated, (2,3) anti-correlated. Candidate
+        // steps couple (0←1) and (2←3); only the first should survive a
+        // threshold of 1.0 (corr ratio 0 <= 1; anti ratio 4 > 1).
+        let base = vec![3.0_f32, 1.0, -2.0, 4.0];
+        let chan0 = base.clone();
+        let chan1 = base.clone(); // == chan0 → correlated
+        let chan2 = base.clone();
+        let chan3: Vec<f32> = base.iter().map(|&v| -v).collect(); // anti
+        let channels = vec![chan0, chan1, chan2, chan3];
+        let coupling = vec![
+            MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            },
+            MappingCouplingStep {
+                magnitude_channel: 2,
+                angle_channel: 3,
+            },
+        ];
+        let kept = prune_coupling_steps(&channels, &coupling, 1.0).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].magnitude_channel, 0);
+        assert_eq!(kept[0].angle_channel, 1);
+    }
+
+    #[test]
+    fn prune_does_not_mutate_input_channels() {
+        let channels = vec![vec![3.0_f32, 1.0], vec![3.0_f32, 1.0]];
+        let snapshot = channels.clone();
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 1,
+        }];
+        let kept = prune_coupling_steps(&channels, &coupling, 1.0).unwrap();
+        assert_eq!(kept.len(), 1); // correlated → kept
+        assert_eq!(channels, snapshot); // but input untouched
+    }
+
+    #[test]
+    fn prune_high_threshold_keeps_all_low_threshold_drops_all() {
+        let channels = vec![
+            vec![3.0_f32, 1.0, -2.0],
+            vec![-3.0_f32, -1.0, 2.0], // anti-correlated, ratio 4
+        ];
+        let coupling = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 1,
+        }];
+        // Threshold above 4 keeps the anti-correlated pair.
+        assert_eq!(
+            prune_coupling_steps(&channels, &coupling, 10.0)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Threshold below 4 drops it.
+        assert_eq!(
+            prune_coupling_steps(&channels, &coupling, 1.0)
+                .unwrap()
+                .len(),
+            0
+        );
+        // A non-finite/negative gate drops everything.
+        assert_eq!(
+            prune_coupling_steps(&channels, &coupling, -1.0)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn prune_kept_steps_round_trip_through_forward_then_inverse() {
+        // The kept-step list, threaded through forward_couple_all then
+        // inverse_couple_all, must reconstruct the original spectra — i.e.
+        // pruning yields a self-consistent encode/decode coupling set.
+        let original = vec![
+            vec![5.0_f32, 1.0, -2.0, 3.0],
+            vec![5.0_f32, 1.0, -2.0, 3.0], // == ch0 (correlated)
+            vec![2.0_f32, -4.0, 1.0, 0.5],
+            vec![-2.0_f32, 4.0, -1.0, -0.5], // anti of ch2
+        ];
+        let coupling = vec![
+            MappingCouplingStep {
+                magnitude_channel: 0,
+                angle_channel: 1,
+            },
+            MappingCouplingStep {
+                magnitude_channel: 2,
+                angle_channel: 3,
+            },
+        ];
+        let kept = prune_coupling_steps(&original, &coupling, 1.0).unwrap();
+        let mut spectra = original.clone();
+        forward_couple_all(&mut spectra, &kept).expect("forward couple kept steps");
+        inverse_couple_all(&mut spectra, &kept).expect("inverse couple kept steps");
+        assert_eq!(spectra, original);
+    }
+
+    #[test]
+    fn prune_rejects_out_of_range_and_same_channel() {
+        let channels = vec![vec![1.0_f32, 2.0], vec![1.0_f32, 2.0]];
+        let oob = vec![MappingCouplingStep {
+            magnitude_channel: 0,
+            angle_channel: 5,
+        }];
+        assert_eq!(
+            prune_coupling_steps(&channels, &oob, 1.0),
+            Err(CouplingError::ChannelOutOfRange {
+                step: 0,
+                channel: 5,
+                channels: 2,
+            })
+        );
+        let same = vec![MappingCouplingStep {
+            magnitude_channel: 1,
+            angle_channel: 1,
+        }];
+        assert_eq!(
+            prune_coupling_steps(&channels, &same, 1.0),
+            Err(CouplingError::SameChannel {
+                step: 0,
+                channel: 1,
+            })
+        );
     }
 
     // ---- spectrum factoring (§4.3.6 inverse) ----

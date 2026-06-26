@@ -22,6 +22,21 @@ All notable changes to `oxideav-vorbis` are recorded here.
   re-exported at the crate root. Tests prove the measurement matches a
   committed `forward_couple`, leaves inputs untouched, and that the ratio
   separates correlated from anti-correlated pairs (exactly 0 vs 4).
+- **Coupling-step pruning driver (`prune_coupling_steps`)** — the
+  channel-pair-level §4.3.5 decision built on `should_couple`: given the
+  per-channel Cartesian spectra and a *candidate* coupling-step list (e.g.
+  couple every adjacent pair), it returns the subset of steps worth
+  applying. The decision is sequential and order-faithful to
+  `forward_couple_all`: steps are visited in ascending order on a working
+  *copy* of the spectra, a kept step forward-couples its pair in the copy so
+  later steps that reference the same channel see its square-polar result,
+  and a dropped step leaves its channels Cartesian. The input spectra are
+  never mutated. The kept-step list threads back through
+  `forward_couple_all` → `inverse_couple_all` to reconstruct the original
+  spectra (proven by a round-trip test), so pruning yields a self-consistent
+  encode/decode coupling set. Same channel-range / same-channel validation
+  as `forward_couple_all`, applied to every candidate step. Re-exported at
+  the crate root.
 - **Residue cascade rate term (`ScoredPartitionCascade::bit_cost`)** — the
   scored cascade planner (`plan_partition_cascade_scored`) now reports the
   exact value-codeword bit cost it emits for a partition: the sum of
