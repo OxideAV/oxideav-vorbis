@@ -51,6 +51,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
   reports the winning index, plan, classword bits, and Lagrangian cost. New
   `ResidueEncodeError::ZeroPartitionsPerClassword` guards a malformed
   classbook dimension. All re-exported at the crate root.
+- **Rate-distortion residue PCM round-trip suite**
+  (`tests/rate_distortion_residue_roundtrip.rs`) — the rate-aware
+  counterpart to `tests/pcm_adaptive_residue_roundtrip.rs`, driving the same
+  synthetic tilted-spectrum PCM through `plan_vector_residue_rd` and
+  `select_residue_config` and decoding back through the real §4.3 decoder.
+  It proves: (1) at `lambda == 0` the rate-distortion plan round-trips to
+  the same pinned ≥20 dB PCM-domain SNR as the distortion plan and is
+  content-adaptive; (2) a monotone-increasing `lambda` sweep never
+  *increases* the plan's total value-codeword bit cost and the cheapest
+  point spends strictly fewer bits than `lambda == 0` (the rate knob bites);
+  (3) every rate point still round-trips to finite PCM (rate reduction
+  trades fidelity, it does not corrupt the bitstream — a higher `lambda`
+  yields lower SNR but a valid stream); and (4) `select_residue_config` over
+  a fine vs coarse-only candidate pair picks the fine config at tiny
+  `lambda` and the narrower-classbook coarse config at large `lambda`, with
+  both winners round-tripping.
 - **Residue format-0 strided-scatter PCM round-trip**
   (`tests/residue_format0_roundtrip.rs`) — the first *audio-packet-level*
   exercise of §8.6.3 (read `i`, element `j` → `i + j·step`); format 0 had
