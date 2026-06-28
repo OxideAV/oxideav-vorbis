@@ -223,8 +223,8 @@ pub use floor1_encode::{
 };
 pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
 pub use floor1_layout::{
-    design_floor1_header, min_rangebits, plan_floor1_partition_layout, plan_floor1_x_list,
-    Floor1LayoutError, Floor1PartitionLayout,
+    design_floor1_header, floor1_x_list_distortion, min_rangebits, plan_floor1_partition_layout,
+    plan_floor1_x_list, select_floor1_post_budget, Floor1LayoutError, Floor1PartitionLayout,
 };
 pub use framing::{FrameSplitter, FramingError};
 pub use huffman::{

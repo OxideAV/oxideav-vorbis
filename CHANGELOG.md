@@ -6,6 +6,19 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-1 rate-distortion post-budget selection (`floor1_layout` module:
+  `select_floor1_post_budget`, `floor1_x_list_distortion`)** — makes the
+  floor-1 post count *bit-budget aware*, the geometry analogue of the
+  residue RD stack. `floor1_x_list_distortion` exposes the ladder-domain
+  sum-squared error of a placement (the objective `plan_floor1_x_list`
+  greedily minimises). `select_floor1_post_budget` sweeps post counts
+  `1..=max_posts`, plans each placement, and returns the one minimising
+  `distortion + lambda · posts` (the post count a direct proxy for the
+  x-list + Y bit cost). `lambda == 0` spends the whole budget (densest,
+  lowest distortion); a punishing `lambda` strips to the endpoint-only floor.
+  Tests pin that distortion drops monotonically as posts are added, that the
+  lambda sweep moves the chosen budget from full to empty, and the
+  bad-envelope guard. Re-exported at the crate root.
 - **Floor-0 order design (`floor0_layout` module: `select_floor0_order`,
   `select_floor0_order_rd`, `score_floor0_orders`, `suggest_floor0_params`,
   `Floor0OrderFit`)** — the floor-0 analogue of the floor-1 post-budget

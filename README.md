@@ -353,6 +353,42 @@ each fitted amplitude (even/odd selectors, sparse master books, and the
 unreachable-cval refusal). The floor-1 WRITE path now needs **neither**
 `floor1_y` **nor** `partition_cvals` supplied by hand.
 
+The **floor-1 setup-header geometry designer** (`floor1_layout` module:
+`plan_floor1_x_list`, `plan_floor1_partition_layout`, `design_floor1_header`,
+`min_rangebits`) closes the header-*design* gap upstream of the per-packet
+chain. The §7.2.4 step-2 render draws straight integer line segments between
+posts in the dB-ladder domain, so a good x-list is one whose piecewise-linear
+interpolation through the chosen posts tracks the desired envelope mapped into
+that ladder domain (via the §10.1 dB-table inverse). `plan_floor1_x_list`
+places the explicit posts by **adaptive refinement** — from the two implicit
+endpoints it repeatedly inserts the interior bin furthest from the current
+reconstruction, stopping at a post budget or a worst-case ladder-error
+tolerance. `plan_floor1_partition_layout` tiles a chosen post count into the
+fewest §7.2.2 partitions over a catalogue of class dimensions via exact
+dynamic-programming tiling (greedy descending alone dead-ends, e.g. dims {2,3}
+posts 4 — the DP finds 2+2), honouring the 5-bit partition / 4-bit class-index
+ceilings. `design_floor1_header` composes the two with `min_rangebits` into a
+write-ready `Floor1Header` from a representative envelope and a caller-supplied
+class catalogue. `tests/floor1_designed_header_roundtrip.rs` drives the full
+§4.3 packet with a header **designed from the spectrum** (not hand-built) —
+PCM → forward MDCT → envelope → `design_floor1_header` → fit → residue against
+the rendered floor → `write_audio_packet` → decode — clearing a pinned **35 dB**
+PCM-domain SNR across a 128/256/1024 block-size sweep. The floor-1 setup
+header's geometry + partition grouping + carriage are now planned from
+spectrum; only the value-codebook *contents* (bit-allocation) design remains.
+
+The **floor-0 order selector** (`floor0_layout` module: `select_floor0_order`,
+`select_floor0_order_rd`, `score_floor0_orders`, `suggest_floor0_params`) is
+the floor-0 analogue: choosing `floor0_order`, the number of §6.2.3 LSP poles.
+It sweeps a candidate order range, fits each order's LSP shape + amplitude,
+renders the §6.2.3 curve the decoder would draw, and scores its log-domain
+fidelity (the curve is exponential, so the natural metric is `ln`-space).
+`select_floor0_order` returns the smallest order meeting an SNR target;
+`select_floor0_order_rd` minimises `distortion + lambda · order` (the order a
+monotone proxy for the per-pole coefficient bit cost). `suggest_floor0_params`
+offers spec-grounded defaults for the surrounding header fields. No reference
+encoder emits floor 0, so fidelity is the crate's own decoder render.
+
 Two further integration tests close the encode→decode loop on the residue
 and the time domain. `tests/residue_cascade_roundtrip.rs` drives a real
 signed, non-flat spectral residual through the full residue encode chain
@@ -464,32 +500,29 @@ residue formats now have an end-to-end §4.3 packet round-trip.
   integration test carries a minimal RFC-3533 page de-framer as private
   test scaffolding to feed real `input.ogg` packets to the decoder;
   production Ogg demuxing belongs in `oxideav-ogg`.
-- **Optimal floor-0 setup-header design** — the floor-0 *per-packet* encode
-  chain is now closed end to end (`floor0_envelope::plan_floor0_lsp` →
-  `fit_floor0_amplitude` → `floor0_encode::plan_floor0_coefficients`,
-  composed by `floor0_envelope::plan_floor0_packet`): a desired
-  linear-domain envelope plans a complete write-ready `Floor0Packet`, with
-  neither the LSP `[coefficients]`, the `[amplitude]`, nor the entry run
-  supplied by hand (see above). What remains is the *setup-header*
-  optimisation upstream of the per-packet plan: choosing `floor0_order`, the
-  `bark_map_size`, the `amplitude_bits` / `amplitude_offset`, and the value
-  codebook *contents* that pack a given spectrum most compactly (a
-  rate-distortion codebook-design problem). Note no reference encoder emits
-  floor 0 (real-world Vorbis streams use floor 1 exclusively), so this path has no fixture —
-  its fidelity is pinned by self-consistency against the crate's own decoder.
-- **Optimal floor-1 class / sub-book *layout* selection** — the floor-1
-  encode chain is now closed end to end: `floor1_envelope::plan_floor1_envelope`
-  → `floor1_encode::plan_floor1_y` → `floor1_encode::plan_floor1_partition_cvals`
-  (composed by `plan_floor1_packet`) plans a complete write-ready
-  `Floor1Packet` from a linear-domain envelope, with neither `floor1_y` nor
-  `partition_cvals` supplied by hand (see above). What remains is the
-  *setup-header* optimisation upstream of the per-packet plan: choosing the
-  partition count, the class dimensions / sub-book **assignments**, and the
-  master/sub codebook *contents* that pack a given amplitude distribution
-  most compactly. `plan_floor1_partition_cvals` selects the smallest valid
-  master-selector for a **given** class layout; deriving the layout itself
-  (a rate-distortion codebook-design problem) is the open floor-1 encode
-  followup.
+- **Floor-0 value-codebook *content* design** — the floor-0 per-packet
+  chain (`plan_floor0_packet`) and the setup-header *order* selection
+  (`floor0_layout::select_floor0_order` / `select_floor0_order_rd`, plus the
+  `suggest_floor0_params` defaults for `bark_map_size` / `amplitude_bits` /
+  `amplitude_offset`) are now both closed (see above): a desired envelope
+  picks the LSP order and plans a complete write-ready `Floor0Packet`. What
+  remains is designing the value codebook *contents* — the Huffman
+  bit-allocation that packs the LSP coefficient distribution most compactly,
+  a rate-distortion codebook-design problem. No reference encoder emits floor
+  0 (real-world Vorbis streams use floor 1 exclusively), so this path has no
+  fixture — its fidelity is pinned by self-consistency against the crate's
+  own decoder.
+- **Floor-1 sub-book *content* design** — the floor-1 encode chain
+  (`plan_floor1_packet`) and the setup-header *geometry* design
+  (`floor1_layout::design_floor1_header`: adaptive x-list placement + DP
+  partition tiling + `min_rangebits`) are now both closed (see above): a
+  desired envelope + class catalogue plans a complete write-ready
+  `Floor1Header` and `Floor1Packet`, with neither the post coordinates,
+  partition grouping, `floor1_y`, nor `partition_cvals` supplied by hand.
+  What remains is designing the master/sub codebook *contents* — the Huffman
+  bit-allocation that packs a given amplitude distribution most compactly (a
+  rate-distortion codebook-design problem), the floor-1 analogue of the
+  floor-0 value-codebook followup above.
 
 ## Clean-room provenance
 

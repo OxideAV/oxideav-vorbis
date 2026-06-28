@@ -516,6 +516,104 @@ pub fn design_floor1_header(
         x_list,
     })
 }
+/// The ladder-domain **distortion** of a placed x-list: the sum-squared
+/// error between the envelope's ladder values and the piecewise-linear
+/// reconstruction through the implicit endpoints plus the explicit posts
+/// (Vorbis I §7.2.4, encode direction).
+///
+/// This is the objective [`plan_floor1_x_list`] greedily minimises, exposed
+/// so a rate-distortion budget search can score a placement. `x_list` is the
+/// explicit interior coordinates (excluding the endpoints), as produced by
+/// [`plan_floor1_x_list`]; they need not be sorted (the scorer sorts a copy).
+///
+/// # Errors
+///
+/// [`Floor1LayoutError::EmptyEnvelope`] or
+/// [`Floor1LayoutError::NonFiniteEnvelope`] (the envelope is mapped to the
+/// ladder domain first).
+pub fn floor1_x_list_distortion(
+    envelope: &[f32],
+    x_list: &[u32],
+) -> Result<f64, Floor1LayoutError> {
+    let ladder = envelope_to_ladder(envelope)?;
+    let n = ladder.len();
+    // Build the sorted post set: endpoints (0, n) plus the explicit interior
+    // coordinates clamped into 1..n (a post at or past n is ignored — it
+    // coincides with the right endpoint).
+    let mut posts: Vec<usize> = vec![0, n];
+    for &x in x_list {
+        let xi = x as usize;
+        if (1..n).contains(&xi) {
+            posts.push(xi);
+        }
+    }
+    posts.sort_unstable();
+    posts.dedup();
+
+    let mut sse = 0.0f64;
+    for s in 0..posts.len() - 1 {
+        let x0 = posts[s];
+        let x1 = posts[s + 1];
+        let y0 = ladder[x0.min(n - 1)];
+        let y1 = ladder[x1.min(n - 1)];
+        for (offset, &ladder_y) in ladder[x0..x1].iter().enumerate() {
+            let x = x0 + offset;
+            let approx = ladder_interp(x0, y0, x1, y1, x);
+            let d = (ladder_y - approx) as f64;
+            sse += d * d;
+        }
+    }
+    // The last bin (n-1) sits at the right endpoint's left edge; the loop
+    // above covers it in the final segment's `x0..x1` (x1 == n), so all bins
+    // 0..n are scored exactly once.
+    Ok(sse)
+}
+
+/// Select a floor-1 explicit-post budget minimising a rate-distortion
+/// objective `distortion + lambda · posts` (Vorbis I §7.2.2 / §7.2.4,
+/// encode direction).
+///
+/// Sweeps post counts `1..=max_posts`, plans each placement
+/// ([`plan_floor1_x_list`] with `tolerance == 0` so each budget is fully
+/// spent), scores its ladder-domain distortion ([`floor1_x_list_distortion`]),
+/// and returns the placement whose `distortion + lambda · post_count` is
+/// least. The post count is a direct proxy for the x-list + Y bit cost
+/// (each post adds one `rangebits`-wide x-coordinate plus one Huffman Y
+/// codeword). `lambda == 0` reduces to "place the most posts the budget
+/// allows" (densest, lowest distortion); larger `lambda` trades fidelity for
+/// fewer posts. Ties break toward **fewer** posts (cheaper).
+///
+/// Returns the chosen x-list (possibly empty if the endpoint-only floor wins
+/// at a punishing `lambda`).
+///
+/// # Errors
+///
+/// As [`plan_floor1_x_list`].
+pub fn select_floor1_post_budget(
+    envelope: &[f32],
+    max_posts: usize,
+    lambda: f64,
+) -> Result<Vec<u32>, Floor1LayoutError> {
+    // Validate the envelope + budget once via a probe placement; this also
+    // surfaces EmptyEnvelope / TooManyPosts / ZeroPosts uniformly.
+    let _ = plan_floor1_x_list(envelope, max_posts, 0.0)?;
+
+    // The endpoint-only baseline (zero posts) is always a candidate.
+    let mut best_x: Vec<u32> = Vec::new();
+    let mut best_cost = floor1_x_list_distortion(envelope, &[])? + lambda * 0.0;
+
+    for posts in 1..=max_posts {
+        let x = plan_floor1_x_list(envelope, posts, 0.0)?;
+        // A smaller-than-requested placement (tolerance met / no candidates)
+        // means more posts cannot help; score it at its real post count.
+        let cost = floor1_x_list_distortion(envelope, &x)? + lambda * x.len() as f64;
+        if cost < best_cost {
+            best_cost = cost;
+            best_x = x;
+        }
+    }
+    Ok(best_x)
+}
 
 #[cfg(test)]
 mod tests {
@@ -806,6 +904,64 @@ mod tests {
         );
         // 31 posts of dim-1 is exactly the ceiling — allowed.
         assert!(plan_floor1_partition_layout(31, &dims).is_ok());
+    }
+
+    // ---------- rate-distortion post budget ----------
+
+    #[test]
+    fn distortion_drops_as_posts_are_added() {
+        // On a bumpy envelope, more posts can only reduce (or hold) the
+        // ladder-domain SSE — the greedy placement strictly refines.
+        let env: Vec<f32> = (0..96)
+            .map(|k| 0.01 + 0.5 * ((k as f32 * 0.4).sin().abs()))
+            .collect();
+        let d0 = floor1_x_list_distortion(&env, &[]).unwrap();
+        let x4 = plan_floor1_x_list(&env, 4, 0.0).unwrap();
+        let d4 = floor1_x_list_distortion(&env, &x4).unwrap();
+        let x12 = plan_floor1_x_list(&env, 12, 0.0).unwrap();
+        let d12 = floor1_x_list_distortion(&env, &x12).unwrap();
+        assert!(d4 <= d0, "4 posts ({d4}) must not exceed 0 posts ({d0})");
+        assert!(d12 <= d4, "12 posts ({d12}) must not exceed 4 posts ({d4})");
+    }
+
+    #[test]
+    fn rd_lambda_zero_spends_full_budget() {
+        // lambda 0 → distortion-only → the densest placement (full budget)
+        // wins, since each added post only lowers distortion.
+        let env: Vec<f32> = (0..96)
+            .map(|k| 0.01 + 0.5 * ((k as f32 * 0.4).sin().abs()))
+            .collect();
+        let x = select_floor1_post_budget(&env, 10, 0.0).unwrap();
+        assert_eq!(x.len(), 10, "lambda 0 spends the whole budget");
+    }
+
+    #[test]
+    fn rd_large_lambda_prefers_fewer_posts() {
+        let env: Vec<f32> = (0..96)
+            .map(|k| 0.01 + 0.5 * ((k as f32 * 0.4).sin().abs()))
+            .collect();
+        let cheap = select_floor1_post_budget(&env, 10, 0.0).unwrap();
+        // A punishing per-post penalty drives the budget toward the
+        // endpoint-only floor (zero interior posts).
+        let dear = select_floor1_post_budget(&env, 10, 1e9).unwrap();
+        assert!(
+            dear.len() <= cheap.len(),
+            "large lambda ({}) must not pick more posts than lambda 0 ({})",
+            dear.len(),
+            cheap.len()
+        );
+        assert!(
+            dear.is_empty(),
+            "a punishing lambda strips to endpoint-only"
+        );
+    }
+
+    #[test]
+    fn distortion_scorer_guards_bad_envelope() {
+        assert_eq!(
+            floor1_x_list_distortion(&[], &[1]),
+            Err(Floor1LayoutError::EmptyEnvelope)
+        );
     }
 
     // ---------- one-call header design ----------
