@@ -4,6 +4,72 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.11...v0.0.12) - 2026-06-28
+
+### Other
+
+- vorbis §7.2.2/§7.2.4: select_floor1_post_budget — RD post-count selection + README rollup
+- vorbis §6.2.1/§6.2.3: floor0_layout — LSP order selection + fmt fix
+- vorbis §4.3/§7.2.2: designed-floor-1-header PCM round-trip suite
+- vorbis §7.2.2: design_floor1_header — one-call envelope→Floor1Header
+- vorbis §7.2.2: plan_floor1_partition_layout — DP exact post tiling
+- vorbis §7.2.2/§7.2.4: floor1_layout — adaptive x-list post-placement designer
+- README — rate-distortion residue + stereo coupling decision + block-size selection rollup
+- vorbis §1.3.2: blocksize module — long/short block-size transient decision
+- vorbis §4.3.5: prune_coupling_steps — channel-pair coupling decision driver
+- vorbis §4.3.5: coupling_energy + should_couple — stereo coupling decision heuristic
+- vorbis §4.3/§8.6: rate-distortion residue PCM round-trip suite
+- vorbis §8.6: plan_vector_residue_rd + select_residue_config — RD residue-config selection
+- vorbis §8.6.2: plan_vector_classifications_rd — rate-distortion residue classification
+- vorbis §8.6.2: ScoredPartitionCascade::bit_cost — exact value-codeword rate term
+- scrub libvorbis naming from floor-0 fixture-gap prose (Hat-2 hygiene)
+- vorbis §8.6.3: residue format-0 strided-scatter full-packet PCM round-trip
+- vorbis §8.6.5: residue format-2 multi-channel encode→decode→PCM round-trip
+- vorbis §4.3.5: stereo channel-coupling encode→decode→PCM round-trip
+- README + CHANGELOG — floor-0 envelope-fit chain (§6.2.3 inverse) rollup
+- vorbis §4.3: floor-0 PCM→encode→decode→PCM full-packet round-trip
+- vorbis §6.2.2/§6.2.3: plan_floor0_packet — one-call envelope→Floor0Packet + parity-aware LSP
+- vorbis §6.2.3: plan_floor0_lsp — envelope→LSP via autocorrelation/Levinson/LSP
+- vorbis §6.2.3: fit_floor0_amplitude — log-domain amplitude inverse from a target curve
+- README + CHANGELOG — floor-1 partition-packing + one-call packet planner rollup
+- vorbis §7.2.3/§7.2.4/§10.1: plan_floor1_packet — linear envelope to write-ready Floor1Packet
+- vorbis §7.2.3: plan_floor1_partition_cvals — derive master-selector cvals from fitted floor1_Y
+- vorbis §4.3/§8.6.2: adaptive-classification PCM encode->decode round-trip
+- vorbis §8.6.2: from-spectrum residue classification round-trip + SNR
+- vorbis §8.6.2: residue classification-selection from spectrum (encode)
+- vorbis §6.2.3/§4.3.6: cross-check Floor0Decoder::render_curve vs full driver
+- vorbis §6.2.3: Floor0Decoder::render_curve encoder-side LSP-floor primitive
+- vorbis §7.2.4/§4.3.6: non-flat floor-1 PCM round-trip fidelity suite
+- vorbis §7.2.4: Floor1Decoder::render_curve encoder-side floor primitive
+- vorbis §4.3.8: overlap-add output-geometry conformance over the full fixture decode
+- vorbis §4.2.2/§4.2.4: setup-header structural trace conformance across all fixtures
+- vorbis §4.3.1: per-packet header-decision trace conformance across all fixtures
+- scrub external-impl reference from floor0 test doc comment
+- README + CHANGELOG — floor-0 decode-path coverage rollup
+- vorbis §4.3.2/§6.2: floor-0 driven through the full audio-packet driver
+- vorbis §8.6.3: residue format-0 strided-scatter encode→decode round-trip
+- vorbis §6.2.2/§6.2.3: floor-0 LSP end-to-end packet round-trip + curve oracle
+- vorbis §4.3: PCM roundtrip block-size sweep + README/CHANGELOG rollup
+- vorbis §4.3: full PCM→encode→decode→PCM time-domain roundtrip test
+- vorbis §8.6.2: residue cascade encode→decode spectral roundtrip test
+- README + CHANGELOG — floor-1 envelope-fit + end-to-end round-trip
+- forward-MDCT → floor-1 envelope-fit → encode → decode round-trip
+- vorbis §7.2.4/§10.1: floor-1 envelope→posts dB-table inverse (encode)
+- vorbis §4.3: decode-driver robustness against malformed packets
+- vorbis §5.2: comment-header parse + decode over the metadata fixtures
+- vorbis §4.3: chained-Ogg decode across a logical-bitstream boundary
+- scrub decorative reference-impl naming from r338 decode comments
+- skip fixture-PCM tests when docs/ submodule absent (standalone CI)
+- vorbis §4.3: sample-exact PCM decode + pin IMDCT normalization to 1.0
+- vorbis §3.2.1: fix canonical Huffman assignment for non-monotonic books
+- §7.2.4 step-1 amplitude-unwrap encode glue (plan_floor1_y)
+- §6.2.2 floor-0 VQ-encode glue (coefficient → entry run)
+- §8.6.2 residue VQ-encode cascade planner (encode glue)
+- §3.2.1 VQ-encode quantiser (nearest-entry, encode inverse of unpack_vector)
+- vorbis §4.3.9 output channel order — mapping-type-0 speaker layout
+- vorbis §4.3 fixture-anchored end-to-end silence-decode integration test
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **Floor-1 rate-distortion post-budget selection (`floor1_layout` module:
