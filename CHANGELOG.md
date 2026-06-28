@@ -6,6 +6,19 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Designed-floor-1-header PCM round-trip
+  (`tests/floor1_designed_header_roundtrip.rs`)** — the integration suite
+  that drives the §4.3 audio packet with a floor-1 header **designed from
+  the spectrum** (not hand-built). Synthetic PCM → forward MDCT → smoothed
+  `|X|` envelope → `design_floor1_header` (adaptive posts + DP partition
+  tiling over a `{1, 2, 4}`-dimension class catalogue) → `plan_floor1_envelope`
+  → `plan_floor1_y` → residue against the rendered floor → `write_audio_packet`
+  → `decode_audio_packet_windowed`, clearing a pinned **35 dB** PCM-domain
+  SNR against `window ⊙ IMDCT(X)` across a 128/256/1024 block-size sweep. It
+  also pins the designed header's self-consistency (partitions tile the
+  x-list; a tilted spectrum designs interior posts) and that a larger post
+  budget does not regress fidelity. The floor-1 encode path is now closed
+  from raw spectrum through a self-designed setup header.
 - **Floor-1 one-call setup-header designer (`floor1_layout` module:
   `design_floor1_header`)** — the composition that ties the layout module
   to the existing per-packet floor-1 encode chain
