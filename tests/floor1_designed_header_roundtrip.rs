@@ -352,7 +352,11 @@ fn designed_header_pcm_round_trips_to_time_domain() {
         .iter()
         .map(|&ci| header.classes[ci as usize].dimensions as usize)
         .sum();
-    assert_eq!(tiled, header.x_list.len(), "partitions must tile the x-list");
+    assert_eq!(
+        tiled,
+        header.x_list.len(),
+        "partitions must tile the x-list"
+    );
 }
 
 #[test]

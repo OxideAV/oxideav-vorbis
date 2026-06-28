@@ -160,6 +160,7 @@ pub mod encoder;
 pub mod floor0;
 pub mod floor0_encode;
 pub mod floor0_envelope;
+pub mod floor0_layout;
 pub mod floor0_lsp;
 pub mod floor1;
 pub mod floor1_encode;
@@ -209,6 +210,10 @@ pub use encoder::{
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor0_encode::{floor0_vector_count, plan_floor0_coefficients, Floor0EncodeError};
+pub use floor0_layout::{
+    score_floor0_orders, select_floor0_order, select_floor0_order_rd, suggest_floor0_params,
+    Floor0LayoutError, Floor0OrderFit,
+};
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };

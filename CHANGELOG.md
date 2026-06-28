@@ -6,6 +6,25 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-0 order design (`floor0_layout` module: `select_floor0_order`,
+  `select_floor0_order_rd`, `score_floor0_orders`, `suggest_floor0_params`,
+  `Floor0OrderFit`)** — the floor-0 analogue of the floor-1 post-budget
+  choice: choosing `floor0_order`, the number of §6.2.3 LSP poles. The
+  selector sweeps a caller-bounded order range, fits each candidate's LSP
+  shape + amplitude (`plan_floor0_lsp` → `fit_floor0_amplitude`), renders
+  the §6.2.3 curve the decoder would draw (`Floor0Decoder::render_curve`),
+  and scores its **log-domain** fidelity (the curve is exponential, so the
+  natural error metric is in `ln` space). `select_floor0_order` returns the
+  smallest order meeting an SNR target (cheapest "good enough" model);
+  `select_floor0_order_rd` minimises `distortion + lambda · order` (the
+  order is a monotone proxy for the per-pole coefficient bit cost), ties to
+  the lower order. `suggest_floor0_params` offers spec-grounded defaults for
+  the surrounding header fields (`bark_map_size` = bin count, full 6-bit
+  amplitude width, a non-zero gain offset). Because no reference encoder
+  emits floor 0, fidelity is measured against the crate's own decoder
+  render. Tests pin that a higher order fits a multi-resonance envelope no
+  worse, that the smallest-order/RD selectors pick correctly across the
+  lambda sweep, and the error-surface guards. Re-exported at the crate root.
 - **Designed-floor-1-header PCM round-trip
   (`tests/floor1_designed_header_roundtrip.rs`)** — the integration suite
   that drives the §4.3 audio packet with a floor-1 header **designed from
