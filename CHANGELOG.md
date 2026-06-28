@@ -6,6 +6,26 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-1 x-list (post-placement) design (`floor1_layout` module:
+  `plan_floor1_x_list`, `min_rangebits`)** — the first piece of the
+  floor-1 *setup-header* design the README named as the open followup.
+  The §7.2.4 step-2 render draws straight integer line segments between
+  posts in the dB-ladder domain, so a good x-list is one whose
+  piecewise-linear interpolation through the chosen posts tracks the
+  desired envelope mapped into that ladder domain. `plan_floor1_x_list`
+  derives the explicit x-coordinates by **adaptive refinement**: starting
+  from the two implicit endpoints (`0` and the floor length) it repeatedly
+  inserts the interior bin whose ladder value is furthest from the current
+  reconstruction, until a post budget is met or the worst-case ladder error
+  falls below a caller tolerance. Error is measured in §10.1 dB-ladder
+  indices (via `invert_inverse_db`), the domain the line is actually drawn
+  in. `min_rangebits` returns the smallest 4-bit `rangebits` whose implicit
+  upper endpoint `2^rangebits` covers a given floor length. Tests pin the
+  placement is sorted/unique/interior, that a flat envelope needs no
+  interior posts, that adaptive placement beats uniform spacing at equal
+  budget on a peaky envelope (full envelope → posts → decode → curve SSE),
+  and the error-surface guards (empty/non-finite envelope, zero/over-budget
+  post counts). Re-exported at the crate root.
 - **Long/short block-size decision (`blocksize` module: `detect_transient`,
   `choose_blocksize`)** — the encode-side §1.3.2 / §4.3.1 block-size
   selection that drives a mode's `blockflag`. The spec fixes the bitstream

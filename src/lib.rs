@@ -164,6 +164,7 @@ pub mod floor0_lsp;
 pub mod floor1;
 pub mod floor1_encode;
 pub mod floor1_envelope;
+pub mod floor1_layout;
 pub mod framing;
 pub mod huffman;
 pub mod identification;
@@ -216,6 +217,7 @@ pub use floor1_encode::{
     plan_floor1_y, Floor1CvalError, Floor1EncodeError, Floor1PacketPlanError,
 };
 pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
+pub use floor1_layout::{min_rangebits, plan_floor1_x_list, Floor1LayoutError};
 pub use framing::{FrameSplitter, FramingError};
 pub use huffman::{
     BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,
