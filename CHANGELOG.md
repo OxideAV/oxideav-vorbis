@@ -6,6 +6,21 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-1 partition layout design (`floor1_layout` module:
+  `plan_floor1_partition_layout`, `Floor1PartitionLayout`)** — the
+  partition-grouping half of the floor-1 setup-header design. Each §7.2.2
+  partition draws `class.dimensions` Y-values, and the partitions'
+  dimensions must sum to exactly the explicit-post count. Given the
+  catalogue of available class dimensions (each `1..=8`; the codebook a
+  class carries fixes its dimension), the planner tiles the post count into
+  the fewest partitions via exact dynamic-programming tiling (greedy
+  descending alone can dead-end, e.g. dims {2,3} posts 4 — the DP finds
+  2+2). It returns the `floor1_partition_class_list` indexing into the
+  caller's class order plus the partition count, honouring the §7.2.2 5-bit
+  partition ceiling (31) and 4-bit class-index ceiling (15). Tests pin
+  exact tiling across 1..=40 posts, minimum-partition-count selection, the
+  non-greedy DP case, the §7.2.2 ceilings, and the untileable/illegal-dim
+  guards. Re-exported at the crate root.
 - **Floor-1 x-list (post-placement) design (`floor1_layout` module:
   `plan_floor1_x_list`, `min_rangebits`)** — the first piece of the
   floor-1 *setup-header* design the README named as the open followup.

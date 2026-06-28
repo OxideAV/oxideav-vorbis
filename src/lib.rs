@@ -217,7 +217,10 @@ pub use floor1_encode::{
     plan_floor1_y, Floor1CvalError, Floor1EncodeError, Floor1PacketPlanError,
 };
 pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
-pub use floor1_layout::{min_rangebits, plan_floor1_x_list, Floor1LayoutError};
+pub use floor1_layout::{
+    min_rangebits, plan_floor1_partition_layout, plan_floor1_x_list, Floor1LayoutError,
+    Floor1PartitionLayout,
+};
 pub use framing::{FrameSplitter, FramingError};
 pub use huffman::{
     BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,

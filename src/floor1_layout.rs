@@ -315,6 +315,115 @@ pub fn min_rangebits(floor_length: usize) -> Result<u8, Floor1LayoutError> {
     })
 }
 
+/// The §7.2.2 ceiling on `floor1_partitions` (a 5-bit field).
+const MAX_PARTITIONS: usize = 31;
+
+/// The §7.2.2 ceiling on a partition-class index (a 4-bit field in
+/// `floor1_partition_class_list`).
+const MAX_CLASS_INDEX: usize = 15;
+
+/// A planned floor-1 partition layout: the `floor1_partitions` count and
+/// the `floor1_partition_class_list` that tiles a chosen explicit-post
+/// count across a caller-supplied class catalogue (Vorbis I §7.2.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Floor1PartitionLayout {
+    /// `floor1_partitions` — the [`Floor1Header::partitions`] value
+    /// (`partition_class_list.len()`).
+    ///
+    /// [`Floor1Header::partitions`]: crate::setup::Floor1Header::partitions
+    pub partitions: u8,
+    /// `floor1_partition_class_list` — one class index per partition, in
+    /// header order. The sum of `classes[partition_class_list[p]].dimensions`
+    /// over all partitions equals the explicit-post count this layout was
+    /// planned for.
+    pub partition_class_list: Vec<u8>,
+}
+
+/// Plan a floor-1 **partition layout** that tiles `posts` explicit
+/// x-coordinates across a caller-supplied class catalogue (Vorbis I
+/// §7.2.2, encode direction).
+///
+/// Each floor-1 partition draws `class.dimensions` Y-values at once; the
+/// partitions' dimensions must sum to exactly the explicit-post count
+/// (`header.x_list.len()`). This planner picks, for each partition, the
+/// largest available class dimension that still fits the remaining posts —
+/// a greedy descending tiling that minimises the partition count (fewer
+/// 4-bit class-list entries and fewer §7.2.3 master/sub codewords per
+/// packet). It returns the `partition_class_list` indexing into
+/// `class_dims` (the per-class `dimensions`, in the order the caller will
+/// place the `Floor1Class` entries) plus the partition count.
+///
+/// `class_dims` is the catalogue of available class dimensions (each
+/// `1..=8` per §7.2.2; the codebook a class carries fixes its dimension).
+/// The planner only chooses *which* class each partition uses; the class
+/// contents (sub-book assignments, master book) remain the caller's.
+///
+/// # Errors
+///
+/// * [`Floor1LayoutError::ZeroPosts`] if `posts == 0`.
+/// * [`Floor1LayoutError::NoTilingClass`] if no class dimension can be used
+///   to exactly tile the remaining posts (e.g. only dimension-`3` classes
+///   exist but `posts == 4`), or if the tiling would need more than the
+///   §7.2.2 ceiling of 31 partitions.
+pub fn plan_floor1_partition_layout(
+    posts: usize,
+    class_dims: &[u8],
+) -> Result<Floor1PartitionLayout, Floor1LayoutError> {
+    if posts == 0 {
+        return Err(Floor1LayoutError::ZeroPosts);
+    }
+    if class_dims.is_empty() || class_dims.len() > MAX_CLASS_INDEX + 1 {
+        return Err(Floor1LayoutError::NoTilingClass { posts });
+    }
+    // Every class dimension must be a legal §7.2.2 value (1..=8); a 0 would
+    // never advance the tiling, and >8 cannot be encoded.
+    if class_dims.iter().any(|&d| !(1..=8).contains(&d)) {
+        return Err(Floor1LayoutError::NoTilingClass { posts });
+    }
+
+    // Dynamic-programming exact tiling: `reach[r]` is the minimum partition
+    // count to tile exactly `r` posts, and `from[r]` the class index used
+    // for the last partition on that optimal path. Greedy-descending alone
+    // can dead-end (e.g. dims {3,2}, posts 4 — greedy takes 3 then strands
+    // 1); the DP always finds an exact tiling when one exists.
+    let mut reach = vec![usize::MAX; posts + 1];
+    let mut from = vec![0u8; posts + 1];
+    reach[0] = 0;
+    for r in 1..=posts {
+        for (ci, &d) in class_dims.iter().enumerate() {
+            let d = d as usize;
+            if d <= r && reach[r - d] != usize::MAX && reach[r - d] + 1 < reach[r] {
+                reach[r] = reach[r - d] + 1;
+                from[r] = ci as u8;
+            }
+        }
+    }
+    if reach[posts] == usize::MAX {
+        return Err(Floor1LayoutError::NoTilingClass { posts });
+    }
+    if reach[posts] > MAX_PARTITIONS {
+        return Err(Floor1LayoutError::NoTilingClass { posts });
+    }
+
+    // Reconstruct the class sequence from the back, then reverse so the
+    // partition_class_list is in ascending-post (header) order. Sorting the
+    // sequence is not required (the spec allows any order); keeping the
+    // natural reconstruction order is deterministic and stable.
+    let mut class_list: Vec<u8> = Vec::with_capacity(reach[posts]);
+    let mut r = posts;
+    while r > 0 {
+        let ci = from[r];
+        class_list.push(ci);
+        r -= class_dims[ci as usize] as usize;
+    }
+    class_list.reverse();
+
+    Ok(Floor1PartitionLayout {
+        partitions: class_list.len() as u8,
+        partition_class_list: class_list,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +620,99 @@ mod tests {
         assert_eq!(min_rangebits(128).unwrap(), 7);
         assert_eq!(min_rangebits(129).unwrap(), 8);
         assert_eq!(min_rangebits(1024).unwrap(), 10);
+    }
+
+    // ---------- partition layout ----------
+
+    /// Sum the planned partitions' dimensions to confirm an exact tiling.
+    fn tiled_posts(layout: &Floor1PartitionLayout, class_dims: &[u8]) -> usize {
+        layout
+            .partition_class_list
+            .iter()
+            .map(|&ci| class_dims[ci as usize] as usize)
+            .sum()
+    }
+
+    #[test]
+    fn partition_layout_tiles_exactly() {
+        let dims = [1u8, 2, 4];
+        for posts in 1..=40usize {
+            let layout = plan_floor1_partition_layout(posts, &dims).unwrap();
+            assert_eq!(
+                tiled_posts(&layout, &dims),
+                posts,
+                "tiling must sum to {posts}"
+            );
+            assert_eq!(
+                layout.partitions as usize,
+                layout.partition_class_list.len()
+            );
+        }
+    }
+
+    #[test]
+    fn partition_layout_minimises_partition_count() {
+        // dims {2,4}, posts 8 → fewest partitions is two dim-4 (count 2),
+        // not four dim-2 (count 4).
+        let dims = [2u8, 4];
+        let layout = plan_floor1_partition_layout(8, &dims).unwrap();
+        assert_eq!(layout.partitions, 2);
+        assert_eq!(tiled_posts(&layout, &dims), 8);
+    }
+
+    #[test]
+    fn partition_layout_dp_finds_non_greedy_tiling() {
+        // dims {2,3}, posts 4 → greedy-descending takes 3 then strands 1
+        // (no dim-1 class); the DP finds 2+2. Two partitions, both dim-2.
+        let dims = [2u8, 3];
+        let layout = plan_floor1_partition_layout(4, &dims).unwrap();
+        assert_eq!(tiled_posts(&layout, &dims), 4);
+        assert_eq!(layout.partitions, 2);
+    }
+
+    #[test]
+    fn partition_layout_rejects_untileable() {
+        // Only dim-3 classes; posts 4 cannot be tiled.
+        let dims = [3u8];
+        assert_eq!(
+            plan_floor1_partition_layout(4, &dims),
+            Err(Floor1LayoutError::NoTilingClass { posts: 4 })
+        );
+    }
+
+    #[test]
+    fn partition_layout_guards() {
+        assert_eq!(
+            plan_floor1_partition_layout(0, &[1]),
+            Err(Floor1LayoutError::ZeroPosts)
+        );
+        // Empty catalogue.
+        assert_eq!(
+            plan_floor1_partition_layout(4, &[]),
+            Err(Floor1LayoutError::NoTilingClass { posts: 4 })
+        );
+        // Illegal class dimension (0 / >8).
+        assert_eq!(
+            plan_floor1_partition_layout(4, &[0, 2]),
+            Err(Floor1LayoutError::NoTilingClass { posts: 4 })
+        );
+        assert_eq!(
+            plan_floor1_partition_layout(4, &[9]),
+            Err(Floor1LayoutError::NoTilingClass { posts: 4 })
+        );
+    }
+
+    #[test]
+    fn partition_layout_respects_partition_ceiling() {
+        // Only dim-1 classes, posts 32 → would need 32 partitions, over
+        // the §7.2.2 5-bit ceiling of 31.
+        let dims = [1u8];
+        assert_eq!(
+            plan_floor1_partition_layout(32, &dims),
+            Err(Floor1LayoutError::NoTilingClass { posts: 32 })
+        );
+        // 31 posts of dim-1 is exactly the ceiling — allowed.
+        assert!(plan_floor1_partition_layout(31, &dims).is_ok());
     }
 
     #[test]
