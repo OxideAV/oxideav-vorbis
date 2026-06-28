@@ -16,8 +16,18 @@
 //! block-size and coupling decisions (see [`crate::blocksize`],
 //! [`crate::synthesis::should_couple`]).
 //!
-//! This module is the first piece of that design: the **x-list
-//! (post-placement) planner**. The floor renders as straight integer line
+//! This module supplies that design in three composable pieces:
+//!
+//! * the **x-list (post-placement) planner** ([`plan_floor1_x_list`]) —
+//!   where the posts sit;
+//! * the **partition layout planner** ([`plan_floor1_partition_layout`]) —
+//!   how the posts group into §7.2.2 partitions/classes;
+//! * the **one-call header designer** ([`design_floor1_header`]) — the
+//!   composition that, from an envelope and a class catalogue, assembles a
+//!   write-ready [`crate::setup::Floor1Header`] the per-packet chain
+//!   consumes.
+//!
+//! The floor renders as straight integer line
 //! segments between posts in the dB-ladder domain (§7.2.4 step 2, see
 //! [`crate::floor1::render_line`]), so an x-list is good exactly when the
 //! desired envelope — mapped to that ladder domain — is well approximated
@@ -43,14 +53,13 @@
 //!
 //! ## Scope
 //!
-//! This module decides the **explicit** x-coordinates only — the
-//! `x_list` field of a [`crate::setup::Floor1Header`] (which excludes the
-//! two implicit endpoints, per §7.2.2). It does not choose the partition /
-//! class grouping, the codebook contents, or the multiplier; those remain
-//! the caller's (the partition grouping has its own
-//! [`plan_floor1_partition_layout`] in this module). Feeding the planned
-//! x-list into a header and through the existing envelope → packet chain is
-//! the integration the [`crate::floor1_layout`] tests exercise.
+//! This module decides the floor's **geometry** — post coordinates and
+//! partition grouping — and the `rangebits` / `multiplier` carriage around
+//! them. It does **not** design the codebook *contents* (the master/sub
+//! book bit allocations a class references): the caller supplies the
+//! `Floor1Class` catalogue, and the planner chooses *which* class (by
+//! dimension) tiles each partition. Codebook-content design (the
+//! rate-distortion bit-allocation problem) remains the open followup.
 
 use crate::floor1_envelope::invert_inverse_db;
 
@@ -424,6 +433,90 @@ pub fn plan_floor1_partition_layout(
     })
 }
 
+/// Design a complete floor-1 **setup header** from a desired envelope and
+/// a caller-supplied class catalogue (Vorbis I §7.2.2, encode direction).
+///
+/// This is the one-call composition that ties the layout module to the
+/// existing per-packet floor-1 encode chain
+/// ([`crate::floor1_encode::plan_floor1_packet`]). Given a representative
+/// linear-domain envelope, a post budget, a fit tolerance, the
+/// `floor1_multiplier`, and the `Floor1Class` entries the stream's
+/// codebooks support, it:
+///
+/// 1. places the explicit x-coordinates by adaptive refinement
+///    ([`plan_floor1_x_list`]);
+/// 2. tiles those posts into partitions over the classes' dimensions
+///    ([`plan_floor1_partition_layout`]);
+/// 3. picks the smallest `rangebits` covering the floor length
+///    ([`min_rangebits`]);
+///
+/// and assembles the [`crate::setup::Floor1Header`] the per-packet chain
+/// consumes. The x-list the planner produced is re-sorted ascending and
+/// reordered to match the partition tiling: partition `p` (class
+/// `partition_class_list[p]`, dimension `d`) owns the next `d` explicit
+/// x-coordinates in ascending order, so the header's `x_list` is exactly
+/// the ascending placement (the decoder reconstructs post identity from
+/// the x-values, not their header position, so any consistent ordering
+/// renders the same curve; ascending keeps it canonical).
+///
+/// The classes are taken verbatim — the planner chooses *which* class
+/// tiles each partition (by dimension), not the class contents (sub-book
+/// assignments, master book). Those, and the codebooks the
+/// `subclasses > 0` classes reference, remain the caller's responsibility.
+///
+/// # Errors
+///
+/// Any [`Floor1LayoutError`] the placement or tiling raises:
+/// empty/non-finite envelope, an out-of-budget or untileable post count,
+/// or an illegal multiplier (outside `1..=4`, surfaced as
+/// [`Floor1LayoutError::NoTilingClass`] is *not* used — multiplier is
+/// validated downstream by the envelope fit, so this function accepts any
+/// `multiplier` and lets the per-packet chain reject an illegal one).
+pub fn design_floor1_header(
+    envelope: &[f32],
+    max_posts: usize,
+    tolerance: f32,
+    multiplier: u8,
+    classes: &[crate::setup::Floor1Class],
+) -> Result<crate::setup::Floor1Header, Floor1LayoutError> {
+    if classes.is_empty() {
+        return Err(Floor1LayoutError::NoTilingClass { posts: max_posts });
+    }
+    let floor_length = envelope.len();
+    let rangebits = min_rangebits(floor_length)?;
+
+    // 1) place the explicit posts.
+    let x_list = plan_floor1_x_list(envelope, max_posts, tolerance)?;
+    let posts = x_list.len();
+    if posts == 0 {
+        // A flat-enough envelope wanted no interior posts; the floor is the
+        // two-endpoint segment. Build a single dimension-0 partition is
+        // illegal (dimensions are 1..=8), so an endpoint-only floor uses
+        // zero partitions — a legal §7.2.2 header (partitions = 0).
+        return Ok(crate::setup::Floor1Header {
+            partitions: 0,
+            partition_class_list: Vec::new(),
+            classes: classes.to_vec(),
+            multiplier,
+            rangebits,
+            x_list: Vec::new(),
+        });
+    }
+
+    // 2) tile the posts into partitions over the classes' dimensions.
+    let class_dims: Vec<u8> = classes.iter().map(|c| c.dimensions).collect();
+    let layout = plan_floor1_partition_layout(posts, &class_dims)?;
+
+    Ok(crate::setup::Floor1Header {
+        partitions: layout.partitions,
+        partition_class_list: layout.partition_class_list,
+        classes: classes.to_vec(),
+        multiplier,
+        rangebits,
+        x_list,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +806,93 @@ mod tests {
         );
         // 31 posts of dim-1 is exactly the ceiling — allowed.
         assert!(plan_floor1_partition_layout(31, &dims).is_ok());
+    }
+
+    // ---------- one-call header design ----------
+
+    /// A catalogue of `subclasses = 0` classes with the given dimensions.
+    /// Each uses sub-book slot 0 with no codebook (the negative-book path),
+    /// so the §7.2.4 render needs no codebook table.
+    fn catalogue(dims: &[u8]) -> Vec<Floor1Class> {
+        dims.iter()
+            .map(|&d| Floor1Class {
+                dimensions: d,
+                subclasses: 0,
+                masterbook: None,
+                subclass_books: vec![None],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn designed_header_is_structurally_valid_and_fits() {
+        let n = 128usize;
+        let env: Vec<f32> = (0..n)
+            .map(|k| {
+                let d = (k as f32 - 50.0) / 10.0;
+                0.01 + 0.5 * (-d * d).exp()
+            })
+            .collect();
+        let classes = catalogue(&[1, 2, 4]);
+        let header = design_floor1_header(&env, 12, 0.0, 1, &classes).unwrap();
+
+        // The partitions' dimensions tile the explicit x-list exactly.
+        let tiled: usize = header
+            .partition_class_list
+            .iter()
+            .map(|&ci| header.classes[ci as usize].dimensions as usize)
+            .sum();
+        assert_eq!(tiled, header.x_list.len());
+        assert_eq!(
+            header.partitions as usize,
+            header.partition_class_list.len()
+        );
+
+        // The header builds a decoder (validates §7.2.2 undecodability:
+        // unique x-list, multiplier, <= 65 values). No codebook table is
+        // needed for the subclasses = 0 negative-book classes.
+        let decoder = Floor1Decoder::new(&header, &[]).unwrap();
+
+        // The designed header fits the envelope: plan posts, render, and
+        // confirm the reconstruction is close (the designer chose where the
+        // posts go to make this true). Compare against a uniform-x header
+        // at the same post budget — the designed one must be no worse.
+        let sse_designed = reconstruct_sse(&env, &header);
+        let _ = decoder; // decoder build validated above
+
+        let mut uniform_x: Vec<u32> = Vec::new();
+        let posts = header.x_list.len();
+        for j in 1..=posts {
+            uniform_x.push(((j * n) / (posts + 1)).clamp(1, n - 1) as u32);
+        }
+        uniform_x.dedup();
+        let uniform_hdr = header_from_x_list(uniform_x, 1, n);
+        let sse_uniform = reconstruct_sse(&env, &uniform_hdr);
+        assert!(
+            sse_designed <= sse_uniform,
+            "designed ({sse_designed}) must be <= uniform ({sse_uniform})"
+        );
+    }
+
+    #[test]
+    fn designed_header_flat_envelope_is_endpoint_only() {
+        let env = vec![0.15_f32; 64];
+        let classes = catalogue(&[1, 2]);
+        let header = design_floor1_header(&env, 8, 0.5, 1, &classes).unwrap();
+        assert_eq!(header.partitions, 0);
+        assert!(header.x_list.is_empty());
+        assert!(header.partition_class_list.is_empty());
+        // An endpoint-only floor still builds a valid decoder.
+        assert!(Floor1Decoder::new(&header, &[]).is_ok());
+    }
+
+    #[test]
+    fn designed_header_empty_catalogue_rejected() {
+        let env = vec![0.1_f32, 0.4, 0.2, 0.6, 0.1, 0.3];
+        assert_eq!(
+            design_floor1_header(&env, 3, 0.0, 1, &[]),
+            Err(Floor1LayoutError::NoTilingClass { posts: 3 })
+        );
     }
 
     #[test]

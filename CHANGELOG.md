@@ -6,6 +6,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-1 one-call setup-header designer (`floor1_layout` module:
+  `design_floor1_header`)** — the composition that ties the layout module
+  to the existing per-packet floor-1 encode chain
+  (`floor1_encode::plan_floor1_packet`). From a representative envelope, a
+  post budget, a fit tolerance, the multiplier, and a caller-supplied
+  `Floor1Class` catalogue, it places the explicit x-coordinates
+  (`plan_floor1_x_list`), tiles them into partitions over the classes'
+  dimensions (`plan_floor1_partition_layout`), picks the smallest covering
+  `rangebits` (`min_rangebits`), and assembles a write-ready
+  `Floor1Header`. A flat-enough envelope yields a legal endpoint-only
+  header (`partitions = 0`). Tests pin that a designed header is
+  structurally valid (builds a `Floor1Decoder`), tiles its x-list exactly,
+  reconstructs a peaky envelope no worse than uniform spacing at equal
+  budget, degenerates correctly on a flat envelope, and rejects an empty
+  catalogue. The geometry + partition + carriage of the floor-1
+  setup-header is now planned from spectrum; codebook-content
+  (bit-allocation) design remains the open followup. Re-exported at the
+  crate root.
 - **Floor-1 partition layout design (`floor1_layout` module:
   `plan_floor1_partition_layout`, `Floor1PartitionLayout`)** — the
   partition-grouping half of the floor-1 setup-header design. Each §7.2.2
