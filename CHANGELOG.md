@@ -6,6 +6,26 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Codebook assembly + usage-driven retraining (`book_design` module:
+  `design_entropy_codebook`, `redesign_codebook`, `BookTallies`)** —
+  the layer that turns designed codeword lengths into write-ready
+  codebooks and closes the training loop. `design_entropy_codebook`
+  builds a complete lookup-type-0 `VorbisCodebook` from a
+  symbol-frequency table (accepted by `write_codebook`, reproduced by
+  `parse_codebook`, tree-buildable). `redesign_codebook` retrains an
+  *existing* book around a measured distribution while preserving its
+  shape and VQ lookup — every entry still unpacks to the identical
+  §3.2.1 vector, so packets referencing the same entry indices decode
+  **bit-identically** while serialising into fewer bits.
+  `BookTallies` is the per-stream accumulator (one frequency row per
+  codebook): the encoder records every codeword it plans, then
+  `retrain` redesigns exactly the exercised books and clones the rest
+  unchanged. Tests pin the write→parse round-trip, a measured on-wire
+  win over the flat book (emitted bytes counted through
+  `HuffmanTree::encode_entry`, agreeing with `stream_cost_bits`
+  pricing), VQ-semantics preservation entry-for-entry, the
+  only-exercised-books retraining contract, and the new shape /
+  out-of-range error surface. Re-exported at the crate root.
 - **Codebook content design — optimal codeword-length assignment
   (`book_design` module: `design_codeword_lengths`,
   `design_codeword_lengths_dense`, `stream_cost_bits`,

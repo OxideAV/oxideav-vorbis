@@ -52,7 +52,7 @@
 
 use core::fmt;
 
-use crate::codebook::UNUSED_ENTRY;
+use crate::codebook::{VorbisCodebook, VqLookup, UNUSED_ENTRY};
 
 /// The §3.2.1 maximum codeword length: the codebook header stores
 /// `length − 1` in 5 bits, so lengths span `1..=32`.
@@ -104,6 +104,34 @@ pub enum BookDesignError {
         /// The recorded length.
         length: u8,
     },
+    /// [`design_entropy_codebook`] / [`redesign_codebook`]: the
+    /// frequency table's length disagrees with the codebook's declared
+    /// `entries` count — every entry needs a frequency slot (zero for
+    /// never-emitted entries).
+    EntryCountMismatch {
+        /// The codebook's `entries`.
+        entries: u32,
+        /// `freqs.len()`.
+        freqs: usize,
+    },
+    /// [`BookTallies::record`]: the codebook index is outside the
+    /// stream's codebook table.
+    BookIndexOutOfRange {
+        /// The offending codebook index.
+        book: usize,
+        /// The codebook table length the tally was built from.
+        books: usize,
+    },
+    /// [`BookTallies::record`]: the recorded entry index is outside the
+    /// named codebook's entry range.
+    EntryOutOfRange {
+        /// The codebook index.
+        book: usize,
+        /// The offending entry.
+        entry: u32,
+        /// The codebook's `entries`.
+        entries: u32,
+    },
 }
 
 impl fmt::Display for BookDesignError {
@@ -132,6 +160,22 @@ impl fmt::Display for BookDesignError {
             BookDesignError::InvalidLength { entry, length } => write!(
                 f,
                 "vorbis book design: entry {entry} has invalid codeword length {length} (must be 1..=32 per §3.2.1)"
+            ),
+            BookDesignError::EntryCountMismatch { entries, freqs } => write!(
+                f,
+                "vorbis book design: codebook has {entries} entries but frequency table has {freqs}"
+            ),
+            BookDesignError::BookIndexOutOfRange { book, books } => write!(
+                f,
+                "vorbis book design: codebook index {book} outside the stream's {books}-book table"
+            ),
+            BookDesignError::EntryOutOfRange {
+                book,
+                entry,
+                entries,
+            } => write!(
+                f,
+                "vorbis book design: entry {entry} outside codebook {book}'s {entries} entries"
             ),
         }
     }
@@ -275,6 +319,183 @@ pub fn stream_cost_bits(lengths: &[u8], freqs: &[u64]) -> Result<u64, BookDesign
         total = total.saturating_add(freq.saturating_mul(len as u64));
     }
     Ok(total)
+}
+
+/// Design a complete entropy-only (`codebook_lookup_type = 0`)
+/// [`VorbisCodebook`] from a symbol-frequency table.
+///
+/// The returned book carries the given shape (`entries`,
+/// `dimensions`), [`VqLookup::None`], and the bit-cost-optimal
+/// codeword lengths [`design_codeword_lengths`] /
+/// [`design_codeword_lengths_dense`] assign (per the `dense` policy
+/// flag). It is write-ready: `crate::encoder::write_codebook` accepts
+/// it and `crate::codebook::parse_codebook` reproduces it.
+///
+/// `freqs` must have exactly `entries` slots (zero for entries the
+/// encoder never emits).
+pub fn design_entropy_codebook(
+    entries: u32,
+    dimensions: u16,
+    freqs: &[u64],
+    max_len: u8,
+    dense: bool,
+) -> Result<VorbisCodebook, BookDesignError> {
+    if freqs.len() != entries as usize {
+        return Err(BookDesignError::EntryCountMismatch {
+            entries,
+            freqs: freqs.len(),
+        });
+    }
+    let codeword_lengths = if dense {
+        design_codeword_lengths_dense(freqs, max_len)?
+    } else {
+        design_codeword_lengths(freqs, max_len)?
+    };
+    Ok(VorbisCodebook {
+        dimensions,
+        entries,
+        codeword_lengths,
+        lookup: VqLookup::None,
+    })
+}
+
+/// Redesign an existing codebook's entropy content around a new
+/// symbol-frequency table, leaving its shape and VQ lookup untouched.
+///
+/// This is the retraining step: the returned book has the same
+/// `entries`, `dimensions`, and (for lookup types 1 / 2) the same
+/// multiplicand table — so every entry still decodes to the identical
+/// §3.2.1 VQ vector, and a packet that references the same entry
+/// indices decodes to **bit-identical** spectra — but its codeword
+/// lengths are re-optimised for the measured distribution, so those
+/// same packets serialise into fewer bits. With `dense == true` every
+/// entry the original book *uses* stays encodable (never-observed
+/// entries keep a long codeword); with `dense == false` never-observed
+/// entries are pruned to sparse [`UNUSED_ENTRY`] slots.
+///
+/// Note the sparse caveat for scalar-context books (the floor-1
+/// master / sub-books, whose decoded *entry index* is the value): a
+/// pruned entry makes that value unrepresentable in future packets.
+/// The dense policy is the safe default when the training corpus may
+/// not cover the value range.
+pub fn redesign_codebook(
+    book: &VorbisCodebook,
+    freqs: &[u64],
+    max_len: u8,
+    dense: bool,
+) -> Result<VorbisCodebook, BookDesignError> {
+    if freqs.len() != book.entries as usize {
+        return Err(BookDesignError::EntryCountMismatch {
+            entries: book.entries,
+            freqs: freqs.len(),
+        });
+    }
+    let codeword_lengths = if dense {
+        design_codeword_lengths_dense(freqs, max_len)?
+    } else {
+        design_codeword_lengths(freqs, max_len)?
+    };
+    Ok(VorbisCodebook {
+        dimensions: book.dimensions,
+        entries: book.entries,
+        codeword_lengths,
+        lookup: book.lookup.clone(),
+    })
+}
+
+/// Per-codebook symbol-usage accumulator: one frequency slot per entry
+/// of every codebook in a stream's setup-header table.
+///
+/// An encoder tallies every codeword it emits (or plans to emit)
+/// against the book it emits it through, then [`BookTallies::retrain`]
+/// redesigns exactly the books the corpus exercised — the training
+/// loop behind the floor / residue codebook-content designers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookTallies {
+    counts: Vec<Vec<u64>>,
+}
+
+impl BookTallies {
+    /// Build an all-zero tally table shaped after a stream's codebook
+    /// list (one row per book, one slot per entry).
+    #[must_use]
+    pub fn new(codebooks: &[VorbisCodebook]) -> Self {
+        Self {
+            counts: codebooks
+                .iter()
+                .map(|b| vec![0u64; b.entries as usize])
+                .collect(),
+        }
+    }
+
+    /// Record one emission of `entry` through codebook `book`.
+    pub fn record(&mut self, book: usize, entry: u32) -> Result<(), BookDesignError> {
+        let books = self.counts.len();
+        let row = self
+            .counts
+            .get_mut(book)
+            .ok_or(BookDesignError::BookIndexOutOfRange { book, books })?;
+        let entries = row.len() as u32;
+        let slot = row
+            .get_mut(entry as usize)
+            .ok_or(BookDesignError::EntryOutOfRange {
+                book,
+                entry,
+                entries,
+            })?;
+        *slot = slot.saturating_add(1);
+        Ok(())
+    }
+
+    /// The accumulated frequency row for codebook `book`, if in range.
+    #[must_use]
+    pub fn counts(&self, book: usize) -> Option<&[u64]> {
+        self.counts.get(book).map(Vec::as_slice)
+    }
+
+    /// Total number of symbol emissions recorded against `book`.
+    #[must_use]
+    pub fn total(&self, book: usize) -> u64 {
+        self.counts
+            .get(book)
+            .map(|row| row.iter().sum())
+            .unwrap_or(0)
+    }
+
+    /// Redesign every codebook the tally exercised, leaving untouched
+    /// books (no recorded emission) exactly as they were.
+    ///
+    /// The returned table is index-aligned with `codebooks`: retrained
+    /// books keep their shape and VQ lookup ([`redesign_codebook`]) so
+    /// existing entry-index plans decode bit-identically, while their
+    /// codeword lengths are re-optimised for the recorded
+    /// distribution; a book with zero recorded emissions is cloned
+    /// unchanged (there is no evidence to retrain it on — and §3.2.1
+    /// has no zero-used-entry book to express "never used" with).
+    pub fn retrain(
+        &self,
+        codebooks: &[VorbisCodebook],
+        max_len: u8,
+        dense: bool,
+    ) -> Result<Vec<VorbisCodebook>, BookDesignError> {
+        if codebooks.len() != self.counts.len() {
+            return Err(BookDesignError::BookIndexOutOfRange {
+                book: codebooks.len(),
+                books: self.counts.len(),
+            });
+        }
+        codebooks
+            .iter()
+            .zip(self.counts.iter())
+            .map(|(book, freqs)| {
+                if freqs.iter().all(|&f| f == 0) {
+                    Ok(book.clone())
+                } else {
+                    redesign_codebook(book, freqs, max_len, dense)
+                }
+            })
+            .collect()
+    }
 }
 
 /// Package-merge (coin-collector) core: optimal length-limited prefix
@@ -748,6 +969,203 @@ mod tests {
         assert_eq!(
             stream_cost_bits(&lengths, &freqs).unwrap(),
             10 + 40 + 90 + 120
+        );
+    }
+
+    /// A designed entropy codebook is write-ready: it serialises via
+    /// the §3.2.1 codebook writer, parses back field-for-field, and its
+    /// tree builds.
+    #[test]
+    fn designed_entropy_codebook_write_parse_round_trips() {
+        use crate::encoder::write_codebook;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let freqs = [400u64, 120, 87, 87, 40, 12, 4, 1];
+        let book = design_entropy_codebook(8, 1, &freqs, 32, false).expect("designs");
+        assert_eq!(book.entries, 8);
+        assert_eq!(book.lookup, VqLookup::None);
+        let bytes = write_codebook(&book).expect("writes");
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = crate::codebook::parse_codebook(&mut r).expect("parses");
+        assert_eq!(parsed, book);
+        HuffmanTree::from_codebook(&parsed).expect("tree builds");
+    }
+
+    /// Measured on the wire: coding a skewed symbol stream through the
+    /// designed book costs strictly fewer bits than through the flat
+    /// (balanced) book of the same entry count.
+    #[test]
+    fn designed_book_beats_flat_book_on_the_wire() {
+        use oxideav_core::bits::BitWriterLsb;
+
+        // Zipf-ish 16-symbol distribution.
+        let freqs: Vec<u64> = (0..16u64).map(|i| 600 / (i + 1)).collect();
+        let designed = design_entropy_codebook(16, 1, &freqs, 32, false).expect("designs");
+        let flat = VorbisCodebook {
+            dimensions: 1,
+            entries: 16,
+            codeword_lengths: vec![4u8; 16],
+            lookup: VqLookup::None,
+        };
+        let designed_tree = HuffmanTree::from_codebook(&designed).unwrap();
+        let flat_tree = HuffmanTree::from_codebook(&flat).unwrap();
+
+        // Emit the whole training stream through both books.
+        let mut w_designed = BitWriterLsb::new();
+        let mut w_flat = BitWriterLsb::new();
+        for (entry, &f) in freqs.iter().enumerate() {
+            for _ in 0..f {
+                designed_tree
+                    .encode_entry(entry as u32, &mut w_designed)
+                    .unwrap();
+                flat_tree.encode_entry(entry as u32, &mut w_flat).unwrap();
+            }
+        }
+        let designed_bytes = w_designed.finish().len();
+        let flat_bytes = w_flat.finish().len();
+        assert!(
+            designed_bytes < flat_bytes,
+            "designed book must beat the flat book: {designed_bytes} vs {flat_bytes} bytes"
+        );
+        // And the a-priori pricing agrees with the emitted size.
+        let priced = stream_cost_bits(&designed.codeword_lengths, &freqs).unwrap();
+        assert_eq!(designed_bytes, priced.div_ceil(8) as usize);
+    }
+
+    /// Retraining a VQ (lattice) book rewrites only the codeword
+    /// lengths: every entry still unpacks to the identical §3.2.1
+    /// vector, so existing entry-index plans decode bit-identically.
+    #[test]
+    fn redesign_preserves_vq_lookup_semantics() {
+        use crate::vq::unpack_vector;
+
+        // 2-D lattice, 9 entries (lookup1_values = 3), multiplicands
+        // {0,1,2} → grid {-1.0, 0.0, 1.0}.
+        let original = VorbisCodebook {
+            dimensions: 2,
+            entries: 9,
+            codeword_lengths: vec![4u8, 4, 4, 4, 4, 4, 4, 4, 4],
+            lookup: VqLookup::Lattice {
+                minimum_value: -1.0,
+                delta_value: 1.0,
+                value_bits: 2,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2],
+            },
+        };
+        // Fix the Kraft slack of the hand-rolled table: 9 entries at
+        // length 4 leave capacity; use the designer itself to build a
+        // legal starting book instead.
+        let flat_freqs = vec![1u64; 9];
+        let original = redesign_codebook(&original, &flat_freqs, 32, false).expect("legalises");
+
+        let skewed: Vec<u64> = (0..9u64).map(|i| 1 + 1000 / (1 + i * i)).collect();
+        let retrained = redesign_codebook(&original, &skewed, 32, true).expect("retrains");
+        assert_eq!(retrained.entries, original.entries);
+        assert_eq!(retrained.dimensions, original.dimensions);
+        assert_eq!(retrained.lookup, original.lookup);
+        assert_ne!(
+            retrained.codeword_lengths, original.codeword_lengths,
+            "a skewed distribution must actually change the lengths"
+        );
+        for entry in 0..9u32 {
+            assert_eq!(
+                unpack_vector(&original, entry).unwrap(),
+                unpack_vector(&retrained, entry).unwrap(),
+                "entry {entry} must decode to the identical VQ vector"
+            );
+        }
+        // The retrained book is cheaper on its own training stream.
+        let before = stream_cost_bits(&original.codeword_lengths, &skewed).unwrap();
+        let after = stream_cost_bits(&retrained.codeword_lengths, &skewed).unwrap();
+        assert!(after < before, "retrained {after} must beat flat {before}");
+    }
+
+    /// Shape validation: the frequency table must match the entry
+    /// count exactly.
+    #[test]
+    fn entry_count_mismatch_is_rejected() {
+        assert_eq!(
+            design_entropy_codebook(8, 1, &[1u64; 7], 32, false),
+            Err(BookDesignError::EntryCountMismatch {
+                entries: 8,
+                freqs: 7
+            })
+        );
+        let book = design_entropy_codebook(4, 1, &[1u64; 4], 32, false).unwrap();
+        assert_eq!(
+            redesign_codebook(&book, &[1u64; 5], 32, false),
+            Err(BookDesignError::EntryCountMismatch {
+                entries: 4,
+                freqs: 5
+            })
+        );
+    }
+
+    /// BookTallies: record / out-of-range surface / totals.
+    #[test]
+    fn book_tallies_record_and_error_surface() {
+        let books = vec![
+            design_entropy_codebook(4, 1, &[1u64; 4], 32, false).unwrap(),
+            design_entropy_codebook(2, 1, &[1u64; 2], 32, false).unwrap(),
+        ];
+        let mut tallies = BookTallies::new(&books);
+        tallies.record(0, 3).unwrap();
+        tallies.record(0, 3).unwrap();
+        tallies.record(1, 0).unwrap();
+        assert_eq!(tallies.counts(0).unwrap(), &[0, 0, 0, 2]);
+        assert_eq!(tallies.total(0), 2);
+        assert_eq!(tallies.total(1), 1);
+        assert_eq!(tallies.total(9), 0);
+        assert_eq!(
+            tallies.record(2, 0),
+            Err(BookDesignError::BookIndexOutOfRange { book: 2, books: 2 })
+        );
+        assert_eq!(
+            tallies.record(1, 2),
+            Err(BookDesignError::EntryOutOfRange {
+                book: 1,
+                entry: 2,
+                entries: 2
+            })
+        );
+    }
+
+    /// Retraining through tallies touches exactly the exercised books:
+    /// untallied books come back unchanged, tallied ones re-optimised.
+    #[test]
+    fn tallies_retrain_only_exercised_books() {
+        let flat8 = design_entropy_codebook(8, 1, &[1u64; 8], 32, false).unwrap();
+        let flat4 = design_entropy_codebook(4, 1, &[1u64; 4], 32, false).unwrap();
+        let books = vec![flat8.clone(), flat4.clone()];
+        let mut tallies = BookTallies::new(&books);
+        // Exercise only book 0, heavily skewed toward entry 0.
+        for _ in 0..1000 {
+            tallies.record(0, 0).unwrap();
+        }
+        for e in 1..8u32 {
+            tallies.record(0, e).unwrap();
+        }
+        let retrained = tallies.retrain(&books, 32, true).expect("retrains");
+        assert_eq!(retrained.len(), 2);
+        assert_eq!(retrained[1], flat4, "untallied book must be unchanged");
+        assert_ne!(
+            retrained[0].codeword_lengths, flat8.codeword_lengths,
+            "tallied book must be re-optimised"
+        );
+        assert_eq!(
+            retrained[0].codeword_lengths[0], 1,
+            "dominant symbol gets 1 bit"
+        );
+        // Dense: every original entry stays encodable.
+        assert!(retrained[0]
+            .codeword_lengths
+            .iter()
+            .all(|&l| l != UNUSED_ENTRY));
+        // Table-shape mismatch is rejected.
+        assert_eq!(
+            tallies.retrain(&books[..1], 32, true),
+            Err(BookDesignError::BookIndexOutOfRange { book: 1, books: 2 })
         );
     }
 
