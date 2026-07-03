@@ -191,6 +191,16 @@ pub enum BookDesignError {
     /// its classbook entry failed (carried verbatim from the §8.6.2
     /// grouping primitive).
     ResidueClassPack(crate::encoder::PackResidueClassGroupsError),
+    /// [`tally_floor0_packet`]: the packet's `[booknumber]` selects a
+    /// position outside the header's `floor0_book_list` (§6.2.2 step
+    /// 5: "if `[booknumber]` is greater than the highest number decode
+    /// codebook, this packet is undecodable").
+    Floor0BooknumberOutOfRange {
+        /// The rejected `[booknumber]`.
+        booknumber: u32,
+        /// `header.book_list.len()`.
+        books: usize,
+    },
 }
 
 impl fmt::Display for BookDesignError {
@@ -274,6 +284,10 @@ impl fmt::Display for BookDesignError {
             BookDesignError::ResidueClassPack(source) => write!(
                 f,
                 "vorbis book design: classification stride does not pack to a classbook entry: {source} (§8.6.2)"
+            ),
+            BookDesignError::Floor0BooknumberOutOfRange { booknumber, books } => write!(
+                f,
+                "vorbis book design: booknumber {booknumber} outside the header's {books}-book floor0_book_list (§6.2.2)"
             ),
         }
     }
@@ -829,6 +843,57 @@ pub fn tally_residue_plans(
         }
     }
     tallies.record_all(&emissions)
+}
+
+/// Tally every codeword emission a §6.2.2 floor-0 packet makes into a
+/// per-book frequency table — the statistics-collection step of the
+/// floor-0 value-codebook-content trainer, the floor-0 analogue of
+/// [`tally_floor1_packet`].
+///
+/// A floor-0 packet's only codewords are the §6.2.2 step-7 VQ entry
+/// run: each entry is recorded against the value book the packet's
+/// `[booknumber]` selects through `floor0_book_list` (§6.2.2 step 5).
+/// The `[amplitude]` and `[booknumber]` fields themselves are raw
+/// fixed-width reads (`floor0_amplitude_bits` /
+/// `ilog(floor0_number_of_books)` wide), not codewords, so they are
+/// not tallied; an [`Floor0Packet::Unused`] packet
+/// (`crate::encoder::Floor0Packet::Unused`) emits only the zero
+/// amplitude field and tallies nothing.
+///
+/// Feeding a corpus of planned packets (e.g. from
+/// `crate::floor0_envelope::plan_floor0_packet`) through this and
+/// calling [`BookTallies::retrain`] yields a floor-0 value book whose
+/// codeword lengths are bit-cost-optimal for that corpus while the
+/// same packets decode to bit-identical §6.2.3 curves (retraining
+/// preserves the book's VQ lookup, so every entry still unpacks to the
+/// identical LSP coefficient sub-vector). This closes the
+/// statistics-collection half of the floor-0 codebook-content design
+/// followup; on error nothing is recorded.
+pub fn tally_floor0_packet(
+    tallies: &mut BookTallies,
+    packet: &crate::encoder::Floor0Packet,
+    header: &crate::setup::Floor0Header,
+) -> Result<(), BookDesignError> {
+    match packet {
+        // §6.2.2 step 2: a zero amplitude short-circuits to 'unused'
+        // before any codeword — nothing to tally.
+        crate::encoder::Floor0Packet::Unused => Ok(()),
+        crate::encoder::Floor0Packet::Curve {
+            booknumber,
+            entries,
+            ..
+        } => {
+            let book_idx = *header.book_list.get(*booknumber as usize).ok_or(
+                BookDesignError::Floor0BooknumberOutOfRange {
+                    booknumber: *booknumber,
+                    books: header.book_list.len(),
+                },
+            )? as usize;
+            let emissions: Vec<(usize, u32)> =
+                entries.iter().map(|&entry| (book_idx, entry)).collect();
+            tallies.record_all(&emissions)
+        }
+    }
 }
 
 /// Package-merge (coin-collector) core: optimal length-limited prefix
@@ -1789,6 +1854,114 @@ mod tests {
         assert_eq!(
             tally_residue_plans(&mut tallies, &[ok], &bad_header, &books),
             Err(BookDesignError::BookIndexOutOfRange { book: 9, books: 3 })
+        );
+        for b in 0..3 {
+            assert_eq!(tallies.total(b), 0, "failing calls record nothing");
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // tally_floor0_packet — the §6.2.2 emission tally.
+    // ----------------------------------------------------------------
+
+    fn floor0_tally_header() -> crate::setup::Floor0Header {
+        crate::setup::Floor0Header {
+            order: 8,
+            rate: 44_100,
+            bark_map_size: 128,
+            amplitude_bits: 10,
+            amplitude_offset: 32,
+            // booknumber 0 → codebook 2, booknumber 1 → codebook 0.
+            book_list: vec![2, 0],
+        }
+    }
+
+    /// The VQ entry run is recorded against the book `[booknumber]`
+    /// selects through `floor0_book_list`; amplitude / booknumber are
+    /// raw fields and tally nothing.
+    #[test]
+    fn floor0_tally_records_entries_against_selected_book() {
+        use crate::encoder::Floor0Packet;
+        let header = floor0_tally_header();
+        let books = vec![
+            design_entropy_codebook(16, 1, &[1u64; 16], 32, false).unwrap(),
+            design_entropy_codebook(4, 1, &[1u64; 4], 32, false).unwrap(),
+            design_entropy_codebook(32, 2, &[1u64; 32], 32, false).unwrap(),
+        ];
+        let mut tallies = BookTallies::new(&books);
+        let packet = Floor0Packet::Curve {
+            amplitude: 500,
+            booknumber: 0, // → book_list[0] = codebook 2
+            entries: vec![7, 7, 30, 1],
+        };
+        tally_floor0_packet(&mut tallies, &packet, &header).expect("tallies");
+        assert_eq!(tallies.total(2), 4);
+        assert_eq!(tallies.counts(2).unwrap()[7], 2);
+        assert_eq!(tallies.counts(2).unwrap()[30], 1);
+        assert_eq!(tallies.counts(2).unwrap()[1], 1);
+        assert_eq!(tallies.total(0), 0);
+        assert_eq!(tallies.total(1), 0);
+
+        // booknumber 1 routes to codebook 0.
+        let second = Floor0Packet::Curve {
+            amplitude: 12,
+            booknumber: 1,
+            entries: vec![3],
+        };
+        tally_floor0_packet(&mut tallies, &second, &header).expect("tallies");
+        assert_eq!(tallies.counts(0).unwrap()[3], 1);
+    }
+
+    /// An unused floor-0 packet tallies nothing; error surface covers
+    /// the out-of-range booknumber and an entry outside the selected
+    /// book (atomically — nothing recorded).
+    #[test]
+    fn floor0_tally_unused_and_error_surface() {
+        use crate::encoder::Floor0Packet;
+        let header = floor0_tally_header();
+        let books = vec![
+            design_entropy_codebook(16, 1, &[1u64; 16], 32, false).unwrap(),
+            design_entropy_codebook(4, 1, &[1u64; 4], 32, false).unwrap(),
+            design_entropy_codebook(32, 2, &[1u64; 32], 32, false).unwrap(),
+        ];
+        let mut tallies = BookTallies::new(&books);
+        tally_floor0_packet(&mut tallies, &Floor0Packet::Unused, &header).expect("tallies");
+        for b in 0..3 {
+            assert_eq!(tallies.total(b), 0);
+        }
+        assert_eq!(
+            tally_floor0_packet(
+                &mut tallies,
+                &Floor0Packet::Curve {
+                    amplitude: 1,
+                    booknumber: 2,
+                    entries: vec![0],
+                },
+                &header,
+            ),
+            Err(BookDesignError::Floor0BooknumberOutOfRange {
+                booknumber: 2,
+                books: 2
+            })
+        );
+        // Entry 40 is outside codebook 2's 32 entries: the batch is
+        // rejected atomically, so the in-range entry 5 before it is
+        // not recorded either.
+        assert_eq!(
+            tally_floor0_packet(
+                &mut tallies,
+                &Floor0Packet::Curve {
+                    amplitude: 1,
+                    booknumber: 0,
+                    entries: vec![5, 40],
+                },
+                &header,
+            ),
+            Err(BookDesignError::EntryOutOfRange {
+                book: 2,
+                entry: 40,
+                entries: 32
+            })
         );
         for b in 0..3 {
             assert_eq!(tallies.total(b), 0, "failing calls record nothing");

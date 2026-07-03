@@ -6,6 +6,31 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-0 value-codebook-content trainer
+  (`book_design::tally_floor0_packet` +
+  `tests/floor0_trained_books.rs`)** — closes the "floor-0
+  value-codebook *contents*" followup the README named, completing the
+  trainer triad (floor-1 / residue / floor-0). A floor-0 packet's only
+  codewords are the §6.2.2 step-7 VQ entry run; the tally records each
+  entry against the value book the packet's `[booknumber]` selects
+  through `floor0_book_list` (§6.2.2 step 5), skipping the raw
+  fixed-width `[amplitude]` / `[booknumber]` fields and the `Unused`
+  short-circuit, committing atomically via `record_all`. The
+  integration suite drives the training loop over a 32-envelope
+  formant corpus with drifting resonance centres (LSP coefficients of
+  similar spectra cluster on the value ladder — the test asserts a
+  strict minority of the 256 entries is used, so the statistical
+  structure is real): plan (`plan_floor0_packet`) → tally → `retrain`
+  → re-write, pinning bit-identical §6.2.3 curves under the trained
+  book (VQ ladder preserved), a strictly smaller corpus on the wire,
+  and §3.2.1 writer/parser carriage legality (the test book's ladder
+  is dyadic, `−0.5 + e/64`, so it is exactly §9.2.2-packable). A
+  second test pins the sparse policy: pruned ladder entries, a
+  successful re-plan (the §3.2.1 quantiser only ever selects used
+  entries), the same reconstructed curve, and no extra cost on the
+  training corpus. Unit tests pin the booknumber routing and the
+  atomic error surface (`Floor0BooknumberOutOfRange`, out-of-range
+  entries recording nothing).
 - **Residue codebook-content trainer (`book_design::tally_residue_plans`
   + `BookTallies::record_all` + `tests/residue_trained_books.rs`)** —
   the residue analogue of the floor-1 trainer. The tally mirrors
