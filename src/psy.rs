@@ -31,9 +31,11 @@
 //! 3. **Spreading.** A masker's influence decays across the Bark axis
 //!    asymmetrically: steeply toward lower frequencies
 //!    (−27 dB/Bark) and shallowly toward higher ones (−10 dB/Bark) —
-//!    masking spreads upward. Each band's threshold takes the
-//!    **maximum** over all maskers' spread contributions (a
-//!    conservative, deterministic combination).
+//!    masking spreads upward. Each **bin** evaluates every masker's
+//!    skirt at its own continuous Bark coordinate and takes the
+//!    **maximum** (a conservative, deterministic combination); the
+//!    per-bin evaluation keeps the skirts continuous across band
+//!    edges instead of forming box-edge cliffs.
 //! 4. **Threshold in quiet.** The spread threshold is floored,
 //!    per bin, by the absolute threshold of hearing (the standard
 //!    three-term analytic ATH approximation in dB SPL over kHz),
@@ -325,34 +327,40 @@ pub fn compute_masking(spectrum: &[f32], config: &PsyConfig) -> Result<MaskingAn
         .map(|&e| config.full_scale_db + 10.0 * (e.max(ENERGY_FLOOR)).log10() as f32)
         .collect();
 
-    // ---- 3. Spread each masker across the Bark axis (max-combine). ----
-    let mut band_threshold_db = vec![f32::NEG_INFINITY; bands];
-    for i in 0..bands {
-        if count[i] == 0 {
+    // ---- 3. Reduce each populated band to one masker. ----
+    let mut maskers: Vec<(f32, f32)> = Vec::with_capacity(bands); // (centre bark, masker dB)
+    for b in 0..bands {
+        if count[b] == 0 {
             continue;
         }
-        let alpha = band_tonality[i];
-        let offset = alpha * tonal_offset_db(band_center[i]) + (1.0 - alpha) * NOISE_OFFSET_DB;
-        let masker = band_level_db[i] - offset;
-        for j in 0..bands {
-            let dz = band_center[j] - band_center[i];
+        let alpha = band_tonality[b];
+        let offset = alpha * tonal_offset_db(band_center[b]) + (1.0 - alpha) * NOISE_OFFSET_DB;
+        maskers.push((band_center[b], band_level_db[b] - offset));
+    }
+
+    // ---- 4. Per-bin threshold: spread each masker to the bin's own
+    // (continuous) Bark coordinate, max-combine, floor by the
+    // threshold in quiet. Evaluating the spread at the bin — not at
+    // its band's centre — keeps the masking skirts continuous across
+    // band edges, so a bin just outside a loud masker's band still
+    // sees the skirt rather than a box-edge cliff.
+    let mut threshold = Vec::with_capacity(n_half);
+    for k in 0..n_half {
+        let zk = bark(bin_freq(k)).max(0.0);
+        let mut masked = f32::NEG_INFINITY;
+        for &(zc, masker) in &maskers {
+            let dz = zk - zc;
             let spread = if dz >= 0.0 {
                 -SPREAD_UP_DB_PER_BARK * dz
             } else {
                 SPREAD_DOWN_DB_PER_BARK * dz
             };
             let contrib = masker + spread;
-            if contrib > band_threshold_db[j] {
-                band_threshold_db[j] = contrib;
+            if contrib > masked {
+                masked = contrib;
             }
         }
-    }
-
-    // ---- 4. Per-bin threshold: spread masking ∨ threshold in quiet. ----
-    let mut threshold = Vec::with_capacity(n_half);
-    for k in 0..n_half {
         let quiet = ath_db(bin_freq(k));
-        let masked = band_threshold_db[bin_band[k]];
         let t_db = masked.max(quiet) - config.threshold_offset_db;
         // dB SPL → linear amplitude under the full-scale calibration.
         let amp = 10.0f32.powf((t_db - config.full_scale_db) / 20.0);
@@ -452,16 +460,22 @@ pub fn plan_psy_floor_envelope(
 /// with the weight
 ///
 /// ```text
-/// w[p] = mean over p's bins of (floor[k] / threshold[k])²
+/// w[p] = mean over p's bins of min((floor[k] / threshold[k])², 10⁴)
 /// ```
 ///
-/// turns the chooser's Lagrangian into an approximate NMR-vs-bits
-/// trade: partitions whose noise would surface **above** the masking
-/// threshold (floor ≫ threshold) weigh heavily and attract bits;
-/// partitions fully under the threshold (floor ≤ threshold) weigh
-/// lightly and give bits up. The weights are normalised to mean `1.0`
-/// across partitions so the caller's `lambda` keeps the same scale as
-/// the unweighted chooser.
+/// turns the chooser's Lagrangian **into** an NMR-vs-bits trade:
+/// `w[p] · error_sq` is (to partition granularity) the summed
+/// noise-to-mask ratio the plan's residue error produces, so one
+/// `lambda` now prices *audibility* per bit uniformly across every
+/// partition and frame. Partitions whose noise would surface far
+/// above the masking threshold (floor ≫ threshold) weigh heavily and
+/// attract bits; partitions at or under the threshold weigh `≤ 1` and
+/// give their bits up first. The weights are deliberately **not**
+/// normalised — their absolute scale is the audibility calibration —
+/// but each bin's ratio is capped at `10⁴` (a 40 dB noise-to-mask
+/// excess): beyond that a violation is perceptually saturated, and an
+/// uncapped ratio from a single near-silent threshold bin would
+/// otherwise dominate the whole vector's bit budget.
 ///
 /// `floor` is the **rendered** floor curve (`render_curve`, the exact
 /// per-bin values the decoder multiplies back in) over the whole
@@ -512,7 +526,6 @@ pub fn residue_partition_weights(
 
     let partitions = (end - begin) / ps;
     let mut weights = Vec::with_capacity(partitions);
-    let mut sum = 0.0f64;
     for p in 0..partitions {
         let mut acc = 0.0f64;
         let lo = begin + p * ps;
@@ -520,25 +533,23 @@ pub fn residue_partition_weights(
             .iter()
             .zip(&masking.threshold[lo..lo + ps])
         {
-            // threshold is strictly positive by construction.
+            // threshold is strictly positive by construction; the
+            // per-bin ratio is capped at the perceptual-saturation
+            // ceiling (see the doc note).
             let r = f64::from(fl) / f64::from(th);
-            acc += r * r;
+            acc += (r * r).min(RATIO_SQ_CAP);
         }
-        let w = acc / ps as f64;
-        sum += w;
-        weights.push(w);
-    }
-    // Normalise to mean 1 so `lambda` keeps its unweighted scale. An
-    // all-zero weight vector (floor identically zero over the window)
-    // is left as-is: nothing in the window can ever be audible.
-    if sum > 0.0 {
-        let mean = sum / partitions as f64;
-        for w in &mut weights {
-            *w /= mean;
-        }
+        weights.push(acc / ps as f64);
     }
     Ok(weights)
 }
+
+/// The per-bin `(floor/threshold)²` ceiling
+/// [`residue_partition_weights`] applies: a 40 dB noise-to-mask excess.
+/// Beyond it a violation is perceptually saturated, and a single
+/// near-silent-threshold bin would otherwise dominate the whole
+/// vector's bit budget.
+const RATIO_SQ_CAP: f64 = 1.0e4;
 
 #[cfg(test)]
 mod tests {
@@ -866,26 +877,40 @@ mod tests {
     #[test]
     fn weights_favor_audible_partitions() {
         // Two partitions: floor ≫ threshold in the first (audible
-        // noise), floor ≪ threshold in the second (masked). The first
-        // weight must dominate, and the mean must be 1.
+        // noise — the 100× ratio squares to the 10⁴ cap exactly),
+        // floor ≪ threshold in the second (masked, ratio² = 0.01).
         let floor = vec![1.0f32, 1.0, 1.0, 1.0, 0.001, 0.001, 0.001, 0.001];
         let m = masking_of(vec![0.01f32; 8]);
         let w = residue_partition_weights(&floor, &m, 0, 8, 4).unwrap();
         assert_eq!(w.len(), 2);
-        assert!(w[0] > w[1] * 100.0, "w = {w:?}");
-        let mean = (w[0] + w[1]) / 2.0;
-        assert!((mean - 1.0).abs() < 1e-9);
+        assert!((w[0] - 1.0e4).abs() < 1.0, "audible weight {w:?}");
+        assert!((w[1] - 0.01).abs() < 1e-6, "masked weight {w:?}");
     }
 
     #[test]
-    fn uniform_ratio_yields_unit_weights() {
-        // floor/threshold constant → every weight exactly 1.
+    fn weights_carry_the_raw_nmr_scale() {
+        // floor/threshold constant → every weight is exactly the
+        // squared ratio (no normalisation: the absolute scale is the
+        // audibility calibration the chooser's lambda trades against).
         let floor = vec![0.2f32; 12];
         let m = masking_of(vec![0.05f32; 12]);
         let w = residue_partition_weights(&floor, &m, 0, 12, 4).unwrap();
         for &wi in &w {
-            assert!((wi - 1.0).abs() < 1e-12);
+            assert!((wi - 16.0).abs() < 1e-4, "weight {wi} != ratio² 16");
         }
+    }
+
+    #[test]
+    fn weight_cap_stops_a_single_bin_from_dominating() {
+        // One bin with a 10⁶ ratio (10¹² squared) is capped at 10⁴, so
+        // the partition's mean weight is bounded by the cap.
+        let mut floor = vec![0.01f32; 4];
+        floor[2] = 1.0e3;
+        let m = masking_of(vec![0.001f32; 4]);
+        let w = residue_partition_weights(&floor, &m, 0, 4, 4).unwrap();
+        // Three bins at ratio² = 100, one capped at 10⁴.
+        let expect = (3.0 * 100.0 + 1.0e4) / 4.0;
+        assert!((w[0] - expect).abs() < 1e-3, "weight {w:?} vs {expect}");
     }
 
     #[test]

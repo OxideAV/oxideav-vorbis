@@ -805,8 +805,8 @@ pub fn plan_vector_classifications_rd(
 /// floor rides far above the masking threshold surfaces loudly, while
 /// noise in a fully-masked partition is inaudible at any residue error.
 /// Scaling each partition's distortion by a caller-supplied weight —
-/// canonically [`crate::psy::residue_partition_weights`]'s
-/// mean-normalised `(floor/threshold)²` factors — turns the Lagrangian
+/// canonically [`crate::psy::residue_partition_weights`]'s capped
+/// `(floor/threshold)²` factors — turns the Lagrangian
 /// into an approximate NMR-vs-bits trade: heavily weighted (audible)
 /// partitions attract denser cascades, lightly weighted (masked)
 /// partitions give their bits up first as `lambda` rises.

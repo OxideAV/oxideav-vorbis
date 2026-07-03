@@ -22,8 +22,9 @@ All notable changes to `oxideav-vorbis` are recorded here.
   the peak-held signal where audible and rides the threshold where
   masked, clamped to the §10.1 dB-ladder range) and
   `residue_partition_weights` (per-partition `(floor/threshold)²`
-  noise-to-mask weights, mean-normalised so the residue chooser's
-  `lambda` keeps its scale). Tests pin the ATH dip at 3–4 kHz, the
+  noise-to-mask weights on the raw audibility scale, each bin's ratio
+  capped at a 40 dB excess so one near-silent-threshold bin cannot
+  monopolise the bit budget). Tests pin the ATH dip at 3–4 kHz, the
   silence→threshold-in-quiet reduction, masker-local threshold lift,
   the upward-spread asymmetry, threshold monotonicity in masker
   level, tone/noise tonality separation, the
@@ -38,7 +39,7 @@ All notable changes to `oxideav-vorbis` are recorded here.
   `weights[p] · error_sq + lambda · bit_cost`. Equal residue-domain
   error is not equally audible (the decoder multiplies the residue by
   the rendered floor, §4.3.6), so charging each partition's squared
-  error with `psy::residue_partition_weights`'s mean-normalised
+  error with `psy::residue_partition_weights`'s capped
   `(floor/threshold)²` factor turns the trade into an approximate
   noise-to-mask-ratio-vs-bits descent: audible partitions attract
   denser cascades, masked partitions surrender bits first. All-`1.0`
