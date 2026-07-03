@@ -6,6 +6,35 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Closed-loop rate-aware residue training
+  (`book_design::train_residue_books_rd`,
+  `ResidueRdTrainingOutcome`)** — couples the trainer to the
+  rate-distortion planner. A single tally→retrain pass re-prices
+  codewords for plans chosen under the *old* prices;
+  `plan_vector_residue_rd` charges exact codeword lengths in its
+  Lagrangian, so re-planning under retrained books shifts choices
+  toward the now-cheaper symbols, justifying another retrain. The loop
+  is classic alternating minimisation over the shared objective
+  `Σ error_sq + λ · value_bits`: the plan step is per-partition
+  optimal given the books, and the **sparse** retrain step is exactly
+  optimal for the observed frequencies (dense smoothing would break
+  the descent guarantee — the policy note documents this, and every
+  entry the current plans use keeps its codeword so the previous
+  plans stay feasible). The outcome reports the per-iteration
+  Lagrangian (provably monotone non-increasing), the per-iteration
+  total codeword bits (value + classwords, priced through
+  `stream_cost_bits`), the final plans, the trained books, and a
+  fixed-point convergence flag (identical plans ⇒ identical tallies ⇒
+  identical retrain ⇒ stop). Integration tests drive the loop over
+  the residue corpus: monotone descent + convergence + strictly fewer
+  total bits than the flat-book first pass + final plans round-trip
+  through the real §8.6.2 writer/decoder under the trained books +
+  carriage legality; a `λ = 0` case pins the distortion-only
+  reduction (price-independent choices stabilise after one retrain,
+  which still pays off on the wire). Unit tests pin the
+  `ZeroIterations` / non-finite-λ guards and small-corpus
+  convergence. `BookDesignError` drops its `Eq` derive (it now
+  carries `ResidueEncodeError`, which is `PartialEq` only).
 - **Floor-0 value-codebook-content trainer
   (`book_design::tally_floor0_packet` +
   `tests/floor0_trained_books.rs`)** — closes the "floor-0

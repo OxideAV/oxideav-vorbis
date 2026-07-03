@@ -191,7 +191,8 @@ pub use blocksize::{choose_blocksize, detect_transient, BlocksizeError, Transien
 pub use book_design::{
     design_codeword_lengths, design_codeword_lengths_dense, design_entropy_codebook,
     redesign_codebook, stream_cost_bits, tally_floor0_packet, tally_floor1_packet,
-    tally_residue_plans, BookDesignError, BookTallies, MAX_CODEWORD_LEN,
+    tally_residue_plans, train_residue_books_rd, BookDesignError, BookTallies,
+    ResidueRdTrainingOutcome, MAX_CODEWORD_LEN,
 };
 pub use channel_order::{speaker_at, speaker_layout, Speaker};
 pub use codebook::{

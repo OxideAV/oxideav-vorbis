@@ -298,3 +298,93 @@ fn trained_residue_books_with_do_not_decode_channel() {
         "training must shrink the corpus: {trained_bytes} vs {flat_bytes} bytes"
     );
 }
+
+/// Closed-loop rate-aware training (`train_residue_books_rd`):
+/// alternating the §8.6.2 rate-distortion planner with the codebook
+/// retrainer descends the corpus Lagrangian monotonically, reaches a
+/// fixed point, spends strictly fewer total codeword bits than the
+/// first (flat-book) pass, and its final plans serialise + decode
+/// through the real §8.6.2 writer/decoder under the trained books.
+#[test]
+fn rd_training_loop_descends_converges_and_round_trips() {
+    let header = residue_header();
+    let books = flat_books();
+    let residuals = corpus();
+
+    let outcome = oxideav_vorbis::train_residue_books_rd(&residuals, &header, &books, 0.75, 12)
+        .expect("trains");
+
+    // Monotone descent of the shared objective.
+    assert!(
+        outcome.lagrangian_per_iteration.len() >= 2,
+        "the loop must run at least two passes on a fresh corpus"
+    );
+    for w in outcome.lagrangian_per_iteration.windows(2) {
+        assert!(
+            w[1] <= w[0] + 1e-9,
+            "Lagrangian must never rise: {:?}",
+            outcome.lagrangian_per_iteration
+        );
+    }
+    assert!(outcome.converged, "the loop must reach a fixed point");
+
+    // The rate side: strictly fewer total codeword bits than the
+    // flat-book first pass.
+    let first = outcome.total_bits_per_iteration[0];
+    let last = *outcome.total_bits_per_iteration.last().unwrap();
+    assert!(
+        last < first,
+        "training must reduce total bits: {last} vs {first}"
+    );
+
+    // The final plans round-trip through the real writer + decoder
+    // under the trained (sparse) books.
+    for plan in &outcome.plans {
+        let body = write_residue_body(
+            std::slice::from_ref(plan),
+            &header,
+            &outcome.codebooks,
+            BLOCKSIZE,
+            &[false],
+        )
+        .expect("writes under trained books");
+        let vector = decode_vector(&header, &outcome.codebooks, &body);
+        assert!(
+            vector.iter().all(|v| v.is_finite()),
+            "trained-book decode must be finite"
+        );
+    }
+
+    // And the trained books stay carriage-legal.
+    for book in &outcome.codebooks {
+        let bytes = write_codebook(book).expect("writes");
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(&parse_codebook(&mut r).expect("parses"), book);
+    }
+}
+
+/// `lambda = 0` reduces the plan step to the distortion-only chooser:
+/// the loop still converges, and because the distortion chooser's
+/// decisions are price-independent, the plans are already stable after
+/// the first retrain (two measured iterations).
+#[test]
+fn rd_training_loop_lambda_zero_is_distortion_stable() {
+    let header = residue_header();
+    let books = flat_books();
+    let residuals = corpus();
+
+    let outcome = oxideav_vorbis::train_residue_books_rd(&residuals, &header, &books, 0.0, 6)
+        .expect("trains");
+    assert!(outcome.converged);
+    assert_eq!(
+        outcome.lagrangian_per_iteration.len(),
+        2,
+        "distortion-only choices cannot change under re-pricing"
+    );
+    // At lambda = 0 the Lagrangian is pure distortion — identical
+    // across the two passes.
+    let l = &outcome.lagrangian_per_iteration;
+    assert!((l[0] - l[1]).abs() <= 1e-9 * l[0].abs().max(1.0));
+    // The retrain still pays off on the wire.
+    assert!(outcome.total_bits_per_iteration[1] < outcome.total_bits_per_iteration[0]);
+}

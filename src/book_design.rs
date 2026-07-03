@@ -60,7 +60,7 @@ pub const MAX_CODEWORD_LEN: u8 = 32;
 
 /// Errors raised by the codeword-length designers and the
 /// [`stream_cost_bits`] pricing helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BookDesignError {
     /// Every entry's frequency was zero (or the table was empty): there
     /// is no used symbol to assign a codeword to. §3.2.1 rejects a
@@ -201,6 +201,12 @@ pub enum BookDesignError {
         /// `header.book_list.len()`.
         books: usize,
     },
+    /// [`train_residue_books_rd`]: the rate-distortion planner rejected
+    /// a corpus vector (carried verbatim).
+    ResidueEncode(crate::residue_encode::ResidueEncodeError),
+    /// [`train_residue_books_rd`]: `max_iterations` was zero — the
+    /// trainer must run at least one plan→retrain pass.
+    ZeroIterations,
 }
 
 impl fmt::Display for BookDesignError {
@@ -288,6 +294,14 @@ impl fmt::Display for BookDesignError {
             BookDesignError::Floor0BooknumberOutOfRange { booknumber, books } => write!(
                 f,
                 "vorbis book design: booknumber {booknumber} outside the header's {books}-book floor0_book_list (§6.2.2)"
+            ),
+            BookDesignError::ResidueEncode(source) => write!(
+                f,
+                "vorbis book design: rate-distortion residue planning failed: {source}"
+            ),
+            BookDesignError::ZeroIterations => write!(
+                f,
+                "vorbis book design: max_iterations must be at least 1"
             ),
         }
     }
@@ -894,6 +908,167 @@ pub fn tally_floor0_packet(
             tallies.record_all(&emissions)
         }
     }
+}
+
+/// The outcome of a [`train_residue_books_rd`] closed-loop training
+/// run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidueRdTrainingOutcome {
+    /// The trained codebook table (index-aligned with the input;
+    /// books the corpus never exercised are unchanged). Trained books
+    /// are **sparse** — see [`train_residue_books_rd`]'s policy note.
+    pub codebooks: Vec<VorbisCodebook>,
+    /// The final per-corpus-vector plans, chosen by the
+    /// rate-distortion planner under [`Self::codebooks`].
+    pub plans: Vec<crate::encoder::ResidueVectorPlan>,
+    /// Per iteration: the corpus Lagrangian
+    /// `Σ error_sq + lambda · value_bits`, measured at the plan step
+    /// under that iteration's books. Alternating minimisation makes
+    /// this monotonically non-increasing: the plan step minimises it
+    /// per partition given the books, and the (sparse) retrain step
+    /// minimises the bit term given the plans.
+    pub lagrangian_per_iteration: Vec<f64>,
+    /// Per iteration: the corpus' total codeword bits (value codewords
+    /// plus classwords) under that iteration's books.
+    pub total_bits_per_iteration: Vec<u64>,
+    /// `true` if the loop stopped because an iteration reproduced the
+    /// previous iteration's plans exactly (a fixed point — further
+    /// passes cannot change anything), `false` if it ran out of
+    /// `max_iterations`.
+    pub converged: bool,
+}
+
+/// Closed-loop rate-aware residue book training: alternate the §8.6.2
+/// rate-distortion planner and the codebook retrainer until the pair
+/// reaches a fixed point.
+///
+/// A single tally→retrain pass (as in [`tally_residue_plans`] +
+/// [`BookTallies::retrain`]) re-prices the codewords for plans chosen
+/// under the *old* prices. But
+/// `crate::residue_encode::plan_vector_residue_rd` charges the exact
+/// codeword lengths in its Lagrangian `error_sq + lambda · bit_cost`,
+/// so re-planning under the retrained books can shift choices toward
+/// the now-cheaper symbols — which changes the statistics — which
+/// justifies another retrain. This is classic alternating
+/// minimisation, and it descends a shared objective:
+///
+/// * **plan step** — given books `b`, choose plans minimising
+///   `Σ error_sq + lambda · value_bits(p, b)` (per-partition optimal);
+/// * **train step** — given plans `p`, choose codeword lengths
+///   minimising `value_bits(p, b) (+ classword bits)` (the optimal
+///   length-limited code for the observed frequencies).
+///
+/// Each step can only lower (or hold) the Lagrangian, so
+/// [`ResidueRdTrainingOutcome::lagrangian_per_iteration`] is monotone
+/// non-increasing, and the loop terminates at a fixed point or after
+/// `max_iterations`.
+///
+/// **Sparse retrain policy.** The train step uses the sparse policy
+/// (`dense == false`): the descent argument needs the retrained books
+/// to be *exactly* optimal for the observed frequencies, which dense
+/// smoothing (ghost `freq = 1` entries) is not. Every entry the
+/// current plans use keeps a codeword, so the previous plans stay
+/// feasible — the invariant the monotonicity proof rests on. Callers
+/// who need every entry to stay encodable for unseen material can
+/// re-run [`BookTallies::retrain`] with `dense == true` over the
+/// final plans afterwards.
+///
+/// `residuals` holds one target residual vector per corpus member
+/// (each is planned as one §8.6.2 decode vector against `header`'s
+/// type / partitioning). The initial `codebooks` seed the first plan
+/// pass; `lambda` is the rate-distortion multiplier (`>= 0`, finite).
+pub fn train_residue_books_rd(
+    residuals: &[Vec<f32>],
+    header: &crate::setup::ResidueHeader,
+    codebooks: &[VorbisCodebook],
+    lambda: f64,
+    max_iterations: usize,
+) -> Result<ResidueRdTrainingOutcome, BookDesignError> {
+    if max_iterations == 0 {
+        return Err(BookDesignError::ZeroIterations);
+    }
+    let classbook_idx = header.classbook as usize;
+
+    let mut books: Vec<VorbisCodebook> = codebooks.to_vec();
+    let mut prev_plans: Option<Vec<crate::encoder::ResidueVectorPlan>> = None;
+    let mut lagrangians: Vec<f64> = Vec::new();
+    let mut totals: Vec<u64> = Vec::new();
+    let mut converged = false;
+
+    for _ in 0..max_iterations {
+        // Resolve the per-class value-book rows against the current
+        // book table (§8.6.1's books[class][pass] indirection).
+        let mut rows: Vec<[Option<&VorbisCodebook>; 8]> = Vec::with_capacity(header.books.len());
+        for row in &header.books {
+            let mut resolved: [Option<&VorbisCodebook>; 8] = Default::default();
+            for (pass, slot) in row.iter().enumerate() {
+                if let Some(book) = slot {
+                    resolved[pass] = Some(books.get(*book as usize).ok_or(
+                        BookDesignError::BookIndexOutOfRange {
+                            book: *book as usize,
+                            books: books.len(),
+                        },
+                    )?);
+                }
+            }
+            rows.push(resolved);
+        }
+
+        // Plan step: rate-distortion planning under the current books.
+        let mut plans: Vec<crate::encoder::ResidueVectorPlan> = Vec::with_capacity(residuals.len());
+        let mut lagrangian = 0.0f64;
+        let mut value_bits = 0u64;
+        for residual in residuals {
+            let scored = crate::residue_encode::plan_vector_residue_rd(
+                residual,
+                &rows,
+                header.residue_type,
+                header.partition_size,
+                lambda,
+            )
+            .map_err(BookDesignError::ResidueEncode)?;
+            lagrangian += scored.total_error_sq + lambda * scored.total_value_bits as f64;
+            value_bits += scored.total_value_bits;
+            plans.push(crate::encoder::ResidueVectorPlan {
+                classifications: scored.classifications,
+                partition_entries: scored.partition_entries,
+            });
+        }
+
+        // Measure the classword bits of these plans under the current
+        // classbook (the tally routes classwords through it, so the
+        // trained classbook prices them too).
+        let mut tallies = BookTallies::new(&books);
+        tally_residue_plans(&mut tallies, &plans, header, &books)?;
+        let classword_bits = tallies
+            .counts(classbook_idx)
+            .map(|freqs| stream_cost_bits(&books[classbook_idx].codeword_lengths, freqs))
+            .transpose()?
+            .unwrap_or(0);
+        lagrangians.push(lagrangian);
+        totals.push(value_bits + classword_bits);
+
+        // Fixed point: identical plans re-tally to identical
+        // frequencies, so the retrained books cannot change either.
+        if prev_plans.as_ref() == Some(&plans) {
+            converged = true;
+            prev_plans = Some(plans);
+            break;
+        }
+
+        // Train step: sparse retrain (exactly optimal for the
+        // observed frequencies — see the policy note above).
+        books = tallies.retrain(&books, MAX_CODEWORD_LEN, false)?;
+        prev_plans = Some(plans);
+    }
+
+    Ok(ResidueRdTrainingOutcome {
+        codebooks: books,
+        plans: prev_plans.expect("max_iterations >= 1 ran at least one plan pass"),
+        lagrangian_per_iteration: lagrangians,
+        total_bits_per_iteration: totals,
+        converged,
+    })
 }
 
 /// Package-merge (coin-collector) core: optimal length-limited prefix
@@ -1966,6 +2141,63 @@ mod tests {
         for b in 0..3 {
             assert_eq!(tallies.total(b), 0, "failing calls record nothing");
         }
+    }
+
+    // ----------------------------------------------------------------
+    // train_residue_books_rd — guard-rail cases (the descent itself is
+    // pinned by tests/residue_trained_books.rs against real bodies).
+    // ----------------------------------------------------------------
+
+    /// Zero iterations and a non-finite lambda are refused.
+    #[test]
+    fn rd_training_guards() {
+        let header = residue_tally_header();
+        let books = residue_tally_books();
+        let residuals = vec![vec![0.25f32; 16]];
+        assert_eq!(
+            train_residue_books_rd(&residuals, &header, &books, 0.5, 0),
+            Err(BookDesignError::ZeroIterations)
+        );
+        assert!(matches!(
+            train_residue_books_rd(&residuals, &header, &books, f64::NAN, 2),
+            Err(BookDesignError::ResidueEncode(_))
+        ));
+    }
+
+    /// A trivially-stable corpus converges: identical plans on the
+    /// second pass stop the loop with `converged = true`, and the
+    /// Lagrangian never rises.
+    #[test]
+    fn rd_training_converges_on_stable_corpus() {
+        let header = residue_tally_header();
+        let books = residue_tally_books();
+        // Residue books here are entropy-only (no VQ lookup), which the
+        // planner rejects for value reads — build VQ-capable books.
+        let mut books = books;
+        for book in books.iter_mut().skip(1) {
+            book.lookup = VqLookup::Tessellation {
+                minimum_value: -2.0,
+                delta_value: 0.5,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: (0..book.entries).collect(),
+            };
+        }
+        let residuals: Vec<Vec<f32>> = (0..6)
+            .map(|k| (0..16).map(|i| 0.5 * ((i + k) % 5) as f32 - 1.0).collect())
+            .collect();
+        let outcome =
+            train_residue_books_rd(&residuals, &header, &books, 0.25, 10).expect("trains");
+        assert!(outcome.converged, "stable corpus must reach a fixed point");
+        assert!(outcome.lagrangian_per_iteration.len() >= 2);
+        for w in outcome.lagrangian_per_iteration.windows(2) {
+            assert!(
+                w[1] <= w[0] + 1e-9,
+                "Lagrangian must never rise: {:?}",
+                outcome.lagrangian_per_iteration
+            );
+        }
+        assert_eq!(outcome.plans.len(), residuals.len());
     }
 
     /// Large books stay well-behaved: 4096 entries with a Zipf-ish
