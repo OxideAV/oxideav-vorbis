@@ -175,6 +175,7 @@ pub mod mdct;
 pub mod overlap;
 pub mod packet;
 pub mod packet_kind;
+pub mod psy;
 pub mod residue;
 pub mod residue_encode;
 pub mod setup;
@@ -253,6 +254,10 @@ pub use packet::{
 pub use packet_kind::{
     classify_packet, parse_header_packet, ClassifyError, HeaderDispatchError, HeaderPacket,
     PacketKind,
+};
+pub use psy::{
+    ath_db, compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
+    PsyConfig, PsyError,
 };
 pub use residue::{ResidueDecoder, ResidueError};
 pub use residue_encode::{

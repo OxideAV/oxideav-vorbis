@@ -6,6 +6,31 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Psychoacoustic masking model (`psy` module)** — the encoder-side
+  perceptual layer the README named as the last quality gap. The
+  Vorbis I spec defines only decode, so this is clean-room encoder
+  territory built from textbook psychoacoustics over the spec's own
+  §6.2.3 Bark scale: 1-Bark critical-band analysis of the MDCT
+  magnitudes, per-band tonality from spectral flatness (tone- vs
+  noise-masker offsets `14.5 + z` dB / `5.5` dB), asymmetric Bark-axis
+  spreading (−27 dB/Bark down, −10 dB/Bark up, max-combined), and the
+  standard analytic absolute-threshold-of-hearing floor calibrated by
+  `PsyConfig::full_scale_db`. `compute_masking` returns a per-bin
+  linear-amplitude masking threshold plus band tonality; two glue
+  routines feed it into the existing encode stack:
+  `plan_psy_floor_envelope` (a floor-1 envelope target that tracks
+  the peak-held signal where audible and rides the threshold where
+  masked, clamped to the §10.1 dB-ladder range) and
+  `residue_partition_weights` (per-partition `(floor/threshold)²`
+  noise-to-mask weights, mean-normalised so the residue chooser's
+  `lambda` keeps its scale). Tests pin the ATH dip at 3–4 kHz, the
+  silence→threshold-in-quiet reduction, masker-local threshold lift,
+  the upward-spread asymmetry, threshold monotonicity in masker
+  level, tone/noise tonality separation, the
+  tonal-masks-less-than-noise offset ordering, the
+  `threshold_offset_db` lever, envelope max/peak-hold behaviour, and
+  the weight normalisation + guard surface. Re-exported at the crate
+  root.
 - **VQ value-ladder design (`book_design::design_value_ladder`,
   `ValueLadderDesign`)** — the *value*-side half of codebook training
   (the codeword-length half is `design_codeword_lengths`). A
