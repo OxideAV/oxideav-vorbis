@@ -176,6 +176,7 @@ pub mod overlap;
 pub mod packet;
 pub mod packet_kind;
 pub mod psy;
+pub mod quality;
 pub mod residue;
 pub mod residue_encode;
 pub mod setup;
@@ -259,6 +260,9 @@ pub use packet_kind::{
 pub use psy::{
     ath_db, compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
     PsyConfig, PsyError,
+};
+pub use quality::{
+    solve_lambda_for_bits, EncoderTuning, LambdaSolution, LambdaSolveError, QualityError,
 };
 pub use residue::{ResidueDecoder, ResidueError};
 pub use residue_encode::{

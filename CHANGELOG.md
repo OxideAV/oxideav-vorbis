@@ -76,6 +76,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
   legality + final-plan/final-book consistency, the ideal-ladder
   no-op equivalence, and the guard surface. Re-exported at the crate
   root.
+- **Quality targeting (`quality` module: `EncoderTuning`,
+  `solve_lambda_for_bits`)** — one scalar for the encode stack's
+  quality levers, plus the bit-budget inverse.
+  `EncoderTuning::from_quality(q ∈ [0, 1])` expands to a coherent
+  lever set: the residue RD `lambda` falls log-linearly (`1.0` →
+  `10⁻⁴`, pricing bits in noise-to-mask units under the weighted
+  chooser), the psy margin `threshold_offset_db` rises linearly
+  (−12 → +12 dB), and the floor-1 post budget grows (8 → 32) —
+  monotone by construction. `solve_lambda_for_bits` bisects any
+  caller-supplied monotone non-increasing `rate(lambda)` measurement
+  (a plan's value bits, a packet's size, a stream's) to the cheapest
+  `lambda` fitting a bit budget, returning the measured point (no
+  interpolation), the loose-budget fidelity end, or the flagged
+  cheapest end when the budget is unreachable. Tests pin endpoint
+  values, monotonicity across the knob, bracket/iteration guards,
+  loose/unreachable budget behaviour, near-target landing (within 2%
+  under budget on a synthetic curve), budget-monotone solutions, and
+  rate-error propagation. Re-exported at the crate root.
 - **VQ value-ladder design (`book_design::design_value_ladder`,
   `ValueLadderDesign`)** — the *value*-side half of codebook training
   (the codeword-length half is `design_codeword_lengths`). A
