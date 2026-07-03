@@ -6,6 +6,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Whole-stream trained-books round-trip
+  (`tests/trained_stream_roundtrip.rs`)** — the capstone over the
+  codebook-content design stack. A 20-frame mono PCM corpus (drifting
+  harmonic mix) is encoded through the full §4.3 audio-packet writer
+  against a real `VorbisSetupHeader` (floor-1 + three-class residue +
+  four codebooks); **both** subsystems' emissions are tallied into one
+  `BookTallies` (`tally_floor1_packet` + `tally_residue_plans` per
+  packet), the whole codebook table is retrained in one pass, and the
+  same packets re-serialise under a setup header carrying the trained
+  books. Pins: every retrained §4.3 packet decodes to the
+  **bit-identical** windowed PCM frame (the §4.3.2–§4.3.7 numeric
+  pipeline sees identical inputs — floor-1 post coding is lossless and
+  every VQ lookup is preserved); the audio corpus serialises into
+  **strictly fewer bytes**; every book in the stream is exercised; and
+  the trained setup header itself round-trips **whole** through
+  `write_setup_header` → `parse_setup_header` field-for-field (§4.2.4
+  carriage, with the mandatory time-transform placeholder), so the
+  trained stream is carriage-complete — headers and audio.
 - **Closed-loop rate-aware residue training
   (`book_design::train_residue_books_rd`,
   `ResidueRdTrainingOutcome`)** — couples the trainer to the
