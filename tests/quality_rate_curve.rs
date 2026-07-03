@@ -123,7 +123,7 @@ fn mono_setup(
     };
     VorbisSetupHeader {
         codebooks: vec![scalar_book(256, 8), scalar_book(2, 1), coarse, fine],
-        time_placeholders: Vec::new(),
+        time_placeholders: vec![0],
         floors: vec![floor],
         residues: vec![residue],
         mappings: vec![MappingHeader {
@@ -386,6 +386,131 @@ fn quality_knob_traces_a_monotone_rate_and_fidelity_curve() {
         "q=1 mean NMR {} must sit below 0 dB",
         nmr_curve[4]
     );
+}
+
+/// Encode + decode the corpus from ready-made plans (the trainer's
+/// output) under an arbitrary setup: total bytes + decoded spectra.
+fn encode_with_plans(
+    corpus: &PreparedCorpus,
+    setup: &VorbisSetupHeader,
+    plans: &[ResidueVectorPlan],
+) -> CorpusPoint {
+    let state = AudioDecoderState::new(setup).expect("decoder state builds");
+    let mut bytes_total = 0usize;
+    let mut reference = Vec::with_capacity(FRAMES * HALF_N);
+    let mut decoded_all = Vec::with_capacity(FRAMES * HALF_N);
+    for (frame, plan) in corpus.frames.iter().zip(plans) {
+        let floors = vec![AudioChannelFloor::Type1(Floor1Packet {
+            nonzero: true,
+            floor1_y: frame.floor1_y.clone(),
+            partition_cvals: vec![0u32; corpus.header.partition_class_list.len()],
+        })];
+        let residue_plans = vec![vec![plan.clone()]];
+        let header = AudioPacketHeader {
+            mode_number: 0,
+            blockflag: false,
+            n: N,
+            previous_window_flag: false,
+            next_window_flag: false,
+        };
+        let bytes = write_audio_packet(&header, setup, N, 2048, 1, &floors, &residue_plans)
+            .expect("audio packet serialises");
+        bytes_total += bytes.len();
+        let mut reader = BitReaderLsb::new(&bytes);
+        let outcome = decode_audio_packet_pre_imdct(&mut reader, setup, &state, 1, N, 2048)
+            .expect("audio packet decodes");
+        match outcome {
+            AudioPacketOutcome::PreImdct { spectra, .. } => {
+                decoded_all.extend_from_slice(&spectra[0]);
+            }
+            other => panic!("expected PreImdct outcome, got {other:?}"),
+        }
+        reference.extend_from_slice(&frame.x);
+    }
+    CorpusPoint {
+        bytes: bytes_total,
+        reference,
+        decoded: decoded_all,
+    }
+}
+
+#[test]
+fn ladder_trained_books_cut_the_rate_of_the_psy_stream() {
+    // The round's two stacks compose: the psy floor + quality tuning
+    // fix the residue targets; train_residue_books_rd_ladder then
+    // retrains the seed value books (lengths AND reconstruction
+    // values) on those targets. The trained stream must serialise into
+    // fewer bytes at no fidelity loss beyond the Lagrangian trade,
+    // stay §4.2.4 carriage-legal, and keep the model-transparent NMR.
+    use oxideav_vorbis::encoder::write_setup_header;
+    use oxideav_vorbis::setup::parse_setup_header;
+    use oxideav_vorbis::train_residue_books_rd_ladder;
+
+    let tuning = EncoderTuning::from_quality(0.5).expect("tuning");
+    let corpus = prepare_corpus(&tuning);
+    let residuals: Vec<Vec<f32>> = corpus.frames.iter().map(|f| f.target.clone()).collect();
+    let residue_header = corpus.setup.residues[0].clone();
+
+    // Baseline: unweighted RD plans under the seed books (the trainer
+    // plans unweighted, so both sides use the same chooser).
+    let seed_outcome = train_residue_books_rd_ladder(
+        &residuals,
+        &residue_header,
+        &corpus.setup.codebooks,
+        tuning.lambda,
+        1, // one iteration = plan-only measurement pass + one train step
+    )
+    .expect("seed pass");
+    let baseline_plans = seed_outcome.plans.clone();
+    let baseline = encode_with_plans(&corpus, &corpus.setup, &baseline_plans);
+
+    // Trained: the full closed loop.
+    let trained = train_residue_books_rd_ladder(
+        &residuals,
+        &residue_header,
+        &corpus.setup.codebooks,
+        tuning.lambda,
+        10,
+    )
+    .expect("trains");
+    for w in trained.lagrangian_per_iteration.windows(2) {
+        assert!(w[1] <= w[0] + 1e-9, "monotone descent");
+    }
+    let mut trained_setup = corpus.setup.clone();
+    trained_setup.codebooks = trained.codebooks.clone();
+    let point = encode_with_plans(&corpus, &trained_setup, &trained.plans);
+
+    let base_nmr = corpus_nmr(&baseline.reference, &baseline.decoded);
+    let trained_nmr = corpus_nmr(&point.reference, &point.decoded);
+    eprintln!(
+        "trained books: {} B → {} B, NMR {base_nmr:.5} → {trained_nmr:.5} (accepted {} ladder updates)",
+        baseline.bytes, point.bytes, trained.ladder_updates_accepted
+    );
+
+    // Training must genuinely shrink the stream…
+    assert!(
+        point.bytes < baseline.bytes,
+        "trained stream {} B must undercut the seed stream {} B",
+        point.bytes,
+        baseline.bytes
+    );
+    // …while the reconstruction stays transparent under the model
+    // (the Lagrangian trade may move distortion a little, never
+    // catastrophically).
+    assert!(
+        trained_nmr < 1.0,
+        "trained NMR {trained_nmr} must stay below 0 dB"
+    );
+    assert!(
+        trained_nmr <= base_nmr * 2.0 + 1e-6,
+        "trained NMR {trained_nmr} must not blow up over baseline {base_nmr}"
+    );
+
+    // The trained table is §4.2.4 carriage-legal: the whole setup
+    // header round-trips through the writer and parser.
+    let header_bytes = write_setup_header(&trained_setup, 1).expect("trained setup writes");
+    let parsed = parse_setup_header(&header_bytes, 1).expect("trained setup parses back");
+    assert_eq!(parsed, trained_setup, "setup header round-trips");
 }
 
 #[test]

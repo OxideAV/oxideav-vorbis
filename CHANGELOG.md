@@ -110,6 +110,15 @@ All notable changes to `oxideav-vorbis` are recorded here.
   *real* stream rate–lambda curve: a halfway byte budget is landed
   exactly (12 672 / 12 672 bits, `within_budget`), and a tighter
   budget never receives a smaller lambda.
+- **Psy × training composition capstone
+  (`tests/quality_rate_curve.rs::ladder_trained_books_cut_the_rate_of_the_psy_stream`)**
+  — the psy floor + quality tuning fix the residue targets of the
+  8-frame stream; `train_residue_books_rd_ladder` then retrains the
+  seed value books on those targets. Measured: the trained stream
+  serialises into 1 473 B against the seed books' 2 288 B (−36%) at
+  unchanged NMR (0.00118), the descent is monotone, and the trained
+  setup header round-trips whole through `write_setup_header` →
+  `parse_setup_header` (§4.2.4 carriage).
 - **VQ value-ladder design (`book_design::design_value_ladder`,
   `ValueLadderDesign`)** — the *value*-side half of codebook training
   (the codeword-length half is `design_codeword_lengths`). A
