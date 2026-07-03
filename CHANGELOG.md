@@ -94,6 +94,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
   loose/unreachable budget behaviour, near-target landing (within 2%
   under budget on a synthetic curve), budget-monotone solutions, and
   rate-error propagation. Re-exported at the crate root.
+- **Measured quality → rate/fidelity curve
+  (`tests/quality_rate_curve.rs`)** — the capstone over the round's
+  psychoacoustic + quality stack. An 8-frame corpus (breathing tones,
+  re-rolled borderline pedestal + masked hash) is encoded at
+  `q ∈ {0, 0.25, 0.5, 0.75, 1}` through the full chain — per-tuning
+  masking → psy floor envelope → `design_floor1_header` at the
+  tuning's post budget → per-frame post fit → NMR-weighted residue RD
+  at the tuning's lambda → `write_audio_packet` →
+  `decode_audio_packet_pre_imdct` — and the measured curve is pinned
+  monotone: rate 488 → 776 → 2264 → 2480 → 2600 B, spectral SNR
+  7.2 → 32.8 → 36.4 → 36.9 → 37.3 dB, mean nominal-threshold NMR
+  5.8 → 0.58 → 0.002 → 0.0005 → 0.0005 (q = 1 transparent under the
+  model). A second test drives `solve_lambda_for_bits` over the
+  *real* stream rate–lambda curve: a halfway byte budget is landed
+  exactly (12 672 / 12 672 bits, `within_budget`), and a tighter
+  budget never receives a smaller lambda.
 - **VQ value-ladder design (`book_design::design_value_ladder`,
   `ValueLadderDesign`)** — the *value*-side half of codebook training
   (the codeword-length half is `design_codeword_lengths`). A
