@@ -443,6 +443,69 @@ reduces to optimal length assignment plus VQ value placement:
   the trained setup header round-trips whole through
   `write_setup_header` → `parse_setup_header` (§4.2.4 carriage).
 
+The **psychoacoustic masking model** (`psy` module) is the encoder's
+what-is-audible layer — clean-room encoder territory (the spec defines
+only decode) built from textbook psychoacoustics over the spec's own
+§6.2.3 Bark scale. `compute_masking` turns one frame's MDCT magnitudes
+into a per-bin linear-amplitude **masking threshold**: 1-Bark
+critical-band analysis, spectral-flatness tonality (the tone-masking-
+noise `14.5 + z` dB vs noise-masking-tone `5.5` dB offset asymmetry),
+asymmetric spreading (−27 dB/Bark down, −10 dB/Bark up) evaluated at
+each bin's *continuous* Bark coordinate (no box-edge cliffs), and the
+standard analytic threshold-in-quiet floor calibrated by
+`PsyConfig::full_scale_db`. Two glue routines drive the encode stack
+from it: `plan_psy_floor_envelope` (a floor-1 envelope target riding
+`max(peak-held |X|, threshold)` — the floor shapes residue noise under
+the masking curve, since the decoder multiplies the residue by the
+floor per §4.3.6) and `residue_partition_weights` (per-partition
+`(floor/threshold)²` noise-to-mask factors on the raw audibility
+scale, each bin capped at a 40 dB excess). The **weighted residue RD
+chooser** (`plan_vector_classifications_rd_weighted` /
+`plan_vector_residue_rd_weighted`) charges `weights[p] · error_sq +
+lambda · bit_cost`, making the Lagrangian an NMR-vs-bits trade;
+all-`1.0` weights reproduce the unweighted chooser bit-for-bit.
+`tests/psy_encode_roundtrip.rs` measures the payoff on a
+tones + borderline-pedestal + ATH-masked-hash spectrum: the psy floor
++ weighted chooser encode 293 B against the naive magnitude-envelope
+encode's 413 B (−29%) at equal transparent NMR; at a rate-starved
+lambda the unweighted chooser drops the tones (NMR 17.3) while the
+weighted one keeps them transparent (NMR 0.0004); the
+`threshold_offset_db` margin sweeps rate 101→293 B against NMR
+0.49→0.0009, monotone.
+
+The **distortion-aware ladder step in the closed training loop**
+(`train_residue_books_rd_ladder`, over
+`residue_encode::replay_partition_cascade`) extends the length-only
+alternating descent to the value books' *reconstruction values*:
+the replay re-walks each planned §8.6.2 cascade deterministically to
+recover the exact target sub-vector every entry quantised, each
+exercised tessellation book's entries move to the centroid of their
+targets (the classic VQ codebook update), re-expressed on a fresh
+§9.2.2-packable grid. Cascade stages interact — a joint update from
+stale targets can regress — so the joint and each single-book
+candidate are evaluated by fresh plan passes and only the best strict
+improvement is adopted: the Lagrangian is monotone non-increasing by
+construction and multi-stage ladders converge stage-by-stage. A ±5
+corpus against a `[-2, 1.5]` seed ladder (unreachable by re-pricing
+alone) at least halves the final Lagrangian.
+
+**Quality targeting** (`quality` module) ties the levers to one
+scalar: `EncoderTuning::from_quality(q ∈ [0, 1])` expands to the
+residue `lambda` (log-linear `1.0 → 10⁻⁴`, pricing bits in
+noise-to-mask units under the weighted chooser), the psy margin
+(−12 → +12 dB) and the floor post budget (8 → 32), monotone by
+construction; `solve_lambda_for_bits` bisects any monotone
+`rate(lambda)` measurement to the cheapest lambda inside a bit
+budget. `tests/quality_rate_curve.rs` measures the whole stack on an
+8-frame stream: rate 488 → 776 → 2264 → 2480 → 2600 B, spectral SNR
+7.2 → 32.8 → 36.4 → 36.9 → 37.3 dB, and mean NMR 5.8 → 0.58 → 0.002 →
+0.0005 → 0.0005 across `q ∈ {0, ¼, ½, ¾, 1}` — monotone in every
+metric, transparent at the top; the budget solver lands the real
+stream's halfway byte budget exactly (12 672 / 12 672 bits), and the
+ladder trainer composes with the psy stack — retraining the seed
+books on the psy targets cuts the stream 2 288 → 1 473 B (−36%) at
+unchanged NMR, the trained setup header §4.2.4 carriage-legal.
+
 Two further integration tests close the encode→decode loop on the residue
 and the time domain. `tests/residue_cascade_roundtrip.rs` drives a real
 signed, non-flat spectral residual through the full residue encode chain
@@ -554,21 +617,21 @@ residue formats now have an end-to-end §4.3 packet round-trip.
   integration test carries a minimal RFC-3533 page de-framer as private
   test scaffolding to feed real `input.ogg` packets to the decoder;
   production Ogg demuxing belongs in `oxideav-ogg`.
-- **Codebook-content design is closed; the ladder is not yet inside the
-  closed loop.** Both previously-named followups — floor-0 value-codebook
-  contents and floor-1 master/sub-book contents — are now closed by the
-  `book_design` training stack (optimal §3.2.1 length assignment +
-  per-subsystem emission tallies + retraining, see above), as is the
-  residue classbook/value-book case and the §3.2.1 VQ value-ladder
-  design. What remains is coupling `design_value_ladder` into
-  `train_residue_books_rd`'s alternating loop: a ladder update changes
-  the *reconstruction values* (not just the codeword prices), so the
-  descent bookkeeping needs a distortion-aware ladder step — plans are
-  no longer bit-identical across it.
-- **No psychoacoustic model** — the encoder's quality levers (transient
-  detection, coupling gates, RD lambdas, envelope smoothing) are signal-
-  driven but there is no masking-threshold model shaping the floor fit
-  or the residue bit allocation perceptually.
+- **Codebook-content design + closed-loop training are closed** —
+  optimal §3.2.1 length assignment, per-subsystem emission tallies,
+  retraining, the §3.2.1 VQ value-ladder design, and (this round) the
+  distortion-aware ladder step inside the alternating RD loop
+  (`train_residue_books_rd_ladder`).
+- **The psy model is per-frame and partition-granular.** Masking has
+  no temporal component (no forward/backward temporal masking — the
+  `blocksize::detect_transient` short-block switch is the only
+  pre-echo control), the tonality estimate is band-level spectral
+  flatness (no phase-predictability tracking), and the perceptual
+  weighting enters the residue chooser per *partition* — the VQ entry
+  selection inside `vq::quantize_vector` is still unweighted
+  Euclidean per read. Stereo coupling decisions
+  (`synthesis::should_couple`) are energy-driven, not yet
+  masking-driven.
 
 ## Clean-room provenance
 
