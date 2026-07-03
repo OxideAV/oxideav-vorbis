@@ -389,6 +389,60 @@ monotone proxy for the per-pole coefficient bit cost). `suggest_floor0_params`
 offers spec-grounded defaults for the surrounding header fields. No reference
 encoder emits floor 0, so fidelity is the crate's own decoder render.
 
+The **codebook content design + training stack** (`book_design` module)
+closes the codebook-*content* followups both floor paths and the residue
+named — a Vorbis codebook's entropy content is fully determined by its
+per-entry codeword-**length** list (§3.2.1's canonical
+lowest-valued-codeword rule implies the codewords), so content design
+reduces to optimal length assignment plus VQ value placement:
+
+- **Optimal codeword lengths** (`design_codeword_lengths` /
+  `_dense`, `stream_cost_bits`) — the classic package-merge
+  (coin-collector) construction for length-limited prefix codes:
+  bit-cost-optimal lengths for a symbol-frequency table under the
+  §3.2.1 constraints (lengths `1..=32`, Kraft sum exactly 1 so the tree
+  is fully populated, sparse `UNUSED_ENTRY` slots, the errata-20150226
+  single-entry book). Pinned against an exhaustive small-case
+  brute-force oracle.
+- **Book assembly + retraining** (`design_entropy_codebook`,
+  `redesign_codebook`, `BookTallies`) — write-ready books from
+  frequencies, and *retraining* an existing book around a measured
+  distribution while preserving its shape and VQ lookup: every entry
+  still unpacks to the identical §3.2.1 vector, so packets referencing
+  the same entry indices decode **bit-identically** while serialising
+  into fewer bits.
+- **Per-subsystem emission tallies** — `tally_floor1_packet` (the
+  §7.2.3 master-cval + sub-book-Y walk, mirroring
+  `write_floor1_packet`'s emission exactly), `tally_residue_plans`
+  (§8.6.2 classwords through the classbook via the writer's own
+  grouping primitive, per-stage entries through the cascade's value
+  books), and `tally_floor0_packet` (the §6.2.2 VQ entry run against
+  the `[booknumber]`-selected book). All commit atomically
+  (`BookTallies::record_all`). Three integration suites
+  (`tests/floor1_trained_books.rs`, `tests/residue_trained_books.rs`,
+  `tests/floor0_trained_books.rs`) pin the shared contract per
+  subsystem: trained books decode the training corpus **bit-identically**
+  while it serialises into **strictly fewer bytes**, stay carriage-legal
+  through the §3.2.1 codebook writer/parser, and the sparse policy
+  prunes + re-plans cleanly.
+- **Closed-loop rate-aware training** (`train_residue_books_rd`) —
+  alternates the §8.6.2 rate-distortion planner (which charges exact
+  codeword lengths in its Lagrangian) with the sparse retrainer;
+  classic alternating minimisation with a provably monotone
+  non-increasing Lagrangian and fixed-point convergence detection.
+- **VQ value-ladder design** (`design_value_ladder`) — the value-side
+  half: 1-D Lloyd centroids for a training-scalar set, snapped to a
+  `value_bits`-wide multiplicand grid whose `minimum` / `delta` are
+  rounded to §9.2.2-packable floats, wrapped as a write-ready
+  tessellation lookup.
+- **Whole-stream capstone** (`tests/trained_stream_roundtrip.rs`) — a
+  20-frame mono PCM corpus through the full §4.3 audio-packet writer,
+  floor + residue emissions tallied together, the entire codebook
+  table retrained in one pass: every retrained §4.3 packet decodes to
+  the bit-identical windowed PCM frame, the audio corpus shrinks, and
+  the trained setup header round-trips whole through
+  `write_setup_header` → `parse_setup_header` (§4.2.4 carriage).
+
 Two further integration tests close the encode→decode loop on the residue
 and the time domain. `tests/residue_cascade_roundtrip.rs` drives a real
 signed, non-flat spectral residual through the full residue encode chain
@@ -500,29 +554,21 @@ residue formats now have an end-to-end §4.3 packet round-trip.
   integration test carries a minimal RFC-3533 page de-framer as private
   test scaffolding to feed real `input.ogg` packets to the decoder;
   production Ogg demuxing belongs in `oxideav-ogg`.
-- **Floor-0 value-codebook *content* design** — the floor-0 per-packet
-  chain (`plan_floor0_packet`) and the setup-header *order* selection
-  (`floor0_layout::select_floor0_order` / `select_floor0_order_rd`, plus the
-  `suggest_floor0_params` defaults for `bark_map_size` / `amplitude_bits` /
-  `amplitude_offset`) are now both closed (see above): a desired envelope
-  picks the LSP order and plans a complete write-ready `Floor0Packet`. What
-  remains is designing the value codebook *contents* — the Huffman
-  bit-allocation that packs the LSP coefficient distribution most compactly,
-  a rate-distortion codebook-design problem. No reference encoder emits floor
-  0 (real-world Vorbis streams use floor 1 exclusively), so this path has no
-  fixture — its fidelity is pinned by self-consistency against the crate's
-  own decoder.
-- **Floor-1 sub-book *content* design** — the floor-1 encode chain
-  (`plan_floor1_packet`) and the setup-header *geometry* design
-  (`floor1_layout::design_floor1_header`: adaptive x-list placement + DP
-  partition tiling + `min_rangebits`) are now both closed (see above): a
-  desired envelope + class catalogue plans a complete write-ready
-  `Floor1Header` and `Floor1Packet`, with neither the post coordinates,
-  partition grouping, `floor1_y`, nor `partition_cvals` supplied by hand.
-  What remains is designing the master/sub codebook *contents* — the Huffman
-  bit-allocation that packs a given amplitude distribution most compactly (a
-  rate-distortion codebook-design problem), the floor-1 analogue of the
-  floor-0 value-codebook followup above.
+- **Codebook-content design is closed; the ladder is not yet inside the
+  closed loop.** Both previously-named followups — floor-0 value-codebook
+  contents and floor-1 master/sub-book contents — are now closed by the
+  `book_design` training stack (optimal §3.2.1 length assignment +
+  per-subsystem emission tallies + retraining, see above), as is the
+  residue classbook/value-book case and the §3.2.1 VQ value-ladder
+  design. What remains is coupling `design_value_ladder` into
+  `train_residue_books_rd`'s alternating loop: a ladder update changes
+  the *reconstruction values* (not just the codeword prices), so the
+  descent bookkeeping needs a distortion-aware ladder step — plans are
+  no longer bit-identical across it.
+- **No psychoacoustic model** — the encoder's quality levers (transient
+  detection, coupling gates, RD lambdas, envelope smoothing) are signal-
+  driven but there is no masking-threshold model shaping the floor fit
+  or the residue bit allocation perceptually.
 
 ## Clean-room provenance
 

@@ -2410,8 +2410,8 @@ All notable changes to `oxideav-vorbis` are recorded here.
   `amplitude = 0` direct `curve_computation` returning the all-zero
   length-`n` vector, the reserved-`booknumber` → `Unused` path, and a
   full packet → `Floor0Curve` end-to-end round trip. Test count: 164
-  total (146 → 164). libvorbis never emits floor 0 (every reference
-  encoder uses floor 1 exclusively) but a conformant Vorbis I decoder
+  total (146 → 164). No real-world encoder emits floor 0 (production
+  encoders use floor 1 exclusively) but a conformant Vorbis I decoder
   must implement the codepath because the spec defines it; this is the
   missing-piece half of the floor decode pipeline (round 9 covered
   floor 1).
