@@ -159,6 +159,25 @@ pub enum ResidueEncodeError {
         /// The underlying quantiser error.
         source: QuantizeError,
     },
+    /// [`replay_partition_cascade`] was given an entry table whose
+    /// shape disagrees with the stage books: a populated stage without
+    /// a book (or vice versa), or a stage entry list whose length is
+    /// not the format's read count.
+    CascadeShapeMismatch {
+        /// The cascade stage (pass) index `0..=7` that disagreed.
+        pass: usize,
+    },
+    /// [`replay_partition_cascade`]: a recorded entry index failed to
+    /// unpack through its stage book (out of range, or the book's
+    /// lookup desyncs its declared shape).
+    Unpack {
+        /// The cascade stage (pass) index `0..=7` whose unpack failed.
+        pass: usize,
+        /// The VQ-read ordinal within the partition that failed.
+        read: usize,
+        /// The underlying unpack error.
+        source: crate::vq::UnpackError,
+    },
     /// [`plan_vector_classifications_rd_weighted`] was given a weight
     /// slice whose length did not match the partition count implied by
     /// `scalars.len() / partition_size`.
@@ -226,6 +245,14 @@ impl core::fmt::Display for ResidueEncodeError {
                 f,
                 "vorbis residue encode: stage-{pass} read-{read} quantise failed: {source}"
             ),
+            ResidueEncodeError::CascadeShapeMismatch { pass } => write!(
+                f,
+                "vorbis residue encode: stage-{pass} entry list and stage book disagree (§8.6.2 replay)"
+            ),
+            ResidueEncodeError::Unpack { pass, read, source } => write!(
+                f,
+                "vorbis residue encode: stage-{pass} read-{read} entry unpack failed: {source}"
+            ),
             ResidueEncodeError::WeightLengthMismatch { expected, actual } => write!(
                 f,
                 "vorbis residue encode: {actual} partition weights supplied for {expected} partitions"
@@ -242,6 +269,7 @@ impl std::error::Error for ResidueEncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ResidueEncodeError::Quantize { source, .. } => Some(source),
+            ResidueEncodeError::Unpack { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -509,6 +537,106 @@ pub fn plan_partition_cascade_scored(
         populated_stages,
         bit_cost,
     })
+}
+
+/// Replay a planned partition cascade (Vorbis I §8.6.2, encode
+/// direction), handing each VQ read's **target sub-vector** and chosen
+/// entry to `sink` — the training-side inverse of
+/// [`plan_partition_cascade`].
+///
+/// [`plan_partition_cascade`] chooses the entries and discards the
+/// per-read targets it quantised. Value-side codebook training (the
+/// distortion-aware ladder step in
+/// [`crate::book_design::train_residue_books_rd_ladder`]) needs those
+/// targets back: an entry's ideal reconstruction is the centroid of
+/// the sub-vectors that selected it. Because the cascade is
+/// deterministic given the entry lists, the targets can be recovered
+/// exactly — this routine re-walks the cascade in the write direction,
+/// gathering each read's target from the running residual at the
+/// format's addressing positions (§8.6.3 strided / §8.6.4 contiguous,
+/// out-of-range tail elements as `0.0`, exactly as the planner
+/// targeted them), calling `sink(pass, entry, target)`, then
+/// subtracting the **recorded** entry's §3.2.1 reconstruction before
+/// the next stage.
+///
+/// Replaying the entry lists [`plan_partition_cascade`] just produced,
+/// against the same books, visits the identical `(pass, entry,
+/// target)` triples the planner quantised.
+///
+/// # Errors
+///
+/// The shared cascade validation of [`plan_partition_cascade`], plus
+/// [`ResidueEncodeError::CascadeShapeMismatch`] when `entries` and
+/// `stage_books` disagree (a populated stage without a book, a book
+/// without an entry list, or a wrong-length entry list) and
+/// [`ResidueEncodeError::Unpack`] when a recorded entry fails to
+/// unpack through its stage book.
+pub fn replay_partition_cascade<F>(
+    residual: &[f32],
+    entries: &[Option<Vec<u32>>; 8],
+    stage_books: &[Option<&VorbisCodebook>; 8],
+    residue_type: u16,
+    partition_size: u32,
+    mut sink: F,
+) -> Result<(), ResidueEncodeError>
+where
+    F: FnMut(usize, u32, &[f32]),
+{
+    if residue_type > 2 {
+        return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
+    }
+    if partition_size == 0 {
+        return Err(ResidueEncodeError::ZeroPartitionSize);
+    }
+    if residual.len() != partition_size as usize {
+        return Err(ResidueEncodeError::ResidualLengthMismatch {
+            expected: partition_size as usize,
+            actual: residual.len(),
+        });
+    }
+
+    let n = partition_size as usize;
+    let mut work = residual.to_vec();
+
+    for (pass, (slot, entry_slot)) in stage_books.iter().zip(entries.iter()).enumerate() {
+        let (book, entry_list) = match (slot, entry_slot) {
+            (Some(book), Some(list)) => (book, list),
+            (None, None) => continue,
+            _ => return Err(ResidueEncodeError::CascadeShapeMismatch { pass }),
+        };
+
+        let dims = book.dimensions as usize;
+        if dims == 0 {
+            return Err(ResidueEncodeError::ZeroDimensions { pass });
+        }
+        if matches!(book.lookup, VqLookup::None) {
+            return Err(ResidueEncodeError::ScalarValueBook { pass });
+        }
+        let reads = partition_reads(residue_type, partition_size, book.dimensions, pass)?;
+        if entry_list.len() != reads {
+            return Err(ResidueEncodeError::CascadeShapeMismatch { pass });
+        }
+        let step = if residue_type == 0 { n / dims } else { 0 };
+
+        let mut target = vec![0.0f32; dims];
+        for (read, &entry) in entry_list.iter().enumerate() {
+            for (j, t) in target.iter_mut().enumerate() {
+                *t = match gather_index(residue_type, read, j, step, dims, n) {
+                    Some(idx) => work[idx],
+                    None => 0.0,
+                };
+            }
+            let recon = crate::vq::unpack_vector(book, entry)
+                .map_err(|source| ResidueEncodeError::Unpack { pass, read, source })?;
+            sink(pass, entry, &target);
+            for (j, &r) in recon.iter().enumerate() {
+                if let Some(idx) = gather_index(residue_type, read, j, step, dims, n) {
+                    work[idx] -= r;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Plan the `partition_entries` field of a full decode vector's
@@ -2009,6 +2137,116 @@ mod tests {
             nan,
             Err(ResidueEncodeError::BadWeight { partition: 0, value }) if value.is_nan()
         ));
+    }
+
+    // ---------- cascade replay ----------
+
+    /// Replaying the entries a plan just chose visits the identical
+    /// `(pass, entry, target)` triples the planner quantised: stage-0
+    /// targets are the raw residual chunks, stage-1 targets the
+    /// leftover after subtracting stage-0's reconstruction.
+    #[test]
+    fn replay_reproduces_the_planned_targets() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&coarse);
+        row[1] = Some(&fine);
+        let residual = vec![3.0f32, 3.0, 5.0, 1.0];
+
+        let planned = plan_partition_cascade(&residual, &row, 1, 4).unwrap();
+
+        let mut seen: Vec<(usize, u32, Vec<f32>)> = Vec::new();
+        replay_partition_cascade(&residual, &planned, &row, 1, 4, |pass, entry, target| {
+            seen.push((pass, entry, target.to_vec()));
+        })
+        .unwrap();
+
+        // 2 reads per stage × 2 stages.
+        assert_eq!(seen.len(), 4);
+        // Stage 0 first, in read order, with the raw residual targets.
+        assert_eq!(seen[0].0, 0);
+        assert_eq!(seen[0].2, vec![3.0, 3.0]);
+        assert_eq!(seen[1].0, 0);
+        assert_eq!(seen[1].2, vec![5.0, 1.0]);
+        // The recorded entries are exactly the planned ones.
+        let planned0 = planned[0].as_ref().unwrap();
+        let planned1 = planned[1].as_ref().unwrap();
+        assert_eq!(seen[0].1, planned0[0]);
+        assert_eq!(seen[1].1, planned0[1]);
+        assert_eq!(seen[2].1, planned1[0]);
+        assert_eq!(seen[3].1, planned1[1]);
+        // Stage-1 targets are the leftover after stage-0's recon.
+        let recon0 = unpack_vector(&coarse, planned0[0]).unwrap();
+        let recon1 = unpack_vector(&coarse, planned0[1]).unwrap();
+        assert_eq!(
+            seen[2].2,
+            vec![3.0 - recon0[0], 3.0 - recon0[1]],
+            "stage-1 read 0"
+        );
+        assert_eq!(
+            seen[3].2,
+            vec![5.0 - recon1[0], 1.0 - recon1[1]],
+            "stage-1 read 1"
+        );
+    }
+
+    /// Shape disagreements between the entry table and the stage books
+    /// are refused, as is an entry that cannot unpack.
+    #[test]
+    fn replay_rejects_shape_and_unpack_mismatches() {
+        let (coarse, _) = coarse_fine_books();
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&coarse);
+
+        // The stage-0 book has no entry list (and pass 1 has an entry
+        // list without a book — the walk trips on pass 0 first).
+        let mut orphan: [Option<Vec<u32>>; 8] = Default::default();
+        orphan[1] = Some(vec![0]);
+        let err = replay_partition_cascade(&[1.0; 4], &orphan, &row, 1, 4, |_, _, _| {});
+        assert_eq!(
+            err,
+            Err(ResidueEncodeError::CascadeShapeMismatch { pass: 0 }),
+            "book at pass 0 has no entry list"
+        );
+
+        // Wrong-length entry list (needs 2 reads for dims 2 over 4).
+        let mut short: [Option<Vec<u32>>; 8] = Default::default();
+        short[0] = Some(vec![0]);
+        assert_eq!(
+            replay_partition_cascade(&[1.0; 4], &short, &row, 1, 4, |_, _, _| {}),
+            Err(ResidueEncodeError::CascadeShapeMismatch { pass: 0 })
+        );
+
+        // Out-of-range entry index fails to unpack.
+        let mut oob: [Option<Vec<u32>>; 8] = Default::default();
+        oob[0] = Some(vec![99, 0]);
+        assert!(matches!(
+            replay_partition_cascade(&[1.0; 4], &oob, &row, 1, 4, |_, _, _| {}),
+            Err(ResidueEncodeError::Unpack {
+                pass: 0,
+                read: 0,
+                ..
+            })
+        ));
+    }
+
+    /// A format-0 replay gathers with the strided addressing — the
+    /// stage-0 targets interleave the residual exactly as the planner
+    /// gathered it.
+    #[test]
+    fn replay_uses_format0_strided_addressing() {
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        // n = 4, dims = 2 → step = 2: read i gathers [i, i+2].
+        let residual = vec![0.0f32, 1.0, 2.0, 3.0];
+        let planned = plan_partition_cascade(&residual, &row, 0, 4).unwrap();
+        let mut targets: Vec<Vec<f32>> = Vec::new();
+        replay_partition_cascade(&residual, &planned, &row, 0, 4, |_, _, t| {
+            targets.push(t.to_vec());
+        })
+        .unwrap();
+        assert_eq!(targets, vec![vec![0.0, 2.0], vec![1.0, 3.0]]);
     }
 
     #[test]

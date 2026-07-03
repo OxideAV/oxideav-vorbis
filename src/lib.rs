@@ -192,7 +192,8 @@ pub use blocksize::{choose_blocksize, detect_transient, BlocksizeError, Transien
 pub use book_design::{
     design_codeword_lengths, design_codeword_lengths_dense, design_entropy_codebook,
     design_value_ladder, redesign_codebook, stream_cost_bits, tally_floor0_packet,
-    tally_floor1_packet, tally_residue_plans, train_residue_books_rd, BookDesignError, BookTallies,
+    tally_floor1_packet, tally_residue_plans, train_residue_books_rd,
+    train_residue_books_rd_ladder, BookDesignError, BookTallies, ResidueLadderTrainingOutcome,
     ResidueRdTrainingOutcome, ValueLadderDesign, MAX_CODEWORD_LEN,
 };
 pub use channel_order::{speaker_at, speaker_layout, Speaker};
@@ -264,9 +265,9 @@ pub use residue_encode::{
     plan_partition_cascade, plan_partition_cascade_scored, plan_vector_classifications,
     plan_vector_classifications_rd, plan_vector_classifications_rd_weighted,
     plan_vector_partition_entries, plan_vector_residue, plan_vector_residue_rd,
-    plan_vector_residue_rd_weighted, select_residue_config, PartitionClassChoice,
-    ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade, ScoredVectorResidue,
-    SelectedResidueConfig,
+    plan_vector_residue_rd_weighted, replay_partition_cascade, select_residue_config,
+    PartitionClassChoice, ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade,
+    ScoredVectorResidue, SelectedResidueConfig,
 };
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,

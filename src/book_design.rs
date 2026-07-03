@@ -1040,44 +1040,8 @@ pub fn train_residue_books_rd(
     let mut converged = false;
 
     for _ in 0..max_iterations {
-        // Resolve the per-class value-book rows against the current
-        // book table (§8.6.1's books[class][pass] indirection).
-        let mut rows: Vec<[Option<&VorbisCodebook>; 8]> = Vec::with_capacity(header.books.len());
-        for row in &header.books {
-            let mut resolved: [Option<&VorbisCodebook>; 8] = Default::default();
-            for (pass, slot) in row.iter().enumerate() {
-                if let Some(book) = slot {
-                    resolved[pass] = Some(books.get(*book as usize).ok_or(
-                        BookDesignError::BookIndexOutOfRange {
-                            book: *book as usize,
-                            books: books.len(),
-                        },
-                    )?);
-                }
-            }
-            rows.push(resolved);
-        }
-
         // Plan step: rate-distortion planning under the current books.
-        let mut plans: Vec<crate::encoder::ResidueVectorPlan> = Vec::with_capacity(residuals.len());
-        let mut lagrangian = 0.0f64;
-        let mut value_bits = 0u64;
-        for residual in residuals {
-            let scored = crate::residue_encode::plan_vector_residue_rd(
-                residual,
-                &rows,
-                header.residue_type,
-                header.partition_size,
-                lambda,
-            )
-            .map_err(BookDesignError::ResidueEncode)?;
-            lagrangian += scored.total_error_sq + lambda * scored.total_value_bits as f64;
-            value_bits += scored.total_value_bits;
-            plans.push(crate::encoder::ResidueVectorPlan {
-                classifications: scored.classifications,
-                partition_entries: scored.partition_entries,
-            });
-        }
+        let (plans, lagrangian, value_bits) = plan_corpus(residuals, header, &books, lambda)?;
 
         // Measure the classword bits of these plans under the current
         // classbook (the tally routes classwords through it, so the
@@ -1112,6 +1076,435 @@ pub fn train_residue_books_rd(
         lagrangian_per_iteration: lagrangians,
         total_bits_per_iteration: totals,
         converged,
+    })
+}
+
+/// The outcome of a [`train_residue_books_rd_ladder`] closed-loop
+/// training run — [`ResidueRdTrainingOutcome`] extended with the
+/// ladder-step bookkeeping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidueLadderTrainingOutcome {
+    /// The trained codebook table (index-aligned with the input).
+    /// Value books the ladder step touched carry **new reconstruction
+    /// values**, so — unlike [`train_residue_books_rd`] — packets
+    /// planned under earlier iterations are *not* bit-identical under
+    /// the final books; the final [`Self::plans`] are the matching
+    /// plan set.
+    pub codebooks: Vec<VorbisCodebook>,
+    /// The final per-corpus-vector plans, chosen by the
+    /// rate-distortion planner under [`Self::codebooks`].
+    pub plans: Vec<crate::encoder::ResidueVectorPlan>,
+    /// Per iteration: the corpus Lagrangian
+    /// `Σ error_sq + lambda · value_bits`, measured at the plan step
+    /// under that iteration's books. Monotone non-increasing: the
+    /// plan and length-retrain steps descend as in
+    /// [`train_residue_books_rd`], and the ladder step is
+    /// accept-if-improved (a candidate that does not lower the
+    /// re-planned Lagrangian is discarded).
+    pub lagrangian_per_iteration: Vec<f64>,
+    /// Per iteration: the corpus' total codeword bits (value
+    /// codewords plus classwords) under that iteration's books.
+    pub total_bits_per_iteration: Vec<u64>,
+    /// `true` if the loop stopped at a plan fixed point.
+    pub converged: bool,
+    /// How many iterations' ladder candidates were adopted (they
+    /// lowered, or matched, the re-planned Lagrangian).
+    pub ladder_updates_accepted: usize,
+    /// How many iterations' ladder candidates were discarded.
+    pub ladder_updates_rejected: usize,
+}
+
+/// One corpus plan pass: rate-distortion plans for every residual
+/// under the given books, plus the summed Lagrangian
+/// `Σ error_sq + lambda · value_bits` and the value-bit total.
+type CorpusPlan = (Vec<crate::encoder::ResidueVectorPlan>, f64, u64);
+
+fn plan_corpus(
+    residuals: &[Vec<f32>],
+    header: &crate::setup::ResidueHeader,
+    books: &[VorbisCodebook],
+    lambda: f64,
+) -> Result<CorpusPlan, BookDesignError> {
+    // Resolve the per-class value-book rows against the book table
+    // (§8.6.1's books[class][pass] indirection).
+    let mut rows: Vec<[Option<&VorbisCodebook>; 8]> = Vec::with_capacity(header.books.len());
+    for row in &header.books {
+        let mut resolved: [Option<&VorbisCodebook>; 8] = Default::default();
+        for (pass, slot) in row.iter().enumerate() {
+            if let Some(book) = slot {
+                resolved[pass] = Some(books.get(*book as usize).ok_or(
+                    BookDesignError::BookIndexOutOfRange {
+                        book: *book as usize,
+                        books: books.len(),
+                    },
+                )?);
+            }
+        }
+        rows.push(resolved);
+    }
+
+    let mut plans = Vec::with_capacity(residuals.len());
+    let mut lagrangian = 0.0f64;
+    let mut value_bits = 0u64;
+    for residual in residuals {
+        let scored = crate::residue_encode::plan_vector_residue_rd(
+            residual,
+            &rows,
+            header.residue_type,
+            header.partition_size,
+            lambda,
+        )
+        .map_err(BookDesignError::ResidueEncode)?;
+        lagrangian += scored.total_error_sq + lambda * scored.total_value_bits as f64;
+        value_bits += scored.total_value_bits;
+        plans.push(crate::encoder::ResidueVectorPlan {
+            classifications: scored.classifications,
+            partition_entries: scored.partition_entries,
+        });
+    }
+    Ok((plans, lagrangian, value_bits))
+}
+
+/// Build the ladder-update candidate: for every tessellation value
+/// book the plans exercised, move each entry's reconstruction vector
+/// to the **centroid of the target sub-vectors that selected it**
+/// (recovered exactly by [`crate::residue_encode::replay_partition_cascade`]),
+/// then re-express every entry on a fresh §9.2.2-packable
+/// `minimum/delta` grid at the book's `value_bits`. Entries the corpus
+/// never selected keep their old values (snapped to the new grid);
+/// `sequence_p` books and lattice (lookup-type-1) books are left
+/// untouched — their per-entry values are not independently free.
+fn ladder_update_candidate(
+    books: &[VorbisCodebook],
+    plans: &[crate::encoder::ResidueVectorPlan],
+    residuals: &[Vec<f32>],
+    header: &crate::setup::ResidueHeader,
+) -> Result<Vec<VorbisCodebook>, BookDesignError> {
+    let ps = header.partition_size as usize;
+
+    // Per-book accumulation: (Σ target per entry-component, count per entry).
+    let mut acc: Vec<Option<(Vec<f64>, Vec<u64>)>> = books.iter().map(|_| None).collect();
+
+    for (plan, residual) in plans.iter().zip(residuals) {
+        if plan.classifications.is_empty() && plan.partition_entries.is_empty() {
+            continue;
+        }
+        if plan.partition_entries.len() != plan.classifications.len() {
+            return Err(BookDesignError::ResiduePlanShapeMismatch {
+                classifications: plan.classifications.len(),
+                partition_entries: plan.partition_entries.len(),
+            });
+        }
+        let need = plan.classifications.len() * ps;
+        if residual.len() != need {
+            return Err(BookDesignError::ResidueEncode(
+                crate::residue_encode::ResidueEncodeError::ResidualLengthMismatch {
+                    expected: need,
+                    actual: residual.len(),
+                },
+            ));
+        }
+
+        for (p, (&class, stages)) in plan
+            .classifications
+            .iter()
+            .zip(plan.partition_entries.iter())
+            .enumerate()
+        {
+            // A classification with no configured row decodes nothing
+            // (mirrors the planner's padding of short book tables).
+            let row = header.books.get(class as usize);
+            let mut stage_books: [Option<&VorbisCodebook>; 8] = [None; 8];
+            let mut stage_idx: [usize; 8] = [usize::MAX; 8];
+            if let Some(row) = row {
+                for (pass, slot) in row.iter().enumerate() {
+                    if let Some(book) = slot {
+                        stage_books[pass] = Some(books.get(*book as usize).ok_or(
+                            BookDesignError::BookIndexOutOfRange {
+                                book: *book as usize,
+                                books: books.len(),
+                            },
+                        )?);
+                        stage_idx[pass] = *book as usize;
+                    }
+                }
+            }
+            let scalars = &residual[p * ps..(p + 1) * ps];
+            crate::residue_encode::replay_partition_cascade(
+                scalars,
+                stages,
+                &stage_books,
+                header.residue_type,
+                header.partition_size,
+                |pass, entry, target| {
+                    // replay only reports populated stages, so the
+                    // index is always resolved.
+                    let idx = stage_idx[pass];
+                    let book = &books[idx];
+                    let dims = book.dimensions as usize;
+                    let (sums, counts) = acc[idx].get_or_insert_with(|| {
+                        (
+                            vec![0.0f64; book.entries as usize * dims],
+                            vec![0u64; book.entries as usize],
+                        )
+                    });
+                    let base = entry as usize * dims;
+                    for (d, &t) in target.iter().enumerate() {
+                        sums[base + d] += f64::from(t);
+                    }
+                    counts[entry as usize] += 1;
+                },
+            )
+            .map_err(BookDesignError::ResidueEncode)?;
+        }
+    }
+
+    // Rebuild each exercised tessellation book around its centroids.
+    let mut out = books.to_vec();
+    for (idx, cell) in acc.iter().enumerate() {
+        let Some((sums, counts)) = cell else { continue };
+        let book = &books[idx];
+        let VqLookup::Tessellation {
+            minimum_value,
+            delta_value,
+            value_bits,
+            sequence_p,
+            multiplicands,
+        } = &book.lookup
+        else {
+            continue;
+        };
+        if *sequence_p {
+            continue;
+        }
+        let dims = book.dimensions as usize;
+        let entries = book.entries as usize;
+        if multiplicands.len() != entries * dims {
+            continue; // malformed hand-built book: leave untouched
+        }
+
+        // Desired per-component values: centroids where observed, the
+        // old decoded values elsewhere (unused entries keep meaning).
+        let mut values = vec![0.0f64; entries * dims];
+        for e in 0..entries {
+            for d in 0..dims {
+                values[e * dims + d] = if counts[e] > 0 {
+                    sums[e * dims + d] / counts[e] as f64
+                } else {
+                    f64::from(multiplicands[e * dims + d]) * f64::from(*delta_value)
+                        + f64::from(*minimum_value)
+                };
+            }
+        }
+
+        // Snap onto a fresh packable grid spanning the value range.
+        let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let addressable = 1u64 << *value_bits;
+        let (new_min, new_delta) = if hi - lo <= 0.0 {
+            (pack_nearest(lo as f32), 0.0f32)
+        } else {
+            let raw = ((hi - lo) / (addressable - 1) as f64) as f32;
+            (
+                pack_nearest(lo as f32),
+                pack_nearest(raw).max(f32::MIN_POSITIVE),
+            )
+        };
+        let new_mults: Vec<u32> = values
+            .iter()
+            .map(|&v| {
+                if new_delta == 0.0 {
+                    0
+                } else {
+                    let m = ((v - f64::from(new_min)) / f64::from(new_delta)).round();
+                    (m.max(0.0) as u64).min(addressable - 1) as u32
+                }
+            })
+            .collect();
+        out[idx].lookup = VqLookup::Tessellation {
+            minimum_value: new_min,
+            delta_value: new_delta,
+            value_bits: *value_bits,
+            sequence_p: false,
+            multiplicands: new_mults,
+        };
+    }
+    Ok(out)
+}
+
+/// Closed-loop rate-aware residue book training with a
+/// **distortion-aware value-ladder step**: the
+/// [`train_residue_books_rd`] alternating descent extended to update
+/// the value books' *reconstruction values*, not just their codeword
+/// prices.
+///
+/// The length-only trainer holds every book's VQ lookup fixed — a
+/// deliberate invariant (old plans decode bit-identically) that also
+/// caps how far the descent can go: if the initial ladder does not
+/// span the corpus (or wastes rungs where no residual ever lands), no
+/// amount of re-pricing helps. This trainer adds, per iteration, a
+/// third step:
+///
+/// 1. **plan** — rate-distortion plans under the current books
+///    (identical to [`train_residue_books_rd`]);
+/// 2. **length retrain** — optimal sparse codeword lengths for the
+///    plans' emission statistics (identical);
+/// 3. **ladder step** — each exercised tessellation value book's
+///    entries move to the centroid of the target sub-vectors that
+///    chose them (the classic VQ codebook update, targets recovered
+///    exactly by [`crate::residue_encode::replay_partition_cascade`]),
+///    snapped to a fresh §9.2.2-packable grid. Because new values
+///    change every subsequent plan — and because cascade stages
+///    interact (improving an early stage shrinks a later stage's
+///    targets, so a joint update from stale targets can regress) —
+///    the step is **accept-if-improved over candidates**: the joint
+///    update and each single-book update are each evaluated by a
+///    fresh plan pass, and the best *strict* improvement over the
+///    length-retrained books is adopted (none ⇒ the values stay). The
+///    recorded Lagrangian is therefore monotone non-increasing
+///    whether or not any candidate is accepted, and multi-stage
+///    ladders converge stage-by-stage against re-derived targets.
+///
+/// Unlike the length-only trainer, an adopted ladder step changes
+/// reconstruction values, so earlier packets are **not** bit-identical
+/// under the final books — the final [`ResidueLadderTrainingOutcome::plans`]
+/// are the matching plan set to serialise. `sequence_p` and lattice
+/// books are never touched (their entry values are not independently
+/// free); books the corpus never exercises are unchanged.
+///
+/// # Errors
+///
+/// As [`train_residue_books_rd`]: [`BookDesignError::ZeroIterations`],
+/// a book index outside the table, or any planner/tally error.
+pub fn train_residue_books_rd_ladder(
+    residuals: &[Vec<f32>],
+    header: &crate::setup::ResidueHeader,
+    codebooks: &[VorbisCodebook],
+    lambda: f64,
+    max_iterations: usize,
+) -> Result<ResidueLadderTrainingOutcome, BookDesignError> {
+    if max_iterations == 0 {
+        return Err(BookDesignError::ZeroIterations);
+    }
+    let classbook_idx = header.classbook as usize;
+
+    let mut books: Vec<VorbisCodebook> = codebooks.to_vec();
+    let mut prev_plans: Option<Vec<crate::encoder::ResidueVectorPlan>> = None;
+    let mut carried: Option<CorpusPlan> = None;
+    let mut lagrangians: Vec<f64> = Vec::new();
+    let mut totals: Vec<u64> = Vec::new();
+    let mut converged = false;
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+
+    for _ in 0..max_iterations {
+        // Plan step (reusing the evaluation pass that chose the
+        // current books, when one exists).
+        let (plans, lagrangian, value_bits) = match carried.take() {
+            Some(t) => t,
+            None => plan_corpus(residuals, header, &books, lambda)?,
+        };
+
+        // Measure the classword bits under the current classbook.
+        let mut tallies = BookTallies::new(&books);
+        tally_residue_plans(&mut tallies, &plans, header, &books)?;
+        let classword_bits = tallies
+            .counts(classbook_idx)
+            .map(|freqs| stream_cost_bits(&books[classbook_idx].codeword_lengths, freqs))
+            .transpose()?
+            .unwrap_or(0);
+        lagrangians.push(lagrangian);
+        totals.push(value_bits + classword_bits);
+
+        // Fixed point: identical plans re-tally to identical
+        // frequencies and identical centroids.
+        if prev_plans.as_ref() == Some(&plans) {
+            converged = true;
+            prev_plans = Some(plans);
+            break;
+        }
+
+        // Length retrain (sparse — exactly optimal for the plans).
+        let books_len = tallies.retrain(&books, MAX_CODEWORD_LEN, false)?;
+        // Ladder candidate values from the same plans. The length
+        // retrain preserves every lookup, so the replayed
+        // reconstructions are exactly the ones the plans were made
+        // against.
+        let books_ladder = ladder_update_candidate(&books_len, &plans, residuals, header)?;
+        let touched: Vec<usize> = (0..books_len.len())
+            .filter(|&i| books_ladder[i].lookup != books_len[i].lookup)
+            .collect();
+
+        // Accept-if-improved, evaluated by fresh plan passes. Cascade
+        // stages interact — improving an early stage shrinks a later
+        // stage's targets, so a joint update computed from the *old*
+        // targets can regress even when each book's own move is sound.
+        // Try the joint candidate AND each single-book candidate; keep
+        // the best strict improvement over the length-only books (the
+        // remaining books catch up on later iterations, against
+        // re-derived targets).
+        let eval_len = plan_corpus(residuals, header, &books_len, lambda)?;
+        let mut best_books = books_len;
+        let mut best_eval = eval_len;
+        let mut adopted = false;
+        let consider = |cand: Vec<VorbisCodebook>,
+                        best_books: &mut Vec<VorbisCodebook>,
+                        best_eval: &mut CorpusPlan,
+                        adopted: &mut bool|
+         -> Result<(), BookDesignError> {
+            let eval = plan_corpus(residuals, header, &cand, lambda)?;
+            if eval.1 < best_eval.1 {
+                *best_books = cand;
+                *best_eval = eval;
+                *adopted = true;
+            }
+            Ok(())
+        };
+        if touched.len() > 1 {
+            consider(
+                books_ladder.clone(),
+                &mut best_books,
+                &mut best_eval,
+                &mut adopted,
+            )?;
+        }
+        for &i in &touched {
+            let mut single = best_books.clone();
+            // Candidate: only book `i`'s values move (relative to the
+            // length-retrained table the loop otherwise keeps).
+            single[i] = books_ladder[i].clone();
+            if single[i].lookup == best_books[i].lookup {
+                continue; // already adopted via the joint candidate
+            }
+            consider(single, &mut best_books, &mut best_eval, &mut adopted)?;
+        }
+        if adopted {
+            accepted += 1;
+        } else {
+            rejected += 1;
+        }
+        books = best_books;
+        carried = Some(best_eval);
+        prev_plans = Some(plans);
+    }
+
+    // On convergence the last measured plans were planned under the
+    // final books (no update ran after them). On a max_iterations
+    // stop, the winner's evaluation pass — planned under the final
+    // (possibly ladder-updated) books — is the matching set.
+    let final_plans = match carried {
+        Some((plans, _, _)) if !converged => plans,
+        _ => prev_plans.expect("max_iterations >= 1 ran at least one plan pass"),
+    };
+
+    Ok(ResidueLadderTrainingOutcome {
+        codebooks: books,
+        plans: final_plans,
+        lagrangian_per_iteration: lagrangians,
+        total_bits_per_iteration: totals,
+        converged,
+        ladder_updates_accepted: accepted,
+        ladder_updates_rejected: rejected,
     })
 }
 
@@ -2464,6 +2857,176 @@ mod tests {
             );
         }
         assert_eq!(outcome.plans.len(), residuals.len());
+    }
+
+    // ----------------------------------------------------------------
+    // train_residue_books_rd_ladder — the distortion-aware value step.
+    // ----------------------------------------------------------------
+
+    /// VQ-capable variant of the residue tally books: dim-1 8-entry
+    /// tessellation value books whose ladder spans `[-2, 1.5]`.
+    fn ladder_test_books() -> Vec<VorbisCodebook> {
+        let mut books = residue_tally_books();
+        for book in books.iter_mut().skip(1) {
+            book.lookup = VqLookup::Tessellation {
+                minimum_value: -2.0,
+                delta_value: 0.5,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: (0..book.entries).collect(),
+            };
+        }
+        books
+    }
+
+    /// A corpus whose residuals cluster at ±5 — far outside the seed
+    /// ladder's `[-2, 1.5]` span. Length-only retraining can never
+    /// reach them (it must not move reconstruction values); the ladder
+    /// step must, cutting the corpus distortion decisively.
+    #[test]
+    fn ladder_training_fixes_a_mismatched_ladder() {
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        let residuals: Vec<Vec<f32>> = (0..6)
+            .map(|k| {
+                (0..16)
+                    .map(|i| {
+                        let sign = if (i + k) % 2 == 0 { 1.0f32 } else { -1.0 };
+                        sign * (5.0 + 0.02 * ((i * 7 + k) % 5) as f32)
+                    })
+                    .collect()
+            })
+            .collect();
+        let lambda = 0.25;
+
+        let length_only =
+            train_residue_books_rd(&residuals, &header, &books, lambda, 12).expect("trains");
+        let with_ladder =
+            train_residue_books_rd_ladder(&residuals, &header, &books, lambda, 12).expect("trains");
+
+        // The ladder trainer descends monotonically…
+        for w in with_ladder.lagrangian_per_iteration.windows(2) {
+            assert!(
+                w[1] <= w[0] + 1e-9,
+                "Lagrangian must never rise: {:?}",
+                with_ladder.lagrangian_per_iteration
+            );
+        }
+        // …accepts at least one value update…
+        assert!(
+            with_ladder.ladder_updates_accepted >= 1,
+            "a mismatched ladder must be updated (accepted {}, rejected {})",
+            with_ladder.ladder_updates_accepted,
+            with_ladder.ladder_updates_rejected
+        );
+        // …and lands far below what re-pricing alone can reach.
+        let final_len = *length_only.lagrangian_per_iteration.last().unwrap();
+        let final_ladder = *with_ladder.lagrangian_per_iteration.last().unwrap();
+        assert!(
+            final_ladder < 0.5 * final_len,
+            "ladder {final_ladder} must decisively beat length-only {final_len}"
+        );
+    }
+
+    /// The final books stay §3.2.1 carriage-legal after value updates:
+    /// every trained book (skipping never-emitted sparse books that
+    /// retrain to all-unused) serialises through `write_codebook` and
+    /// parses back field-for-field, and the final plans replay against
+    /// the final books (shape-consistent entry lists).
+    #[test]
+    fn ladder_trained_books_stay_carriage_legal() {
+        use crate::encoder::write_codebook;
+        use oxideav_core::bits::BitReaderLsb;
+
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        let residuals: Vec<Vec<f32>> = (0..4)
+            .map(|k| (0..16).map(|i| ((i + k) % 7) as f32 - 3.0).collect())
+            .collect();
+        let outcome =
+            train_residue_books_rd_ladder(&residuals, &header, &books, 0.25, 8).expect("trains");
+
+        for (i, book) in outcome.codebooks.iter().enumerate() {
+            if book.codeword_lengths.iter().all(|&l| l == UNUSED_ENTRY) {
+                continue; // never-emitted → no carriage to check
+            }
+            let bytes = write_codebook(book).unwrap_or_else(|e| panic!("book {i} writes: {e}"));
+            let mut reader = BitReaderLsb::new(&bytes);
+            let parsed =
+                crate::codebook::parse_codebook(&mut reader).expect("trained book parses back");
+            assert_eq!(&parsed, book, "book {i} round-trips");
+        }
+
+        // The stored plans belong to the final books: replaying each
+        // partition's cascade against them succeeds shape-exactly.
+        for (plan, residual) in outcome.plans.iter().zip(&residuals) {
+            for (p, (&class, stages)) in plan
+                .classifications
+                .iter()
+                .zip(plan.partition_entries.iter())
+                .enumerate()
+            {
+                let mut stage_books: [Option<&VorbisCodebook>; 8] = [None; 8];
+                if let Some(row) = header.books.get(class as usize) {
+                    for (pass, slot) in row.iter().enumerate() {
+                        if let Some(b) = slot {
+                            stage_books[pass] = Some(&outcome.codebooks[*b as usize]);
+                        }
+                    }
+                }
+                let ps = header.partition_size as usize;
+                crate::residue_encode::replay_partition_cascade(
+                    &residual[p * ps..(p + 1) * ps],
+                    stages,
+                    &stage_books,
+                    header.residue_type,
+                    header.partition_size,
+                    |_, _, _| {},
+                )
+                .expect("final plans replay against final books");
+            }
+        }
+    }
+
+    /// When the seed ladder already carries the corpus exactly, the
+    /// value step has nothing to win: the trainer converges and its
+    /// final Lagrangian matches the length-only trainer's.
+    #[test]
+    fn ladder_training_matches_length_only_on_an_ideal_ladder() {
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        // Residual values drawn exactly from the ladder rungs.
+        let residuals: Vec<Vec<f32>> = (0..4)
+            .map(|k| (0..16).map(|i| -2.0 + 0.5 * ((i + k) % 8) as f32).collect())
+            .collect();
+        let lambda = 0.25;
+        let length_only =
+            train_residue_books_rd(&residuals, &header, &books, lambda, 8).expect("trains");
+        let with_ladder =
+            train_residue_books_rd_ladder(&residuals, &header, &books, lambda, 8).expect("trains");
+        assert!(with_ladder.converged, "ideal corpus reaches a fixed point");
+        let a = *length_only.lagrangian_per_iteration.last().unwrap();
+        let b = *with_ladder.lagrangian_per_iteration.last().unwrap();
+        assert!(
+            (a - b).abs() <= 1e-9 * a.abs().max(1.0),
+            "ideal ladder: length-only {a} vs ladder {b} must agree"
+        );
+    }
+
+    /// Guards mirror the length-only trainer's.
+    #[test]
+    fn ladder_training_guards() {
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        let residuals = vec![vec![0.25f32; 16]];
+        assert_eq!(
+            train_residue_books_rd_ladder(&residuals, &header, &books, 0.5, 0),
+            Err(BookDesignError::ZeroIterations)
+        );
+        assert!(matches!(
+            train_residue_books_rd_ladder(&residuals, &header, &books, f64::NAN, 2),
+            Err(BookDesignError::ResidueEncode(_))
+        ));
     }
 
     // ----------------------------------------------------------------

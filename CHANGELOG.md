@@ -50,6 +50,32 @@ All notable changes to `oxideav-vorbis` are recorded here.
   totals), the weight-buys-density flip at fixed lambda, the
   zero-weight cheapest-cascade rule, per-partition weight
   independence, and the guard surface. Re-exported at the crate root.
+- **Distortion-aware value-ladder step in the closed RD training loop
+  (`book_design::train_residue_books_rd_ladder`,
+  `residue_encode::replay_partition_cascade`)** — closes the README's
+  "ladder is not yet inside the closed loop" followup. The
+  length-only trainer holds every VQ lookup fixed (old packets decode
+  bit-identically), which caps the descent when the seed ladder does
+  not span the corpus. The extended trainer adds a per-iteration
+  value step: `replay_partition_cascade` re-walks each planned §8.6.2
+  cascade deterministically to recover the exact target sub-vector
+  every entry quantised, each exercised tessellation book's entries
+  move to the centroid of their targets (the classic VQ codebook
+  update), and the result is re-expressed on a fresh §9.2.2-packable
+  `minimum/delta` grid. Because cascade stages interact (improving an
+  early stage shrinks a later stage's targets), the joint update and
+  each single-book update are evaluated by fresh plan passes and only
+  the best strict improvement is adopted — the recorded Lagrangian is
+  monotone non-increasing by construction, and multi-stage ladders
+  converge stage-by-stage against re-derived targets. `sequence_p`
+  and lattice books are never touched. Tests pin the replay's
+  target/entry reproduction (formats 0 and 1, shape/unpack guards), a
+  ±5 corpus against a `[-2, 1.5]` seed ladder (length-only training
+  cannot reach it; the ladder trainer at least halves the final
+  Lagrangian, ≥1 accepted update, monotone descent), §3.2.1 carriage
+  legality + final-plan/final-book consistency, the ideal-ladder
+  no-op equivalence, and the guard surface. Re-exported at the crate
+  root.
 - **VQ value-ladder design (`book_design::design_value_ladder`,
   `ValueLadderDesign`)** — the *value*-side half of codebook training
   (the codeword-length half is `design_codeword_lengths`). A
