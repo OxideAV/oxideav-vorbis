@@ -132,6 +132,33 @@ pub enum BookDesignError {
         /// The codebook's `entries`.
         entries: u32,
     },
+    /// [`tally_floor1_packet`]: `floor1_y` does not carry the two
+    /// endpoints plus one Y value per partition dimension the header
+    /// implies (§7.2.3 reads exactly that many).
+    Floor1YLengthMismatch {
+        /// Expected `floor1_y` length.
+        expected: usize,
+        /// Actual `floor1_y` length.
+        actual: usize,
+    },
+    /// [`tally_floor1_packet`]: `partition_cvals` does not carry one
+    /// selector per §7.2.3 partition.
+    Floor1CvalLengthMismatch {
+        /// Expected `partition_cvals` length.
+        expected: usize,
+        /// Actual `partition_cvals` length.
+        actual: usize,
+    },
+    /// [`tally_floor1_packet`]: a partition names a class outside the
+    /// header's class list.
+    Floor1ClassOutOfRange {
+        /// The partition index.
+        partition: usize,
+        /// The rejected class index.
+        class: u8,
+        /// `header.classes.len()`.
+        class_count: usize,
+    },
 }
 
 impl fmt::Display for BookDesignError {
@@ -176,6 +203,22 @@ impl fmt::Display for BookDesignError {
             } => write!(
                 f,
                 "vorbis book design: entry {entry} outside codebook {book}'s {entries} entries"
+            ),
+            BookDesignError::Floor1YLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis book design: floor1_y carries {actual} values, header implies {expected} (§7.2.3)"
+            ),
+            BookDesignError::Floor1CvalLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis book design: partition_cvals carries {actual} selectors, header has {expected} partitions (§7.2.3)"
+            ),
+            BookDesignError::Floor1ClassOutOfRange {
+                partition,
+                class,
+                class_count,
+            } => write!(
+                f,
+                "vorbis book design: partition {partition} names class {class} outside the header's {class_count} classes (§7.2.3)"
             ),
         }
     }
@@ -496,6 +539,103 @@ impl BookTallies {
             })
             .collect()
     }
+}
+
+/// Tally every codeword emission a §7.2.3 floor-1 packet makes into a
+/// per-book frequency table — the statistics-collection step of the
+/// floor-1 codebook-*content* trainer.
+///
+/// The walk mirrors `crate::encoder::write_floor1_packet`'s emission
+/// order exactly: for each partition, the class's master selector
+/// `cval` is recorded against the class masterbook (only when
+/// `subclasses > 0` and a masterbook is present — §7.2.3 step 12),
+/// then each dimension's packet-domain Y value is recorded against
+/// the sub-book its `cval` slice selects (`(cval >> j·cbits) & csub` —
+/// §7.2.3 steps 14/15), skipping the §7.2.3 step-18 `None` sub-book
+/// slots (which emit no bits and force `Y = 0`). The two endpoint
+/// amplitudes and the `[nonzero]` flag are raw fixed-width fields, not
+/// codewords, so they are not tallied; an unused packet
+/// (`nonzero == false`) tallies nothing.
+///
+/// Feeding a corpus of planned packets (e.g. from
+/// `crate::floor1_encode::plan_floor1_packet`) through this and then
+/// calling [`BookTallies::retrain`] yields floor-1 master / sub-books
+/// whose codeword lengths are bit-cost-optimal for that corpus while
+/// decoding the same packets to bit-identical curves.
+pub fn tally_floor1_packet(
+    tallies: &mut BookTallies,
+    packet: &crate::encoder::Floor1Packet,
+    header: &crate::setup::Floor1Header,
+) -> Result<(), BookDesignError> {
+    // §7.2.3 step 1: an unused floor emits only the raw `[nonzero]`
+    // bit — no codewords to tally.
+    if !packet.nonzero {
+        return Ok(());
+    }
+
+    // Shape gates, mirroring the packet writer's fail-closed checks.
+    let expected_y = header.x_list.len() + 2;
+    if packet.floor1_y.len() != expected_y {
+        return Err(BookDesignError::Floor1YLengthMismatch {
+            expected: expected_y,
+            actual: packet.floor1_y.len(),
+        });
+    }
+    let partitions = header.partition_class_list.len();
+    if packet.partition_cvals.len() != partitions {
+        return Err(BookDesignError::Floor1CvalLengthMismatch {
+            expected: partitions,
+            actual: packet.partition_cvals.len(),
+        });
+    }
+    // The per-partition dimensions must tile floor1_y exactly (two
+    // implicit endpoint slots + one Y per dimension).
+    let mut dims_sum = 0usize;
+    for (partition, &class_no) in header.partition_class_list.iter().enumerate() {
+        let class = header.classes.get(class_no as usize).ok_or({
+            BookDesignError::Floor1ClassOutOfRange {
+                partition,
+                class: class_no,
+                class_count: header.classes.len(),
+            }
+        })?;
+        dims_sum += class.dimensions as usize;
+    }
+    if dims_sum + 2 != expected_y {
+        return Err(BookDesignError::Floor1YLengthMismatch {
+            expected: dims_sum + 2,
+            actual: expected_y,
+        });
+    }
+
+    // Emission walk (§7.2.3 steps 5..19, write direction).
+    let mut offset = 2usize;
+    for (partition, &class_no) in header.partition_class_list.iter().enumerate() {
+        let class = &header.classes[class_no as usize];
+        let cbits = class.subclasses;
+        let csub: u32 = (1u32 << cbits).saturating_sub(1);
+        let mut cval = packet.partition_cvals[partition];
+
+        // Step 12: master selector codeword.
+        if cbits > 0 {
+            if let Some(book) = class.masterbook {
+                tallies.record(book as usize, cval)?;
+            }
+        }
+
+        // Steps 13..19: per-dimension Y codewords.
+        for dim in 0..class.dimensions as usize {
+            let sub_idx = (cval & csub) as usize;
+            cval >>= cbits;
+            let y = packet.floor1_y[offset + dim];
+            if let Some(Some(book)) = class.subclass_books.get(sub_idx) {
+                tallies.record(*book as usize, y)?;
+            }
+            // A `None` sub-book slot emits nothing (§7.2.3 step 18).
+        }
+        offset += class.dimensions as usize;
+    }
+    Ok(())
 }
 
 /// Package-merge (coin-collector) core: optimal length-limited prefix
@@ -1167,6 +1307,150 @@ mod tests {
             tallies.retrain(&books[..1], 32, true),
             Err(BookDesignError::BookIndexOutOfRange { book: 1, books: 2 })
         );
+    }
+
+    // ----------------------------------------------------------------
+    // tally_floor1_packet — the §7.2.3 emission tally.
+    // ----------------------------------------------------------------
+
+    /// A two-partition floor-1 header exercising both class shapes:
+    /// partition 0 uses class 0 (`subclasses = 0`, slot 0 → book 0),
+    /// partition 1 uses class 1 (`subclasses = 1`, masterbook 1,
+    /// slots → books 0 / 2, dimensions 2).
+    fn tally_test_header() -> crate::setup::Floor1Header {
+        use crate::setup::{Floor1Class, Floor1Header};
+        Floor1Header {
+            partitions: 2,
+            partition_class_list: vec![0, 1],
+            classes: vec![
+                Floor1Class {
+                    dimensions: 2,
+                    subclasses: 0,
+                    masterbook: None,
+                    subclass_books: vec![Some(0)],
+                },
+                Floor1Class {
+                    dimensions: 2,
+                    subclasses: 1,
+                    masterbook: Some(1),
+                    subclass_books: vec![Some(0), Some(2)],
+                },
+            ],
+            multiplier: 2,
+            rangebits: 7,
+            x_list: vec![16, 32, 64, 96],
+        }
+    }
+
+    fn tally_test_books() -> Vec<VorbisCodebook> {
+        vec![
+            design_entropy_codebook(128, 1, &[1u64; 128], 32, false).unwrap(),
+            design_entropy_codebook(4, 1, &[1u64; 4], 32, false).unwrap(),
+            design_entropy_codebook(64, 1, &[1u64; 64], 32, false).unwrap(),
+        ]
+    }
+
+    /// The tally mirrors the §7.2.3 emission walk: master cval into the
+    /// masterbook, each Y into the sub-book its cval slice selects.
+    #[test]
+    fn floor1_tally_records_master_and_subbook_symbols() {
+        use crate::encoder::Floor1Packet;
+        let header = tally_test_header();
+        let books = tally_test_books();
+        let mut tallies = BookTallies::new(&books);
+        // cval = 0b10 for partition 1: dim 0 → slot 0 (book 0), dim 1 →
+        // slot 1 (book 2).
+        let packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![5, 9, 20, 30, 40, 50],
+            partition_cvals: vec![0, 2],
+        };
+        tally_floor1_packet(&mut tallies, &packet, &header).expect("tallies");
+        // Partition 0 (class 0, subclasses 0): both dims through book 0.
+        // Partition 1 (class 1): master cval 2 through book 1; dim 0
+        // (Y = 40) slot 0 → book 0, dim 1 (Y = 50) slot 1 → book 2.
+        assert_eq!(tallies.total(0), 3, "book 0: Y 20, 30, 40");
+        assert_eq!(tallies.counts(0).unwrap()[20], 1);
+        assert_eq!(tallies.counts(0).unwrap()[30], 1);
+        assert_eq!(tallies.counts(0).unwrap()[40], 1);
+        assert_eq!(tallies.counts(1).unwrap()[2], 1, "master cval 2");
+        assert_eq!(tallies.total(1), 1);
+        assert_eq!(tallies.counts(2).unwrap()[50], 1, "fine book Y 50");
+        assert_eq!(tallies.total(2), 1);
+        // Endpoints (5, 9) are raw fields — never tallied.
+        assert_eq!(tallies.counts(0).unwrap()[5], 0);
+        assert_eq!(tallies.counts(0).unwrap()[9], 0);
+    }
+
+    /// An unused packet (`nonzero == false`) tallies nothing.
+    #[test]
+    fn floor1_tally_unused_packet_records_nothing() {
+        use crate::encoder::Floor1Packet;
+        let header = tally_test_header();
+        let books = tally_test_books();
+        let mut tallies = BookTallies::new(&books);
+        let packet = Floor1Packet {
+            nonzero: false,
+            floor1_y: vec![],
+            partition_cvals: vec![],
+        };
+        tally_floor1_packet(&mut tallies, &packet, &header).expect("tallies");
+        for b in 0..3 {
+            assert_eq!(tallies.total(b), 0);
+        }
+    }
+
+    /// Shape-gate error surface: wrong Y length, wrong cval count, and
+    /// an out-of-range class index.
+    #[test]
+    fn floor1_tally_error_surface() {
+        use crate::encoder::Floor1Packet;
+        let header = tally_test_header();
+        let books = tally_test_books();
+        let mut tallies = BookTallies::new(&books);
+        let bad_y = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![0; 5],
+            partition_cvals: vec![0, 0],
+        };
+        assert_eq!(
+            tally_floor1_packet(&mut tallies, &bad_y, &header),
+            Err(BookDesignError::Floor1YLengthMismatch {
+                expected: 6,
+                actual: 5
+            })
+        );
+        let bad_cvals = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![0; 6],
+            partition_cvals: vec![0],
+        };
+        assert_eq!(
+            tally_floor1_packet(&mut tallies, &bad_cvals, &header),
+            Err(BookDesignError::Floor1CvalLengthMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+        let mut bad_class_header = header.clone();
+        bad_class_header.partition_class_list[1] = 7;
+        let ok_packet = Floor1Packet {
+            nonzero: true,
+            floor1_y: vec![0; 6],
+            partition_cvals: vec![0, 0],
+        };
+        assert_eq!(
+            tally_floor1_packet(&mut tallies, &ok_packet, &bad_class_header),
+            Err(BookDesignError::Floor1ClassOutOfRange {
+                partition: 1,
+                class: 7,
+                class_count: 2
+            })
+        );
+        // Nothing was recorded by any failing call.
+        for b in 0..3 {
+            assert_eq!(tallies.total(b), 0);
+        }
     }
 
     /// Large books stay well-behaved: 4096 entries with a Zipf-ish

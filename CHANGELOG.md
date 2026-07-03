@@ -6,6 +6,33 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Floor-1 codebook-content trainer (`book_design::tally_floor1_packet`
+  + `tests/floor1_trained_books.rs`)** — closes the "floor-1 master/sub
+  codebook *contents*" followup the README named. The tally walks a
+  planned `Floor1Packet` in `write_floor1_packet`'s exact §7.2.3
+  emission order — the master selector `cval` into the class masterbook
+  (step 12, only when `subclasses > 0`), each packet-domain Y into the
+  sub-book its `cval` slice selects (steps 14/15), skipping step-18
+  `None` slots and the raw (non-codeword) endpoint/`[nonzero]` fields —
+  accumulating per-book symbol frequencies in `BookTallies`. The
+  integration suite drives the full training loop over a 48-envelope
+  corpus against a header exercising both class shapes (a
+  `subclasses = 0` class and a `subclasses = 1` class whose master book
+  routes between a coarse `Y < 96` sub-book and a full-range one, with
+  the corpus straddling the boundary so the master path is
+  load-bearing): plan → tally → `retrain` → re-write, pinning that the
+  trained books decode every packet to the **bit-identical** §7.2.4
+  curve (floor-1 post coding is lossless; retraining only re-prices the
+  codewords) while the corpus serialises into **strictly fewer bytes**,
+  and that the trained books stay carriage-legal through the §3.2.1
+  codebook writer/parser. A second test pins the sparse policy:
+  never-emitted entries are pruned, re-*planning* against the sparse
+  books succeeds (the planner only selects encodable cvals), the fitted
+  `floor1_y` is book-independent, and the sparse corpus costs no more
+  than the dense one. Unit tests pin the tally walk (master + sub-book
+  routing, unused-packet no-op) and its shape-gate error surface
+  (`Floor1YLengthMismatch` / `Floor1CvalLengthMismatch` /
+  `Floor1ClassOutOfRange`).
 - **Codebook assembly + usage-driven retraining (`book_design` module:
   `design_entropy_codebook`, `redesign_codebook`, `BookTallies`)** —
   the layer that turns designed codeword lengths into write-ready
