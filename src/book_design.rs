@@ -159,6 +159,38 @@ pub enum BookDesignError {
         /// `header.classes.len()`.
         class_count: usize,
     },
+    /// [`tally_residue_plans`]: a plan's `partition_entries` row count
+    /// disagrees with its `classifications` count.
+    ResiduePlanShapeMismatch {
+        /// `plan.classifications.len()`.
+        classifications: usize,
+        /// `plan.partition_entries.len()`.
+        partition_entries: usize,
+    },
+    /// [`tally_residue_plans`]: a partition's classification indexes
+    /// outside the residue header's per-class book table.
+    ResidueClassificationOutOfRange {
+        /// The partition index.
+        partition: usize,
+        /// The rejected classification.
+        classification: u32,
+        /// `header.books.len()`.
+        classifications: usize,
+    },
+    /// [`tally_residue_plans`]: an entry list is present where the
+    /// header's cascade holds no book for that `(classification, pass)`
+    /// stage, or absent where it holds one — the plan and the header
+    /// disagree on what §8.6.2 step 18/19 puts on the wire.
+    ResiduePlanCascadeMismatch {
+        /// The partition index.
+        partition: usize,
+        /// The cascade stage.
+        pass: usize,
+    },
+    /// [`tally_residue_plans`]: packing a classification stride into
+    /// its classbook entry failed (carried verbatim from the §8.6.2
+    /// grouping primitive).
+    ResidueClassPack(crate::encoder::PackResidueClassGroupsError),
 }
 
 impl fmt::Display for BookDesignError {
@@ -219,6 +251,29 @@ impl fmt::Display for BookDesignError {
             } => write!(
                 f,
                 "vorbis book design: partition {partition} names class {class} outside the header's {class_count} classes (§7.2.3)"
+            ),
+            BookDesignError::ResiduePlanShapeMismatch {
+                classifications,
+                partition_entries,
+            } => write!(
+                f,
+                "vorbis book design: residue plan carries {partition_entries} partition-entry rows for {classifications} classifications (§8.6.2)"
+            ),
+            BookDesignError::ResidueClassificationOutOfRange {
+                partition,
+                classification,
+                classifications,
+            } => write!(
+                f,
+                "vorbis book design: partition {partition} classification {classification} outside the header's {classifications} classes (§8.6.2)"
+            ),
+            BookDesignError::ResiduePlanCascadeMismatch { partition, pass } => write!(
+                f,
+                "vorbis book design: partition {partition} pass {pass}: plan entries disagree with the header cascade (§8.6.2 steps 18/19)"
+            ),
+            BookDesignError::ResidueClassPack(source) => write!(
+                f,
+                "vorbis book design: classification stride does not pack to a classbook entry: {source} (§8.6.2)"
             ),
         }
     }
@@ -490,6 +545,34 @@ impl BookTallies {
         Ok(())
     }
 
+    /// Record a batch of `(book, entry)` emissions **atomically**:
+    /// every pair is validated against the tally shape first, and on
+    /// any failure nothing is recorded. The packet-level tally walks
+    /// ([`tally_floor1_packet`], [`tally_residue_plans`]) commit
+    /// through this so a rejected packet never leaves a partial tally
+    /// behind.
+    pub fn record_all(&mut self, emissions: &[(usize, u32)]) -> Result<(), BookDesignError> {
+        for &(book, entry) in emissions {
+            let books = self.counts.len();
+            let row = self
+                .counts
+                .get(book)
+                .ok_or(BookDesignError::BookIndexOutOfRange { book, books })?;
+            if entry as usize >= row.len() {
+                return Err(BookDesignError::EntryOutOfRange {
+                    book,
+                    entry,
+                    entries: row.len() as u32,
+                });
+            }
+        }
+        for &(book, entry) in emissions {
+            let slot = &mut self.counts[book][entry as usize];
+            *slot = slot.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// The accumulated frequency row for codebook `book`, if in range.
     #[must_use]
     pub fn counts(&self, book: usize) -> Option<&[u64]> {
@@ -608,7 +691,10 @@ pub fn tally_floor1_packet(
         });
     }
 
-    // Emission walk (§7.2.3 steps 5..19, write direction).
+    // Emission walk (§7.2.3 steps 5..19, write direction). Emissions
+    // are gathered first and committed atomically at the end, so a
+    // rejected packet never leaves a partial tally behind.
+    let mut emissions: Vec<(usize, u32)> = Vec::new();
     let mut offset = 2usize;
     for (partition, &class_no) in header.partition_class_list.iter().enumerate() {
         let class = &header.classes[class_no as usize];
@@ -619,7 +705,7 @@ pub fn tally_floor1_packet(
         // Step 12: master selector codeword.
         if cbits > 0 {
             if let Some(book) = class.masterbook {
-                tallies.record(book as usize, cval)?;
+                emissions.push((book as usize, cval));
             }
         }
 
@@ -629,13 +715,120 @@ pub fn tally_floor1_packet(
             cval >>= cbits;
             let y = packet.floor1_y[offset + dim];
             if let Some(Some(book)) = class.subclass_books.get(sub_idx) {
-                tallies.record(*book as usize, y)?;
+                emissions.push((*book as usize, y));
             }
             // A `None` sub-book slot emits nothing (§7.2.3 step 18).
         }
         offset += class.dimensions as usize;
     }
-    Ok(())
+    tallies.record_all(&emissions)
+}
+
+/// Tally every codeword emission a §8.6.2 residue body makes into a
+/// per-book frequency table — the statistics-collection step of the
+/// residue codebook-content trainer, the residue analogue of
+/// [`tally_floor1_packet`].
+///
+/// `plans` holds one `ResidueVectorPlan` per §8.6.2 decode vector,
+/// exactly as handed to `crate::encoder::write_residue_body`. Two
+/// codeword families are tallied, mirroring the writer's emission:
+///
+/// * **classwords** — each stride of `classwords_per_codeword`
+///   (= the classbook's `dimensions`) partition classifications packs
+///   into one classbook entry (§8.6.2 steps 6..12; the final partial
+///   stride right-padded with the zero digits the decoder discards),
+///   recorded against `header.classbook` via the same
+///   `pack_residue_classification_groups` primitive the writer uses;
+/// * **value codewords** — each `(partition, pass)` whose
+///   classification's cascade holds a book records that stage's entry
+///   list against it (§8.6.2 step 19); `None` stages emit nothing
+///   (step 18).
+///
+/// A 'do not decode' vector's plan (empty `classifications` +
+/// `partition_entries`) tallies nothing, matching the decoder reading
+/// nothing for it. Feeding a corpus of plans through this and calling
+/// [`BookTallies::retrain`] yields a classbook + value books whose
+/// codeword lengths are bit-cost-optimal for the corpus while the
+/// same plans decode to bit-identical residue vectors (retraining
+/// preserves each book's VQ lookup, so every entry still unpacks to
+/// the identical §3.2.1 vector).
+pub fn tally_residue_plans(
+    tallies: &mut BookTallies,
+    plans: &[crate::encoder::ResidueVectorPlan],
+    header: &crate::setup::ResidueHeader,
+    codebooks: &[VorbisCodebook],
+) -> Result<(), BookDesignError> {
+    let classbook_idx = header.classbook as usize;
+    let classbook = codebooks
+        .get(classbook_idx)
+        .ok_or(BookDesignError::BookIndexOutOfRange {
+            book: classbook_idx,
+            books: codebooks.len(),
+        })?;
+    let classwords = classbook.dimensions as usize;
+    let num_classifications = header.classifications as u32;
+
+    // Emissions are gathered first and committed atomically at the
+    // end, so a rejected plan set never leaves a partial tally behind.
+    let mut emissions: Vec<(usize, u32)> = Vec::new();
+    for plan in plans {
+        // A 'do not decode' vector reads nothing (§8.6.2 step 15).
+        if plan.classifications.is_empty() && plan.partition_entries.is_empty() {
+            continue;
+        }
+        if plan.partition_entries.len() != plan.classifications.len() {
+            return Err(BookDesignError::ResiduePlanShapeMismatch {
+                classifications: plan.classifications.len(),
+                partition_entries: plan.partition_entries.len(),
+            });
+        }
+
+        // Classwords: identical grouping to the writer (§8.6.2 steps
+        // 6..12 inverse, final partial stride right-padded).
+        let groups = crate::encoder::pack_residue_classification_groups(
+            &plan.classifications,
+            num_classifications,
+            classwords,
+        )
+        .map_err(BookDesignError::ResidueClassPack)?;
+        for entry in groups {
+            emissions.push((classbook_idx, entry));
+        }
+
+        // Value codewords: per (partition, pass) against the cascade.
+        for (partition, (&class, stages)) in plan
+            .classifications
+            .iter()
+            .zip(plan.partition_entries.iter())
+            .enumerate()
+        {
+            let row = header.books.get(class as usize).ok_or(
+                BookDesignError::ResidueClassificationOutOfRange {
+                    partition,
+                    classification: class,
+                    classifications: header.books.len(),
+                },
+            )?;
+            for (pass, (book, supplied)) in row.iter().zip(stages.iter()).enumerate() {
+                match (book, supplied) {
+                    (Some(book), Some(entries)) => {
+                        for &entry in entries {
+                            emissions.push((*book as usize, entry));
+                        }
+                    }
+                    // §8.6.2 step 18: 'unused' stage — nothing on wire.
+                    (None, None) => {}
+                    _ => {
+                        return Err(BookDesignError::ResiduePlanCascadeMismatch {
+                            partition,
+                            pass,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    tallies.record_all(&emissions)
 }
 
 /// Package-merge (coin-collector) core: optimal length-limited prefix
@@ -1450,6 +1643,155 @@ mod tests {
         // Nothing was recorded by any failing call.
         for b in 0..3 {
             assert_eq!(tallies.total(b), 0);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // tally_residue_plans — the §8.6.2 emission tally.
+    // ----------------------------------------------------------------
+
+    /// A format-1 residue header with two classes: class 0 'unused'
+    /// (no books anywhere in its cascade), class 1 carrying book 1 at
+    /// pass 0 and book 2 at pass 1. Classbook 0 has dimensions 2
+    /// (`classwords_per_codeword = 2`) and 4 entries (2 classes ^ 2).
+    fn residue_tally_header() -> crate::setup::ResidueHeader {
+        let unused: [Option<u8>; 8] = Default::default();
+        let mut two_stage: [Option<u8>; 8] = Default::default();
+        two_stage[0] = Some(1);
+        two_stage[1] = Some(2);
+        crate::setup::ResidueHeader {
+            residue_type: 1,
+            residue_begin: 0,
+            residue_end: 64,
+            partition_size: 8,
+            classifications: 2,
+            classbook: 0,
+            cascade: vec![0, 0b11],
+            books: vec![unused, two_stage],
+        }
+    }
+
+    fn residue_tally_books() -> Vec<VorbisCodebook> {
+        vec![
+            design_entropy_codebook(4, 2, &[1u64; 4], 32, false).unwrap(),
+            design_entropy_codebook(8, 1, &[1u64; 8], 32, false).unwrap(),
+            design_entropy_codebook(8, 1, &[1u64; 8], 32, false).unwrap(),
+        ]
+    }
+
+    /// The tally mirrors the §8.6.2 emission: classification strides
+    /// pack into classbook entries, per-stage entry lists land on the
+    /// cascade's books, 'unused' classes and stages emit nothing.
+    #[test]
+    fn residue_tally_records_classwords_and_value_entries() {
+        use crate::encoder::ResidueVectorPlan;
+        let header = residue_tally_header();
+        let books = residue_tally_books();
+        let mut tallies = BookTallies::new(&books);
+
+        // Three partitions: class 1, class 0 (unused), class 1. With
+        // classwords = 2 the strides are [1, 0] and [1, <pad 0>]:
+        // packed entries 1·2+0 = 2 and 1·2+0 = 2.
+        let mut p0: [Option<Vec<u32>>; 8] = Default::default();
+        p0[0] = Some(vec![3, 3]);
+        p0[1] = Some(vec![5]);
+        let p1: [Option<Vec<u32>>; 8] = Default::default();
+        let mut p2: [Option<Vec<u32>>; 8] = Default::default();
+        p2[0] = Some(vec![3, 7]);
+        p2[1] = Some(vec![5]);
+        let plan = ResidueVectorPlan {
+            classifications: vec![1, 0, 1],
+            partition_entries: vec![p0, p1, p2],
+        };
+        tally_residue_plans(&mut tallies, &[plan], &header, &books).expect("tallies");
+
+        // Classbook: two strides, both packing to entry 2.
+        assert_eq!(tallies.counts(0).unwrap(), &[0, 0, 2, 0]);
+        // Pass-0 book: entries 3, 3, 3, 7.
+        assert_eq!(tallies.counts(1).unwrap()[3], 3);
+        assert_eq!(tallies.counts(1).unwrap()[7], 1);
+        assert_eq!(tallies.total(1), 4);
+        // Pass-1 book: entry 5 twice.
+        assert_eq!(tallies.counts(2).unwrap()[5], 2);
+        assert_eq!(tallies.total(2), 2);
+    }
+
+    /// A 'do not decode' vector's empty plan tallies nothing.
+    #[test]
+    fn residue_tally_skips_do_not_decode_plans() {
+        use crate::encoder::ResidueVectorPlan;
+        let header = residue_tally_header();
+        let books = residue_tally_books();
+        let mut tallies = BookTallies::new(&books);
+        let dnd = ResidueVectorPlan {
+            classifications: vec![],
+            partition_entries: vec![],
+        };
+        tally_residue_plans(&mut tallies, &[dnd], &header, &books).expect("tallies");
+        for b in 0..3 {
+            assert_eq!(tallies.total(b), 0);
+        }
+    }
+
+    /// Error surface: plan shape mismatch, cascade disagreement, and a
+    /// classification outside the header's class table.
+    #[test]
+    fn residue_tally_error_surface() {
+        use crate::encoder::ResidueVectorPlan;
+        let header = residue_tally_header();
+        let books = residue_tally_books();
+        let mut tallies = BookTallies::new(&books);
+
+        let shape = ResidueVectorPlan {
+            classifications: vec![0, 0],
+            partition_entries: vec![Default::default()],
+        };
+        assert_eq!(
+            tally_residue_plans(&mut tallies, &[shape], &header, &books),
+            Err(BookDesignError::ResiduePlanShapeMismatch {
+                classifications: 2,
+                partition_entries: 1
+            })
+        );
+
+        // Class 1's cascade holds a pass-0 book, but the plan omits it.
+        let cascade = ResidueVectorPlan {
+            classifications: vec![1],
+            partition_entries: vec![Default::default()],
+        };
+        assert_eq!(
+            tally_residue_plans(&mut tallies, &[cascade], &header, &books),
+            Err(BookDesignError::ResiduePlanCascadeMismatch {
+                partition: 0,
+                pass: 0
+            })
+        );
+
+        // Classification 5 is outside the two-class header. Packing
+        // catches it first (the §8.6.2 grouping primitive validates
+        // digits against `num_classifications`).
+        let class_oor = ResidueVectorPlan {
+            classifications: vec![5],
+            partition_entries: vec![Default::default()],
+        };
+        assert!(matches!(
+            tally_residue_plans(&mut tallies, &[class_oor], &header, &books),
+            Err(BookDesignError::ResidueClassPack(_))
+        ));
+
+        // Classbook index outside the codebook table.
+        let mut bad_header = residue_tally_header();
+        bad_header.classbook = 9;
+        let ok = ResidueVectorPlan {
+            classifications: vec![0],
+            partition_entries: vec![Default::default()],
+        };
+        assert_eq!(
+            tally_residue_plans(&mut tallies, &[ok], &bad_header, &books),
+            Err(BookDesignError::BookIndexOutOfRange { book: 9, books: 3 })
+        );
+        for b in 0..3 {
+            assert_eq!(tallies.total(b), 0, "failing calls record nothing");
         }
     }
 

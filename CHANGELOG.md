@@ -6,6 +6,31 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Residue codebook-content trainer (`book_design::tally_residue_plans`
+  + `BookTallies::record_all` + `tests/residue_trained_books.rs`)** —
+  the residue analogue of the floor-1 trainer. The tally mirrors
+  `write_residue_body`'s §8.6.2 emission exactly: each stride of
+  `classwords_per_codeword` (= classbook `dimensions`) classifications
+  packs into one classbook entry via the same
+  `pack_residue_classification_groups` primitive the writer uses
+  (steps 6..12, final partial stride right-padded), and each
+  `(partition, pass)` whose cascade holds a book records that stage's
+  entry list (step 19; `None` stages and 'do not decode' vectors emit
+  nothing). Both tally walks now commit **atomically** through the new
+  `BookTallies::record_all` (a rejected packet/plan never leaves a
+  partial tally). The integration suite drives the full training loop
+  over a 40-vector corpus sectioned to exercise all three classes of an
+  unused/coarse/coarse+fine header (silence → class 0; values exactly
+  on the coarse ladder → the fewer-stages tie-break picks class 1;
+  off-grid oscillation → class 2), pinning that trained books decode
+  every body to the **bit-identical** §8.6.2 vector (retraining
+  preserves the VQ lookups) while the corpus serialises into
+  **strictly fewer bytes**, that trained books stay carriage-legal
+  through the §3.2.1 writer/parser, and the same contract with a
+  'do not decode' channel in the bundle. Unit tests pin the
+  classword/value-entry routing and the new error surface
+  (`ResiduePlanShapeMismatch` / `ResidueClassificationOutOfRange` /
+  `ResiduePlanCascadeMismatch` / `ResidueClassPack`).
 - **Floor-1 codebook-content trainer (`book_design::tally_floor1_packet`
   + `tests/floor1_trained_books.rs`)** — closes the "floor-1 master/sub
   codebook *contents*" followup the README named. The tally walks a

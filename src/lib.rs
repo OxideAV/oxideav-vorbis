@@ -190,8 +190,8 @@ pub use audio::{
 pub use blocksize::{choose_blocksize, detect_transient, BlocksizeError, TransientAnalysis};
 pub use book_design::{
     design_codeword_lengths, design_codeword_lengths_dense, design_entropy_codebook,
-    redesign_codebook, stream_cost_bits, tally_floor1_packet, BookDesignError, BookTallies,
-    MAX_CODEWORD_LEN,
+    redesign_codebook, stream_cost_bits, tally_floor1_packet, tally_residue_plans, BookDesignError,
+    BookTallies, MAX_CODEWORD_LEN,
 };
 pub use channel_order::{speaker_at, speaker_layout, Speaker};
 pub use codebook::{
