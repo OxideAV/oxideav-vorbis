@@ -207,6 +207,31 @@ pub enum BookDesignError {
     /// [`train_residue_books_rd`]: `max_iterations` was zero — the
     /// trainer must run at least one plan→retrain pass.
     ZeroIterations,
+    /// [`design_value_ladder`]: the training sample set was empty.
+    EmptyTraining,
+    /// [`design_value_ladder`]: a training sample was NaN or infinite.
+    NonFiniteTraining {
+        /// The offending sample index.
+        index: usize,
+    },
+    /// [`design_value_ladder`]: `levels` was zero — a ladder needs at
+    /// least one rung.
+    ZeroLevels,
+    /// [`design_value_ladder`]: `value_bits` outside the §3.2.1-legal
+    /// `1..=16` range (the codebook header stores `value_bits − 1` in
+    /// 4 bits).
+    InvalidValueBits {
+        /// The rejected width.
+        value_bits: u8,
+    },
+    /// [`design_value_ladder`]: more ladder levels than a
+    /// `value_bits`-wide multiplicand can address.
+    LevelsExceedValueBits {
+        /// The requested level count.
+        levels: u32,
+        /// The multiplicand width.
+        value_bits: u8,
+    },
 }
 
 impl fmt::Display for BookDesignError {
@@ -302,6 +327,25 @@ impl fmt::Display for BookDesignError {
             BookDesignError::ZeroIterations => write!(
                 f,
                 "vorbis book design: max_iterations must be at least 1"
+            ),
+            BookDesignError::EmptyTraining => {
+                write!(f, "vorbis book design: empty training sample set")
+            }
+            BookDesignError::NonFiniteTraining { index } => write!(
+                f,
+                "vorbis book design: training sample {index} is not finite"
+            ),
+            BookDesignError::ZeroLevels => write!(
+                f,
+                "vorbis book design: a value ladder needs at least one level"
+            ),
+            BookDesignError::InvalidValueBits { value_bits } => write!(
+                f,
+                "vorbis book design: value_bits {value_bits} outside 1..=16 (§3.2.1)"
+            ),
+            BookDesignError::LevelsExceedValueBits { levels, value_bits } => write!(
+                f,
+                "vorbis book design: {levels} levels cannot be addressed by {value_bits}-bit multiplicands"
             ),
         }
     }
@@ -1068,6 +1112,228 @@ pub fn train_residue_books_rd(
         lagrangian_per_iteration: lagrangians,
         total_bits_per_iteration: totals,
         converged,
+    })
+}
+
+/// A designed §3.2.1 VQ value ladder — the `minimum_value` /
+/// `delta_value` / `multiplicands` triple a lookup-type-1/2 codebook
+/// carries, produced by [`design_value_ladder`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueLadderDesign {
+    /// The §9.2.2-packable ladder base (`float32_pack` accepts it, so
+    /// `crate::encoder::write_codebook` can carry the ladder).
+    pub minimum_value: f32,
+    /// The §9.2.2-packable ladder step.
+    pub delta_value: f32,
+    /// One multiplicand per designed level, ascending, each strictly
+    /// below `2^value_bits`. Level `i` decodes (with `sequence_p`
+    /// clear) to `multiplicands[i] · delta_value + minimum_value`.
+    pub multiplicands: Vec<u32>,
+    /// The multiplicand bit width the design honoured.
+    pub value_bits: u8,
+    /// The mean squared quantisation error of the training samples
+    /// against the final (grid-snapped) ladder.
+    pub mse: f64,
+}
+
+impl ValueLadderDesign {
+    /// The decoded scalar value of ladder level `i` (with `sequence_p`
+    /// clear): `multiplicands[i] · delta + minimum`, exactly the
+    /// §3.2.1 lookup arithmetic.
+    #[must_use]
+    pub fn level_value(&self, i: usize) -> Option<f32> {
+        self.multiplicands
+            .get(i)
+            .map(|&m| m as f32 * self.delta_value + self.minimum_value)
+    }
+
+    /// Wrap the ladder as a 1-D [`VqLookup::Tessellation`] table for a
+    /// book of `multiplicands.len()` entries — entry `i` decodes to
+    /// [`Self::level_value`]`(i)`.
+    #[must_use]
+    pub fn into_tessellation_lookup(self) -> VqLookup {
+        VqLookup::Tessellation {
+            minimum_value: self.minimum_value,
+            delta_value: self.delta_value,
+            value_bits: self.value_bits,
+            sequence_p: false,
+            multiplicands: self.multiplicands,
+        }
+    }
+}
+
+/// Round a finite `f32` to the nearest §9.2.2-packable value (21-bit
+/// mantissa × power of two): the largest-magnitude ladder parameters a
+/// codebook header can carry exactly.
+fn pack_nearest(x: f32) -> f32 {
+    if crate::codebook::float32_pack(x).is_some() {
+        return x;
+    }
+    // An f32 has a 24-bit significand; §9.2.2 carries 21 bits. Round
+    // the significand to 21 bits (ties away from zero — a half-ulp
+    // choice invisible at ladder scale) and rebuild.
+    let bits = x.abs().to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0 {
+        // Subnormal f32s are far below any audio ladder scale; snap
+        // to zero (packable).
+        return 0.0;
+    }
+    let full = mant | (1 << 23); // 24-bit significand
+    let rounded = (full + 4) >> 3; // 21 bits, round-half-up
+    let value = rounded as f32 * (2.0f32).powi(exp - 127 - 20);
+    if x.is_sign_negative() {
+        -value
+    } else {
+        value
+    }
+}
+
+/// Design a §3.2.1 VQ value ladder from training scalars: the
+/// *value*-side half of codebook training (the codeword-length half is
+/// [`design_codeword_lengths`]).
+///
+/// A lookup-type-1/2 codebook reconstructs every scalar as
+/// `multiplicand · delta + minimum`, so designing the ladder means
+/// choosing `levels` reconstruction points that minimise the training
+/// set's quantisation error, then expressing them in the §3.2.1 grid
+/// form. The optimiser is the classic 1-D Lloyd iteration
+/// (nearest-level assignment ↔ level-at-centroid update, initialised
+/// at the sorted sample quantiles — deterministic, no randomness),
+/// which monotonically reduces the MSE; the converged centroids are
+/// then snapped to the multiplicand grid: `delta` spans the centroid
+/// range across the `value_bits`-wide multiplicand space, `minimum` /
+/// `delta` are rounded to §9.2.2-packable floats ([`float32_pack`]
+/// accepts them, so `crate::encoder::write_codebook` carries the
+/// ladder exactly), and each centroid becomes its nearest grid rung.
+///
+/// The returned [`ValueLadderDesign::mse`] is measured against the
+/// **final snapped** ladder — the reconstruction points a decoder will
+/// actually produce — not the ideal centroids.
+///
+/// [`float32_pack`]: crate::codebook::float32_pack
+pub fn design_value_ladder(
+    samples: &[f32],
+    levels: u32,
+    value_bits: u8,
+) -> Result<ValueLadderDesign, BookDesignError> {
+    if samples.is_empty() {
+        return Err(BookDesignError::EmptyTraining);
+    }
+    if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
+        return Err(BookDesignError::NonFiniteTraining { index });
+    }
+    if levels == 0 {
+        return Err(BookDesignError::ZeroLevels);
+    }
+    if !(1..=16).contains(&value_bits) {
+        return Err(BookDesignError::InvalidValueBits { value_bits });
+    }
+    let addressable = 1u64 << value_bits;
+    if levels as u64 > addressable {
+        return Err(BookDesignError::LevelsExceedValueBits { levels, value_bits });
+    }
+    let k = levels as usize;
+
+    // ---- Lloyd iteration in 1-D over the sorted samples. ----
+    let mut sorted: Vec<f32> = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finiteness checked above"));
+
+    // Quantile initialisation: centroid i at the midpoint of its
+    // equal-population slice.
+    let n = sorted.len();
+    let mut centers: Vec<f64> = (0..k)
+        .map(|i| {
+            let idx = ((2 * i + 1) * n / (2 * k)).min(n - 1);
+            sorted[idx] as f64
+        })
+        .collect();
+
+    for _ in 0..64 {
+        // Assignment: samples are sorted and centers are ascending, so
+        // each center's cell is a contiguous run bounded by midpoints.
+        let mut sums = vec![0.0f64; k];
+        let mut counts = vec![0usize; k];
+        let mut c = 0usize;
+        for &s in &sorted {
+            let s = s as f64;
+            while c + 1 < k && (centers[c + 1] + centers[c]) / 2.0 < s {
+                c += 1;
+            }
+            // `c` is the first cell whose upper midpoint bound is at or
+            // above `s` — the nearest center for ascending input.
+            sums[c] += s;
+            counts[c] += 1;
+        }
+        // Update: move each populated center to its cell centroid.
+        let mut changed = false;
+        for i in 0..k {
+            if counts[i] > 0 {
+                let next = sums[i] / counts[i] as f64;
+                if (next - centers[i]).abs() > 1e-12 {
+                    centers[i] = next;
+                    changed = true;
+                }
+            }
+        }
+        centers.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        if !changed {
+            break;
+        }
+    }
+
+    // ---- Snap the centroids to the §3.2.1 multiplicand grid. ----
+    let lo = centers[0];
+    let hi = centers[k - 1];
+    let span = hi - lo;
+    let (minimum_value, delta_value) = if span <= 0.0 {
+        // Degenerate single-point ladder: every level reconstructs the
+        // same value; delta 0 keeps the arithmetic exact.
+        (pack_nearest(lo as f32), 0.0f32)
+    } else {
+        let raw_delta = (span / (addressable - 1) as f64) as f32;
+        let delta = pack_nearest(raw_delta).max(f32::MIN_POSITIVE);
+        (pack_nearest(lo as f32), delta)
+    };
+
+    let multiplicands: Vec<u32> = centers
+        .iter()
+        .map(|&c| {
+            if delta_value == 0.0 {
+                0
+            } else {
+                let m = ((c - minimum_value as f64) / delta_value as f64).round();
+                (m.max(0.0) as u64).min(addressable - 1) as u32
+            }
+        })
+        .collect();
+
+    // ---- Final MSE against the snapped reconstruction points. ----
+    let points: Vec<f64> = multiplicands
+        .iter()
+        .map(|&m| m as f64 * delta_value as f64 + minimum_value as f64)
+        .collect();
+    let mut err = 0.0f64;
+    for &s in &sorted {
+        let s = s as f64;
+        let best = points
+            .iter()
+            .map(|&p| (s - p) * (s - p))
+            .fold(f64::INFINITY, f64::min);
+        err += best;
+    }
+    let mse = err / n as f64;
+
+    debug_assert!(crate::codebook::float32_pack(minimum_value).is_some());
+    debug_assert!(crate::codebook::float32_pack(delta_value).is_some());
+
+    Ok(ValueLadderDesign {
+        minimum_value,
+        delta_value,
+        multiplicands,
+        value_bits,
+        mse,
     })
 }
 
@@ -2198,6 +2464,150 @@ mod tests {
             );
         }
         assert_eq!(outcome.plans.len(), residuals.len());
+    }
+
+    // ----------------------------------------------------------------
+    // design_value_ladder — the VQ value-side designer.
+    // ----------------------------------------------------------------
+
+    /// Two tight clusters, two levels: the designed ladder lands one
+    /// reconstruction point near each cluster mean and beats the
+    /// uniform (range-spanning) ladder's MSE decisively.
+    #[test]
+    fn value_ladder_finds_clusters_and_beats_uniform() {
+        let mut samples = Vec::new();
+        for i in 0..50 {
+            samples.push(-1.0 + 0.001 * (i % 7) as f32);
+            samples.push(2.0 + 0.001 * (i % 5) as f32);
+        }
+        let design = design_value_ladder(&samples, 2, 8).expect("designs");
+        assert_eq!(design.multiplicands.len(), 2);
+        let l0 = design.level_value(0).unwrap();
+        let l1 = design.level_value(1).unwrap();
+        assert!((l0 - (-1.0)).abs() < 0.05, "level 0 near cluster: {l0}");
+        assert!((l1 - 2.0).abs() < 0.05, "level 1 near cluster: {l1}");
+
+        // Uniform 2-level ladder over the same range: endpoints only.
+        let lo = -1.0f64;
+        let hi = 2.004f64;
+        let uniform_mse: f64 = samples
+            .iter()
+            .map(|&s| {
+                let s = s as f64;
+                (s - lo).powi(2).min((s - hi).powi(2))
+            })
+            .sum::<f64>()
+            / samples.len() as f64;
+        assert!(
+            design.mse <= uniform_mse,
+            "designed {} must not exceed uniform {}",
+            design.mse,
+            uniform_mse
+        );
+        assert!(design.mse < 1e-4, "clusters are tight: {}", design.mse);
+    }
+
+    /// The designed ladder is carriage-exact: a book carrying it
+    /// serialises through the §3.2.1 writer, parses back
+    /// field-for-field, and each entry unpacks to the design's level
+    /// value; the §3.2.1 quantiser picks the nearest designed level.
+    #[test]
+    fn value_ladder_book_carries_and_quantises() {
+        use crate::encoder::write_codebook;
+        use crate::vq::{quantize_vector, unpack_vector};
+        use oxideav_core::bits::BitReaderLsb;
+
+        let samples: Vec<f32> = (0..200)
+            .map(|i| ((i * 37) % 101) as f32 * 0.02 - 1.0)
+            .collect();
+        let design = design_value_ladder(&samples, 8, 8).expect("designs");
+        let levels: Vec<f32> = (0..8).map(|i| design.level_value(i).unwrap()).collect();
+        let lengths = design_codeword_lengths(&[1u64; 8], 32).unwrap();
+        let book = VorbisCodebook {
+            dimensions: 1,
+            entries: 8,
+            codeword_lengths: lengths,
+            lookup: design.clone().into_tessellation_lookup(),
+        };
+        let bytes = write_codebook(&book).expect("writes");
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(
+            crate::codebook::parse_codebook(&mut r).expect("parses"),
+            book
+        );
+        for (i, &lv) in levels.iter().enumerate() {
+            assert_eq!(unpack_vector(&book, i as u32).unwrap(), vec![lv]);
+        }
+        // Quantising a value near level 3 picks level 3.
+        let target = levels[3] + 0.001;
+        let q = quantize_vector(&book, &[target]).expect("quantises");
+        assert_eq!(q.entry, 3);
+    }
+
+    /// Degenerate constant training data yields the exact single-point
+    /// ladder (delta 0, zero error), and the guard-rail error surface
+    /// fires.
+    #[test]
+    fn value_ladder_degenerate_and_error_surface() {
+        let design = design_value_ladder(&[0.25; 30], 4, 8).expect("designs");
+        assert_eq!(design.delta_value, 0.0);
+        assert!(design.multiplicands.iter().all(|&m| m == 0));
+        assert!(design.mse < 1e-12);
+        for i in 0..4 {
+            assert_eq!(design.level_value(i), Some(design.minimum_value));
+        }
+
+        assert_eq!(
+            design_value_ladder(&[], 2, 8),
+            Err(BookDesignError::EmptyTraining)
+        );
+        assert_eq!(
+            design_value_ladder(&[1.0, f32::NAN], 2, 8),
+            Err(BookDesignError::NonFiniteTraining { index: 1 })
+        );
+        assert_eq!(
+            design_value_ladder(&[1.0], 0, 8),
+            Err(BookDesignError::ZeroLevels)
+        );
+        assert_eq!(
+            design_value_ladder(&[1.0], 2, 0),
+            Err(BookDesignError::InvalidValueBits { value_bits: 0 })
+        );
+        assert_eq!(
+            design_value_ladder(&[1.0], 2, 17),
+            Err(BookDesignError::InvalidValueBits { value_bits: 17 })
+        );
+        assert_eq!(
+            design_value_ladder(&[1.0], 5, 2),
+            Err(BookDesignError::LevelsExceedValueBits {
+                levels: 5,
+                value_bits: 2
+            })
+        );
+    }
+
+    /// The ladder parameters are always §9.2.2-packable — including
+    /// when the centroid span produces a non-dyadic raw delta.
+    #[test]
+    fn value_ladder_parameters_are_always_packable() {
+        use crate::codebook::float32_pack;
+        let mut rng = Rng(0x1ADD_E12D_E51F_0001);
+        for _ in 0..40 {
+            let n = 20 + (rng.next() % 200) as usize;
+            let scale = 0.001 + (rng.next() % 1000) as f32 * 0.01;
+            let samples: Vec<f32> = (0..n)
+                .map(|_| ((rng.next() % 2001) as f32 - 1000.0) * scale / 1000.0)
+                .collect();
+            let levels = 2 + (rng.next() % 15) as u32;
+            let design = design_value_ladder(&samples, levels, 8).expect("designs");
+            assert!(float32_pack(design.minimum_value).is_some());
+            assert!(float32_pack(design.delta_value).is_some());
+            assert!(design
+                .multiplicands
+                .iter()
+                .all(|&m| m < (1u32 << design.value_bits)));
+            assert!(design.mse.is_finite());
+        }
     }
 
     /// Large books stay well-behaved: 4096 entries with a Zipf-ish

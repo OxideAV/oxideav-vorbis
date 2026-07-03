@@ -6,6 +6,30 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **VQ value-ladder design (`book_design::design_value_ladder`,
+  `ValueLadderDesign`)** — the *value*-side half of codebook training
+  (the codeword-length half is `design_codeword_lengths`). A
+  lookup-type-1/2 codebook reconstructs every scalar as
+  `multiplicand · delta + minimum` (§3.2.1), so designing the ladder
+  means choosing the reconstruction points that minimise the training
+  set's quantisation error and expressing them in that grid form. The
+  optimiser is the classic 1-D Lloyd iteration (nearest-level
+  assignment ↔ centroid update, deterministic quantile
+  initialisation, monotone MSE descent); the converged centroids snap
+  to a `value_bits`-wide multiplicand grid whose `minimum` / `delta`
+  are rounded to **§9.2.2-packable** floats (a 21-bit-significand
+  `pack_nearest` helper), so `write_codebook` carries the designed
+  ladder exactly. `ValueLadderDesign` reports the snapped parameters,
+  per-level reconstruction values, the final-grid MSE, and wraps
+  itself as a `VqLookup::Tessellation` (`into_tessellation_lookup`).
+  Tests pin cluster recovery (two-cluster data beats the uniform
+  ladder decisively), full §3.2.1 carriage + `unpack_vector` /
+  `quantize_vector` agreement with the designed levels, the
+  degenerate constant-corpus ladder (`delta = 0`, zero error),
+  packability across 40 pseudo-random corpora, and the new guard
+  surface (`EmptyTraining` / `NonFiniteTraining` / `ZeroLevels` /
+  `InvalidValueBits` / `LevelsExceedValueBits`). Re-exported at the
+  crate root.
 - **Whole-stream trained-books round-trip
   (`tests/trained_stream_roundtrip.rs`)** — the capstone over the
   codebook-content design stack. A 20-frame mono PCM corpus (drifting
