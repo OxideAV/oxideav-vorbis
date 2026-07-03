@@ -31,6 +31,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
   `threshold_offset_db` lever, envelope max/peak-hold behaviour, and
   the weight normalisation + guard surface. Re-exported at the crate
   root.
+- **Perceptually weighted residue rate-distortion chooser
+  (`residue_encode::plan_vector_classifications_rd_weighted`,
+  `plan_vector_residue_rd_weighted`)** — the §8.6.2 encode-direction
+  Lagrangian gains a per-partition distortion weight:
+  `weights[p] · error_sq + lambda · bit_cost`. Equal residue-domain
+  error is not equally audible (the decoder multiplies the residue by
+  the rendered floor, §4.3.6), so charging each partition's squared
+  error with `psy::residue_partition_weights`'s mean-normalised
+  `(floor/threshold)²` factor turns the trade into an approximate
+  noise-to-mask-ratio-vs-bits descent: audible partitions attract
+  denser cascades, masked partitions surrender bits first. All-`1.0`
+  weights reproduce the unweighted chooser bit-for-bit (shared core,
+  identical arithmetic); a `0.0` weight makes a partition rate-only.
+  New guard variants `WeightLengthMismatch` / `BadWeight`. Tests pin
+  the all-ones equivalence across lambdas (choices and scored
+  totals), the weight-buys-density flip at fixed lambda, the
+  zero-weight cheapest-cascade rule, per-partition weight
+  independence, and the guard surface. Re-exported at the crate root.
 - **VQ value-ladder design (`book_design::design_value_ladder`,
   `ValueLadderDesign`)** — the *value*-side half of codebook training
   (the codeword-length half is `design_codeword_lengths`). A

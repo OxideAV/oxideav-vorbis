@@ -159,6 +159,24 @@ pub enum ResidueEncodeError {
         /// The underlying quantiser error.
         source: QuantizeError,
     },
+    /// [`plan_vector_classifications_rd_weighted`] was given a weight
+    /// slice whose length did not match the partition count implied by
+    /// `scalars.len() / partition_size`.
+    WeightLengthMismatch {
+        /// The partition count (expected weight count).
+        expected: usize,
+        /// The supplied weight count.
+        actual: usize,
+    },
+    /// A per-partition perceptual weight was NaN, infinite, or
+    /// negative. A weight scales squared distortion, so it must be a
+    /// finite non-negative factor.
+    BadWeight {
+        /// The partition whose weight was rejected.
+        partition: usize,
+        /// The offending weight.
+        value: f64,
+    },
 }
 
 impl core::fmt::Display for ResidueEncodeError {
@@ -207,6 +225,14 @@ impl core::fmt::Display for ResidueEncodeError {
             ResidueEncodeError::Quantize { pass, read, source } => write!(
                 f,
                 "vorbis residue encode: stage-{pass} read-{read} quantise failed: {source}"
+            ),
+            ResidueEncodeError::WeightLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis residue encode: {actual} partition weights supplied for {expected} partitions"
+            ),
+            ResidueEncodeError::BadWeight { partition, value } => write!(
+                f,
+                "vorbis residue encode: partition-{partition} weight {value} is not a finite non-negative factor"
             ),
         }
     }
@@ -756,6 +782,83 @@ pub fn plan_vector_classifications_rd(
     partition_size: u32,
     lambda: f64,
 ) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    plan_vector_classifications_rd_impl(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        None,
+    )
+}
+
+/// Choose the per-partition classification by a **perceptually
+/// weighted** rate-distortion criterion (Vorbis I §8.6.2, encode
+/// direction): for every partition `p`, minimise the Lagrangian
+/// `weights[p] · error_sq + lambda · bit_cost`.
+///
+/// This is the noise-to-mask-aware sibling of
+/// [`plan_vector_classifications_rd`]. That routine charges every
+/// partition's squared residue-domain error equally — but the decoder
+/// multiplies the residue by the rendered floor (§4.3.6), so equal
+/// residue error is *not* equally audible: noise in a partition whose
+/// floor rides far above the masking threshold surfaces loudly, while
+/// noise in a fully-masked partition is inaudible at any residue error.
+/// Scaling each partition's distortion by a caller-supplied weight —
+/// canonically [`crate::psy::residue_partition_weights`]'s
+/// mean-normalised `(floor/threshold)²` factors — turns the Lagrangian
+/// into an approximate NMR-vs-bits trade: heavily weighted (audible)
+/// partitions attract denser cascades, lightly weighted (masked)
+/// partitions give their bits up first as `lambda` rises.
+///
+/// `weights` must hold one finite non-negative factor per partition
+/// (`scalars.len() / partition_size` entries). All-`1.0` weights make
+/// the choice **identical** to [`plan_vector_classifications_rd`]
+/// (bit-for-bit — the cost arithmetic degenerates to the unweighted
+/// form). A `0.0` weight makes that partition's choice rate-only: the
+/// cheapest cascade wins regardless of distortion (with the same
+/// stage-count / index tie-breaks).
+///
+/// The returned [`PartitionClassChoice`]s carry the **unweighted**
+/// `error_sq` (the physical squared distortion the decoder will
+/// reconstruct) and the exact `bit_cost`, so a caller can re-derive
+/// the weighted cost as `weights[p] · error_sq + lambda · bit_cost`.
+///
+/// # Errors
+///
+/// Identical to [`plan_vector_classifications_rd`], plus
+/// [`ResidueEncodeError::WeightLengthMismatch`] for a weight slice
+/// that does not match the partition count and
+/// [`ResidueEncodeError::BadWeight`] for a NaN/±∞/negative weight.
+pub fn plan_vector_classifications_rd_weighted(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    weights: &[f64],
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    plan_vector_classifications_rd_impl(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        Some(weights),
+    )
+}
+
+/// Shared core of the unweighted and weighted rate-distortion
+/// classification choosers. `weights == None` charges every partition's
+/// distortion at factor `1.0` (the unweighted Lagrangian).
+fn plan_vector_classifications_rd_impl(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    weights: Option<&[f64]>,
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
     if residue_type > 2 {
         return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
     }
@@ -777,9 +880,25 @@ pub fn plan_vector_classifications_rd(
     }
     let num_partitions = scalars.len() / ps;
 
+    if let Some(w) = weights {
+        if w.len() != num_partitions {
+            return Err(ResidueEncodeError::WeightLengthMismatch {
+                expected: num_partitions,
+                actual: w.len(),
+            });
+        }
+        if let Some(p) = w.iter().position(|v| !v.is_finite() || *v < 0.0) {
+            return Err(ResidueEncodeError::BadWeight {
+                partition: p,
+                value: w[p],
+            });
+        }
+    }
+
     let mut choices = Vec::with_capacity(num_partitions);
     for p in 0..num_partitions {
         let partition_scalars = &scalars[p * ps..(p + 1) * ps];
+        let weight = weights.map_or(1.0, |w| w[p]);
 
         let mut best: Option<PartitionClassChoice> = None;
         let mut best_cost = f64::INFINITY;
@@ -793,10 +912,12 @@ pub fn plan_vector_classifications_rd(
             )?;
 
             // Lagrangian rate-distortion cost. `bit_cost` is exact bits;
-            // `error_sq` is squared sample distortion; `lambda` is the
-            // bits→distortion exchange rate. The accumulation is in f64
-            // to keep the comparison stable across a wide dynamic range.
-            let cost = scored.error_sq + lambda * scored.bit_cost as f64;
+            // `error_sq` is squared sample distortion (scaled by the
+            // partition's perceptual weight, 1.0 when unweighted);
+            // `lambda` is the bits→distortion exchange rate. The
+            // accumulation is in f64 to keep the comparison stable
+            // across a wide dynamic range.
+            let cost = weight * scored.error_sq + lambda * scored.bit_cost as f64;
 
             // Lexicographic preference: (cost ↑, populated stages ↑,
             // classification index ↑). `<` keeps the first-seen
@@ -911,6 +1032,59 @@ pub fn plan_vector_residue_rd(
 ) -> Result<ScoredVectorResidue, ResidueEncodeError> {
     let choices =
         plan_vector_classifications_rd(scalars, value_books, residue_type, partition_size, lambda)?;
+    let mut classifications = Vec::with_capacity(choices.len());
+    let mut partition_entries = Vec::with_capacity(choices.len());
+    let mut total_error_sq = 0.0f64;
+    let mut total_value_bits = 0u64;
+    for choice in choices {
+        total_error_sq += choice.error_sq;
+        total_value_bits += choice.bit_cost;
+        classifications.push(choice.classification);
+        partition_entries.push(choice.entries);
+    }
+    Ok(ScoredVectorResidue {
+        classifications,
+        partition_entries,
+        total_error_sq,
+        total_value_bits,
+    })
+}
+
+/// Plan a complete residue decode vector by the **perceptually
+/// weighted** rate-distortion criterion and report its aggregate
+/// figures (Vorbis I §8.6.2, encode direction).
+///
+/// This is to [`plan_vector_residue_rd`] what
+/// [`plan_vector_classifications_rd_weighted`] is to
+/// [`plan_vector_classifications_rd`]: each partition's classification
+/// minimises `weights[p] · error_sq + lambda · bit_cost`, and the
+/// index-aligned `classifications` + `partition_entries` are assembled
+/// for the WRITE path. The returned
+/// [`ScoredVectorResidue::total_error_sq`] is the **unweighted**
+/// physical distortion sum (the same quantity the unweighted planner
+/// reports, so rate/SNR measurements stay comparable);
+/// `total_value_bits` is exact. All-`1.0` weights reproduce
+/// [`plan_vector_residue_rd`] bit-for-bit.
+///
+/// # Errors
+///
+/// Identical to [`plan_vector_classifications_rd_weighted`].
+pub fn plan_vector_residue_rd_weighted(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    weights: &[f64],
+) -> Result<ScoredVectorResidue, ResidueEncodeError> {
+    let choices = plan_vector_classifications_rd_weighted(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        weights,
+    )?;
     let mut classifications = Vec::with_capacity(choices.len());
     let mut partition_entries = Vec::with_capacity(choices.len());
     let mut total_error_sq = 0.0f64;
@@ -1654,6 +1828,186 @@ mod tests {
         assert!(matches!(
             nan,
             Err(ResidueEncodeError::NonFiniteLambda(l)) if l.is_nan()
+        ));
+    }
+
+    // ---------- perceptually weighted rate-distortion selection ----------
+
+    /// The coarse/fine two-class fixture from
+    /// `rd_large_lambda_prefers_cheaper_class`: class 0 = coarse alone
+    /// (err 2 on [3,3], 1 bit), class 1 = coarse+fine (err 0, 2 bits).
+    fn coarse_fine_books() -> (VorbisCodebook, VorbisCodebook) {
+        let coarse = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![1; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 0.0,
+                delta_value: 2.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        };
+        let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        (coarse, fine)
+    }
+
+    /// All-`1.0` weights must reproduce the unweighted RD chooser
+    /// bit-for-bit at several lambdas.
+    #[test]
+    fn weighted_all_ones_matches_unweighted() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0, 8.0, 8.0, 1.0, 1.0];
+        let ones = vec![1.0f64; 3];
+
+        for lambda in [0.0, 0.5, 2.0, 10.0] {
+            let plain =
+                plan_vector_classifications_rd(&scalars, &value_books, 1, 2, lambda).unwrap();
+            let weighted = plan_vector_classifications_rd_weighted(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                lambda,
+                &ones,
+            )
+            .unwrap();
+            assert_eq!(plain, weighted, "lambda {lambda}");
+            let v_plain = plan_vector_residue_rd(&scalars, &value_books, 1, 2, lambda).unwrap();
+            let v_weighted =
+                plan_vector_residue_rd_weighted(&scalars, &value_books, 1, 2, lambda, &ones)
+                    .unwrap();
+            assert_eq!(v_plain, v_weighted, "lambda {lambda}");
+        }
+    }
+
+    /// A high perceptual weight must buy back the denser cascade the
+    /// unweighted chooser gives up at the same lambda: at λ = 10 the
+    /// cheap class wins unweighted (cost 2 + 10 = 12 vs 0 + 20 = 20),
+    /// but at weight 100 the audible distortion dominates
+    /// (200 + 10 = 210 vs 0 + 20 = 20) and the fine class wins.
+    #[test]
+    fn high_weight_buys_the_denser_cascade() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0];
+
+        let unweighted =
+            plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 10.0, &[1.0])
+                .unwrap();
+        assert_eq!(unweighted[0].classification, 0);
+
+        let weighted =
+            plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 10.0, &[100.0])
+                .unwrap();
+        assert_eq!(weighted[0].classification, 1);
+        assert_eq!(weighted[0].error_sq, 0.0);
+        assert_eq!(weighted[0].bit_cost, 2);
+    }
+
+    /// A zero weight makes a partition's choice rate-only: the cheaper
+    /// cascade wins even though the denser one has strictly lower
+    /// distortion.
+    #[test]
+    fn zero_weight_partition_takes_the_cheapest_cascade() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0];
+
+        // At λ = 0.1 the fine class wins under weight 1 (0.2 vs 2.1)…
+        let w1 = plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 0.1, &[1.0])
+            .unwrap();
+        assert_eq!(w1[0].classification, 1);
+        // …but under weight 0 only the bits matter (0.1 vs 0.2).
+        let w0 = plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 0.1, &[0.0])
+            .unwrap();
+        assert_eq!(w0[0].classification, 0);
+        assert_eq!(w0[0].bit_cost, 1);
+    }
+
+    /// Weights apply per partition: identical targets with different
+    /// weights choose differently within one vector.
+    #[test]
+    fn weights_are_per_partition() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0, 3.0, 3.0];
+
+        let choices = plan_vector_classifications_rd_weighted(
+            &scalars,
+            &value_books,
+            1,
+            2,
+            10.0,
+            &[1.0, 100.0],
+        )
+        .unwrap();
+        assert_eq!(choices[0].classification, 0, "masked partition → cheap");
+        assert_eq!(choices[1].classification, 1, "audible partition → dense");
+    }
+
+    #[test]
+    fn weighted_rejects_bad_weight_vectors() {
+        let book = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&book);
+        let value_books = vec![row];
+        let scalars = vec![3.0, 3.0, 1.0, 1.0];
+
+        assert_eq!(
+            plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 1.0, &[1.0]),
+            Err(ResidueEncodeError::WeightLengthMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            plan_vector_classifications_rd_weighted(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                1.0,
+                &[1.0, -0.5]
+            ),
+            Err(ResidueEncodeError::BadWeight {
+                partition: 1,
+                value: -0.5
+            })
+        );
+        let nan = plan_vector_classifications_rd_weighted(
+            &scalars,
+            &value_books,
+            1,
+            2,
+            1.0,
+            &[f64::NAN, 1.0],
+        );
+        assert!(matches!(
+            nan,
+            Err(ResidueEncodeError::BadWeight { partition: 0, value }) if value.is_nan()
         ));
     }
 

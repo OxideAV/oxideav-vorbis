@@ -262,9 +262,11 @@ pub use psy::{
 pub use residue::{ResidueDecoder, ResidueError};
 pub use residue_encode::{
     plan_partition_cascade, plan_partition_cascade_scored, plan_vector_classifications,
-    plan_vector_classifications_rd, plan_vector_partition_entries, plan_vector_residue,
-    plan_vector_residue_rd, select_residue_config, PartitionClassChoice, ResidueConfigCandidate,
-    ResidueEncodeError, ScoredPartitionCascade, ScoredVectorResidue, SelectedResidueConfig,
+    plan_vector_classifications_rd, plan_vector_classifications_rd_weighted,
+    plan_vector_partition_entries, plan_vector_residue, plan_vector_residue_rd,
+    plan_vector_residue_rd_weighted, select_residue_config, PartitionClassChoice,
+    ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade, ScoredVectorResidue,
+    SelectedResidueConfig,
 };
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
