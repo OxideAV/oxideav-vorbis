@@ -6,6 +6,35 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Codebook content design — optimal codeword-length assignment
+  (`book_design` module: `design_codeword_lengths`,
+  `design_codeword_lengths_dense`, `stream_cost_bits`,
+  `MAX_CODEWORD_LEN`, `BookDesignError`)** — the foundation of the
+  codebook-*content* design followup both floor paths named. A Vorbis
+  codebook's entropy content is fully determined by its per-entry
+  codeword-**length** list (§3.2.1's canonical "lowest valued unused
+  codeword" rule implies the codewords), so designing a book reduces to
+  choosing the length list that minimises `Σ freq·length` subject to
+  §3.2.1 legality: lengths in `1..=32` (the 5-bit `length − 1` field),
+  a **fully populated** decision tree (Kraft sum exactly 1 — §3.2.1
+  rejects both under- and over-specified trees), sparse
+  `UNUSED_ENTRY` slots for never-emitted entries, and the errata-20150226
+  single-used-entry book (sole entry at length 1). The optimiser is the
+  classic package-merge (coin-collector) construction for
+  length-limited prefix codes, realised with the sorted-prefix property
+  (per level only the count of taken symbol coins is tracked). Two
+  sparse policies: `design_codeword_lengths` prunes zero-frequency
+  entries (cheapest, book cannot encode them), `_dense` smooths them to
+  frequency 1 (book keeps its whole entry range encodable).
+  `stream_cost_bits` prices a symbol-frequency table against a length
+  list exactly. 16 new unit tests: balanced/dyadic recovery, an
+  exhaustive small-case **brute-force optimality oracle** (every
+  Kraft-complete capped length multiset enumerated), a binding
+  length-cap case (Fibonacci frequencies) staying legal, Kraft equality
+  + `HuffmanTree` acceptance across 200 pseudo-random tables,
+  never-worse-than-flat, deterministic tie-breaks, sparse/dense/single
+  policies, the full error surface, and a 4096-entry Zipf book. All
+  re-exported at the crate root.
 - **Floor-1 rate-distortion post-budget selection (`floor1_layout` module:
   `select_floor1_post_budget`, `floor1_x_list_distortion`)** — makes the
   floor-1 post count *bit-budget aware*, the geometry analogue of the

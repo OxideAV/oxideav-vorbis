@@ -153,6 +153,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod audio;
 pub mod blocksize;
+pub mod book_design;
 pub mod channel_order;
 pub mod codebook;
 pub mod comment;
@@ -187,6 +188,10 @@ pub use audio::{
     AudioPacketOutcome, WindowedPacketOutcome,
 };
 pub use blocksize::{choose_blocksize, detect_transient, BlocksizeError, TransientAnalysis};
+pub use book_design::{
+    design_codeword_lengths, design_codeword_lengths_dense, stream_cost_bits, BookDesignError,
+    MAX_CODEWORD_LEN,
+};
 pub use channel_order::{speaker_at, speaker_layout, Speaker};
 pub use codebook::{
     float32_pack, float32_unpack, ilog, lookup1_values, parse_codebook,
