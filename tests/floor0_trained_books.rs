@@ -35,8 +35,7 @@ use oxideav_vorbis::floor0::{Floor0Curve, Floor0Decoder};
 use oxideav_vorbis::floor0_envelope::plan_floor0_packet;
 use oxideav_vorbis::setup::Floor0Header;
 use oxideav_vorbis::{
-    design_entropy_codebook, tally_floor0_packet, write_codebook, write_floor0_packet, BookTallies,
-    Floor0Packet,
+    tally_floor0_packet, write_codebook, write_floor0_packet, BookTallies, Floor0Packet,
 };
 
 /// Spectral bins the envelopes are defined over (also the render `n/2`).
