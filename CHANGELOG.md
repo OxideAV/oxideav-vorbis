@@ -4,6 +4,44 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Ogg carriage now rides the `oxideav-ogg` container crate** (new
+  dependency, `0.1`, unconditional). The Vorbis-specific §A.2
+  mapping stays in-crate in `oggfile`: `mux_vorbis_stream` keeps its
+  signature and the §4.2.1 header-order + non-decreasing-granule
+  checks, hands the three headers to the container layer as the
+  Xiph-laced codec-private blob (new pub `lace_vorbis_headers`),
+  carries audio granules on `Packet::pts`, and signals the page
+  policy (soft 4 kB audio page target + a forced break before the
+  final packet so the EOS end-trim granule has an exact
+  blocksize-walk anchor on the previous page) via
+  `PacketFlags::unit_boundary`; new pub `ogg_packets` de-frames a
+  physical stream through `oxideav_ogg::page::Page`.
+  `decode_ogg_to_pcm` / `encode_pcm_to_ogg` keep their signatures
+  and behaviour (pagination differs from the old in-crate muxer;
+  the §A.2 page rules and the end-trim are unchanged). Black-box:
+  the 1 s stereo `q = 0.8` encode decodes through ffmpeg to exactly
+  44100 frames (agreeing with the crate's own decoder to 117 dB,
+  max sample delta 1.3 × 10⁻⁶), and all 15 single-stream fixture
+  remuxes decode through ffmpeg to exactly their declared
+  final-granule length with the original's decode a bit-identical
+  prefix.
+- `MuxError` moved from the removed `oggmux` module into `oggfile`
+  (variants: `HeaderOrder` / `Classify` / `NonMonotoneGranule` /
+  `Container`); `OggFileError::Ogg` now carries the container page
+  parser's rendered message as a `String`.
+
+### Removed
+
+- The in-crate RFC 3533 page layer (`ogg` module: `OggPage`,
+  `parse_pages`, `pages_to_packets`, `PacketAssembler`,
+  `PageWriter`, `ogg_crc32`, `MAX_PAGE_SEGMENTS`,
+  `OGG_CAPTURE_PATTERN`, `PAGE_HEADER_LEN`) and the `oggmux` module
+  (`VorbisOggMuxer`) — superseded by the `oxideav-ogg` dependency;
+  the fixture framing-conformance gate (`tests/ogg_framing.rs`) now
+  pins the dependency byte-for-byte against the corpus instead.
+
 ### Added
 
 - **Closed-loop codebook training wired into the integrated encoder**

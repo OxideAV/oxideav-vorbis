@@ -12,11 +12,13 @@ Clean-room implementation against the Vorbis I Specification
 **Clean-room rebuild in progress.** The crate implements the full
 Vorbis I decode pipeline — **decoding real Vorbis audio packets to
 sample-exact PCM** — and a complete, playable **`PCM → .ogg`
-encoder** (`encode_pcm_to_ogg`): RFC 3533 page framing, the §A.2
-Ogg/Vorbis encapsulation rules, and the whole psychoacoustic /
-floor / residue encode stack behind one quality scalar, black-box
-verified (a `q = 0.8` stereo encode decodes through ffmpeg to the
-exact declared duration at 30.8 dB SNR against the input).
+encoder** (`encode_pcm_to_ogg`): the §A.2 Ogg/Vorbis encapsulation
+rules over the [`oxideav-ogg`](https://github.com/OxideAV/oxideav-ogg)
+container crate's RFC 3533 page transport, and the whole
+psychoacoustic / floor / residue encode stack behind one quality
+scalar, black-box verified (a `q = 0.8` stereo encode decodes
+through ffmpeg to the exact declared duration, agreeing with the
+crate's own decoder to 117 dB / max sample delta 1.3 × 10⁻⁶).
 `register()` installs the codec — decoder and encoder factories plus
 the Matroska `A_VORBIS` tag — into `oxideav_core::RuntimeContext`,
 and the dual-API endpoints `decoder::make_decoder` /
@@ -620,32 +622,37 @@ residue formats now have an end-to-end §4.3 packet round-trip.
 
 ### Ogg carriage + the wired codec
 
-The **RFC 3533 Ogg page layer** (`ogg` module) implements the page
-format both ways: `OggPage::parse` / `parse_pages` (capture pattern,
-version, CRC verify) with `PacketAssembler` reassembling packets
-across `continued` page boundaries, and `OggPage::serialize` +
-`PageWriter` running the packet → 255-byte-lacing → page
-encapsulation (auto page emit on a full segment table,
-last-completed-packet granule stamping with `-1` for spanned pages,
-BOS on the first page, EOS at `finish()` — including re-stamping an
-already-flushed final page in place with a recomputed CRC). The §6
-item 7 CRC (polynomial `0x04c11db7`, MSB-first, zero init, no final
-XOR) and the whole layer are fixture-anchored: every page of all 16
-staged real-world streams parses with a verifying CRC and
-re-serializes **byte-for-byte** (`tests/ogg_framing.rs`).
-
-The **§A.2 Ogg/Vorbis encapsulation** (`oggmux` module,
-`VorbisOggMuxer` / `mux_vorbis_stream`) applies the mapping rules:
-identification header alone on the 58-byte BOS first page, comment +
-setup from page 1 with the setup header finishing its page so audio
-begins fresh, header pages at granule 0, audio pages stamped with
-the end-PCM position of the last packet completed on the page, a
-soft 4 kB audio page-size target, EOS on the final page with the
-end-trim granule. `tests/ogg_vorbis_remux.rs` de-frames all 15
-single-stream fixtures, recomputes every packet's granule from the
-§4.3.1 blocksize walk, remuxes, and asserts the identical packet
-sequence plus every §A.2 page rule; a remuxed fixture decodes
-through ffmpeg sample-identical (±1) to the original.
+The **RFC 3533 Ogg page transport is the
+[`oxideav-ogg`](https://github.com/OxideAV/oxideav-ogg) container
+crate's job** — the in-crate page layer (`ogg` module) and the
+`oggmux` muxer were removed in its favour. What stays here is the
+Vorbis-specific §A.2 mapping, in `oggfile`: `mux_vorbis_stream`
+(same signature as before) verifies the §4.2.1 header ordering and
+the non-decreasing granule positions, packages the three headers as
+the Xiph-laced codec-private blob (`lace_vorbis_headers`) on the
+container `StreamInfo`, carries each audio packet's end-PCM granule
+on `Packet::pts`, and drives the page-boundary policy (RFC 3533
+soft 4 kB audio page target, plus a forced break before the final
+packet so the EOS page carries the end-trim granule with an exact
+blocksize-walk anchor on the page before it) through the container
+crate's `unit_boundary` flag; `ogg_packets` is the inverse
+de-framing convenience over `oxideav_ogg::page::Page`. The §A.2
+page rules still hold on the wire: identification header alone on
+the 58-byte BOS first page, comment + setup from page 1 with audio
+beginning fresh, header pages at granule 0, audio pages stamped
+with the end-PCM position of the last packet completed on the page
+(`-1` for spanned pages), EOS on the final page with the end-trim
+granule. `tests/ogg_framing.rs` pins the dependency against the
+corpus (every page of all 16 staged real-world streams parses with
+a verifying CRC and re-serializes **byte-for-byte**);
+`tests/ogg_vorbis_remux.rs` de-frames all 15 single-stream
+fixtures, recomputes every packet's granule from the §4.3.1
+blocksize walk, remuxes, and asserts the identical packet sequence
+plus every §A.2 page rule. Black-box, all 15 remuxes decode
+through ffmpeg to **exactly their declared final-granule length**,
+with ffmpeg's decode of each original a bit-identical prefix (three
+byte-identical; on the rest ffmpeg under-reads the original's own
+pagination by 128–350 samples that the remux recovers).
 
 The **whole-stream encoder** (`oggfile` module) is the integrated
 `encode(pcm) → .ogg` path: `encode_pcm_to_ogg` (and its packet-level
