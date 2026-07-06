@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Framework registration + dual API** — `register()` is no longer a
+  no-op: it installs one `"vorbis"` codec into
+  `oxideav_core::RuntimeContext` with both factories and the Matroska
+  `A_VORBIS` tag claim. `decoder::make_decoder` builds
+  `VorbisDecoder` (a packet-to-frame `oxideav_core::Decoder`: the
+  three §4.2 header packets in-band and order-checked, §4.3 audio
+  packets through the streaming pipeline, planar-f32 `AudioFrame`s
+  with sample-granularity PTS, `reset()` clearing the §4.3.8 overlap
+  state). `encoder::make_encoder` builds `VorbisStreamEncoder` (a
+  frame-to-packet `oxideav_core::Encoder` over the new
+  `encode_pcm_to_packets`: buffers planar/interleaved F32 frames,
+  runs the two-pass whole-stream encode at `flush()`, and emits the
+  three header packets flagged `header` followed by audio packets
+  with sample timestamps; `"quality"` / `"blocksize"` options).
+  `encode_pcm_to_ogg` is now a thin §A.2 mux over
+  `encode_pcm_to_packets` / `EncodedVorbisStream`.
+  `tests/registry_wiring.rs` round-trips PCM through boxed trait
+  objects on both the registry path and the direct dual-API path
+  (23.5 dB at strict-margin quality on a tonal corpus), checks the
+  tag resolution, header flagging, PTS bookkeeping, factory option
+  guards, and out-of-order header rejection.
 - **Temporal masking (`psy::TemporalMasking`)** — the cross-frame
   extension of the r387 Bark-domain model. Post-masking: a masker's
   threshold elevation decays across following frames at a configurable

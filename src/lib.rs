@@ -157,6 +157,7 @@ pub mod book_design;
 pub mod channel_order;
 pub mod codebook;
 pub mod comment;
+pub mod decoder;
 pub mod encoder;
 pub mod floor0;
 pub mod floor0_encode;
@@ -208,18 +209,19 @@ pub use codebook::{
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
+pub use decoder::{make_decoder, VorbisDecoder, OUTPUT_SAMPLE_FORMAT};
 pub use encoder::{
-    pack_residue_classification_groups, pack_residue_classifications, plan_residue_bundles,
-    residue_body_shape, residue_partition_codeword_count, write_audio_packet,
+    make_encoder, pack_residue_classification_groups, pack_residue_classifications,
+    plan_residue_bundles, residue_body_shape, residue_partition_codeword_count, write_audio_packet,
     write_audio_packet_header, write_codebook, write_comment_header, write_floor0_header,
     write_floor0_packet, write_floor1_header, write_floor1_packet, write_identification_header,
     write_mapping_header, write_mode_header, write_residue_body, write_residue_header,
     write_residue_partition, AudioChannelFloor, Floor0Packet, Floor1Packet, PackResidueClassError,
     PackResidueClassGroupsError, PlanResidueBundlesError, ResidueBodyShape, ResidueBundlePlan,
-    ResidueVectorPlan, SubmapResidueBundle, WriteAudioPacketError, WriteAudioPacketHeaderError,
-    WriteCodebookError, WriteError, WriteFloor0Error, WriteFloor0PacketError, WriteFloor1Error,
-    WriteFloor1PacketError, WriteMappingError, WriteModeError, WriteResidueBodyError,
-    WriteResidueError, WriteResiduePartitionError,
+    ResidueVectorPlan, SubmapResidueBundle, VorbisStreamEncoder, WriteAudioPacketError,
+    WriteAudioPacketHeaderError, WriteCodebookError, WriteError, WriteFloor0Error,
+    WriteFloor0PacketError, WriteFloor1Error, WriteFloor1PacketError, WriteMappingError,
+    WriteModeError, WriteResidueBodyError, WriteResidueError, WriteResiduePartitionError,
 };
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
 pub use floor0_encode::{floor0_vector_count, plan_floor0_coefficients, Floor0EncodeError};
@@ -256,7 +258,8 @@ pub use ogg::{
     MAX_PAGE_SEGMENTS, OGG_CAPTURE_PATTERN, PAGE_HEADER_LEN,
 };
 pub use oggfile::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, DecodedOggStream, OggFileError, StreamEncoderConfig,
+    decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets, DecodedOggStream,
+    EncodedVorbisStream, OggFileError, StreamEncoderConfig,
 };
 pub use oggmux::{mux_vorbis_stream, MuxError, VorbisOggMuxer};
 pub use overlap::{OverlapAdd, OverlapError};
@@ -629,9 +632,20 @@ pub fn decode_packet(
     Err(Error::NotImplemented)
 }
 
-/// No-op codec registration — the round-1 scaffold does not yet
-/// register a [`oxideav_core::Decoder`] or [`oxideav_core::Encoder`]
-/// because the audio-packet pipeline is not yet implemented.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Install the Vorbis codec into an [`oxideav_core::RuntimeContext`]:
+/// one `"vorbis"` registration carrying both the packet-to-frame
+/// decoder factory ([`decoder::make_decoder`]) and the frame-to-packet
+/// encoder factory ([`encoder::make_encoder`]), claiming the Matroska
+/// `A_VORBIS` codec tag. The direct factory endpoints remain callable
+/// without a registry (the workspace dual-API convention).
+pub fn register(ctx: &mut RuntimeContext) {
+    ctx.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("vorbis"))
+            .capabilities(oxideav_core::CodecCapabilities::audio("vorbis_sw"))
+            .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
+            .tags([oxideav_core::CodecTag::matroska("A_VORBIS")]),
+    );
+}
 
 oxideav_core::register!("vorbis", register);

@@ -321,6 +321,26 @@ fn build_setup(
     }
 }
 
+/// The packet-level product of [`encode_pcm_to_packets`]: the three
+/// §4.2 header packets plus the §4.3 audio packets with their absolute
+/// §A.2 granule positions — everything a container muxer needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodedVorbisStream {
+    /// §4.2.2 identification-header packet.
+    pub identification: Vec<u8>,
+    /// §5 comment-header packet.
+    pub comment: Vec<u8>,
+    /// §4.2.4 setup-header packet.
+    pub setup: Vec<u8>,
+    /// §4.3 audio packets, each with the end-PCM-sample granule
+    /// position of the stream after it (packet `f` finishes `f · n/2`
+    /// samples; the final packet's granule is the exact input length —
+    /// the §A.2 end-trim).
+    pub audio: Vec<(Vec<u8>, u64)>,
+    /// The single blocksize `n` the stream uses.
+    pub blocksize: usize,
+}
+
 /// Encode per-channel PCM rows into a complete Ogg/Vorbis physical
 /// bitstream (§A.2 encapsulation of the three §4.2 headers plus the
 /// §4.3 audio packets). See the module docs for the pipeline.
@@ -336,6 +356,29 @@ pub fn encode_pcm_to_ogg(
     pcm: &[Vec<f32>],
     config: &StreamEncoderConfig,
 ) -> Result<Vec<u8>, OggFileError> {
+    let stream = encode_pcm_to_packets(pcm, config)?;
+    let mut muxer = VorbisOggMuxer::new(config.serial);
+    muxer.push_header(&stream.identification)?;
+    muxer.push_header(&stream.comment)?;
+    muxer.push_header(&stream.setup)?;
+    for (packet, granule) in &stream.audio {
+        muxer.push_audio(packet, *granule)?;
+    }
+    Ok(muxer.finish()?)
+}
+
+/// The packet-level encoder under [`encode_pcm_to_ogg`]: the full
+/// analysis/psy/floor/residue pipeline, stopping *before* the Ogg
+/// layer. Container-agnostic consumers (the [`oxideav_core::Encoder`]
+/// implementation, external muxers) use this form.
+///
+/// # Errors
+///
+/// As [`encode_pcm_to_ogg`].
+pub fn encode_pcm_to_packets(
+    pcm: &[Vec<f32>],
+    config: &StreamEncoderConfig,
+) -> Result<EncodedVorbisStream, OggFileError> {
     // ---- validation ----
     if config.channels == 0 || pcm.len() != config.channels as usize {
         return Err(OggFileError::BadChannelCount {
@@ -508,11 +551,7 @@ pub fn encode_pcm_to_ogg(
     cascade_row[1] = Some(&fine);
     let value_books = [empty_row, cascade_row];
 
-    let mut muxer = VorbisOggMuxer::new(config.serial);
-    muxer.push_header(&id_packet)?;
-    muxer.push_header(&comment_packet)?;
-    muxer.push_header(&setup_packet)?;
-
+    let mut audio_packets: Vec<(Vec<u8>, u64)> = Vec::with_capacity(frames);
     let packet_header = AudioPacketHeader {
         mode_number: 0,
         blockflag: false,
@@ -560,9 +599,15 @@ pub fn encode_pcm_to_ogg(
         } else {
             natural
         };
-        muxer.push_audio(&packet, granule)?;
+        audio_packets.push((packet, granule));
     }
-    Ok(muxer.finish()?)
+    Ok(EncodedVorbisStream {
+        identification: id_packet,
+        comment: comment_packet,
+        setup: setup_packet,
+        audio: audio_packets,
+        blocksize: n,
+    })
 }
 
 /// A decoded Ogg/Vorbis stream: per-channel PCM rows (bitstream

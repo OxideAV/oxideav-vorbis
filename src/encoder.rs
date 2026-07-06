@@ -6528,6 +6528,221 @@ fn emit_audio_packet_bodies(
     Ok(())
 }
 
+// ───────────────── framework-facing Encoder (oxideav_core) ─────────────────
+
+/// The framework-facing Vorbis encoder: an [`oxideav_core::Encoder`]
+/// over the crate's whole-stream pipeline
+/// ([`crate::oggfile::encode_pcm_to_packets`]).
+///
+/// The encoder buffers PCM frames (planar or interleaved 32-bit
+/// float) and runs the full two-pass encode at [`flush`]: the codebook
+/// value ladders and the floor-1 header are designed from the whole
+/// stream, so no packets are available before end of input. `flush`
+/// queues the three §4.2 header packets (flagged `header`) followed by
+/// the §4.3 audio packets, each stamped with sample-granularity
+/// timestamps (`time_base = 1/sample_rate`, `pts` = start sample,
+/// `duration` = finished samples) and the absolute §A.2 granule
+/// position as `dts`-agnostic metadata via `pts + duration`.
+///
+/// [`flush`]: oxideav_core::Encoder::flush
+pub struct VorbisStreamEncoder {
+    codec_id: oxideav_core::CodecId,
+    output_params: oxideav_core::CodecParameters,
+    config: crate::oggfile::StreamEncoderConfig,
+    input_format: oxideav_core::SampleFormat,
+    pcm: Vec<Vec<f32>>,
+    queue: std::collections::VecDeque<oxideav_core::Packet>,
+    flushed: bool,
+}
+
+impl core::fmt::Debug for VorbisStreamEncoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VorbisStreamEncoder")
+            .field("channels", &self.pcm.len())
+            .field("buffered_samples", &self.pcm.first().map(Vec::len))
+            .field("queued_packets", &self.queue.len())
+            .field("flushed", &self.flushed)
+            .finish()
+    }
+}
+
+impl oxideav_core::Encoder for VorbisStreamEncoder {
+    fn codec_id(&self) -> &oxideav_core::CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &oxideav_core::CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &oxideav_core::Frame) -> oxideav_core::Result<()> {
+        if self.flushed {
+            return Err(oxideav_core::Error::invalid(
+                "vorbis encoder: send_frame after flush",
+            ));
+        }
+        let audio = match frame {
+            oxideav_core::Frame::Audio(a) => a,
+            _ => {
+                return Err(oxideav_core::Error::invalid(
+                    "vorbis encoder: expected an audio frame",
+                ))
+            }
+        };
+        let ch = self.pcm.len();
+        match self.input_format {
+            oxideav_core::SampleFormat::F32P => {
+                if audio.data.len() != ch {
+                    return Err(oxideav_core::Error::invalid(format!(
+                        "vorbis encoder: {} planes for {ch} channels",
+                        audio.data.len()
+                    )));
+                }
+                for (row, plane) in self.pcm.iter_mut().zip(&audio.data) {
+                    row.extend(
+                        plane
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                    );
+                }
+            }
+            oxideav_core::SampleFormat::F32 => {
+                let plane = audio.data.first().ok_or_else(|| {
+                    oxideav_core::Error::invalid("vorbis encoder: interleaved frame has no plane")
+                })?;
+                for (i, b) in plane.chunks_exact(4).enumerate() {
+                    self.pcm[i % ch].push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                }
+            }
+            other => {
+                return Err(oxideav_core::Error::unsupported(format!(
+                    "vorbis encoder: sample format {other:?} (use F32 / F32P)"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> oxideav_core::Result<oxideav_core::Packet> {
+        if let Some(packet) = self.queue.pop_front() {
+            return Ok(packet);
+        }
+        if self.flushed {
+            Err(oxideav_core::Error::Eof)
+        } else {
+            Err(oxideav_core::Error::NeedMore)
+        }
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        if self.flushed {
+            return Ok(());
+        }
+        self.flushed = true;
+        if self.pcm.first().map(Vec::len).unwrap_or(0) == 0 {
+            // No input — nothing to encode; receive_packet drains to Eof.
+            return Ok(());
+        }
+        let stream = crate::oggfile::encode_pcm_to_packets(&self.pcm, &self.config)
+            .map_err(|e| oxideav_core::Error::invalid(format!("vorbis encoder: {e}")))?;
+        let time_base = oxideav_core::TimeBase::new(1, i64::from(self.config.sample_rate.max(1)));
+        for header in [&stream.identification, &stream.comment, &stream.setup] {
+            self.queue.push_back(
+                oxideav_core::Packet::new(0, time_base, header.clone())
+                    .with_pts(0)
+                    .with_duration(0)
+                    .with_header(true)
+                    .with_keyframe(true),
+            );
+        }
+        let mut prev_granule = 0u64;
+        for (data, granule) in stream.audio {
+            let duration = granule.saturating_sub(prev_granule);
+            self.queue.push_back(
+                oxideav_core::Packet::new(0, time_base, data)
+                    .with_pts(prev_granule as i64)
+                    .with_duration(duration as i64)
+                    .with_keyframe(true),
+            );
+            prev_granule = granule;
+        }
+        Ok(())
+    }
+}
+
+/// Direct-API factory endpoint: build a boxed [`VorbisStreamEncoder`]
+/// from stream parameters. This is also the factory
+/// [`crate::register`] installs into the [`oxideav_core`] codec
+/// registry.
+///
+/// Required parameters: `sample_rate` and `channels`. Optional:
+/// `sample_format` (`F32P` default, `F32` accepted), a `"quality"`
+/// option (`0.0..=1.0`, default `0.7`) and a `"blocksize"` option
+/// (power of two in `64..=8192`, default `1024`).
+///
+/// # Errors
+///
+/// [`oxideav_core::Error::Invalid`]-flavoured errors for missing /
+/// out-of-range parameters.
+pub fn make_encoder(
+    params: &oxideav_core::CodecParameters,
+) -> oxideav_core::Result<Box<dyn oxideav_core::Encoder>> {
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| oxideav_core::Error::invalid("vorbis encoder: sample_rate required"))?;
+    let channels = params
+        .channels
+        .ok_or_else(|| oxideav_core::Error::invalid("vorbis encoder: channels required"))?;
+    if channels == 0 || channels > 255 {
+        return Err(oxideav_core::Error::invalid(format!(
+            "vorbis encoder: channel count {channels} outside 1..=255"
+        )));
+    }
+    let input_format = params
+        .sample_format
+        .unwrap_or(oxideav_core::SampleFormat::F32P);
+    let mut config = crate::oggfile::StreamEncoderConfig::new(sample_rate, channels as u8);
+    if let Some(q) = params.options.get("quality") {
+        let q: f32 = q.parse().map_err(|_| {
+            oxideav_core::Error::invalid(format!("vorbis encoder: quality {q:?} not a number"))
+        })?;
+        if !(0.0..=1.0).contains(&q) {
+            return Err(oxideav_core::Error::invalid(format!(
+                "vorbis encoder: quality {q} outside 0..=1"
+            )));
+        }
+        config.quality = q;
+    }
+    if let Some(b) = params.options.get("blocksize") {
+        let n: usize = b.parse().map_err(|_| {
+            oxideav_core::Error::invalid(format!("vorbis encoder: blocksize {b:?} not an integer"))
+        })?;
+        if !n.is_power_of_two() || !(64..=8192).contains(&n) {
+            return Err(oxideav_core::Error::invalid(format!(
+                "vorbis encoder: blocksize {n} not a power of two in 64..=8192"
+            )));
+        }
+        config.blocksize = n;
+    }
+
+    let mut output_params =
+        oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new("vorbis"));
+    output_params.sample_rate = Some(sample_rate);
+    output_params.channels = Some(channels);
+    output_params.sample_format = Some(oxideav_core::SampleFormat::F32P);
+    output_params.tag = Some(oxideav_core::CodecTag::matroska("A_VORBIS"));
+
+    Ok(Box::new(VorbisStreamEncoder {
+        codec_id: oxideav_core::CodecId::new("vorbis"),
+        output_params,
+        input_format,
+        pcm: vec![Vec::new(); channels as usize],
+        config,
+        queue: std::collections::VecDeque::new(),
+        flushed: false,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
