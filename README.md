@@ -10,11 +10,17 @@ Clean-room implementation against the Vorbis I Specification
 ## Status
 
 **Clean-room rebuild in progress.** The crate implements the full
-Vorbis I decode pipeline at the codec layer — **decoding real Vorbis
-audio packets to sample-exact PCM** — plus a growing set of encoder
-write-path primitives. It is codec-only: Ogg container framing and
-`oxideav-core` registration are not yet wired — `register()` is
-currently a no-op.
+Vorbis I decode pipeline — **decoding real Vorbis audio packets to
+sample-exact PCM** — and a complete, playable **`PCM → .ogg`
+encoder** (`encode_pcm_to_ogg`): RFC 3533 page framing, the §A.2
+Ogg/Vorbis encapsulation rules, and the whole psychoacoustic /
+floor / residue encode stack behind one quality scalar, black-box
+verified (a `q = 0.8` stereo encode decodes through ffmpeg to the
+exact declared duration at 30.8 dB SNR against the input).
+`register()` installs the codec — decoder and encoder factories plus
+the Matroska `A_VORBIS` tag — into `oxideav_core::RuntimeContext`,
+and the dual-API endpoints `decoder::make_decoder` /
+`encoder::make_encoder` are directly callable without a registry.
 
 The §4.3 decode chain is sample-exact end to end: twelve staged fixtures
 (`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1 through q10,
@@ -612,28 +618,98 @@ strided scatter, `read i, element j → i + j·step`): mono PCM → flat floor �
 (format 0 previously had only isolated residue-body coverage). All three
 residue formats now have an end-to-end §4.3 packet round-trip.
 
+### Ogg carriage + the wired codec
+
+The **RFC 3533 Ogg page layer** (`ogg` module) implements the page
+format both ways: `OggPage::parse` / `parse_pages` (capture pattern,
+version, CRC verify) with `PacketAssembler` reassembling packets
+across `continued` page boundaries, and `OggPage::serialize` +
+`PageWriter` running the packet → 255-byte-lacing → page
+encapsulation (auto page emit on a full segment table,
+last-completed-packet granule stamping with `-1` for spanned pages,
+BOS on the first page, EOS at `finish()` — including re-stamping an
+already-flushed final page in place with a recomputed CRC). The §6
+item 7 CRC (polynomial `0x04c11db7`, MSB-first, zero init, no final
+XOR) and the whole layer are fixture-anchored: every page of all 16
+staged real-world streams parses with a verifying CRC and
+re-serializes **byte-for-byte** (`tests/ogg_framing.rs`).
+
+The **§A.2 Ogg/Vorbis encapsulation** (`oggmux` module,
+`VorbisOggMuxer` / `mux_vorbis_stream`) applies the mapping rules:
+identification header alone on the 58-byte BOS first page, comment +
+setup from page 1 with the setup header finishing its page so audio
+begins fresh, header pages at granule 0, audio pages stamped with
+the end-PCM position of the last packet completed on the page, a
+soft 4 kB audio page-size target, EOS on the final page with the
+end-trim granule. `tests/ogg_vorbis_remux.rs` de-frames all 15
+single-stream fixtures, recomputes every packet's granule from the
+§4.3.1 blocksize walk, remuxes, and asserts the identical packet
+sequence plus every §A.2 page rule; a remuxed fixture decodes
+through ffmpeg sample-identical (±1) to the original.
+
+The **whole-stream encoder** (`oggfile` module) is the integrated
+`encode(pcm) → .ogg` path: `encode_pcm_to_ogg` (and its packet-level
+form `encode_pcm_to_packets`) composes the §4.3.8-inverse framing
+splitter, the bare §4.3.7 forward MDCT at the derived `4/n`
+unity-reconstruction scale, per-channel **temporal** psychoacoustics,
+floor-1 design/fit, NMR-weighted RD residue planning, §9.2.2-packable
+lattice value ladders, the three §4.2 header writers and the §A.2
+encapsulation with `f · n/2` granule positions end-trimmed to the
+exact input length — all behind the one `quality ∈ [0, 1]` scalar.
+`decode_ogg_to_pcm` is the inverse convenience (de-frame, header
+parse, streaming decode, end-trim). `tests/ogg_encode_roundtrip.rs`
+pins the §A.2 structure of the produced stream and the round-trip
+fidelity (mono 27.6 dB at `q = 0.7`; the quality knob trades
+1.25 kB / 0.9 dB → 9.4 kB / 6 dB+ on an 8k corpus); black-box, a 1 s
+stereo `q = 0.8` encode decodes through ffmpeg to exactly 44100
+frames at **30.8 dB SNR** against the input.
+
+**Registration + dual API**: `register()` installs the codec
+(decoder + encoder factories, Matroska `A_VORBIS` tag) into
+`oxideav_core::RuntimeContext`. `decoder::VorbisDecoder` is the
+packet-to-frame `oxideav_core::Decoder` (in-band order-checked §4.2
+headers, §4.3 audio through the streaming pipeline, planar-f32
+frames with sample-granularity PTS, seek-safe `reset()`);
+`encoder::VorbisStreamEncoder` is the frame-to-packet
+`oxideav_core::Encoder` (buffers F32/F32P frames, two-pass encode at
+`flush()`, header-flagged §4.2 packets then timestamped audio
+packets; `"quality"` / `"blocksize"` options).
+`tests/registry_wiring.rs` round-trips PCM through boxed trait
+objects on both the registry and the direct dual-API path.
+
+The **temporal masking extension** (`psy::TemporalMasking`) adds the
+cross-frame component the per-frame model lacked: post-masking (a
+masker's threshold elevation decays across following frames at a
+configurable dB/ms rate, default 0.5) and pre-masking (a loud onset
+lifts the previous frame's threshold via one frame of lookahead,
+attenuated 12 dB). Pinned structural properties: never below the
+per-frame model, identical on steady-state signals, monotone decay
+back after a burst. `tests/psy_temporal_masking.rs` validates the
+payoff NMR-style at equal transparency: on a burst-then-low-comb
+transient corpus the temporal encode spends **−14 %** bytes at fixed
+lambda, both encodes transparent under their own model, and on a
+steady corpus the two models are byte-identical. The whole-stream
+encoder runs its thresholds through this pipeline per channel.
+
 ### Not yet supported / known gaps
 
-- **No `Decoder` / `Encoder` registration** and no Ogg container
-  layer — the crate exposes the codec primitives, not a wired codec. The
-  integration test carries a minimal RFC-3533 page de-framer as private
-  test scaffolding to feed real `input.ogg` packets to the decoder;
-  production Ogg demuxing belongs in `oxideav-ogg`.
-- **Codebook-content design + closed-loop training are closed** —
-  optimal §3.2.1 length assignment, per-subsystem emission tallies,
-  retraining, the §3.2.1 VQ value-ladder design, and (this round) the
-  distortion-aware ladder step inside the alternating RD loop
-  (`train_residue_books_rd_ladder`).
-- **The psy model is per-frame and partition-granular.** Masking has
-  no temporal component (no forward/backward temporal masking — the
-  `blocksize::detect_transient` short-block switch is the only
-  pre-echo control), the tonality estimate is band-level spectral
-  flatness (no phase-predictability tracking), and the perceptual
-  weighting enters the residue chooser per *partition* — the VQ entry
-  selection inside `vq::quantize_vector` is still unweighted
-  Euclidean per read. Stereo coupling decisions
-  (`synthesis::should_couple`) are energy-driven, not yet
-  masking-driven.
+- **The integrated encoder is single-blocksize.** `encode_pcm_to_ogg`
+  uses one `blockflag = false` mode (`blocksize_0 == blocksize_1`);
+  the §4.3.1 short/long switching machinery
+  (`blocksize::detect_transient` / `choose_blocksize`, the window
+  flags, the trace-conformant switch decode) exists and is tested,
+  but the whole-stream encoder does not yet drive it — pre-echo
+  control currently rests on the psy model's pre-masking discount.
+  Channel coupling (`synthesis::forward_couple_all`) and the trained
+  codebook stack (`train_residue_books_rd_ladder`) are likewise
+  proven but not yet wired into the integrated path — every channel
+  is carried uncoupled over fixed generic ladders.
+- **The psy tonality estimate is band-level spectral flatness** (no
+  phase-predictability tracking), the perceptual weighting enters the
+  residue chooser per *partition* (the VQ entry selection inside
+  `vq::quantize_vector` is unweighted Euclidean per read), and stereo
+  coupling decisions (`synthesis::should_couple`) are energy-driven,
+  not masking-driven.
 
 ## Clean-room provenance
 
