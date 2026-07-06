@@ -19,11 +19,24 @@
 //! Skips when the docs/ fixtures submodule is absent (standalone CI).
 
 use oxideav_core::bits::BitReaderLsb;
+use oxideav_ogg::page::Page;
 use oxideav_vorbis::identification::parse_identification_header;
-use oxideav_vorbis::ogg::{pages_to_packets, parse_pages};
-use oxideav_vorbis::oggmux::mux_vorbis_stream;
 use oxideav_vorbis::packet::read_packet_header;
 use oxideav_vorbis::setup::parse_setup_header;
+use oxideav_vorbis::{mux_vorbis_stream, ogg_packets};
+
+/// Parse every page of a physical stream (CRC-verified by the
+/// `oxideav-ogg` page parser), keeping each page's on-wire byte length.
+fn parse_pages(data: &[u8]) -> Vec<(Page, usize)> {
+    let mut pages = Vec::new();
+    let mut off = 0usize;
+    while off < data.len() {
+        let (page, used) = Page::parse(&data[off..]).expect("page parses (CRC verifies)");
+        pages.push((page, used));
+        off += used;
+    }
+    pages
+}
 
 fn fixtures_root() -> String {
     format!(
@@ -65,8 +78,8 @@ fn every_fixture_remuxes_to_an_a2_conformant_stream_with_identical_packets() {
     for dir in FIXTURES {
         let path = format!("{}/{dir}/input.ogg", fixtures_root());
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{dir}: read: {e}"));
-        let original_pages = parse_pages(&bytes).expect("original pages parse");
-        let packets = pages_to_packets(&bytes).expect("original packets assemble");
+        let original_pages = parse_pages(&bytes);
+        let packets = ogg_packets(&bytes).expect("original packets assemble");
         assert!(packets.len() >= 4, "{dir}: too few packets");
 
         let id = parse_identification_header(&packets[0]).expect("id header parses");
@@ -92,7 +105,7 @@ fn every_fixture_remuxes_to_an_a2_conformant_stream_with_identical_packets() {
         // §A.2 end-trim pass-through: the original last page's granule
         // replaces the walk's final value; it may understate the walk
         // by less than one long block, never overstate it.
-        let final_granule = original_pages.last().unwrap().granule_position;
+        let final_granule = original_pages.last().unwrap().0.granule_position;
         assert!(final_granule >= 0, "{dir}: final granule");
         let final_granule = final_granule as u64;
         let natural = *granules.last().unwrap();
@@ -111,18 +124,18 @@ fn every_fixture_remuxes_to_an_a2_conformant_stream_with_identical_packets() {
             .unwrap_or_else(|e| panic!("{dir}: remux: {e}"));
 
         // Identical packet sequence back out.
-        let packets_again = pages_to_packets(&remuxed).expect("remuxed packets assemble");
+        let packets_again = ogg_packets(&remuxed).expect("remuxed packets assemble");
         assert_eq!(packets_again, packets, "{dir}: packet sequence changed");
 
         // §A.2 structure.
-        let pages = parse_pages(&remuxed).expect("remuxed pages parse");
-        assert_eq!(pages[0].page_len(), 58, "{dir}: first page");
-        assert!(pages[0].bos, "{dir}");
-        assert_eq!(pages[0].granule_position, 0, "{dir}");
-        assert_eq!(pages[1].granule_position, 0, "{dir}: header page granule");
-        assert!(pages.last().unwrap().eos, "{dir}");
+        let pages = parse_pages(&remuxed);
+        assert_eq!(pages[0].1, 58, "{dir}: first page");
+        assert!(pages[0].0.is_first(), "{dir}");
+        assert_eq!(pages[0].0.granule_position, 0, "{dir}");
+        assert_eq!(pages[1].0.granule_position, 0, "{dir}: header page granule");
+        assert!(pages.last().unwrap().0.is_last(), "{dir}");
         assert_eq!(
-            pages.last().unwrap().granule_position,
+            pages.last().unwrap().0.granule_position,
             final_granule as i64,
             "{dir}: final granule"
         );
@@ -133,7 +146,7 @@ fn every_fixture_remuxes_to_an_a2_conformant_stream_with_identical_packets() {
         // completes on).
         let mut audio_page_start = None;
         let mut completed = 0usize;
-        for (i, page) in pages.iter().enumerate() {
+        for (i, (page, _)) in pages.iter().enumerate() {
             completed += page.lacing.iter().filter(|&&l| l < 255).count();
             if completed >= 3 {
                 audio_page_start = Some(i + 1);
@@ -142,11 +155,11 @@ fn every_fixture_remuxes_to_an_a2_conformant_stream_with_identical_packets() {
         }
         let start = audio_page_start.expect("headers complete somewhere");
         assert!(
-            !pages[start].continued,
+            !pages[start].0.is_continued(),
             "{dir}: audio must begin a fresh page"
         );
         let mut idx = 0usize;
-        for page in &pages[start..] {
+        for (page, _) in &pages[start..] {
             let done = page.lacing.iter().filter(|&&l| l < 255).count();
             if done == 0 {
                 assert_eq!(page.granule_position, -1, "{dir}: spanned page granule");

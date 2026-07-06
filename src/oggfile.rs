@@ -44,9 +44,8 @@ use crate::floor1_layout::{design_floor1_header, Floor1LayoutError};
 use crate::framing::{FrameSplitter, FramingError};
 use crate::identification::{parse_identification_header, VorbisIdentificationHeader};
 use crate::mdct::{mdct_naive_vec, MdctError};
-use crate::ogg::{pages_to_packets, parse_pages, OggError};
-use crate::oggmux::{MuxError, VorbisOggMuxer};
 use crate::packet::AudioPacketHeader;
+use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
 use crate::psy::{
     plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis, PsyConfig, PsyError,
     TemporalMasking, TemporalMaskingConfig,
@@ -60,6 +59,8 @@ use crate::setup::{
 use crate::streaming::{StreamingDecoder, StreamingError, StreamingFrame};
 use crate::synthesis::{vorbis_window, WindowError};
 use crate::VorbisCommentHeader;
+use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
+use oxideav_ogg::page::Page;
 
 /// §8.6.1 residue partition size the integrated encoder uses.
 const PARTITION_SIZE: u32 = 16;
@@ -152,8 +153,9 @@ pub enum OggFileError {
     WritePacket(WriteAudioPacketError),
     /// The §A.2 muxer refused the packet sequence.
     Mux(MuxError),
-    /// RFC 3533 de-framing failed (decode direction).
-    Ogg(OggError),
+    /// RFC 3533 de-framing failed (decode direction) — the rendered
+    /// message from the `oxideav-ogg` page parser.
+    Ogg(String),
     /// A decode-direction header packet failed to parse.
     Header(String),
     /// The §4.3 streaming decode failed (decode direction).
@@ -230,8 +232,277 @@ from_err!(crate::book_design::BookDesignError => Training);
 from_err!(WriteError => Write);
 from_err!(WriteAudioPacketError => WritePacket);
 from_err!(MuxError => Mux);
-from_err!(OggError => Ogg);
 from_err!(StreamingError => Streaming);
+
+// ───────────────────── §A.2 Ogg encapsulation ─────────────────────
+//
+// The codec-agnostic RFC 3533 page transport (framing, lacing, CRC,
+// pagination) is `oxideav-ogg`'s job. What stays here is the Vorbis
+// mapping of §A ("Embedding Vorbis into an Ogg stream"): the
+// three-header ordering rule, the per-packet end-PCM-sample granule
+// semantics (including the §A.2 end-trim), and the codec-private
+// header packaging the container layer carries.
+
+/// Soft page-size target for audio pages, in body bytes. RFC 3533 §6
+/// describes pages as "usually 4-8 kB"; [`mux_vorbis_stream`] signals
+/// a page boundary to the container layer once the pending body
+/// reaches this size (a packet that overshoots it still lands whole
+/// unless the 255-segment table forces a split). Small pages keep the
+/// per-page granule positions dense enough for third-party decoders
+/// to resolve per-packet timestamps (and the §A.2 end-trim) without
+/// walking a whole-stream page.
+const AUDIO_PAGE_TARGET_BYTES: usize = 4096;
+
+/// §A.2 packet-sequencing errors from [`mux_vorbis_stream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MuxError {
+    /// A header packet arrived out of §A.2 order (or an audio packet
+    /// arrived where a header was required).
+    HeaderOrder {
+        /// The header kind the muxer expected next.
+        expected: PacketKind,
+        /// The kind actually classified.
+        got: PacketKind,
+    },
+    /// The packet failed §4.2.1 / §4.3.1 classification.
+    Classify(ClassifyError),
+    /// An audio packet's granule position went backwards.
+    NonMonotoneGranule {
+        /// The previous packet's granule position.
+        prev: u64,
+        /// The offending packet's granule position.
+        got: u64,
+    },
+    /// The `oxideav-ogg` container layer refused the stream — the
+    /// rendered message.
+    Container(String),
+}
+
+impl core::fmt::Display for MuxError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MuxError::HeaderOrder { expected, got } => {
+                write!(
+                    f,
+                    "ogg/vorbis mux: expected {expected:?} header, got {got:?}"
+                )
+            }
+            MuxError::Classify(e) => write!(f, "ogg/vorbis mux: {e}"),
+            MuxError::NonMonotoneGranule { prev, got } => write!(
+                f,
+                "ogg/vorbis mux: granule position {got} < previous {prev}"
+            ),
+            MuxError::Container(e) => write!(f, "ogg/vorbis mux: container: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for MuxError {}
+
+impl From<ClassifyError> for MuxError {
+    fn from(value: ClassifyError) -> Self {
+        MuxError::Classify(value)
+    }
+}
+
+/// Package the three §4.2 header packets as the Xiph-laced
+/// codec-private blob container layers carry for Vorbis (Matroska
+/// `CodecPrivate`, `oxideav-ogg` `StreamInfo::params.extradata`): one
+/// byte `packet_count - 1` (= 2), then the 255-terminated lacing sizes
+/// of the first two packets, then the three packets back to back (the
+/// last packet's size is implicit in the blob length).
+#[must_use]
+pub fn lace_vorbis_headers(identification: &[u8], comment: &[u8], setup: &[u8]) -> Vec<u8> {
+    fn push_lacing(out: &mut Vec<u8>, mut len: usize) {
+        while len >= 255 {
+            out.push(255);
+            len -= 255;
+        }
+        out.push(len as u8);
+    }
+    let mut blob = Vec::with_capacity(
+        3 + identification.len() / 255
+            + comment.len() / 255
+            + identification.len()
+            + comment.len()
+            + setup.len(),
+    );
+    blob.push(2);
+    push_lacing(&mut blob, identification.len());
+    push_lacing(&mut blob, comment.len());
+    blob.extend_from_slice(identification);
+    blob.extend_from_slice(comment);
+    blob.extend_from_slice(setup);
+    blob
+}
+
+/// A `Write + Seek + Send` sink over a shared byte buffer, so the
+/// bytes survive handing ownership of the writer to the container
+/// muxer.
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>);
+
+impl SharedBuf {
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(self.0.lock().expect("shared buffer lock").get_mut())
+    }
+}
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("shared buffer lock").write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for SharedBuf {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.lock().expect("shared buffer lock").seek(pos)
+    }
+}
+
+/// One-call §A.2 encapsulation of a complete packet stream:
+/// `(identification, comment, setup)` headers plus `(packet,
+/// granulepos)` audio packets, under the given logical-bitstream
+/// serial number. The header ordering is verified with the §4.2.1
+/// packet-kind classifier and the granule positions must be
+/// non-decreasing; pagination, lacing and CRC are delegated to
+/// `oxideav-ogg`.
+///
+/// Each audio packet's granule position is the absolute end PCM
+/// sample position (per channel) of the stream after the packet's
+/// samples are returned by decode. The final packet's granule may
+/// deliberately understate the naturally decodable sample count —
+/// §A.2's end-trim rule for ending a stream on a non-block-aligned
+/// length.
+///
+/// # Errors
+///
+/// [`MuxError`] on a §A.2 sequencing violation or a container-layer
+/// failure.
+pub fn mux_vorbis_stream(
+    serial: u32,
+    identification: &[u8],
+    comment: &[u8],
+    setup: &[u8],
+    audio: &[(Vec<u8>, u64)],
+) -> Result<Vec<u8>, MuxError> {
+    // §A.2 packet-sequence validation — codec semantics, kept here.
+    for (packet, expected) in [
+        (identification, PacketKind::Identification),
+        (comment, PacketKind::Comment),
+        (setup, PacketKind::Setup),
+    ] {
+        let got = classify_packet(packet)?;
+        if got != expected {
+            return Err(MuxError::HeaderOrder { expected, got });
+        }
+    }
+    let mut last_granule = 0u64;
+    for (_, granule) in audio {
+        if *granule < last_granule {
+            return Err(MuxError::NonMonotoneGranule {
+                prev: last_granule,
+                got: *granule,
+            });
+        }
+        last_granule = *granule;
+    }
+
+    // Stream description for the container layer. The `StreamInfo`
+    // index doubles as the muxer's on-wire serial; the sample rate
+    // (when the id header parses) gives the granule its 1/rate time
+    // base.
+    let mut params = CodecParameters::audio(CodecId::new("vorbis"));
+    params.extradata = lace_vorbis_headers(identification, comment, setup);
+    let time_base = match parse_identification_header(identification) {
+        Ok(id) => {
+            params.sample_rate = Some(id.audio_sample_rate);
+            params.channels = Some(u16::from(id.audio_channels));
+            TimeBase::new(1, i64::from(id.audio_sample_rate.max(1)))
+        }
+        Err(_) => TimeBase::new(1, 1),
+    };
+    let stream = StreamInfo {
+        index: serial,
+        time_base,
+        duration: audio.last().map(|(_, g)| *g as i64),
+        start_time: Some(0),
+        params,
+    };
+
+    let sink = SharedBuf::default();
+    let container = |e: oxideav_core::Error| MuxError::Container(e.to_string());
+    let mut muxer =
+        oxideav_ogg::mux::open_concrete(Box::new(sink.clone()), std::slice::from_ref(&stream))
+            .map_err(container)?;
+    use oxideav_core::Muxer as _;
+    muxer.write_header().map_err(container)?;
+    let mut pending_body = 0usize;
+    for (i, (packet, granule)) in audio.iter().enumerate() {
+        pending_body += packet.len();
+        // Page-boundary policy: flush at the soft size target, and
+        // always break before the final packet so the last page
+        // carries only the end-trim packet — the penultimate page then
+        // ends on an exact blocksize-walk granule anchor, keeping the
+        // §A.2 final-granule trim locally resolvable for third-party
+        // decoders.
+        let boundary = pending_body >= AUDIO_PAGE_TARGET_BYTES || i + 2 == audio.len();
+        if boundary {
+            pending_body = 0;
+        }
+        let mut pkt =
+            oxideav_core::Packet::new(serial, time_base, packet.clone()).with_pts(*granule as i64);
+        pkt.flags.unit_boundary = boundary;
+        muxer.write_packet(&pkt).map_err(container)?;
+    }
+    muxer.write_trailer().map_err(container)?;
+    drop(muxer);
+    Ok(sink.take())
+}
+
+/// Parse a physical Ogg stream into its page sequence (CRC-verified by
+/// the `oxideav-ogg` page parser).
+fn parse_all_pages(data: &[u8]) -> Result<Vec<Page>, OggFileError> {
+    let mut pages = Vec::new();
+    let mut off = 0usize;
+    while off < data.len() {
+        let (page, used) =
+            Page::parse(&data[off..]).map_err(|e| OggFileError::Ogg(e.to_string()))?;
+        off += used;
+        pages.push(page);
+    }
+    Ok(pages)
+}
+
+/// De-frame a complete single-logical-stream Ogg physical bitstream
+/// into its packet sequence: CRC-verified page parse plus lacing-model
+/// packet reassembly (packets spanning pages are concatenated across
+/// the continuation boundary).
+///
+/// # Errors
+///
+/// [`OggFileError::Ogg`] when a page fails to parse or CRC-verify.
+pub fn ogg_packets(data: &[u8]) -> Result<Vec<Vec<u8>>, OggFileError> {
+    Ok(assemble_packets(&parse_all_pages(data)?))
+}
+
+/// Lacing-model packet reassembly over parsed pages.
+fn assemble_packets(pages: &[Page]) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    let mut pending: Vec<u8> = Vec::new();
+    for page in pages {
+        for seg in page.packet_segments() {
+            pending.extend_from_slice(&page.data[seg.data.clone()]);
+            if seg.terminated {
+                packets.push(std::mem::take(&mut pending));
+            }
+        }
+    }
+    packets
+}
 
 /// A signed 1-D lattice value book: `2^length` entries on the uniform
 /// grid `[-half·step, (half−1)·step]`, all codewords `length` bits.
@@ -371,14 +642,13 @@ pub fn encode_pcm_to_ogg(
     config: &StreamEncoderConfig,
 ) -> Result<Vec<u8>, OggFileError> {
     let stream = encode_pcm_to_packets(pcm, config)?;
-    let mut muxer = VorbisOggMuxer::new(config.serial);
-    muxer.push_header(&stream.identification)?;
-    muxer.push_header(&stream.comment)?;
-    muxer.push_header(&stream.setup)?;
-    for (packet, granule) in &stream.audio {
-        muxer.push_audio(packet, *granule)?;
-    }
-    Ok(muxer.finish()?)
+    Ok(mux_vorbis_stream(
+        config.serial,
+        &stream.identification,
+        &stream.comment,
+        &stream.setup,
+        &stream.audio,
+    )?)
 }
 
 /// The packet-level encoder under [`encode_pcm_to_ogg`]: the full
@@ -668,8 +938,8 @@ pub struct DecodedOggStream {
 ///
 /// See [`OggFileError`].
 pub fn decode_ogg_to_pcm(data: &[u8]) -> Result<DecodedOggStream, OggFileError> {
-    let pages = parse_pages(data)?;
-    let packets = pages_to_packets(data)?;
+    let pages = parse_all_pages(data)?;
+    let packets = assemble_packets(&pages);
     if packets.len() < 3 {
         return Err(OggFileError::MissingHeaders {
             packets: packets.len(),

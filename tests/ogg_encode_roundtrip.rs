@@ -21,10 +21,25 @@
 //!
 //! Fully synthetic — no fixtures required.
 
-use oxideav_vorbis::ogg::{pages_to_packets, parse_pages};
-use oxideav_vorbis::{decode_ogg_to_pcm, encode_pcm_to_ogg, OggFileError, StreamEncoderConfig};
+use oxideav_ogg::page::Page;
+use oxideav_vorbis::{
+    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, OggFileError, StreamEncoderConfig,
+};
 
 const RATE: u32 = 44_100;
+
+/// Parse every page of a physical stream (CRC-verified by the
+/// `oxideav-ogg` page parser), keeping each page's on-wire byte length.
+fn parse_pages(data: &[u8]) -> Vec<(Page, usize)> {
+    let mut pages = Vec::new();
+    let mut off = 0usize;
+    while off < data.len() {
+        let (page, used) = Page::parse(&data[off..]).expect("page parses (CRC verifies)");
+        pages.push((page, used));
+        off += used;
+    }
+    pages
+}
 
 /// A deterministic tones + noise-floor test signal.
 fn test_signal(samples: usize, seed: u32) -> Vec<f32> {
@@ -66,18 +81,18 @@ fn mono_stream_roundtrips_with_a2_structure_and_pinned_snr() {
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
 
     // ---- §A.2 structure ----
-    let pages = parse_pages(&ogg).expect("pages parse (CRCs verify)");
-    assert_eq!(pages[0].page_len(), 58, "id header alone on page 0");
-    assert!(pages[0].bos);
-    assert_eq!(pages[0].granule_position, 0);
-    assert_eq!(pages[1].granule_position, 0, "header pages at granule 0");
-    assert!(pages.last().unwrap().eos);
+    let pages = parse_pages(&ogg);
+    assert_eq!(pages[0].1, 58, "id header alone on page 0");
+    assert!(pages[0].0.is_first());
+    assert_eq!(pages[0].0.granule_position, 0);
+    assert_eq!(pages[1].0.granule_position, 0, "header pages at granule 0");
+    assert!(pages.last().unwrap().0.is_last());
     assert_eq!(
-        pages.last().unwrap().granule_position,
+        pages.last().unwrap().0.granule_position,
         samples as i64,
         "final granule is the exact input length"
     );
-    let packets = pages_to_packets(&ogg).expect("packets assemble");
+    let packets = ogg_packets(&ogg).expect("packets assemble");
     assert!(packets.len() > 3);
 
     // ---- decode + fidelity ----

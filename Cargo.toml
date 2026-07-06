@@ -15,3 +15,12 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+# RFC 3533 Ogg page transport (framing, lacing, CRC, pagination). The
+# Vorbis-specific §A.2 mapping rules (header ordering, granule
+# semantics, end-trim) stay in this crate; the codec-agnostic
+# container layer is the sibling's job. Unconditional: this crate has
+# no feature gating (`oxideav-core` is already an unconditional dep)
+# and `encode_pcm_to_ogg` / `decode_ogg_to_pcm` are core standalone
+# entry points, so there is no configuration in which the container
+# layer is trimmable.
+oxideav-ogg = "0.1"

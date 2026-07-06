@@ -173,9 +173,7 @@ pub mod huffman;
 pub mod identification;
 pub mod imdct;
 pub mod mdct;
-pub mod ogg;
 pub mod oggfile;
-pub mod oggmux;
 pub mod overlap;
 pub mod packet;
 pub mod packet_kind;
@@ -253,15 +251,11 @@ pub use mdct::{
     apply_window_and_mdct, apply_window_and_mdct_vec, mdct_naive, mdct_naive_vec,
     ApplyWindowAndMdctError, MdctError,
 };
-pub use ogg::{
-    ogg_crc32, pages_to_packets, parse_pages, OggError, OggPage, PacketAssembler, PageWriter,
-    MAX_PAGE_SEGMENTS, OGG_CAPTURE_PATTERN, PAGE_HEADER_LEN,
-};
 pub use oggfile::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets, DecodedOggStream,
-    EncodedVorbisStream, OggFileError, StreamEncoderConfig,
+    decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets, lace_vorbis_headers,
+    mux_vorbis_stream, ogg_packets, DecodedOggStream, EncodedVorbisStream, MuxError, OggFileError,
+    StreamEncoderConfig,
 };
-pub use oggmux::{mux_vorbis_stream, MuxError, VorbisOggMuxer};
 pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
