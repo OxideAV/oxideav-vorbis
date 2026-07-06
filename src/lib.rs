@@ -270,7 +270,7 @@ pub use packet_kind::{
 };
 pub use psy::{
     ath_db, compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
-    PsyConfig, PsyError,
+    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 pub use quality::{
     solve_lambda_for_bits, EncoderTuning, LambdaSolution, LambdaSolveError, QualityError,

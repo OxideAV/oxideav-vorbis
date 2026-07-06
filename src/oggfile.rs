@@ -48,7 +48,8 @@ use crate::ogg::{pages_to_packets, parse_pages, OggError};
 use crate::oggmux::{MuxError, VorbisOggMuxer};
 use crate::packet::AudioPacketHeader;
 use crate::psy::{
-    compute_masking, plan_psy_floor_envelope, residue_partition_weights, PsyConfig, PsyError,
+    plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis, PsyConfig, PsyError,
+    TemporalMasking, TemporalMaskingConfig,
 };
 use crate::quality::{EncoderTuning, QualityError};
 use crate::residue_encode::{plan_vector_residue_rd_weighted, ResidueEncodeError};
@@ -392,26 +393,40 @@ pub fn encode_pcm_to_ogg(
     }
 
     // ---- psychoacoustics + floor-1 header design ----
+    // Per channel, the thresholds run through the temporal pipeline:
+    // post-masking decay across frames plus the one-frame-lookahead
+    // pre-masking lift (the encoder is whole-stream, so lookahead is
+    // free). On steady-state content this is exactly the per-frame
+    // model.
     let psy_config = PsyConfig {
         threshold_offset_db: tuning.threshold_offset_db,
         ..PsyConfig::new(config.sample_rate)
     };
-    let mut maskings = Vec::with_capacity(frames); // [frame][channel]
+    let mut maskings: Vec<Vec<MaskingAnalysis>> = vec![Vec::with_capacity(ch); frames];
+    for c in 0..ch {
+        let mut temporal = TemporalMasking::new(&TemporalMaskingConfig::new(half_n), &psy_config)?;
+        let mut emitted = 0usize;
+        for per_ch in &spectra {
+            if let Some(analysis) = temporal.push_frame(&per_ch[c], &psy_config)? {
+                maskings[emitted].push(analysis);
+                emitted += 1;
+            }
+        }
+        if let Some(analysis) = temporal.finish() {
+            maskings[emitted].push(analysis);
+        }
+    }
     let mut envelopes = Vec::with_capacity(frames);
     let mut envelope_max = vec![f32::MIN_POSITIVE; half_n];
-    for per_ch in &spectra {
-        let mut m_row = Vec::with_capacity(ch);
+    for (per_ch, m_row) in spectra.iter().zip(&maskings) {
         let mut e_row = Vec::with_capacity(ch);
-        for x in per_ch {
-            let masking = compute_masking(x, &psy_config)?;
-            let envelope = plan_psy_floor_envelope(x, &masking, tuning.floor_smooth_radius)?;
+        for (x, masking) in per_ch.iter().zip(m_row) {
+            let envelope = plan_psy_floor_envelope(x, masking, tuning.floor_smooth_radius)?;
             for (acc, &v) in envelope_max.iter_mut().zip(&envelope) {
                 *acc = acc.max(v);
             }
-            m_row.push(masking);
             e_row.push(envelope);
         }
-        maskings.push(m_row);
         envelopes.push(e_row);
     }
     let classes = floor_class_catalogue();

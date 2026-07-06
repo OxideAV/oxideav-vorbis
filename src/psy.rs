@@ -157,6 +157,10 @@ pub enum PsyError {
         /// The offending value.
         value: f32,
     },
+    /// A [`TemporalMaskingConfig`] field was invalid: zero
+    /// `hop_samples`, or a non-finite / negative decay rate or
+    /// pre-masking attenuation.
+    BadTemporalConfig,
 }
 
 impl core::fmt::Display for PsyError {
@@ -184,6 +188,9 @@ impl core::fmt::Display for PsyError {
             PsyError::ZeroPartitionSize => write!(f, "vorbis psy: partition size is zero"),
             PsyError::BadFloorValue { bin, value } => {
                 write!(f, "vorbis psy: bad floor value {value} at bin {bin}")
+            }
+            PsyError::BadTemporalConfig => {
+                write!(f, "vorbis psy: invalid temporal-masking configuration")
             }
         }
     }
@@ -550,6 +557,197 @@ pub fn residue_partition_weights(
 /// near-silent-threshold bin would otherwise dominate the whole
 /// vector's bit budget.
 const RATIO_SQ_CAP: f64 = 1.0e4;
+
+// ───────────────────── temporal masking ─────────────────────
+
+/// Configuration for the cross-frame temporal extension of the
+/// masking model ([`TemporalMasking`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalMaskingConfig {
+    /// Analysis hop between consecutive frames, in samples — `n/2`
+    /// under the §4.3.8 lapping geometry. Together with the sample
+    /// rate this fixes the frame advance in milliseconds.
+    pub hop_samples: usize,
+    /// How fast the **post-masking** (forward-masking) skirt decays,
+    /// in dB per millisecond. After a masker stops, its elevated
+    /// threshold does not collapse instantly — it decays over roughly
+    /// 100–200 ms; the classic engineering approximation is a decay
+    /// linear in dB over that span. `0.5` dB/ms (nominal default)
+    /// erases a 60 dB elevation in 120 ms.
+    pub post_decay_db_per_ms: f32,
+    /// Attenuation, in dB, applied to the **next** frame's fresh
+    /// threshold when it is projected one frame *backwards*
+    /// (**pre-masking** / backward masking). Pre-masking is real but
+    /// short (a few ms) and much weaker than post-masking, so the
+    /// projection is strongly attenuated; at the default `12.0` dB a
+    /// loud onset still lifts the preceding frame's threshold by a
+    /// quarter of its own masking — a pre-echo-tolerant bit discount
+    /// just ahead of a transient.
+    pub pre_attenuation_db: f32,
+}
+
+impl TemporalMaskingConfig {
+    /// Nominal parameters for the given hop: `0.5` dB/ms post-masking
+    /// decay, `12` dB pre-masking attenuation.
+    #[must_use]
+    pub fn new(hop_samples: usize) -> Self {
+        TemporalMaskingConfig {
+            hop_samples,
+            post_decay_db_per_ms: 0.5,
+            pre_attenuation_db: 12.0,
+        }
+    }
+}
+
+/// Cross-frame temporal masking: the stateful extension of
+/// [`compute_masking`] with **post-masking** (a masker's threshold
+/// elevation decays across the following frames instead of vanishing)
+/// and **pre-masking** (a loud onset lifts the threshold of the frame
+/// just before it, via one frame of lookahead).
+///
+/// The per-frame *effective* threshold is
+///
+/// ```text
+/// eff[f] = max( fresh[f],                             — the per-frame model
+///               eff[f−1] · 10^(−decay_db_frame / 20), — post-masking tail
+///               fresh[f+1] · 10^(−pre_atten / 20) )   — pre-masking lookahead
+/// ```
+///
+/// where `decay_db_frame = post_decay_db_per_ms · hop_ms`. Three
+/// structural properties follow directly and are pinned by tests:
+/// the effective threshold **never sits below the per-frame model**
+/// (temporal masking only adds masking), it is **identical to the
+/// per-frame model on steady-state signals** (the decayed/attenuated
+/// projections of an equal frame sit below its own fresh threshold),
+/// and after a masker stops the elevation **decays monotonically**
+/// back to the per-frame threshold.
+///
+/// Because pre-masking needs the next frame, the driver is a
+/// one-frame-lookahead pipeline: [`push_frame`](Self::push_frame)
+/// returns the analysis of the *previous* frame (or `None` on the
+/// first call), and [`finish`](Self::finish) drains the final frame
+/// (which has no successor, hence no pre-masking contribution).
+///
+/// Band tonality and the bin→band map in the emitted
+/// [`MaskingAnalysis`] are the frame's own (temporal masking adjusts
+/// audibility thresholds, not the tonality classification).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalMasking {
+    /// Linear per-frame post-masking decay factor
+    /// `10^(−decay_db_frame / 20)`, `< 1`.
+    post_decay: f32,
+    /// Linear pre-masking attenuation `10^(−pre_atten / 20)`, `<= 1`.
+    pre_atten: f32,
+    /// The previous frame's *effective* threshold (the decay chain).
+    prev_effective: Option<Vec<f32>>,
+    /// The lookahead slot: the last pushed frame's fresh analysis,
+    /// waiting for its successor.
+    pending: Option<MaskingAnalysis>,
+}
+
+impl TemporalMasking {
+    /// Build the pipeline. `psy.sample_rate` fixes the hop duration.
+    ///
+    /// # Errors
+    ///
+    /// [`PsyError::ZeroSampleRate`] / [`PsyError::NonFiniteConfig`]
+    /// for a bad [`PsyConfig`]; [`PsyError::BadTemporalConfig`] for a
+    /// zero hop, a non-finite or negative decay rate, or a non-finite
+    /// or negative pre-masking attenuation.
+    pub fn new(config: &TemporalMaskingConfig, psy: &PsyConfig) -> Result<Self, PsyError> {
+        if psy.sample_rate == 0 {
+            return Err(PsyError::ZeroSampleRate);
+        }
+        if !psy.full_scale_db.is_finite() || !psy.threshold_offset_db.is_finite() {
+            return Err(PsyError::NonFiniteConfig);
+        }
+        if config.hop_samples == 0
+            || !config.post_decay_db_per_ms.is_finite()
+            || config.post_decay_db_per_ms < 0.0
+            || !config.pre_attenuation_db.is_finite()
+            || config.pre_attenuation_db < 0.0
+        {
+            return Err(PsyError::BadTemporalConfig);
+        }
+        let hop_ms = config.hop_samples as f32 * 1000.0 / psy.sample_rate as f32;
+        let decay_db_frame = config.post_decay_db_per_ms * hop_ms;
+        Ok(TemporalMasking {
+            post_decay: 10.0f32.powf(-decay_db_frame / 20.0),
+            pre_atten: 10.0f32.powf(-config.pre_attenuation_db / 20.0),
+            prev_effective: None,
+            pending: None,
+        })
+    }
+
+    /// Discard all cross-frame state (stream restart / seek).
+    pub fn reset(&mut self) {
+        self.prev_effective = None;
+        self.pending = None;
+    }
+
+    /// Feed the next frame's spectrum; returns the completed analysis
+    /// of the **previous** frame (`None` on the first push). See the
+    /// type docs for the pipeline shape.
+    ///
+    /// # Errors
+    ///
+    /// Any [`compute_masking`] error for this frame, or
+    /// [`PsyError::LengthMismatch`] if the bin count changed
+    /// mid-stream.
+    pub fn push_frame(
+        &mut self,
+        spectrum: &[f32],
+        psy: &PsyConfig,
+    ) -> Result<Option<MaskingAnalysis>, PsyError> {
+        let fresh = compute_masking(spectrum, psy)?;
+        if let Some(pending) = &self.pending {
+            if pending.threshold.len() != fresh.threshold.len() {
+                return Err(PsyError::LengthMismatch {
+                    floor: fresh.threshold.len(),
+                    threshold: pending.threshold.len(),
+                });
+            }
+        }
+        let emitted = match self.pending.take() {
+            None => {
+                self.pending = Some(fresh);
+                None
+            }
+            Some(mut current) => {
+                // Pre-masking: the (new) next frame's fresh threshold,
+                // attenuated, lifts the current frame.
+                for (cur, &next) in current.threshold.iter_mut().zip(&fresh.threshold) {
+                    *cur = cur.max(next * self.pre_atten);
+                }
+                self.pending = Some(fresh);
+                Some(self.finalize(current))
+            }
+        };
+        Ok(emitted)
+    }
+
+    /// Drain the final frame of the stream (no successor, so no
+    /// pre-masking contribution). Returns `None` when nothing is
+    /// pending. The decay chain continues across the call, so a
+    /// subsequent [`push_frame`] behaves as the next frame of the
+    /// same stream; call [`reset`](Self::reset) for a new stream.
+    pub fn finish(&mut self) -> Option<MaskingAnalysis> {
+        let pending = self.pending.take()?;
+        Some(self.finalize(pending))
+    }
+
+    /// Apply the post-masking decay chain to a pre-masking-adjusted
+    /// frame and record the new effective threshold.
+    fn finalize(&mut self, mut frame: MaskingAnalysis) -> MaskingAnalysis {
+        if let Some(prev) = &self.prev_effective {
+            for (cur, &p) in frame.threshold.iter_mut().zip(prev) {
+                *cur = cur.max(p * self.post_decay);
+            }
+        }
+        self.prev_effective = Some(frame.threshold.clone());
+        frame
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -930,6 +1128,198 @@ mod tests {
         let w = residue_partition_weights(&floor, &m, 4, 8, 4).unwrap();
         assert_eq!(w.len(), 1);
         assert!((w[0] - 1.0).abs() < 1e-12);
+    }
+
+    // ---------- temporal masking ----------
+
+    fn temporal(hop: usize) -> TemporalMasking {
+        TemporalMasking::new(&TemporalMaskingConfig::new(hop), &cfg()).unwrap()
+    }
+
+    /// Drive a frame sequence through the lookahead pipeline and
+    /// return one analysis per input frame.
+    fn temporal_run(frames: &[Vec<f32>], hop: usize) -> Vec<MaskingAnalysis> {
+        let mut tm = temporal(hop);
+        let mut out = Vec::new();
+        for f in frames {
+            if let Some(a) = tm.push_frame(f, &cfg()).unwrap() {
+                out.push(a);
+            }
+        }
+        out.push(tm.finish().expect("final frame drains"));
+        assert_eq!(out.len(), frames.len());
+        out
+    }
+
+    #[test]
+    fn temporal_is_identity_on_steady_state() {
+        // Equal frames: the decayed / attenuated projections of a
+        // frame sit strictly below its own fresh threshold, so the
+        // temporal model reduces to the per-frame model exactly.
+        let n = 256;
+        let mut s = vec![0.0f32; n];
+        s[bin_at(2_000.0, n)] = 0.4;
+        let frames = vec![s.clone(); 5];
+        let fresh = compute_masking(&s, &cfg()).unwrap();
+        for (f, a) in temporal_run(&frames, n).iter().enumerate() {
+            for k in 0..n {
+                assert!(
+                    (a.threshold[k] - fresh.threshold[k]).abs() <= fresh.threshold[k] * 1e-6,
+                    "frame {f} bin {k}: {} vs fresh {}",
+                    a.threshold[k],
+                    fresh.threshold[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_never_sits_below_the_per_frame_model() {
+        let n = 256;
+        let mut loud = vec![0.0f32; n];
+        loud[bin_at(1_000.0, n)] = 0.8;
+        let quiet = vec![0.0f32; n];
+        let frames = vec![quiet.clone(), loud.clone(), quiet.clone(), quiet.clone()];
+        let analyses = temporal_run(&frames, n);
+        for (f, frame) in frames.iter().enumerate() {
+            let fresh = compute_masking(frame, &cfg()).unwrap();
+            for k in 0..n {
+                assert!(
+                    analyses[f].threshold[k] >= fresh.threshold[k] * 0.999_999,
+                    "frame {f} bin {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_masking_decays_monotonically_back_to_the_per_frame_threshold() {
+        let n = 256;
+        let k0 = bin_at(1_000.0, n);
+        let mut loud = vec![0.0f32; n];
+        loud[k0] = 0.8;
+        let quiet = vec![0.0f32; n];
+        // Loud burst, then a long silent tail.
+        let mut frames = vec![loud];
+        frames.extend(std::iter::repeat_n(quiet.clone(), 40));
+        let analyses = temporal_run(&frames, n);
+        let quiet_fresh = compute_masking(&quiet, &cfg()).unwrap();
+
+        // Immediately after the burst the threshold at the masker bin
+        // is far above the silent-frame threshold…
+        assert!(
+            analyses[1].threshold[k0] > quiet_fresh.threshold[k0] * 100.0,
+            "post-masking tail missing: {} vs {}",
+            analyses[1].threshold[k0],
+            quiet_fresh.threshold[k0]
+        );
+        // …decays monotonically…
+        for f in 1..frames.len() - 1 {
+            assert!(
+                analyses[f + 1].threshold[k0] <= analyses[f].threshold[k0] * 1.000_001,
+                "decay must be monotone at frame {f}"
+            );
+        }
+        // …and lands back on the per-frame threshold within the tail
+        // (0.5 dB/ms · ~2.9 ms/frame at n=256 hop ≈ 1.45 dB/frame; the
+        // burst sits ~60 dB up → ~42 frames; ATH flooring makes it
+        // sooner at this bin).
+        let last = analyses.last().unwrap();
+        assert!(
+            last.threshold[k0] <= quiet_fresh.threshold[k0] * 1.5,
+            "decay must return to the per-frame model: {} vs {}",
+            last.threshold[k0],
+            quiet_fresh.threshold[k0]
+        );
+    }
+
+    #[test]
+    fn pre_masking_lifts_only_the_frame_before_an_onset() {
+        let n = 256;
+        let k0 = bin_at(1_000.0, n);
+        let mut loud = vec![0.0f32; n];
+        loud[k0] = 0.8;
+        let quiet = vec![0.0f32; n];
+        let frames = vec![quiet.clone(), quiet.clone(), loud.clone()];
+        let analyses = temporal_run(&frames, n);
+        let quiet_fresh = compute_masking(&quiet, &cfg()).unwrap();
+        let loud_fresh = compute_masking(&loud, &cfg()).unwrap();
+
+        // Frame 1 (just before the onset) is lifted by the attenuated
+        // onset threshold: expect fresh_loud · 10^(−12/20).
+        let expect = loud_fresh.threshold[k0] * 10.0f32.powf(-12.0 / 20.0);
+        assert!(
+            (analyses[1].threshold[k0] - expect).abs() <= expect * 1e-4,
+            "pre-masking lift {} vs expected {}",
+            analyses[1].threshold[k0],
+            expect
+        );
+        // Frame 0 (two frames ahead of the onset) sees no lift beyond
+        // the per-frame threshold (single-frame lookahead)…
+        assert!(
+            analyses[0].threshold[k0] <= quiet_fresh.threshold[k0] * 1.000_001,
+            "pre-masking must not reach two frames back"
+        );
+        // …and the onset frame itself is its own fresh threshold.
+        assert!(
+            (analyses[2].threshold[k0] - loud_fresh.threshold[k0]).abs()
+                <= loud_fresh.threshold[k0] * 1e-5
+        );
+    }
+
+    #[test]
+    fn temporal_pipeline_shape_and_guards() {
+        // Guards.
+        assert_eq!(
+            TemporalMasking::new(&TemporalMaskingConfig::new(0), &cfg()),
+            Err(PsyError::BadTemporalConfig)
+        );
+        let mut bad = TemporalMaskingConfig::new(128);
+        bad.post_decay_db_per_ms = -1.0;
+        assert_eq!(
+            TemporalMasking::new(&bad, &cfg()),
+            Err(PsyError::BadTemporalConfig)
+        );
+        let mut bad = TemporalMaskingConfig::new(128);
+        bad.pre_attenuation_db = f32::NAN;
+        assert_eq!(
+            TemporalMasking::new(&bad, &cfg()),
+            Err(PsyError::BadTemporalConfig)
+        );
+
+        // Pipeline: first push emits nothing; finish drains; a bin-
+        // count change mid-stream is refused.
+        let mut tm = temporal(64);
+        assert!(tm.push_frame(&[0.1; 64], &cfg()).unwrap().is_none());
+        assert!(tm.push_frame(&[0.1; 64], &cfg()).unwrap().is_some());
+        assert_eq!(
+            tm.push_frame(&[0.1; 32], &cfg()),
+            Err(PsyError::LengthMismatch {
+                floor: 32,
+                threshold: 64
+            })
+        );
+        assert!(tm.finish().is_some());
+        assert!(tm.finish().is_none(), "finish is drained");
+
+        // Reset clears the decay chain: after reset, a silent frame's
+        // threshold is the per-frame threshold even after a loud one.
+        let n = 256;
+        let k0 = bin_at(1_000.0, n);
+        let mut loud = vec![0.0f32; n];
+        loud[k0] = 0.8;
+        let quiet = vec![0.0f32; n];
+        let mut tm = temporal(n);
+        let _ = tm.push_frame(&loud, &cfg()).unwrap();
+        let _ = tm.finish();
+        tm.reset();
+        let _ = tm.push_frame(&quiet, &cfg()).unwrap();
+        let a = tm.finish().unwrap();
+        let fresh = compute_masking(&quiet, &cfg()).unwrap();
+        assert!(
+            (a.threshold[k0] - fresh.threshold[k0]).abs() <= fresh.threshold[k0] * 1e-6,
+            "reset must clear the post-masking chain"
+        );
     }
 
     #[test]

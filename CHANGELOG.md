@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Temporal masking (`psy::TemporalMasking`)** — the cross-frame
+  extension of the r387 Bark-domain model. Post-masking: a masker's
+  threshold elevation decays across following frames at a configurable
+  dB/ms rate (default 0.5 dB/ms — a 60 dB elevation erased in
+  ~120 ms) via `eff[f] = max(fresh[f], eff[f−1]·10^(−decay/20))`.
+  Pre-masking: one frame of lookahead projects the next frame's fresh
+  threshold backwards under a 12 dB attenuation, a pre-echo-tolerant
+  discount just ahead of an onset — the driver is a one-frame
+  lookahead pipeline (`push_frame` emits the previous frame,
+  `finish()` drains). Three structural properties are pinned: the
+  effective threshold never sits below the per-frame model, it is
+  *identical* on steady-state signals, and the post-masking tail
+  decays monotonically back to the per-frame threshold.
+  `tests/psy_temporal_masking.rs` validates the payoff NMR-style at
+  equal transparency: on a burst-then-low-comb transient corpus the
+  temporal encode spends 717 B vs the per-frame model's 837 B
+  (−14%), both transparent under their own model (mean NMR 0.034 /
+  0.003), the temporal encode bounded under the nominal model; on a
+  steady corpus the two models produce byte-identical streams. The
+  whole-stream encoder now runs its thresholds through this pipeline
+  per channel (lookahead is free in a whole-stream encode).
 - **Whole-stream encoder + decoder entry points (`oggfile` module)**
   — `encode_pcm_to_ogg(pcm, &StreamEncoderConfig) → Vec<u8>` is the
   crate's first integrated `PCM → playable .ogg` encoder: §4.3.8-
