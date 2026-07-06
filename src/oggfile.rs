@@ -81,11 +81,20 @@ pub struct StreamEncoderConfig {
     pub blocksize: usize,
     /// Ogg logical-bitstream serial number.
     pub serial: u32,
+    /// Closed-loop residue-codebook training iterations
+    /// ([`crate::book_design::train_residue_books_rd_ladder`]): the
+    /// generic seed ladders are retrained on the stream's own residue
+    /// targets — codeword lengths from usage and reconstruction
+    /// values at the target centroids, re-snapped to the
+    /// §9.2.2-packable grid — before the packets are planned. `0`
+    /// disables training (the fixed seed ladders are used verbatim).
+    pub training_iterations: usize,
 }
 
 impl StreamEncoderConfig {
     /// A nominal configuration: `quality = 0.7`, `blocksize = 1024`,
-    /// serial `0x6F78_7662` (arbitrary fixed default).
+    /// 4 codebook-training iterations, serial `0x6F78_7662` (arbitrary
+    /// fixed default).
     #[must_use]
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         StreamEncoderConfig {
@@ -94,6 +103,7 @@ impl StreamEncoderConfig {
             quality: 0.7,
             blocksize: 1024,
             serial: 0x6F78_7662,
+            training_iterations: 4,
         }
     }
 }
@@ -134,6 +144,8 @@ pub enum OggFileError {
     FloorRender(crate::floor1::Floor1Error),
     /// The residue planner failed.
     Residue(ResidueEncodeError),
+    /// Closed-loop codebook training failed.
+    Training(crate::book_design::BookDesignError),
     /// A header writer failed.
     Write(WriteError),
     /// The audio-packet writer failed.
@@ -178,6 +190,7 @@ impl core::fmt::Display for OggFileError {
             OggFileError::FloorWrap(e) => write!(f, "ogg encode: {e}"),
             OggFileError::FloorRender(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Residue(e) => write!(f, "ogg encode: {e}"),
+            OggFileError::Training(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Write(e) => write!(f, "ogg encode: {e}"),
             OggFileError::WritePacket(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Mux(e) => write!(f, "ogg encode: {e}"),
@@ -213,6 +226,7 @@ from_err!(Floor1EnvelopeError => FloorFit);
 from_err!(Floor1EncodeError => FloorWrap);
 from_err!(crate::floor1::Floor1Error => FloorRender);
 from_err!(ResidueEncodeError => Residue);
+from_err!(crate::book_design::BookDesignError => Training);
 from_err!(WriteError => Write);
 from_err!(WriteAudioPacketError => WritePacket);
 from_err!(MuxError => Mux);
@@ -520,12 +534,34 @@ pub fn encode_pcm_to_packets(
     // therefore packable whenever the step is.
     let coarse = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 24.0));
     let fine = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 192.0));
-    let setup = build_setup(
-        floor_header.clone(),
-        coarse.clone(),
-        fine.clone(),
-        half_n as u32,
-    );
+    let mut setup = build_setup(floor_header.clone(), coarse, fine, half_n as u32);
+
+    // ---- optional closed-loop codebook training ----
+    // The generic seed ladders are retrained on the stream's own
+    // residue targets (codeword lengths from usage, reconstruction
+    // values at the observed centroids, re-snapped §9.2.2-packable);
+    // the trained table replaces the seeds in the setup header and
+    // the weighted per-frame planning below runs under it.
+    if config.training_iterations > 0 {
+        let residuals: Vec<Vec<f32>> = targets.iter().flat_map(|row| row.iter().cloned()).collect();
+        let outcome = crate::book_design::train_residue_books_rd_ladder(
+            &residuals,
+            &setup.residues[0],
+            &setup.codebooks,
+            tuning.lambda,
+            config.training_iterations,
+        )?;
+        setup.codebooks = outcome.codebooks;
+        // The trainer plans *unweighted*; the final packets below are
+        // planned with the NMR weights, which can legitimately select
+        // a class the unweighted pass never used. Keep the flat seed
+        // classbook (both classwords stay encodable at 1 bit each —
+        // there is nothing to win on a 2-entry book) and take only
+        // the trained value ladders.
+        setup.codebooks[1] = scalar_book(2, 1);
+    }
+    let coarse = setup.codebooks[2].clone();
+    let fine = setup.codebooks[3].clone();
 
     // ---- the three §4.2 header packets ----
     let id_packet = write_identification_header(&VorbisIdentificationHeader {

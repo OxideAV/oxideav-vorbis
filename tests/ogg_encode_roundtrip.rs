@@ -192,6 +192,44 @@ fn a_smaller_blocksize_also_roundtrips() {
 }
 
 #[test]
+fn codebook_training_cuts_the_stream_at_equal_fidelity() {
+    // The closed-loop ladder trainer (now covering the encoder's 1-D
+    // lattice value books) retrains the generic seed ladders on the
+    // stream's own residue targets; the trained stream must be
+    // smaller at no meaningful fidelity cost, and still §4.2.4
+    // carriage-legal (decode_ogg_to_pcm re-parses the trained setup
+    // header from the produced bytes).
+    let samples = 16_384;
+    let pcm = vec![test_signal(samples, 11)];
+    let mut untrained = StreamEncoderConfig::new(RATE, 1);
+    untrained.training_iterations = 0;
+    let mut trained = StreamEncoderConfig::new(RATE, 1);
+    trained.training_iterations = 6;
+
+    let ogg_untrained = encode_pcm_to_ogg(&pcm, &untrained).expect("untrained encodes");
+    let ogg_trained = encode_pcm_to_ogg(&pcm, &trained).expect("trained encodes");
+    let snr_untrained = snr_db(&pcm[0], &decode_ogg_to_pcm(&ogg_untrained).unwrap().pcm[0]);
+    let snr_trained = snr_db(&pcm[0], &decode_ogg_to_pcm(&ogg_trained).unwrap().pcm[0]);
+    eprintln!(
+        "training: {} B / {snr_untrained:.2} dB → {} B / {snr_trained:.2} dB",
+        ogg_untrained.len(),
+        ogg_trained.len()
+    );
+    assert!(
+        ogg_trained.len() < ogg_untrained.len(),
+        "trained stream {} B must undercut the seed stream {} B",
+        ogg_trained.len(),
+        ogg_untrained.len()
+    );
+    // The Lagrangian may trade a little distortion for the rate win,
+    // never catastrophically.
+    assert!(
+        snr_trained >= snr_untrained - 3.0,
+        "trained SNR {snr_trained:.2} dB collapsed vs {snr_untrained:.2} dB"
+    );
+}
+
+#[test]
 fn shape_guards_fire() {
     let config = StreamEncoderConfig::new(RATE, 2);
     // Row count != channels.

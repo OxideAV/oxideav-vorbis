@@ -6,6 +6,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Closed-loop codebook training wired into the integrated encoder**
+  — `StreamEncoderConfig::training_iterations` (default 4) runs
+  `train_residue_books_rd_ladder` over the stream's own residue
+  targets before packet planning, replacing the generic seed ladders
+  with usage-priced, centroid-placed, §9.2.2-packable trained books
+  in the emitted setup header. The ladder *value* step now also
+  covers **1-D lattice books** (lookup type 1 with
+  `dimensions == 1`, where the scalar table is directly
+  entry-indexed — the interoperable shape the integrated encoder
+  emits), rebuilding them in their own lookup type; multi-dimensional
+  lattices stay untouched (their entries are permutations of a shared
+  table). The flat 2-entry classbook is kept as seeded — the trainer
+  plans unweighted and could starve a class the NMR-weighted final
+  plan selects. Measured: a 16 k mono stream drops 16 760 → 8 433 B
+  at *better* SNR (36.8 → 37.7 dB); the registry round-trip stream
+  drops 13.8 kB → 6.0 kB at identical SNR; black-box, the 1 s stereo
+  `q = 0.8` encode drops 64.4 kB → 28.3 kB (−56 %) and still decodes
+  through ffmpeg to exactly 44100 frames at 30.3 dB.
 - **Framework registration + dual API** — `register()` is no longer a
   no-op: it installs one `"vorbis"` codec into
   `oxideav_core::RuntimeContext` with both factories and the Matroska

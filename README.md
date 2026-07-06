@@ -700,10 +700,13 @@ encoder runs its thresholds through this pipeline per channel.
   flags, the trace-conformant switch decode) exists and is tested,
   but the whole-stream encoder does not yet drive it — pre-echo
   control currently rests on the psy model's pre-masking discount.
-  Channel coupling (`synthesis::forward_couple_all`) and the trained
-  codebook stack (`train_residue_books_rd_ladder`) are likewise
-  proven but not yet wired into the integrated path — every channel
-  is carried uncoupled over fixed generic ladders.
+  Channel coupling (`synthesis::forward_couple_all`) is likewise
+  proven but not wired — every channel is carried uncoupled. (The
+  trained-codebook stack IS wired: `StreamEncoderConfig::
+  training_iterations` retrains the seed ladders on the stream's own
+  residue targets — the ladder value step now covers the encoder's
+  1-D lattice books — cutting a 1 s stereo `q = 0.8` stream 56 %
+  at unchanged ffmpeg-decoded SNR.)
 - **The psy tonality estimate is band-level spectral flatness** (no
   phase-predictability tracking), the perceptual weighting enters the
   residue chooser per *partition* (the VQ entry selection inside

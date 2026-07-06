@@ -1259,21 +1259,52 @@ fn ladder_update_candidate(
         }
     }
 
-    // Rebuild each exercised tessellation book around its centroids.
+    // Rebuild each exercised value book around its centroids. Two
+    // lookup shapes qualify: a tessellation table (§3.2.1 lookup
+    // type 2, indexed `entry · dims + d`) and a **one-dimensional
+    // lattice** (lookup type 1 with `dimensions == 1`, where
+    // `lookup1_values == entries` makes the scalar table directly
+    // entry-indexed — the same geometry as a 1-D tessellation, in the
+    // lookup type widely interoperable decoders support).
+    // Multi-dimensional lattices are skipped: their per-entry vectors
+    // are permutations of a shared scalar table, so per-entry
+    // centroid placement is not expressible there.
     let mut out = books.to_vec();
     for (idx, cell) in acc.iter().enumerate() {
         let Some((sums, counts)) = cell else { continue };
         let book = &books[idx];
-        let VqLookup::Tessellation {
-            minimum_value,
-            delta_value,
-            value_bits,
-            sequence_p,
-            multiplicands,
-        } = &book.lookup
-        else {
-            continue;
-        };
+        let (minimum_value, delta_value, value_bits, sequence_p, multiplicands, is_lattice) =
+            match &book.lookup {
+                VqLookup::Tessellation {
+                    minimum_value,
+                    delta_value,
+                    value_bits,
+                    sequence_p,
+                    multiplicands,
+                } => (
+                    minimum_value,
+                    delta_value,
+                    value_bits,
+                    sequence_p,
+                    multiplicands,
+                    false,
+                ),
+                VqLookup::Lattice {
+                    minimum_value,
+                    delta_value,
+                    value_bits,
+                    sequence_p,
+                    multiplicands,
+                } if book.dimensions == 1 && multiplicands.len() == book.entries as usize => (
+                    minimum_value,
+                    delta_value,
+                    value_bits,
+                    sequence_p,
+                    multiplicands,
+                    true,
+                ),
+                _ => continue,
+            };
         if *sequence_p {
             continue;
         }
@@ -1321,12 +1352,25 @@ fn ladder_update_candidate(
                 }
             })
             .collect();
-        out[idx].lookup = VqLookup::Tessellation {
-            minimum_value: new_min,
-            delta_value: new_delta,
-            value_bits: *value_bits,
-            sequence_p: false,
-            multiplicands: new_mults,
+        // Rebuild in the shape the book arrived in, so a lattice book
+        // stays a lattice book (decoder interoperability) and a
+        // tessellation book stays a tessellation book.
+        out[idx].lookup = if is_lattice {
+            VqLookup::Lattice {
+                minimum_value: new_min,
+                delta_value: new_delta,
+                value_bits: *value_bits,
+                sequence_p: false,
+                multiplicands: new_mults,
+            }
+        } else {
+            VqLookup::Tessellation {
+                minimum_value: new_min,
+                delta_value: new_delta,
+                value_bits: *value_bits,
+                sequence_p: false,
+                multiplicands: new_mults,
+            }
         };
     }
     Ok(out)
