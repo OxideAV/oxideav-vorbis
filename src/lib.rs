@@ -173,6 +173,7 @@ pub mod identification;
 pub mod imdct;
 pub mod mdct;
 pub mod ogg;
+pub mod oggfile;
 pub mod oggmux;
 pub mod overlap;
 pub mod packet;
@@ -253,6 +254,9 @@ pub use mdct::{
 pub use ogg::{
     ogg_crc32, pages_to_packets, parse_pages, OggError, OggPage, PacketAssembler, PageWriter,
     MAX_PAGE_SEGMENTS, OGG_CAPTURE_PATTERN, PAGE_HEADER_LEN,
+};
+pub use oggfile::{
+    decode_ogg_to_pcm, encode_pcm_to_ogg, DecodedOggStream, OggFileError, StreamEncoderConfig,
 };
 pub use oggmux::{mux_vorbis_stream, MuxError, VorbisOggMuxer};
 pub use overlap::{OverlapAdd, OverlapError};

@@ -6,6 +6,32 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Whole-stream encoder + decoder entry points (`oggfile` module)**
+  — `encode_pcm_to_ogg(pcm, &StreamEncoderConfig) → Vec<u8>` is the
+  crate's first integrated `PCM → playable .ogg` encoder: §4.3.8-
+  inverse framing split (single-blocksize geometry, `n/2` zero
+  pre-roll, tail pad), bare §4.3.7 forward MDCT at the derived `4/n`
+  unity-reconstruction scale (kernel identity `mdct(imdct) = n/2·`
+  times the windowed-TDAC ½), per-frame/channel psychoacoustic
+  masking + psy floor envelope, floor-1 header design from the
+  corpus-max envelope + per-frame post fit, rendered-floor residue
+  targets with NMR partition weights, the perceptually weighted RD
+  residue chooser, §9.2.2-packable signed lattice value ladders
+  (lookup type 1 for black-box interoperability), the three §4.2
+  header writers, and §A.2 encapsulation with `f·n/2` granule
+  positions end-trimmed to the exact input length. Any channel count,
+  uncoupled. One `quality ∈ [0,1]` scalar drives margin, post budget
+  and λ. `decode_ogg_to_pcm` is the inverse convenience (de-frame,
+  header parse, §4.3 streaming decode, §A.2 end-trim).
+  `tests/ogg_encode_roundtrip.rs` pins §A.2 structure on the produced
+  stream, mono 27.6 dB / stereo 29.7 + 22.7 dB time-domain SNR at
+  `q = 0.7`, the rate/fidelity quality trade on the real .ogg
+  (1.25 kB / 0.9 dB at `q = 0.2` → 9.4 kB / 6.0+ dB at `q = 0.9` on
+  an 8k corpus), sub-block and silent streams, n = 256 geometry, and
+  the shape guards. Black-box (local): a 1-second stereo `q = 0.8`
+  encode decodes through ffmpeg to exactly 44100 frames at
+  **30.8 dB SNR** against the input — `encode(pcm) → .ogg` plays
+  through an independent decoder end to end.
 - **Vorbis I §A.2 Ogg encapsulation (`oggmux` module)** —
   `VorbisOggMuxer` / `mux_vorbis_stream` apply the Vorbis mapping
   rules on top of the RFC 3533 page writer: identification header

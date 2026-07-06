@@ -6037,7 +6037,7 @@ impl AudioChannelFloor {
 /// floor body, the residue-bundle plan, and every submap's residue body
 /// before emitting a single bit, so a caller's `writer` is bit-exactly
 /// untouched on every error path.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WriteAudioPacketError {
     /// The §4.3.1 prelude failed a [`write_audio_packet_header`]
     /// invariant.

@@ -1558,7 +1558,7 @@ impl ValueLadderDesign {
 /// Round a finite `f32` to the nearest §9.2.2-packable value (21-bit
 /// mantissa × power of two): the largest-magnitude ladder parameters a
 /// codebook header can carry exactly.
-fn pack_nearest(x: f32) -> f32 {
+pub(crate) fn pack_nearest(x: f32) -> f32 {
     if crate::codebook::float32_pack(x).is_some() {
         return x;
     }
