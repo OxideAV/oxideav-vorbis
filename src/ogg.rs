@@ -544,6 +544,15 @@ impl PageWriter {
         self.sequence
     }
 
+    /// Body bytes accumulated on the pending (not yet emitted) page.
+    /// Callers use this to apply a page-size policy tighter than the
+    /// 255-segment hard limit (RFC 3533 §6 describes pages as "usually
+    /// 4-8 kB").
+    #[must_use]
+    pub fn pending_body_len(&self) -> usize {
+        self.body.len()
+    }
+
     /// Append one packet with its codec-defined position stamp
     /// (`granulepos` of the stream *after* this packet; for Vorbis §A.2
     /// audio packets, the end PCM sample position, and `0` for the

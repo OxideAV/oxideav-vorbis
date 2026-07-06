@@ -6,6 +6,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Vorbis I §A.2 Ogg encapsulation (`oggmux` module)** —
+  `VorbisOggMuxer` / `mux_vorbis_stream` apply the Vorbis mapping
+  rules on top of the RFC 3533 page writer: identification header
+  alone on the 58-byte BOS first page, comment + setup from page 1
+  with the setup header finishing its page, audio beginning fresh,
+  header pages at granule 0, audio pages stamped with the end-PCM
+  position of the last packet completed (−1 when spanned), EOS on the
+  final page with the §A.2 end-trim granule passed through. Packet
+  order is enforced with the §4.2.1 classifier and granule positions
+  must be non-decreasing. `tests/ogg_vorbis_remux.rs` de-frames all
+  15 single-stream fixtures, recomputes each packet's granule from
+  the §4.3.1 blocksize walk, remuxes, and asserts the identical
+  packet sequence, every §A.2 page rule, and per-page granule
+  bookkeeping; black-box: a remuxed fixture decodes through ffmpeg to
+  the full declared duration, sample-identical (±1) to the original
+  decode.
 - **RFC 3533 Ogg page framing (`ogg` module)** — the transport layer
   under the Vorbis I §A encapsulation, both directions. Read side:
   `OggPage::parse` / `parse_pages` (capture pattern, version, CRC
