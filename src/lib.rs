@@ -172,6 +172,7 @@ pub mod huffman;
 pub mod identification;
 pub mod imdct;
 pub mod mdct;
+pub mod ogg;
 pub mod overlap;
 pub mod packet;
 pub mod packet_kind;
@@ -247,6 +248,10 @@ pub use imdct::{imdct_naive, imdct_naive_vec, ImdctError};
 pub use mdct::{
     apply_window_and_mdct, apply_window_and_mdct_vec, mdct_naive, mdct_naive_vec,
     ApplyWindowAndMdctError, MdctError,
+};
+pub use ogg::{
+    ogg_crc32, pages_to_packets, parse_pages, OggError, OggPage, PacketAssembler, PageWriter,
+    MAX_PAGE_SEGMENTS, OGG_CAPTURE_PATTERN, PAGE_HEADER_LEN,
 };
 pub use overlap::{OverlapAdd, OverlapError};
 pub use packet::{

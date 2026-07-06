@@ -6,6 +6,25 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **RFC 3533 Ogg page framing (`ogg` module)** — the transport layer
+  under the Vorbis I §A encapsulation, both directions. Read side:
+  `OggPage::parse` / `parse_pages` (capture pattern, version, CRC
+  verify) and `PacketAssembler` (lacing→packet coalescing across
+  `continued` page boundaries, serial-locked). Write side:
+  `OggPage::serialize` and `PageWriter` (packet→255-byte lacing
+  segmentation, auto page emit on a full segment table with the
+  `continued` flag on the follow-on page, last-completed-packet
+  granule stamping with `-1` for spanned pages, BOS on the first
+  page, EOS on `finish()` — including re-stamping an already-flushed
+  final page in place with a recomputed CRC). The §6 item 7 CRC
+  (polynomial `0x04c11db7`, MSB-first, zero init, no final XOR) is
+  pinned by `tests/ogg_framing.rs`: every page of every staged
+  real-world fixture stream parses with a verifying CRC and the
+  parsed pages re-serialize **byte-for-byte** to each `input.ogg`,
+  chained streams included; every logical stream's first packet
+  parses as a §4.2.2 identification header, and the §A.2 58-byte
+  first-page shape is asserted.
+
 - **Psychoacoustic masking model (`psy` module)** — the encoder-side
   perceptual layer the README named as the last quality gap. The
   Vorbis I spec defines only decode, so this is clean-room encoder
