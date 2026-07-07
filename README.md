@@ -255,7 +255,13 @@ per-block decision to a whole stream: it walks the §4.3.8 granule
 recurrence (`(n_prev + n_cur)/4` per packet) forward, deciding each
 packet's flag over the lookahead a candidate long frame would smear noise
 across, and returns the `blockflags` + granule walk the integrated encoder
-emits verbatim.
+emits verbatim. Two independent criteria call a region transient:
+within-window peak-to-mean **concentration** (a sharp attack), and an
+**energy rise** against the previous decision region (a sustained
+loudness step — a noise burst over a tone bed — that is flat within the
+window and invisible to concentration; the staged
+`transient-blocksize-switch` fixture is exactly this shape, measuring
+concentration ≤ 2.7 in every window).
 
 The **floor-0 VQ-encode glue** (`floor0_encode` module:
 `plan_floor0_coefficients` + `floor0_vector_count`) is the analogous glue
@@ -699,7 +705,12 @@ over the shared ladders. Measured: on an attack-after-silence corpus,
 switching cuts the pre-attack noise energy beyond the short block's
 intrinsic `n0/2` reach by **220×** against a forced-long encode at
 equal quality; ffmpeg decodes a switched stream to the exact declared
-length, agreeing with the crate's own decoder to **134 dB**.
+length, agreeing with the crate's own decoder to **134 dB**. The
+real-audio corpus re-encodes cleanly (`tests/fixture_reencode.rs`):
+the `transient-blocksize-switch` fixture schedules shorts at its
+noise-burst onset (the energy-rise criterion), steady music stays
+all-long at 47.1 dB, and the decorrelated stereo fixture is correctly
+left uncoupled — all end-trim-exact through the crate's own decoder.
 
 **§4.3.5 channel coupling** is likewise wired
 (`tests/ogg_coupled_stream.rs`): adjacent channel pairs are gated on
@@ -756,11 +767,17 @@ the §1.3.2 mechanism).
   one coupling decision per pair, since the §4.2.4 mapping fixes the
   steps for every packet using it — per-packet coupling choice would
   need a second uncoupled mapping per block size).
-- **The transient detector is a single global threshold** (peak-to-mean
-  energy concentration over a 16-sub-frame lookahead); it is not
+- **The transient detector is two global thresholds** (peak-to-mean
+  concentration + energy rise over a 16-sub-frame lookahead); it is not
   loudness-adaptive, and the block schedule is decided on a channel
   mixdown, so a transient confined to one channel of an uncoupled pair
   still switches both.
+- **The re-encoded rate trails the reference corpus** — re-encoding the
+  staged `q5` fixtures' PCM at the default quality spends ~1.4–1.6× the
+  original stream's bytes (`tests/fixture_reencode.rs` measurements):
+  the residue books are 1-D trained lattices, not the multi-dimensional
+  trained VQ tessellations a mature encoder ships. Multi-dim residue
+  book design is the natural next rate frontier.
 
 ## Clean-room provenance
 
