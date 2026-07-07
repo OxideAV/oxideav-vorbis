@@ -53,11 +53,11 @@ use crate::psy::{
 use crate::quality::{EncoderTuning, QualityError};
 use crate::residue_encode::{plan_vector_residue_rd_weighted, ResidueEncodeError};
 use crate::setup::{
-    parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingHeader, MappingSubmap,
-    ModeHeader, ResidueHeader, VorbisSetupHeader,
+    parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader,
+    MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
 };
 use crate::streaming::{StreamingDecoder, StreamingError, StreamingFrame};
-use crate::synthesis::{vorbis_window, WindowError};
+use crate::synthesis::{coupling_energy, forward_couple_all, vorbis_window, WindowError};
 use crate::VorbisCommentHeader;
 use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
 use oxideav_ogg::page::Page;
@@ -65,14 +65,38 @@ use oxideav_ogg::page::Page;
 /// §8.6.1 residue partition size the integrated encoder uses.
 const PARTITION_SIZE: u32 = 16;
 
+/// The §4.3.5 coupling gate: a candidate channel pair is coupled when
+/// its whole-stream square-polar angle energy is at most this fraction
+/// of its magnitude energy ([`CouplingEnergy::angle_ratio`] semantics,
+/// accumulated over every frame's residue targets). A strongly
+/// correlated stereo pair sits far below this (the `L − R` angle
+/// residue quantises toward zero); an independent or anti-correlated
+/// pair sits near or above `1.0`, where coupling would only move
+/// energy around. `0.5` keeps the gate on the clearly-profitable side.
+///
+/// [`CouplingEnergy::angle_ratio`]: crate::synthesis::CouplingEnergy::angle_ratio
+const COUPLING_MAX_ANGLE_RATIO: f64 = 0.5;
+
 /// Configuration for [`encode_pcm_to_ogg`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamEncoderConfig {
     /// PCM sample rate in Hz (§4.2.2 `audio_sample_rate`).
     pub sample_rate: u32,
-    /// Channel count; every channel is carried uncoupled (its own
-    /// floor + residue vector under one submap).
+    /// Channel count. Each channel carries its own floor + residue
+    /// vector under one submap; adjacent channel pairs are §4.3.5
+    /// square-polar coupled when [`Self::coupling`] is set and the
+    /// energy gate finds the pair profitable.
     pub channels: u8,
+    /// Offer §4.3.5 square-polar channel coupling on adjacent channel
+    /// pairs `(0, 1)`, `(2, 3)`, …. Each candidate pair is gated on
+    /// the whole stream's coupling-energy split
+    /// ([`crate::synthesis::coupling_energy`] accumulated over every
+    /// frame's residue targets): only pairs whose angle/magnitude
+    /// energy ratio stays under the profitability threshold are
+    /// actually coupled (recorded as mapping coupling steps and
+    /// forward-coupled before residue planning). `false` carries every
+    /// channel uncoupled.
+    pub coupling: bool,
     /// Quality knob `q ∈ [0, 1]` — expanded through
     /// [`EncoderTuning::from_quality`].
     pub quality: f32,
@@ -94,13 +118,14 @@ pub struct StreamEncoderConfig {
 
 impl StreamEncoderConfig {
     /// A nominal configuration: `quality = 0.7`, `blocksize = 1024`,
-    /// 4 codebook-training iterations, serial `0x6F78_7662` (arbitrary
-    /// fixed default).
+    /// coupling offered on adjacent pairs, 4 codebook-training
+    /// iterations, serial `0x6F78_7662` (arbitrary fixed default).
     #[must_use]
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         StreamEncoderConfig {
             sample_rate,
             channels,
+            coupling: true,
             quality: 0.7,
             blocksize: 1024,
             serial: 0x6F78_7662,
@@ -553,13 +578,14 @@ fn floor_class_catalogue() -> Vec<Floor1Class> {
 /// The stream's setup header: 4 codebooks (floor posts, residue
 /// classwords, coarse + fine value ladders), one floor, one two-class
 /// residue (class 0 = silence, class 1 = two-stage cascade), one
-/// mapping with every channel uncoupled under a single submap, one
-/// `blockflag = false` mode.
+/// mapping carrying the gated §4.3.5 coupling steps under a single
+/// submap, one `blockflag = false` mode.
 fn build_setup(
     floor_header: crate::setup::Floor1Header,
     coarse: VorbisCodebook,
     fine: VorbisCodebook,
     half_n: u32,
+    coupling: Vec<MappingCouplingStep>,
 ) -> VorbisSetupHeader {
     let floor = FloorHeader {
         floor_type: 1,
@@ -586,7 +612,7 @@ fn build_setup(
         mappings: vec![MappingHeader {
             mapping_type: 0,
             submaps: 1,
-            coupling: Vec::new(),
+            coupling,
             // §4.2.4: the mux table is only present when submaps > 1;
             // with one submap every channel implicitly maps to it.
             mux: Vec::new(),
@@ -766,7 +792,6 @@ pub fn encode_pcm_to_packets(
     let mut floor_ys: Vec<Vec<Vec<u32>>> = Vec::with_capacity(frames);
     let mut targets: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames);
     let mut weights: Vec<Vec<Vec<f64>>> = Vec::with_capacity(frames);
-    let mut max_abs = 0.0f32;
     for f in 0..frames {
         let mut y_row = Vec::with_capacity(ch);
         let mut t_row = Vec::with_capacity(ch);
@@ -780,9 +805,6 @@ pub fn encode_pcm_to_packets(
                 .zip(&rendered)
                 .map(|(&xv, &fv)| xv / fv)
                 .collect();
-            for &t in &target {
-                max_abs = max_abs.max(t.abs());
-            }
             let w =
                 residue_partition_weights(&rendered, &maskings[f][c], 0, half_n, PARTITION_SIZE)?;
             y_row.push(floor1_y);
@@ -792,6 +814,71 @@ pub fn encode_pcm_to_packets(
         floor_ys.push(y_row);
         targets.push(t_row);
         weights.push(w_row);
+    }
+
+    // ---- §4.3.5 channel coupling (gated per adjacent pair) ----
+    // Candidate steps couple the disjoint adjacent pairs (0,1), (2,3),
+    // …. The gate is whole-stream (coupling steps live in the setup
+    // header's mapping, so the choice is per stream, not per packet):
+    // each pair's square-polar energy split is accumulated over every
+    // frame's residue targets and the pair is kept only when its angle
+    // energy stays under COUPLING_MAX_ANGLE_RATIO × its magnitude
+    // energy. Disjoint pairs share no channel with any other step, so
+    // the per-pair gate is exact. Kept steps are forward-coupled here —
+    // the residue planner below quantises magnitude/angle vectors — and
+    // the decoder's §4.3.5 inverse coupling undoes the transform after
+    // residue decode, before the §4.3.6 floor multiply. The coupling is
+    // applied to the *residue targets* (`X / rendered_floor`), the
+    // exact vectors the decoder inverse-couples.
+    let coupling_steps: Vec<MappingCouplingStep> = if config.coupling && ch >= 2 {
+        (0..ch / 2)
+            .filter_map(|pair| {
+                let (mag, ang) = (2 * pair, 2 * pair + 1);
+                let mut mag_energy = 0.0f64;
+                let mut ang_energy = 0.0f64;
+                for t_row in &targets {
+                    let e = coupling_energy(&t_row[mag], &t_row[ang]);
+                    mag_energy += e.magnitude_energy;
+                    ang_energy += e.angle_energy;
+                }
+                (ang_energy <= COUPLING_MAX_ANGLE_RATIO * mag_energy).then_some(
+                    MappingCouplingStep {
+                        magnitude_channel: mag as u8,
+                        angle_channel: ang as u8,
+                    },
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !coupling_steps.is_empty() {
+        for (t_row, w_row) in targets.iter_mut().zip(weights.iter_mut()) {
+            forward_couple_all(t_row, &coupling_steps)
+                .expect("coupling steps are constructed in range with distinct channels");
+            // Merge each coupled pair's per-partition NMR weights to
+            // the element-wise max: quantisation error in either
+            // coupled vector spreads into both output channels through
+            // the inverse coupling, so the more sensitive channel's
+            // audibility bound must govern both.
+            for step in &coupling_steps {
+                let (mag, ang) = (step.magnitude_channel as usize, step.angle_channel as usize);
+                for p in 0..w_row[mag].len() {
+                    let w = w_row[mag][p].max(w_row[ang][p]);
+                    w_row[mag][p] = w;
+                    w_row[ang][p] = w;
+                }
+            }
+        }
+    }
+
+    let mut max_abs = 0.0f32;
+    for t_row in &targets {
+        for target in t_row {
+            for &t in target {
+                max_abs = max_abs.max(t.abs());
+            }
+        }
     }
     if max_abs <= 0.0 {
         max_abs = 1.0; // all-silent input: any positive ladder scale works
@@ -804,7 +891,13 @@ pub fn encode_pcm_to_packets(
     // therefore packable whenever the step is.
     let coarse = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 24.0));
     let fine = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 192.0));
-    let mut setup = build_setup(floor_header.clone(), coarse, fine, half_n as u32);
+    let mut setup = build_setup(
+        floor_header.clone(),
+        coarse,
+        fine,
+        half_n as u32,
+        coupling_steps,
+    );
 
     // ---- optional closed-loop codebook training ----
     // The generic seed ladders are retrained on the stream's own

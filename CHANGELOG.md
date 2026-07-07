@@ -4,6 +4,29 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **§4.3.5 channel coupling in the integrated encoder.**
+  `encode_pcm_to_ogg` / `encode_pcm_to_packets` now offer square-polar
+  coupling on adjacent channel pairs `(0, 1)`, `(2, 3)`, … — new
+  `StreamEncoderConfig::coupling` knob (default `true`) and a
+  `"coupling"` option on the registry encoder factory. Each candidate
+  pair is gated on the whole stream's coupling-energy split
+  (`synthesis::coupling_energy` accumulated over every frame's residue
+  targets; kept only when the angle energy stays under half the
+  magnitude energy), kept steps are recorded as mapping coupling steps
+  in the setup header and forward-coupled over the residue targets
+  (`X / rendered_floor`, the exact vectors the decoder's §4.3.5
+  inverse coupling recovers), and each coupled pair's per-partition
+  NMR weights merge to the element-wise max (error in either coupled
+  vector spreads into both output channels). Measured on a correlated
+  stereo corpus at `q = 0.7`: **14 024 B coupled vs 20 556 B
+  dual-mono (−32 %) at equal per-channel SNR** (32.2 dB vs 32.2 dB);
+  black-box, a 1 s coupled stereo `q = 0.8` encode decodes through
+  ffmpeg to exactly 44 100 frames at 46.3 dB SNR. An anti-correlated
+  pair fails the gate and stays uncoupled
+  (`tests/ogg_coupled_stream.rs`).
+
 ### Changed
 
 - **Ogg carriage now rides the `oxideav-ogg` container crate** (new

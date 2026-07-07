@@ -6677,8 +6677,10 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
 ///
 /// Required parameters: `sample_rate` and `channels`. Optional:
 /// `sample_format` (`F32P` default, `F32` accepted), a `"quality"`
-/// option (`0.0..=1.0`, default `0.7`) and a `"blocksize"` option
-/// (power of two in `64..=8192`, default `1024`).
+/// option (`0.0..=1.0`, default `0.7`), a `"blocksize"` option
+/// (power of two in `64..=8192`, default `1024`) and a `"coupling"`
+/// option (`true`/`false`, default `true` — offer §4.3.5 square-polar
+/// coupling on adjacent channel pairs, gated on profitability).
 ///
 /// # Errors
 ///
@@ -6723,6 +6725,13 @@ pub fn make_encoder(
             )));
         }
         config.blocksize = n;
+    }
+    if let Some(c) = params.options.get("coupling") {
+        config.coupling = c.parse().map_err(|_| {
+            oxideav_core::Error::invalid(format!(
+                "vorbis encoder: coupling {c:?} not a boolean (true/false)"
+            ))
+        })?;
     }
 
     let mut output_params =
