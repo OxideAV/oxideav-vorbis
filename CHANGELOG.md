@@ -6,6 +6,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Energy-rise transient criterion + fixture-corpus re-encode.**
+  `plan_block_sequence` gains a second, independent transient
+  criterion (new `energy_rise_threshold` parameter): the lookahead's
+  peak sub-frame energy against the previous decision region's mean —
+  catching a sustained loudness step (a noise burst over a tone bed)
+  that is flat *within* the window and therefore invisible to the
+  peak-to-mean concentration ratio, exactly the shape the staged
+  `transient-blocksize-switch` fixture carries (measured concentration
+  ≤ 2.7 across its windows). The integrated encoder passes `4.0`
+  (+6 dB over one lookahead). New `tests/fixture_reencode.rs` drives
+  the staged **real-audio** corpus back through the default encoder:
+  the transient fixture now schedules short blocks at the burst onset
+  and round-trips end-trim-exact; steady music stays all-long at
+  47.1 dB; and the genuinely decorrelated stereo fixture
+  (angle/magnitude energy ratio ≈ 1.7) is correctly left uncoupled by
+  the profitability gate.
+
 - **Depth tests over the two new subsystems**: the closed-loop
   ladder trainer composes with coupling + switching — retraining on
   the coupled magnitude/angle residue corpus (chained per block size)

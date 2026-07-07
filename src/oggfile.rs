@@ -106,6 +106,16 @@ const TRANSIENT_SUBFRAMES: usize = 16;
 /// between the two regimes.
 const TRANSIENT_PEAK_TO_MEAN: f64 = 3.0;
 
+/// Energy-rise factor of the §4.3.1 schedule's second transient
+/// criterion: the lookahead's peak sub-frame energy against the
+/// previous decision region's mean sub-frame energy. Catches a
+/// sustained loudness step (a noise burst over a tone bed) that is
+/// flat *within* the window — invisible to the concentration ratio —
+/// but whose onset a long block would smear pre-echo across. `4.0`
+/// (+6 dB in energy over one lookahead) is well above ordinary
+/// musical envelope motion.
+const TRANSIENT_ENERGY_RISE: f64 = 4.0;
+
 /// Configuration for [`encode_pcm_to_ogg`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamEncoderConfig {
@@ -838,7 +848,14 @@ pub fn encode_pcm_to_packets(
         for m in &mut mix {
             *m *= scale;
         }
-        let plan = plan_block_sequence(&mix, n0, n1, TRANSIENT_SUBFRAMES, TRANSIENT_PEAK_TO_MEAN)?;
+        let plan = plan_block_sequence(
+            &mix,
+            n0,
+            n1,
+            TRANSIENT_SUBFRAMES,
+            TRANSIENT_PEAK_TO_MEAN,
+            TRANSIENT_ENERGY_RISE,
+        )?;
         (plan.blockflags, plan.granules)
     } else {
         let half = n1 / 2;

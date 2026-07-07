@@ -275,6 +275,20 @@ pub struct BlockSequencePlan {
 /// `short_n == long_n` is legal and degenerates to an all-`false`
 /// single-blocksize plan.
 ///
+/// Two independent criteria call a region transient (either fires):
+///
+/// * **within-window concentration** — [`detect_transient`]'s
+///   peak-to-mean ratio exceeds `peak_to_mean_threshold`: a sharp
+///   attack inside an otherwise quieter window;
+/// * **energy rise against context** — the region's peak sub-frame
+///   energy exceeds `energy_rise_threshold ×` the *previous* decision
+///   region's mean sub-frame energy: a sustained loudness step (e.g. a
+///   noise burst over a tone bed) that is flat *within* the window —
+///   invisible to the concentration ratio — but whose onset would
+///   still smear pre-echo across a long block reaching back into the
+///   quieter context. A silent previous region floors at the smallest
+///   positive energy, so a true silence→sound onset always fires.
+///
 /// # Errors
 ///
 /// * [`BlocksizeError::EmptyBlock`] — `pcm` is empty.
@@ -287,6 +301,7 @@ pub fn plan_block_sequence(
     long_n: usize,
     subframes: usize,
     peak_to_mean_threshold: f64,
+    energy_rise_threshold: f64,
 ) -> Result<BlockSequencePlan, BlocksizeError> {
     if pcm.is_empty() {
         return Err(BlocksizeError::EmptyBlock);
@@ -300,7 +315,14 @@ pub fn plan_block_sequence(
     }
 
     let lookahead = long_n;
-    let decide = |g: usize| -> Result<bool, BlocksizeError> {
+    // Mean sub-frame energy of the previous decision region — the
+    // context the energy-rise criterion compares against. `None` until
+    // the first non-empty region is analysed. (Packet 0 and packet 1
+    // decide at the same granule; the second call's context is then
+    // that same region's own mean, degenerating the rise criterion to
+    // the concentration criterion — harmless.)
+    let mut prev_mean: Option<f64> = None;
+    let mut decide = |g: usize| -> Result<bool, BlocksizeError> {
         if short_n == long_n {
             // Degenerate single-blocksize stream: the flag is
             // meaningless; report the short/only block.
@@ -314,7 +336,14 @@ pub fn plan_block_sequence(
         }
         let region = &pcm[g..end];
         let sf = subframes.min(region.len());
-        Ok(choose_blocksize(region, sf, peak_to_mean_threshold)?.0)
+        let analysis = detect_transient(region, sf)?;
+        let concentrated = analysis.peak_to_mean > peak_to_mean_threshold;
+        let rise = match prev_mean {
+            Some(pm) => analysis.peak_energy > energy_rise_threshold * pm.max(f64::MIN_POSITIVE),
+            None => false,
+        };
+        prev_mean = Some(analysis.mean_energy);
+        Ok(!(concentrated || rise))
     };
 
     let size = |flag: bool| if flag { long_n } else { short_n };
@@ -434,7 +463,7 @@ mod tests {
     #[test]
     fn steady_signal_plans_all_long() {
         let pcm: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
-        let plan = plan_block_sequence(&pcm, 256, 1024, 8, 4.0).unwrap();
+        let plan = plan_block_sequence(&pcm, 256, 1024, 8, 4.0, 4.0).unwrap();
         assert_walk_consistent(&plan, 256, 1024);
         assert!(plan.blockflags.iter().all(|&f| f), "steady ⇒ all long");
         // The walk covers the input and stops as soon as it does.
@@ -453,7 +482,7 @@ mod tests {
         for (i, s) in pcm.iter_mut().enumerate().skip(3000) {
             *s = (i as f32 * 0.05).sin() * 0.4;
         }
-        let plan = plan_block_sequence(&pcm, 256, 1024, 8, 4.0).unwrap();
+        let plan = plan_block_sequence(&pcm, 256, 1024, 8, 4.0, 4.0).unwrap();
         assert_walk_consistent(&plan, 256, 1024);
         assert!(
             plan.blockflags.iter().any(|&f| !f),
@@ -487,7 +516,7 @@ mod tests {
     #[test]
     fn equal_blocksizes_degenerate_to_all_short_flags() {
         let pcm = vec![0.25f32; 3000];
-        let plan = plan_block_sequence(&pcm, 512, 512, 8, 4.0).unwrap();
+        let plan = plan_block_sequence(&pcm, 512, 512, 8, 4.0, 4.0).unwrap();
         assert!(plan.blockflags.iter().all(|&f| !f));
         assert_walk_consistent(&plan, 512, 512);
         // Uniform walk: every packet after priming finishes 256.
@@ -495,34 +524,80 @@ mod tests {
     }
 
     #[test]
+    fn sustained_burst_fires_the_energy_rise_criterion() {
+        // A tone bed, then a 2000-sample loud pseudo-noise burst, then
+        // the bed again — the burst is FLAT within any lookahead
+        // window (concentration ratio ≈ 1), so only the energy-rise
+        // criterion can catch its onset. Concentration is disabled
+        // (threshold 1e9) to prove the rise criterion alone fires.
+        let mut pcm: Vec<f32> = (0..12_000)
+            .map(|i| 0.3 * (i as f32 * 0.031).sin())
+            .collect();
+        for (i, s) in pcm.iter_mut().enumerate().skip(5000).take(2000) {
+            let h = (i as u32).wrapping_mul(2_654_435_761) >> 8;
+            *s = ((h & 0xffff) as f32 / 32768.0 - 1.0) * 0.9;
+        }
+        let plan = plan_block_sequence(&pcm, 256, 1024, 16, 1e9, 4.0).unwrap();
+        assert_walk_consistent(&plan, 256, 1024);
+        assert!(
+            plan.blockflags.iter().any(|&f| !f),
+            "the burst onset must fire the rise criterion"
+        );
+        assert!(
+            plan.blockflags.iter().any(|&f| f),
+            "the tone beds must stay long"
+        );
+        // Every short block's decision region overlaps the burst onset
+        // (sample 5000): rises fire at the step, not inside the flat
+        // burst or on the fall back to the bed.
+        for f in 0..plan.blockflags.len() {
+            if !plan.blockflags[f] {
+                let g = if f == 0 {
+                    0
+                } else {
+                    plan.granules[f - 1] as usize
+                };
+                assert!(
+                    g <= 5000 && g + 1024 > 5000,
+                    "short block at packet {f} (granule {g}) does not cover the burst onset"
+                );
+            }
+        }
+        // With the rise criterion disabled too, the plan is all-long —
+        // the burst is invisible to concentration alone.
+        let blind = plan_block_sequence(&pcm, 256, 1024, 16, 1e9, f64::INFINITY).unwrap();
+        assert!(blind.blockflags.iter().all(|&f| f));
+    }
+
+    #[test]
     fn plan_rejects_bad_shapes() {
         assert_eq!(
-            plan_block_sequence(&[], 256, 1024, 8, 4.0),
+            plan_block_sequence(&[], 256, 1024, 8, 4.0, 4.0),
             Err(BlocksizeError::EmptyBlock)
         );
         assert_eq!(
-            plan_block_sequence(&[0.0; 100], 100, 1024, 8, 4.0),
+            plan_block_sequence(&[0.0; 100], 100, 1024, 8, 4.0, 4.0),
             Err(BlocksizeError::BadBlocksizePair {
                 short_n: 100,
                 long_n: 1024
             })
         );
         assert_eq!(
-            plan_block_sequence(&[0.0; 100], 1024, 256, 8, 4.0),
+            plan_block_sequence(&[0.0; 100], 1024, 256, 8, 4.0, 4.0),
             Err(BlocksizeError::BadBlocksizePair {
                 short_n: 1024,
                 long_n: 256
             })
         );
         assert_eq!(
-            plan_block_sequence(&[0.0; 100], 256, 16384, 8, 4.0),
+            plan_block_sequence(&[0.0; 100], 256, 16384, 8, 4.0, 4.0),
             Err(BlocksizeError::BadBlocksizePair {
                 short_n: 256,
                 long_n: 16384
             })
         );
         assert_eq!(
-            plan_block_sequence(&[0.0; 100], 256, 1024, 0, 4.0),
+            plan_block_sequence(&[0.0; 100], 256, 1024, 0, 4.0, 4.0),
             Err(BlocksizeError::ZeroSubframes)
         );
     }
