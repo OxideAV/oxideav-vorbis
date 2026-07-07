@@ -6,6 +6,16 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Registry encoder options for the new subsystems**: the
+  `make_encoder` factory grows a `"short_blocksize"` option (power of
+  two `<=` the long size; equal disables §4.3.1 block switching) next
+  to the existing `"blocksize"`, with a lone `"blocksize"` below the
+  default short size clamping the short size down (so a small
+  single-blocksize request stays legal), plus shape/order guards; the
+  `"coupling"` boolean option (added with the coupling subsystem)
+  rejects non-boolean values. `tests/registry_wiring.rs` pins the
+  option matrix.
+
 - **§4.3.1 block switching in the integrated encoder.**
   `encode_pcm_to_ogg` / `encode_pcm_to_packets` now run short/long
   block switching — new `StreamEncoderConfig::short_blocksize` knob

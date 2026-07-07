@@ -6677,10 +6677,15 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
 ///
 /// Required parameters: `sample_rate` and `channels`. Optional:
 /// `sample_format` (`F32P` default, `F32` accepted), a `"quality"`
-/// option (`0.0..=1.0`, default `0.7`), a `"blocksize"` option
-/// (power of two in `64..=8192`, default `1024`) and a `"coupling"`
-/// option (`true`/`false`, default `true` — offer §4.3.5 square-polar
-/// coupling on adjacent channel pairs, gated on profitability).
+/// option (`0.0..=1.0`, default `0.7`), a `"blocksize"` option (the
+/// long size; power of two in `64..=8192`, default `1024`), a
+/// `"short_blocksize"` option (power of two `<=` the long size,
+/// default `256` — equal to the long size disables §4.3.1 block
+/// switching; a `"blocksize"` below the default short size clamps the
+/// short size down, keeping a lone `"blocksize"` a single-blocksize
+/// request) and a `"coupling"` option (`true`/`false`, default `true`
+/// — offer §4.3.5 square-polar coupling on adjacent channel pairs,
+/// gated on profitability).
 ///
 /// # Errors
 ///
@@ -6725,6 +6730,29 @@ pub fn make_encoder(
             )));
         }
         config.blocksize = n;
+        // A long blocksize below the default short size implies a
+        // single-blocksize stream unless the caller also picks an
+        // explicit short size below.
+        config.short_blocksize = config.short_blocksize.min(n);
+    }
+    if let Some(b) = params.options.get("short_blocksize") {
+        let n: usize = b.parse().map_err(|_| {
+            oxideav_core::Error::invalid(format!(
+                "vorbis encoder: short_blocksize {b:?} not an integer"
+            ))
+        })?;
+        if !n.is_power_of_two() || !(64..=8192).contains(&n) {
+            return Err(oxideav_core::Error::invalid(format!(
+                "vorbis encoder: short_blocksize {n} not a power of two in 64..=8192"
+            )));
+        }
+        if n > config.blocksize {
+            return Err(oxideav_core::Error::invalid(format!(
+                "vorbis encoder: short_blocksize {n} exceeds blocksize {}",
+                config.blocksize
+            )));
+        }
+        config.short_blocksize = n;
     }
     if let Some(c) = params.options.get("coupling") {
         config.coupling = c.parse().map_err(|_| {
