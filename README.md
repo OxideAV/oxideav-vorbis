@@ -15,14 +15,18 @@ sample-exact PCM** — and a complete, playable **`PCM → .ogg`
 encoder** (`encode_pcm_to_ogg`): the §A.2 Ogg/Vorbis encapsulation
 rules over the [`oxideav-ogg`](https://github.com/OxideAV/oxideav-ogg)
 container crate's RFC 3533 page transport, and the whole
-psychoacoustic / floor / residue encode stack behind one quality
-scalar, black-box verified (a `q = 0.8` stereo encode decodes
-through ffmpeg to the exact declared duration, agreeing with the
-crate's own decoder to 117 dB / max sample delta 1.3 × 10⁻⁶).
-`register()` installs the codec — decoder and encoder factories plus
-the Matroska `A_VORBIS` tag — into `oxideav_core::RuntimeContext`,
-and the dual-API endpoints `decoder::make_decoder` /
-`encoder::make_encoder` are directly callable without a registry.
+psychoacoustic / floor / residue encode stack — **§4.3.1 short/long
+block switching** (transient-scheduled short blocks, per-size setup
+entries, hybrid window edges) and gated **§4.3.5 square-polar channel
+coupling** (a correlated stereo pair encodes −32 % vs dual-mono at
+equal SNR) included — behind one quality scalar, black-box verified
+(a switched `q = 0.7` encode decodes through ffmpeg to the exact
+declared duration, agreeing with the crate's own decoder to 134 dB /
+max sample delta 2.1 × 10⁻⁷). `register()` installs the codec —
+decoder and encoder factories plus the Matroska `A_VORBIS` tag —
+into `oxideav_core::RuntimeContext`, and the dual-API endpoints
+`decoder::make_decoder` / `encoder::make_encoder` are directly
+callable without a registry.
 
 The §4.3 decode chain is sample-exact end to end: twelve staged fixtures
 (`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1 through q10,
@@ -239,14 +243,19 @@ kept set round-trips cleanly through `forward_couple_all` →
 `inverse_couple_all`.
 
 The **long/short block-size decision** (`blocksize` module:
-`detect_transient`, `choose_blocksize`) is the §1.3.2 / §4.3.1 encode-side
-selection that drives a mode's `blockflag`. A clean-room energy-envelope
-transient detector splits a PCM block into sub-frames, measures each
-sub-frame's energy, and flags a transient by the peak-to-mean concentration
-ratio; `choose_blocksize` picks the **short** block for a transient (to
-confine quantisation noise around the attack and avoid pre-echo) and the
-**long** block otherwise, with the ratio threshold as the caller's
-quality/bit-rate lever.
+`detect_transient`, `choose_blocksize`, `plan_block_sequence`) is the
+§1.3.2 / §4.3.1 encode-side selection that drives a mode's `blockflag`. A
+clean-room energy-envelope transient detector splits a PCM block into
+sub-frames, measures each sub-frame's energy, and flags a transient by the
+peak-to-mean concentration ratio; `choose_blocksize` picks the **short**
+block for a transient (to confine quantisation noise around the attack and
+avoid pre-echo) and the **long** block otherwise, with the ratio threshold
+as the caller's quality/bit-rate lever. `plan_block_sequence` lifts the
+per-block decision to a whole stream: it walks the §4.3.8 granule
+recurrence (`(n_prev + n_cur)/4` per packet) forward, deciding each
+packet's flag over the lookahead a candidate long frame would smear noise
+across, and returns the `blockflags` + granule walk the integrated encoder
+emits verbatim.
 
 The **floor-0 VQ-encode glue** (`floor0_encode` module:
 `plan_floor0_coefficients` + `floor0_vector_count`) is the analogous glue
@@ -656,20 +665,54 @@ pagination by 128–350 samples that the remux recovers).
 
 The **whole-stream encoder** (`oggfile` module) is the integrated
 `encode(pcm) → .ogg` path: `encode_pcm_to_ogg` (and its packet-level
-form `encode_pcm_to_packets`) composes the §4.3.8-inverse framing
-splitter, the bare §4.3.7 forward MDCT at the derived `4/n`
-unity-reconstruction scale, per-channel **temporal** psychoacoustics,
-floor-1 design/fit, NMR-weighted RD residue planning, §9.2.2-packable
-lattice value ladders, the three §4.2 header writers and the §A.2
-encapsulation with `f · n/2` granule positions end-trimmed to the
+form `encode_pcm_to_packets`) composes the §4.3.1 block-size schedule,
+the §4.3.8-inverse framing splitter (per-frame §4.3.1 windows, hybrid
+edges included), the bare §4.3.7 forward MDCT at the derived `4/n`
+unity-reconstruction scale, per-channel psychoacoustics, per-size
+floor-1 design/fit, the gated §4.3.5 forward channel coupling,
+NMR-weighted RD residue planning, §9.2.2-packable lattice value
+ladders, the three §4.2 header writers and the §A.2 encapsulation with
+the mixed-size `(n_prev + n_cur)/4` granule walk end-trimmed to the
 exact input length — all behind the one `quality ∈ [0, 1]` scalar.
 `decode_ogg_to_pcm` is the inverse convenience (de-frame, header
 parse, streaming decode, end-trim). `tests/ogg_encode_roundtrip.rs`
 pins the §A.2 structure of the produced stream and the round-trip
-fidelity (mono 27.6 dB at `q = 0.7`; the quality knob trades
-1.25 kB / 0.9 dB → 9.4 kB / 6 dB+ on an 8k corpus); black-box, a 1 s
-stereo `q = 0.8` encode decodes through ffmpeg to exactly 44100
-frames at **30.8 dB SNR** against the input.
+fidelity; on a switched+coupled stereo transient corpus the knob
+sweeps 3.6 kB / 0 dB → 32.4 kB / 17.6 dB monotone across
+`q ∈ {0, ¼, ½, ¾, 1}`; black-box, a 1 s coupled stereo `q = 0.8`
+encode decodes through ffmpeg to exactly 44100 frames at **46.3 dB
+SNR** against the input.
+
+**§4.3.1 block switching** is wired through that whole chain
+(`tests/ogg_block_switching.rs`): `blocksize::plan_block_sequence`
+walks the §4.3.8 granule recurrence forward, deciding each packet's
+`blockflag` with the energy-envelope transient detector over the
+`long_n` lookahead a candidate long frame's quantisation noise would
+smear across; the setup header carries a floor / residue / mapping /
+mode set per block size, every long packet's window flags mirror its
+neighbours' blockflags (§4.3.1 hybrid edges at each long↔short
+transition — the encoder-side `FrameSplitter` grew the short→long
+negative-stride zero-fill this needs, pinned by a mixed-size
+FrameSplitter → OverlapAdd chain that reconstructs the input exactly),
+and codebook training chains the short- and long-block residue corpora
+over the shared ladders. Measured: on an attack-after-silence corpus,
+switching cuts the pre-attack noise energy beyond the short block's
+intrinsic `n0/2` reach by **220×** against a forced-long encode at
+equal quality; ffmpeg decodes a switched stream to the exact declared
+length, agreeing with the crate's own decoder to **134 dB**.
+
+**§4.3.5 channel coupling** is likewise wired
+(`tests/ogg_coupled_stream.rs`): adjacent channel pairs are gated on
+the whole stream's square-polar energy split (angle ≤ half the
+magnitude energy, accumulated over every frame's residue targets),
+kept steps land in every mapping and are forward-coupled over the
+residue targets (`X / rendered_floor`, the exact vectors the decoder
+inverse-couples), and each coupled pair's per-partition NMR weights
+merge to the element-wise max. Measured: a correlated stereo corpus at
+`q = 0.7` encodes to **14.0 kB coupled vs 20.6 kB dual-mono (−32 %)**
+at equal per-channel SNR (32.2 dB / 32.2 dB); an anti-correlated pair
+fails the gate and stays uncoupled; a 4-channel stream gates each pair
+independently.
 
 **Registration + dual API**: `register()` installs the codec
 (decoder + encoder factories, Matroska `A_VORBIS` tag) into
@@ -680,7 +723,8 @@ frames with sample-granularity PTS, seek-safe `reset()`);
 `encoder::VorbisStreamEncoder` is the frame-to-packet
 `oxideav_core::Encoder` (buffers F32/F32P frames, two-pass encode at
 `flush()`, header-flagged §4.2 packets then timestamped audio
-packets; `"quality"` / `"blocksize"` options).
+packets; `"quality"` / `"blocksize"` / `"short_blocksize"` /
+`"coupling"` options).
 `tests/registry_wiring.rs` round-trips PCM through boxed trait
 objects on both the registry and the direct dual-API path.
 
@@ -696,30 +740,27 @@ payoff NMR-style at equal transparency: on a burst-then-low-comb
 transient corpus the temporal encode spends **−14 %** bytes at fixed
 lambda, both encodes transparent under their own model, and on a
 steady corpus the two models are byte-identical. The whole-stream
-encoder runs its thresholds through this pipeline per channel.
+encoder runs its thresholds through this pipeline per channel on
+uniform-blocksize streams; a genuinely switched stream has a variable
+frame hop the temporal model does not define, so it uses the per-frame
+model (pre-echo control there rests on the short blocks themselves —
+the §1.3.2 mechanism).
 
 ### Not yet supported / known gaps
 
-- **The integrated encoder is single-blocksize.** `encode_pcm_to_ogg`
-  uses one `blockflag = false` mode (`blocksize_0 == blocksize_1`);
-  the §4.3.1 short/long switching machinery
-  (`blocksize::detect_transient` / `choose_blocksize`, the window
-  flags, the trace-conformant switch decode) exists and is tested,
-  but the whole-stream encoder does not yet drive it — pre-echo
-  control currently rests on the psy model's pre-masking discount.
-  Channel coupling (`synthesis::forward_couple_all`) is likewise
-  proven but not wired — every channel is carried uncoupled. (The
-  trained-codebook stack IS wired: `StreamEncoderConfig::
-  training_iterations` retrains the seed ladders on the stream's own
-  residue targets — the ladder value step now covers the encoder's
-  1-D lattice books — cutting a 1 s stereo `q = 0.8` stream 56 %
-  at unchanged ffmpeg-decoded SNR.)
 - **The psy tonality estimate is band-level spectral flatness** (no
   phase-predictability tracking), the perceptual weighting enters the
   residue chooser per *partition* (the VQ entry selection inside
-  `vq::quantize_vector` is unweighted Euclidean per read), and stereo
-  coupling decisions (`synthesis::should_couple`) are energy-driven,
-  not masking-driven.
+  `vq::quantize_vector` is unweighted Euclidean per read), and the
+  coupling gate is energy-driven, not masking-driven (and whole-stream:
+  one coupling decision per pair, since the §4.2.4 mapping fixes the
+  steps for every packet using it — per-packet coupling choice would
+  need a second uncoupled mapping per block size).
+- **The transient detector is a single global threshold** (peak-to-mean
+  energy concentration over a 16-sub-frame lookahead); it is not
+  loudness-adaptive, and the block schedule is decided on a channel
+  mixdown, so a transient confined to one channel of an uncoupled pair
+  still switches both.
 
 ## Clean-room provenance
 
