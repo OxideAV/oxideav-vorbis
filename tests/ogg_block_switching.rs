@@ -268,6 +268,51 @@ fn steady_content_stays_all_long() {
 }
 
 #[test]
+fn all_transient_content_stays_all_short_and_roundtrips() {
+    // Dense impulses: every lookahead region is transient, so the
+    // schedule is all-short — the degenerate opposite of the steady
+    // corpus. This also exercises the unused-size floor design (the
+    // long entry's representative envelope is resampled from the
+    // short one, since no long frame ever contributes).
+    let samples = 10_000;
+    let mut pcm = vec![0.0f32; samples];
+    let mut k = 150usize;
+    while k < samples {
+        for j in 0..24.min(samples - k) {
+            let d = (-(j as f32) / 6.0).exp();
+            pcm[k + j] = 0.8 * d * if j % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        k += 300;
+    }
+    let input = vec![pcm];
+    let config = StreamEncoderConfig::new(RATE, 1);
+    let ogg = encode_pcm_to_ogg(&input, &config).expect("encodes");
+    let preludes = packet_preludes(&ogg);
+    // Every interior packet is short; only the stream tail — whose
+    // decision lookahead is the silent zero-padding past the last
+    // impulse — may fall back to long.
+    let first_long = preludes.iter().position(|p| p.0).unwrap_or(preludes.len());
+    assert!(
+        first_long + 4 >= preludes.len(),
+        "long blocks before the stream tail: first at packet {first_long} of {}",
+        preludes.len()
+    );
+    assert!(
+        preludes[..first_long].len() > preludes.len() / 2,
+        "the impulse corpus must be predominantly short"
+    );
+    // The setup still carries both entries (mode 1 is simply unused).
+    let packets = ogg_packets(&ogg).unwrap();
+    let setup = parse_setup_header(&packets[2], 1).unwrap();
+    assert_eq!(setup.modes.len(), 2);
+    let decoded = decode_ogg_to_pcm(&ogg).expect("decodes");
+    assert_eq!(decoded.pcm[0].len(), samples, "end-trim to input length");
+    let snr = snr_db(&input[0], &decoded.pcm[0]);
+    eprintln!("all-short impulse corpus: {} B, SNR {snr:.2} dB", ogg.len());
+    assert!(snr.is_finite());
+}
+
+#[test]
 fn stereo_switched_stream_couples_and_roundtrips() {
     // Block switching and channel coupling compose: a correlated
     // stereo pair with attacks must produce a switched, coupled stream

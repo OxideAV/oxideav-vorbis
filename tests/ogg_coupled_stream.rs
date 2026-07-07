@@ -196,6 +196,73 @@ fn four_channel_stream_gates_each_adjacent_pair_independently() {
 }
 
 #[test]
+fn trained_books_shrink_a_coupled_switched_stream_at_equal_fidelity() {
+    // The closed-loop ladder trainer must compose with both new
+    // subsystems: the residue corpus it retrains on is the coupled
+    // magnitude/angle targets, split per block size and chained over
+    // the shared ladders. The trained stream must be meaningfully
+    // smaller at no meaningful fidelity cost.
+    let samples = 30_000;
+    let mid: Vec<f32> = {
+        // Tone beds with periodic attacks, so the stream genuinely
+        // switches while the pair stays correlated.
+        let mut pcm: Vec<f32> = (0..samples)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                0.25 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.10 * (2.0 * std::f32::consts::PI * 1370.0 * t).sin()
+            })
+            .collect();
+        let mut k = 3000usize;
+        while k + 400 < samples {
+            for j in 0..400 {
+                let d = (-(j as f32) / 60.0).exp();
+                pcm[k + j] += 0.7 * d * if j % 2 == 0 { 1.0 } else { -1.0 };
+            }
+            k += 5500;
+        }
+        pcm
+    };
+    let left: Vec<f32> = mid.iter().map(|&m| m * 1.02).collect();
+    let right: Vec<f32> = mid.iter().map(|&m| m * 0.98).collect();
+    let pcm = vec![left, right];
+
+    let mut untrained = StreamEncoderConfig::new(RATE, 2);
+    untrained.training_iterations = 0;
+    let mut trained = StreamEncoderConfig::new(RATE, 2);
+    trained.training_iterations = 6;
+
+    let ogg_untrained = encode_pcm_to_ogg(&pcm, &untrained).expect("untrained encodes");
+    let ogg_trained = encode_pcm_to_ogg(&pcm, &trained).expect("trained encodes");
+    // Both are coupled, switched streams.
+    assert_eq!(coupling_steps_of(&ogg_untrained, 2).len(), 1);
+    assert_eq!(coupling_steps_of(&ogg_trained, 2).len(), 1);
+
+    eprintln!(
+        "coupled+switched training: {} B -> {} B",
+        ogg_untrained.len(),
+        ogg_trained.len()
+    );
+    assert!(
+        (ogg_trained.len() as f64) < 0.9 * ogg_untrained.len() as f64,
+        "training must cut >= 10%: {} vs {} bytes",
+        ogg_trained.len(),
+        ogg_untrained.len()
+    );
+    let dec_u = decode_ogg_to_pcm(&ogg_untrained).expect("untrained decodes");
+    let dec_t = decode_ogg_to_pcm(&ogg_trained).expect("trained decodes");
+    for (c, input) in pcm.iter().enumerate() {
+        let snr_u = snr_db(input, &dec_u.pcm[c]);
+        let snr_t = snr_db(input, &dec_t.pcm[c]);
+        eprintln!("ch{c}: untrained {snr_u:.2} dB, trained {snr_t:.2} dB");
+        assert!(
+            snr_t >= snr_u - 1.0,
+            "training must not cost fidelity: ch{c} {snr_t:.2} vs {snr_u:.2} dB"
+        );
+    }
+}
+
+#[test]
 fn mono_and_disabled_coupling_emit_no_steps() {
     let samples = 6_000;
     let mono = vec![tone_mix(samples, 9)];

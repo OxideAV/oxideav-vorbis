@@ -6,6 +6,16 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Depth tests over the two new subsystems**: the closed-loop
+  ladder trainer composes with coupling + switching — retraining on
+  the coupled magnitude/angle residue corpus (chained per block size)
+  cuts a coupled+switched stereo stream **15 228 → 12 161 B (−20 %)**
+  at identical per-channel SNR
+  (`tests/ogg_coupled_stream.rs`); a dense-impulse corpus schedules
+  predominantly short blocks (long only on the silent stream tail)
+  and exercises the unused-size floor design via envelope resampling
+  (`tests/ogg_block_switching.rs`).
+
 - **Registry encoder options for the new subsystems**: the
   `make_encoder` factory grows a `"short_blocksize"` option (power of
   two `<=` the long size; equal disables §4.3.1 block switching) next
