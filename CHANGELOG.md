@@ -6,6 +6,44 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **§4.3.1 block switching in the integrated encoder.**
+  `encode_pcm_to_ogg` / `encode_pcm_to_packets` now run short/long
+  block switching — new `StreamEncoderConfig::short_blocksize` knob
+  (default `256` against the long `1024`; setting it equal to
+  `blocksize` disables switching). New pub
+  `blocksize::plan_block_sequence` (+ `BlockSequencePlan`) walks the
+  §4.3.8 granule recurrence forward, deciding each packet's
+  `blockflag` with the energy-envelope transient detector over the
+  `long_n` lookahead a candidate long frame's quantisation noise
+  would smear across. The stream carries per-size floors / residues /
+  mappings / modes (the setup header grows a second entry set), each
+  long packet's window flags mirror its neighbours' blockflags
+  (§4.3.1 hybrid edges at every long↔short transition), and the
+  §A.2 granules follow the mixed-size walk. A genuinely switched
+  stream uses the per-frame psy model (the temporal pipeline needs a
+  fixed hop); uniform streams keep the temporal path. Codebook
+  training chains the short- and long-block residue corpora over the
+  shared ladders. Measured (`tests/ogg_block_switching.rs`):
+  short blocks cut the pre-attack noise energy beyond the short
+  block's intrinsic reach by **220×** (1.7 × 10⁻⁶ vs 3.7 × 10⁻⁴)
+  against a forced-long encode at equal quality and equal whole-stream
+  SNR; black-box, switched mono and switched+coupled stereo 1 s
+  encodes decode through ffmpeg to exactly 44 100 frames, ffmpeg
+  agreeing with the crate's own decoder to **134 dB** (max sample
+  delta 2.1 × 10⁻⁷).
+- **`FrameSplitter` short→long geometry fix.** The §4.3.8-inverse
+  splitter mis-placed a frame following a smaller predecessor (the
+  negative-stride case): the frame's global start precedes the
+  buffered head by `cur_n/4 − prev_n/4`, which the old code ignored,
+  drifting the walk. Those positions fall entirely inside the long
+  block's §4.3.1 zero lead-in, so `take_frame` now zero-fills them
+  and aligns the buffered samples at the window's rising edge,
+  draining `cur_n/2 − lead` to keep the head-at-center invariant. A
+  new mixed-size chain test drives a short/long flag sequence with
+  the real hybrid windows through FrameSplitter → OverlapAdd and
+  reconstructs the input exactly (the cross-transition w² TDAC
+  identity).
+
 - **§4.3.5 channel coupling in the integrated encoder.**
   `encode_pcm_to_ogg` / `encode_pcm_to_packets` now offer square-polar
   coupling on adjacent channel pairs `(0, 1)`, `(2, 3)`, … — new

@@ -321,20 +321,44 @@ impl FrameSplitter {
                 window_len: analysis_window.len(),
             });
         }
-        if self.buffer.len() < cur_n {
+
+        // Negative pending stride (a short→long transition): the
+        // current frame's §4.3.8 global start precedes the buffered
+        // head — which sits at the previous frame's center — by
+        // `lead = cur_n/4 - prev_n/4`. Those samples were consumed by
+        // the previous frame's left-half drop, but every one of them
+        // falls inside the current frame's zero lead-in: §4.3.1 step 2
+        // places the long block's hybrid rising edge at
+        // `left_window_start = cur_n/4 - blocksize_0/4`, exactly
+        // `lead` when the previous block was the short size (the only
+        // §4.2.2 configuration a smaller previous block can have).
+        // The windowed frame is therefore exact with the first `lead`
+        // positions zero-filled — the multiplication by the window's
+        // zero lead-in would have produced zeros regardless of the
+        // sample values there.
+        let lead = match self.prev_n {
+            Some(prev_n) if cur_n > prev_n => cur_n / 4 - prev_n / 4,
+            _ => 0,
+        };
+        let need = cur_n - lead;
+        if self.buffer.len() < need {
             return Err(FramingError::NeedMoreInput {
-                shortfall: cur_n - self.buffer.len(),
+                shortfall: need - self.buffer.len(),
             });
         }
 
-        // §4.3.7 close: slice cur_n samples from the buffer start
-        // and multiply pointwise by the analysis window. The
-        // window's lead-in and tail zeros (§4.3.1 step 4 / step 8)
-        // mean PCM samples outside the analysis support are zeroed
-        // by the multiplication.
-        let mut frame: Vec<f32> = self.buffer[..cur_n].to_vec();
-        for (sample, &w) in frame.iter_mut().zip(analysis_window.iter()) {
-            *sample *= w;
+        // §4.3.7 close: slice the frame's buffered samples (offset by
+        // `lead` within the frame) and multiply pointwise by the
+        // analysis window. The window's lead-in and tail zeros
+        // (§4.3.1 step 4 / step 8) mean PCM samples outside the
+        // analysis support are zeroed by the multiplication.
+        let mut frame = vec![0.0f32; cur_n];
+        for ((sample, &pcm), &w) in frame[lead..]
+            .iter_mut()
+            .zip(&self.buffer[..need])
+            .zip(&analysis_window[lead..])
+        {
+            *sample = pcm * w;
         }
 
         // §4.3.8 advance: drop the consumed PCM. The stride is the
@@ -407,7 +431,10 @@ impl FrameSplitter {
         // the right half makes those samples available for the
         // overlap geometry of the next frame.
         let prev_n_was = self.prev_n;
-        let half = cur_n / 2;
+        // Restore the head-at-center invariant: the frame's global
+        // start is `lead` before the old head, so its center is
+        // `cur_n/2 - lead` past it.
+        let half = cur_n / 2 - lead;
         self.buffer.drain(..half);
         self.prev_n = Some(cur_n);
 
@@ -764,41 +791,106 @@ mod tests {
     }
 
     #[test]
-    fn stride_after_short_then_long_does_not_drop() {
-        // prev_n=64, cur_n=256. §4.3.8 stride from previous center
-        // to current start = 16 - 64 = -48 (negative). The current
-        // frame's left half overlaps the buffered right half of the
-        // previous frame; no samples are dropped.
-        //
-        // After frame 0 (n=64), 32 samples are drained, buffer holds
-        // global 32.. . The next frame's start is at global -16, i.e.
-        // 48 samples BEFORE the current buffer head. But §4.3.8 also
-        // says the priming step's first frame is positioned at g_0=0
-        // — and the geometry for a stream-start short-then-long
-        // transition is degenerate (the long block's left half tries
-        // to overlap data before time 0). For a stream-middle
-        // transition this is the standard hybrid window case and the
-        // splitter behaves correctly under the model that no advance
-        // happens at this step.
+    fn stride_after_short_then_long_zero_fills_the_lead_in() {
+        // prev_n=64, cur_n=256. §4.3.8 stride from previous center to
+        // current start = 16 - 64 = -48 (negative): the long frame's
+        // global start precedes the buffered head (the previous
+        // frame's center) by `lead = 256/4 - 64/4 = 48` samples. Those
+        // samples were consumed by the previous frame's left-half
+        // drop, but they fall entirely inside the long frame's §4.3.1
+        // zero lead-in (`left_window_start = 256/4 - 64/4 = 48` for a
+        // long block lapping a short predecessor), so the splitter
+        // zero-fills positions 0..48 and aligns the buffered samples
+        // at position 48 — where the window's rising edge begins.
         let mut splitter = FrameSplitter::new();
         let n0 = 64;
         let n1 = 256;
         let input: Vec<f32> = (0..400).map(|i| i as f32).collect();
         splitter.push_pcm(&input);
         let window0 = vec![1.0f32; n0];
-        let window1 = vec![1.0f32; n1];
+        // The real §4.3.1 hybrid window (long block, short previous
+        // neighbour): zero lead-in over 0..48, rising edge 48..112.
+        let window1 = vorbis_window(n1, n0, true, false, true).unwrap();
         let _f0 = splitter.take_frame(n0, &window0).unwrap();
         // After frame 0, buffer holds 400 - 32 = 368 samples (samples
         // 32..400).
         assert_eq!(splitter.buffered(), 368);
         let buffered_before = splitter.buffered();
         splitter.advance_pending_stride(n1);
-        // Negative stride ⇒ no drop.
+        // Negative stride ⇒ nothing for the pending-stride drop.
         assert_eq!(splitter.buffered(), buffered_before);
         let f1 = splitter.take_frame(n1, &window1).unwrap();
-        // f1[0] is global position 32 (the buffer head from frame 0's
-        // center anchor).
-        assert!((f1[0] - 32.0).abs() < 1e-6, "f1[0]={}", f1[0]);
+        // Zero-filled lead-in.
+        for (i, v) in f1.iter().enumerate().take(48) {
+            assert_eq!(*v, 0.0, "lead-in f1[{i}] = {v}");
+        }
+        // Position 48 carries global sample 32 (the previous center)
+        // weighted by the window's first rising-edge value: the frame's
+        // §4.3.8 global start is 32 - 48 = -16, so index k holds
+        // global sample k - 16.
+        for (k, v) in f1.iter().enumerate().skip(48) {
+            let expected = (k as f32 - 16.0) * window1[k];
+            assert!(
+                (v - expected).abs() < 1e-4,
+                "f1[{k}] = {v}, want {expected}"
+            );
+        }
+        // The head-at-center invariant: the frame's center is at
+        // global -16 + 128 = 112, i.e. 80 samples past the old head —
+        // the drain is cur_n/2 - lead = 128 - 48 = 80.
+        assert_eq!(splitter.buffered(), buffered_before - 80);
+    }
+
+    #[test]
+    fn mixed_blocksize_chain_round_trips_through_overlap_add() {
+        // The full §4.3.8 mixed-size contract: a short/long blockflag
+        // sequence with the real §4.3.1 hybrid windows, driven through
+        // FrameSplitter → (identity transform stand-in) → second
+        // window multiply → OverlapAdd, must reconstruct the input
+        // inside every returned range — the w² TDAC identity holds
+        // across long↔short transitions because the hybrid edges pair
+        // slopes of equal length.
+        let n0 = 64;
+        let n1 = 256;
+        let flags = [false, false, true, true, false, false, true, false];
+        let pcm: Vec<f32> = (0..1024).map(|i| 0.5 + (i as f32 * 0.013).sin()).collect();
+        let mut splitter = FrameSplitter::new();
+        splitter.push_pcm(&pcm);
+        let mut adder = OverlapAdd::new();
+        // Global position of the first returned sample: frame 0's
+        // center (no pre-roll in this test, mirroring the equal-size
+        // round-trip tests above).
+        let mut out_pos = n0 / 2;
+        let mut returned = 0usize;
+        for (f, &flag) in flags.iter().enumerate() {
+            let n = if flag { n1 } else { n0 };
+            let prev = flag && (f == 0 || flags[f - 1]);
+            let next = flag && (f + 1 == flags.len() || flags[f + 1]);
+            let window = vorbis_window(n, n0, flag, prev, next).unwrap();
+            splitter.advance_pending_stride(n);
+            let frame = splitter.take_frame(n, &window).unwrap();
+            let windowed: Vec<f32> = frame.iter().zip(&window).map(|(s, w)| s * w).collect();
+            if let Some(out) = adder.push_frame(&windowed).unwrap() {
+                for (k, v) in out.iter().enumerate() {
+                    let expected = pcm[out_pos + k];
+                    assert!(
+                        (v - expected).abs() < 1e-4,
+                        "frame {f} out[{k}] (global {}) = {v}, want {expected}",
+                        out_pos + k
+                    );
+                }
+                out_pos += out.len();
+                returned += out.len();
+            }
+        }
+        // Every §4.3.8 lap must have been returned: Σ (n_prev+n_cur)/4.
+        let mut expect = 0usize;
+        for f in 1..flags.len() {
+            let np = if flags[f - 1] { n1 } else { n0 };
+            let nc = if flags[f] { n1 } else { n0 };
+            expect += (np + nc) / 4;
+        }
+        assert_eq!(returned, expect);
     }
 
     // ---- end-to-end round-trip with OverlapAdd ----

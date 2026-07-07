@@ -72,10 +72,18 @@ fn snr_db(reference: &[f32], decoded: &[f32]) -> f64 {
 }
 
 /// Parse the coupling steps out of a produced stream's setup header.
+/// Every mapping (one per block size) must carry the identical step
+/// list — the coupling decision is per stream, not per block size.
 fn coupling_steps_of(ogg: &[u8], channels: u8) -> Vec<MappingCouplingStep> {
     let packets = ogg_packets(ogg).expect("stream de-frames");
     let setup = parse_setup_header(&packets[2], channels).expect("setup header parses");
-    assert_eq!(setup.mappings.len(), 1);
+    assert!(!setup.mappings.is_empty());
+    for mapping in &setup.mappings[1..] {
+        assert_eq!(
+            mapping.coupling, setup.mappings[0].coupling,
+            "all mappings must agree on the coupling steps"
+        );
+    }
     setup.mappings[0].coupling.clone()
 }
 

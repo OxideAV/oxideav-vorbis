@@ -42,6 +42,15 @@
 pub enum BlocksizeError {
     /// The PCM block was empty. Energy analysis needs at least one sample.
     EmptyBlock,
+    /// A block-sequence blocksize was not a power of two in `64..=8192`
+    /// (§4.2.2), or the short size exceeded the long size (§4.2.2:
+    /// `blocksize_0` must be `<= blocksize_1`).
+    BadBlocksizePair {
+        /// The short (`blocksize_0`) candidate.
+        short_n: usize,
+        /// The long (`blocksize_1`) candidate.
+        long_n: usize,
+    },
     /// `subframes` was zero. The block must be split into at least one
     /// sub-frame to measure an energy envelope (one sub-frame trivially
     /// reports no transient).
@@ -65,6 +74,11 @@ impl core::fmt::Display for BlocksizeError {
             BlocksizeError::EmptyBlock => {
                 write!(f, "vorbis blocksize: empty PCM block")
             }
+            BlocksizeError::BadBlocksizePair { short_n, long_n } => write!(
+                f,
+                "vorbis blocksize: illegal blocksize pair ({short_n}, {long_n}) — each must be \
+                 a power of two in 64..=8192 with short <= long"
+            ),
             BlocksizeError::ZeroSubframes => {
                 write!(f, "vorbis blocksize: subframes=0 (need >= 1)")
             }
@@ -219,6 +233,108 @@ pub fn choose_blocksize(
     Ok((blockflag, analysis))
 }
 
+/// A whole-stream block-size schedule (Vorbis I §4.3.1 / §4.3.8, encode
+/// direction): the per-packet `blockflag` sequence plus the granule walk
+/// it implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSequencePlan {
+    /// Per-packet `blockflag`s: `false` selects the short block
+    /// (`blocksize_0`), `true` the long block (`blocksize_1`). One entry
+    /// per audio packet, the §4.3.8 priming packet included.
+    pub blockflags: Vec<bool>,
+    /// Cumulative granule position after each packet — the absolute
+    /// end-PCM-sample count the §4.3.8 lapping rule finishes: packet 0
+    /// (priming) finishes 0 samples, packet `f` then adds
+    /// `(n_{f-1} + n_f) / 4`. The final entry is `>=` the input length
+    /// (the §A.2 end-trim lowers it at mux time).
+    pub granules: Vec<u64>,
+}
+
+/// Plan a whole stream's block-size sequence from its PCM (Vorbis I
+/// §1.3.2 / §4.3.1, encode direction) — the schedule that drives the
+/// per-packet mode selection of a two-blocksize stream.
+///
+/// Walks the §4.3.8 granule recurrence forward: packet 0 is the priming
+/// frame (finishes no PCM), and each subsequent packet `f` finishes
+/// `(n_{f-1} + n_f) / 4` samples, where each `n` is `short_n` or
+/// `long_n` per the packet's `blockflag`. At every step the flag is
+/// decided by [`choose_blocksize`] over the *lookahead* region a
+/// candidate **long** frame's quantisation noise would smear across —
+/// the `long_n` samples from the current granule position (a long
+/// frame scheduled at granule `g` is centred at most `g + long_n / 2`
+/// and spans a full `long_n` window, so an attack anywhere inside
+/// `[g, g + long_n)` could pick up its pre-echo; the region is clamped
+/// to the input end, a region shorter than `subframes` shrinks the
+/// sub-frame count, and an empty region — pure zero-padding — is
+/// always long). The walk stops once the cumulative granule covers the
+/// whole input, so the returned plan is exactly the packet sequence a
+/// whole-stream encoder emits.
+///
+/// `pcm` is one channel's (or a mixdown's) PCM; `subframes` and
+/// `peak_to_mean_threshold` are the [`detect_transient`] levers.
+/// `short_n == long_n` is legal and degenerates to an all-`false`
+/// single-blocksize plan.
+///
+/// # Errors
+///
+/// * [`BlocksizeError::EmptyBlock`] — `pcm` is empty.
+/// * [`BlocksizeError::BadBlocksizePair`] — a blocksize is not a power
+///   of two in `64..=8192`, or `short_n > long_n` (§4.2.2).
+/// * [`BlocksizeError::ZeroSubframes`] — `subframes == 0`.
+pub fn plan_block_sequence(
+    pcm: &[f32],
+    short_n: usize,
+    long_n: usize,
+    subframes: usize,
+    peak_to_mean_threshold: f64,
+) -> Result<BlockSequencePlan, BlocksizeError> {
+    if pcm.is_empty() {
+        return Err(BlocksizeError::EmptyBlock);
+    }
+    let legal = |n: usize| n.is_power_of_two() && (64..=8192).contains(&n);
+    if !legal(short_n) || !legal(long_n) || short_n > long_n {
+        return Err(BlocksizeError::BadBlocksizePair { short_n, long_n });
+    }
+    if subframes == 0 {
+        return Err(BlocksizeError::ZeroSubframes);
+    }
+
+    let lookahead = long_n;
+    let decide = |g: usize| -> Result<bool, BlocksizeError> {
+        if short_n == long_n {
+            // Degenerate single-blocksize stream: the flag is
+            // meaningless; report the short/only block.
+            return Ok(false);
+        }
+        let end = (g + lookahead).min(pcm.len());
+        if g >= end {
+            // The frame covers only zero-padding past the input: no
+            // transient there — long block.
+            return Ok(true);
+        }
+        let region = &pcm[g..end];
+        let sf = subframes.min(region.len());
+        Ok(choose_blocksize(region, sf, peak_to_mean_threshold)?.0)
+    };
+
+    let size = |flag: bool| if flag { long_n } else { short_n };
+    let mut blockflags = vec![decide(0)?];
+    let mut granules = vec![0u64];
+    let mut g = 0usize;
+    while g < pcm.len() {
+        let flag = decide(g)?;
+        let n_prev = size(*blockflags.last().expect("non-empty"));
+        // §4.3.8: packet f finishes (n_{f-1} + n_f) / 4 samples.
+        g += (n_prev + size(flag)) / 4;
+        blockflags.push(flag);
+        granules.push(g as u64);
+    }
+    Ok(BlockSequencePlan {
+        blockflags,
+        granules,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +411,120 @@ mod tests {
         transient[0] = 10.0;
         let (flag, _) = choose_blocksize(&transient, 8, 1e9).unwrap();
         assert!(flag, "no finite ratio beats a 1e9 threshold → long");
+    }
+
+    // ---- plan_block_sequence ----
+
+    /// The §4.3.8 granule walk the plan reports must match the flags it
+    /// chose: packet 0 at granule 0, then `(n_prev + n_cur) / 4` steps.
+    fn assert_walk_consistent(plan: &BlockSequencePlan, short_n: usize, long_n: usize) {
+        assert_eq!(plan.blockflags.len(), plan.granules.len());
+        assert_eq!(plan.granules[0], 0);
+        let size = |flag: bool| if flag { long_n } else { short_n } as u64;
+        for f in 1..plan.blockflags.len() {
+            let step = (size(plan.blockflags[f - 1]) + size(plan.blockflags[f])) / 4;
+            assert_eq!(
+                plan.granules[f],
+                plan.granules[f - 1] + step,
+                "granule walk broken at packet {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn steady_signal_plans_all_long() {
+        let pcm: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let plan = plan_block_sequence(&pcm, 256, 1024, 8, 4.0).unwrap();
+        assert_walk_consistent(&plan, 256, 1024);
+        assert!(plan.blockflags.iter().all(|&f| f), "steady ⇒ all long");
+        // The walk covers the input and stops as soon as it does.
+        let last = *plan.granules.last().unwrap() as usize;
+        assert!(last >= pcm.len());
+        assert!(last - 512 < pcm.len(), "walk overshot by a whole packet");
+    }
+
+    #[test]
+    fn attack_forces_short_blocks_around_it_only() {
+        // Silence, then a burst at sample 2000, then steady tone.
+        let mut pcm = vec![0.0f32; 6000];
+        for (i, s) in pcm.iter_mut().enumerate().skip(2000).take(64) {
+            *s = if i % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        for (i, s) in pcm.iter_mut().enumerate().skip(3000) {
+            *s = (i as f32 * 0.05).sin() * 0.4;
+        }
+        let plan = plan_block_sequence(&pcm, 256, 1024, 8, 4.0).unwrap();
+        assert_walk_consistent(&plan, 256, 1024);
+        assert!(
+            plan.blockflags.iter().any(|&f| !f),
+            "the attack must force short blocks"
+        );
+        assert!(
+            plan.blockflags.iter().any(|&f| f),
+            "the steady regions must stay long"
+        );
+        // Every short block's decision region [g, g + long_n) must
+        // overlap a genuine attack — the burst at 2000..2064 or the
+        // silence→tone onset at 3000 — so shorts cluster at the
+        // transients, not elsewhere.
+        for f in 0..plan.blockflags.len() {
+            if !plan.blockflags[f] {
+                let g = if f == 0 {
+                    0
+                } else {
+                    plan.granules[f - 1] as usize
+                };
+                let covers_burst = g < 2064 && g + 1024 > 2000;
+                let covers_tone_onset = g <= 3000 && g + 1024 > 3000;
+                assert!(
+                    covers_burst || covers_tone_onset,
+                    "short block at packet {f} (granule {g}) covers no transient"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_blocksizes_degenerate_to_all_short_flags() {
+        let pcm = vec![0.25f32; 3000];
+        let plan = plan_block_sequence(&pcm, 512, 512, 8, 4.0).unwrap();
+        assert!(plan.blockflags.iter().all(|&f| !f));
+        assert_walk_consistent(&plan, 512, 512);
+        // Uniform walk: every packet after priming finishes 256.
+        assert_eq!(plan.granules[1], 256);
+    }
+
+    #[test]
+    fn plan_rejects_bad_shapes() {
+        assert_eq!(
+            plan_block_sequence(&[], 256, 1024, 8, 4.0),
+            Err(BlocksizeError::EmptyBlock)
+        );
+        assert_eq!(
+            plan_block_sequence(&[0.0; 100], 100, 1024, 8, 4.0),
+            Err(BlocksizeError::BadBlocksizePair {
+                short_n: 100,
+                long_n: 1024
+            })
+        );
+        assert_eq!(
+            plan_block_sequence(&[0.0; 100], 1024, 256, 8, 4.0),
+            Err(BlocksizeError::BadBlocksizePair {
+                short_n: 1024,
+                long_n: 256
+            })
+        );
+        assert_eq!(
+            plan_block_sequence(&[0.0; 100], 256, 16384, 8, 4.0),
+            Err(BlocksizeError::BadBlocksizePair {
+                short_n: 256,
+                long_n: 16384
+            })
+        );
+        assert_eq!(
+            plan_block_sequence(&[0.0; 100], 256, 1024, 0, 4.0),
+            Err(BlocksizeError::ZeroSubframes)
+        );
     }
 
     #[test]

@@ -13,15 +13,28 @@
 //!
 //! # Encoder geometry
 //!
-//! The stream uses a single blocksize `n` (`blocksize_0 == blocksize_1`,
-//! one `blockflag = false` mode). With the §4.3.8 lapping rule each
-//! audio packet after the first finishes `n/2` PCM samples, so packet
-//! `f` carries the absolute granule position `f · n/2`; the final
+//! The stream carries the §4.2.2 blocksize pair `(blocksize_0,
+//! blocksize_1)`. When they differ, the encoder runs §4.3.1 **block
+//! switching**: a clean-room energy-envelope transient detector
+//! ([`crate::blocksize::plan_block_sequence`]) schedules the short
+//! block over attacks (confining quantisation noise to avoid
+//! pre-echo) and the long block elsewhere; each long packet's
+//! `previous_window_flag` / `next_window_flag` mirror its neighbours'
+//! blockflags so the §4.3.1 hybrid window edges lap every long↔short
+//! transition, and the setup header carries a floor / residue /
+//! mapping / mode set **per block size**. With the §4.3.8 lapping
+//! rule packet `f` finishes `(n_{f-1} + n_f) / 4` PCM samples, whose
+//! running sum is the packet's absolute granule position; the final
 //! packet's granule is lowered to the true sample count — the §A.2
 //! end-trim that lets a stream end on a non-block-aligned length. The
-//! encoder pre-rolls `n/2` zeros (the priming frame's left half lands
-//! on pre-stream silence) and zero-pads the tail so the last emitted
-//! packet covers the final input sample.
+//! encoder pre-rolls half the first frame of zeros (the priming
+//! frame's left half lands on pre-stream silence) and zero-pads the
+//! tail so the last emitted packet covers the final input sample.
+//! `blocksize_0 == blocksize_1` degenerates to the single-blocksize,
+//! single-mode stream.
+//!
+//! Adjacent channel pairs are §4.3.5 square-polar **coupled** when
+//! profitable — see [`StreamEncoderConfig::coupling`].
 //!
 //! # Rate control
 //!
@@ -32,6 +45,7 @@
 //! `weights · error²  + λ · bits` per §8.6 partition).
 
 use crate::audio::AudioDecoderState;
+use crate::blocksize::{plan_block_sequence, BlocksizeError};
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::encoder::{
     write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
@@ -47,8 +61,8 @@ use crate::mdct::{mdct_naive_vec, MdctError};
 use crate::packet::AudioPacketHeader;
 use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
 use crate::psy::{
-    plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis, PsyConfig, PsyError,
-    TemporalMasking, TemporalMaskingConfig,
+    compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
+    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 use crate::quality::{EncoderTuning, QualityError};
 use crate::residue_encode::{plan_vector_residue_rd_weighted, ResidueEncodeError};
@@ -57,7 +71,7 @@ use crate::setup::{
     MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
 };
 use crate::streaming::{StreamingDecoder, StreamingError, StreamingFrame};
-use crate::synthesis::{coupling_energy, forward_couple_all, vorbis_window, WindowError};
+use crate::synthesis::{coupling_energy, forward_couple_all, WindowError};
 use crate::VorbisCommentHeader;
 use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
 use oxideav_ogg::page::Page;
@@ -76,6 +90,21 @@ const PARTITION_SIZE: u32 = 16;
 ///
 /// [`CouplingEnergy::angle_ratio`]: crate::synthesis::CouplingEnergy::angle_ratio
 const COUPLING_MAX_ANGLE_RATIO: f64 = 0.5;
+
+/// Sub-frame count the §4.3.1 transient detector splits its lookahead
+/// region into ([`crate::blocksize::detect_transient`]): sixteen
+/// sub-frames over the `long_n` lookahead resolve an attack finely
+/// enough that a decaying hit over a tone bed still concentrates in
+/// one or two sub-frames instead of diluting into the bed energy.
+const TRANSIENT_SUBFRAMES: usize = 16;
+
+/// Peak-to-mean energy-concentration ratio above which the lookahead
+/// region is called a transient and the encoder schedules the short
+/// block. A flat region scores `≈ 1`; a tonal region whose lookahead
+/// covers only a fraction of a low-frequency cycle stays under `≈
+/// 2.5`; a genuine attack over a tone bed clears `4`–`8`. `3.0` sits
+/// between the two regimes.
+const TRANSIENT_PEAK_TO_MEAN: f64 = 3.0;
 
 /// Configuration for [`encode_pcm_to_ogg`].
 #[derive(Debug, Clone, PartialEq)]
@@ -100,10 +129,22 @@ pub struct StreamEncoderConfig {
     /// Quality knob `q ∈ [0, 1]` — expanded through
     /// [`EncoderTuning::from_quality`].
     pub quality: f32,
-    /// The single analysis/synthesis blocksize `n` (a power of two in
-    /// `64..=8192`, §4.2.2). Both identification-header blocksizes are
-    /// set to it.
+    /// The **long** blocksize `blocksize_1` (a power of two in
+    /// `64..=8192`, §4.2.2) — the analysis/synthesis size steady
+    /// content uses.
     pub blocksize: usize,
+    /// The **short** blocksize `blocksize_0` (a power of two in
+    /// `64..=8192`, `<=` [`Self::blocksize`], §4.2.2). When strictly
+    /// smaller than the long size, the encoder runs §4.3.1 block
+    /// switching: a clean-room energy-envelope transient detector
+    /// ([`crate::blocksize::plan_block_sequence`]) schedules short
+    /// blocks around attacks (confining quantisation noise to avoid
+    /// pre-echo) and long blocks elsewhere, with per-size floors and
+    /// residues and the §4.3.1 hybrid window edges at every
+    /// long↔short transition. Setting it equal to
+    /// [`Self::blocksize`] disables switching (a single-blocksize,
+    /// single-mode stream).
+    pub short_blocksize: usize,
     /// Ogg logical-bitstream serial number.
     pub serial: u32,
     /// Closed-loop residue-codebook training iterations
@@ -117,7 +158,8 @@ pub struct StreamEncoderConfig {
 }
 
 impl StreamEncoderConfig {
-    /// A nominal configuration: `quality = 0.7`, `blocksize = 1024`,
+    /// A nominal configuration: `quality = 0.7`, long blocksize
+    /// `1024` with short blocksize `256` (block switching enabled),
     /// coupling offered on adjacent pairs, 4 codebook-training
     /// iterations, serial `0x6F78_7662` (arbitrary fixed default).
     #[must_use]
@@ -128,6 +170,7 @@ impl StreamEncoderConfig {
             coupling: true,
             quality: 0.7,
             blocksize: 1024,
+            short_blocksize: 256,
             serial: 0x6F78_7662,
             training_iterations: 4,
         }
@@ -150,6 +193,16 @@ pub enum OggFileError {
     ZeroSampleRate,
     /// `blocksize` was not a power of two in `64..=8192` (§4.2.2).
     BadBlocksize(usize),
+    /// `short_blocksize` exceeded `blocksize` (§4.2.2 requires
+    /// `blocksize_0 <= blocksize_1`).
+    BadBlocksizePair {
+        /// The configured short (`blocksize_0`) size.
+        short_n: usize,
+        /// The configured long (`blocksize_1`) size.
+        long_n: usize,
+    },
+    /// The §4.3.1 block-size schedule planner failed.
+    Blocksize(BlocksizeError),
     /// The quality knob was rejected.
     Quality(QualityError),
     /// The §1.3.2 / §4.3.1 window builder failed.
@@ -207,6 +260,11 @@ impl core::fmt::Display for OggFileError {
                 f,
                 "ogg encode: blocksize {n} is not a power of two in 64..=8192"
             ),
+            OggFileError::BadBlocksizePair { short_n, long_n } => write!(
+                f,
+                "ogg encode: short blocksize {short_n} exceeds long blocksize {long_n}"
+            ),
+            OggFileError::Blocksize(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Quality(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Window(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Framing(e) => write!(f, "ogg encode: {e}"),
@@ -243,6 +301,7 @@ macro_rules! from_err {
         }
     };
 }
+from_err!(BlocksizeError => Blocksize);
 from_err!(QualityError => Quality);
 from_err!(WindowError => Window);
 from_err!(FramingError => Framing);
@@ -575,59 +634,96 @@ fn floor_class_catalogue() -> Vec<Floor1Class> {
         .collect()
 }
 
-/// The stream's setup header: 4 codebooks (floor posts, residue
-/// classwords, coarse + fine value ladders), one floor, one two-class
-/// residue (class 0 = silence, class 1 = two-stage cascade), one
-/// mapping carrying the gated §4.3.5 coupling steps under a single
-/// submap, one `blockflag = false` mode.
+/// Linearly resample a positive spectral envelope onto a new bin
+/// count. Used to derive a representative design envelope for a block
+/// size the schedule never actually used (its floor/residue set must
+/// still exist in the setup header for the mode to be legal).
+fn resample_envelope(src: &[f32], dst_len: usize) -> Vec<f32> {
+    if src.len() == dst_len {
+        return src.to_vec();
+    }
+    let last = (src.len() - 1) as f64;
+    let denom = dst_len.saturating_sub(1).max(1) as f64;
+    (0..dst_len)
+        .map(|i| {
+            let pos = i as f64 * last / denom;
+            let lo = pos.floor() as usize;
+            let hi = (lo + 1).min(src.len() - 1);
+            let t = (pos - lo as f64) as f32;
+            src[lo] * (1.0 - t) + src[hi] * t
+        })
+        .collect()
+}
+
+/// The stream's setup header: 4 shared codebooks (floor posts, residue
+/// classwords, coarse + fine value ladders) plus, **per block size**
+/// (one entry when `blocksize_0 == blocksize_1`, two — short then long
+/// — when the stream switches), a floor, a two-class residue (class 0
+/// = silence, class 1 = two-stage cascade over the shared ladders,
+/// `residue_end` at that size's `n/2`), a mapping carrying the gated
+/// §4.3.5 coupling steps under a single submap, and a mode
+/// (`blockflag` clear on the short entry, set on the long one).
 fn build_setup(
-    floor_header: crate::setup::Floor1Header,
+    floor_headers: Vec<crate::setup::Floor1Header>,
     coarse: VorbisCodebook,
     fine: VorbisCodebook,
-    half_n: u32,
+    half_ns: &[u32],
     coupling: Vec<MappingCouplingStep>,
+    switching: bool,
 ) -> VorbisSetupHeader {
-    let floor = FloorHeader {
-        floor_type: 1,
-        kind: FloorKind::Type1(floor_header),
-    };
+    let floors = floor_headers
+        .into_iter()
+        .map(|h| FloorHeader {
+            floor_type: 1,
+            kind: FloorKind::Type1(h),
+        })
+        .collect();
     let mut stages: [Option<u8>; 8] = Default::default();
     stages[0] = Some(2);
     stages[1] = Some(3);
-    let residue = ResidueHeader {
-        residue_type: 1,
-        residue_begin: 0,
-        residue_end: half_n,
-        partition_size: PARTITION_SIZE,
-        classifications: 2,
-        classbook: 1,
-        cascade: vec![0, 0b11],
-        books: vec![Default::default(), stages],
-    };
-    VorbisSetupHeader {
-        codebooks: vec![scalar_book(256, 8), scalar_book(2, 1), coarse, fine],
-        time_placeholders: vec![0],
-        floors: vec![floor],
-        residues: vec![residue],
-        mappings: vec![MappingHeader {
+    let residues = half_ns
+        .iter()
+        .map(|&half_n| ResidueHeader {
+            residue_type: 1,
+            residue_begin: 0,
+            residue_end: half_n,
+            partition_size: PARTITION_SIZE,
+            classifications: 2,
+            classbook: 1,
+            cascade: vec![0, 0b11],
+            books: vec![Default::default(), stages],
+        })
+        .collect();
+    let mappings = (0..half_ns.len())
+        .map(|e| MappingHeader {
             mapping_type: 0,
             submaps: 1,
-            coupling,
+            coupling: coupling.clone(),
             // §4.2.4: the mux table is only present when submaps > 1;
             // with one submap every channel implicitly maps to it.
             mux: Vec::new(),
             submap_configs: vec![MappingSubmap {
                 time_placeholder: 0,
-                floor: 0,
-                residue: 0,
+                floor: e as u8,
+                residue: e as u8,
             }],
-        }],
-        modes: vec![ModeHeader {
-            blockflag: false,
+        })
+        .collect();
+    let modes = (0..half_ns.len())
+        .map(|e| ModeHeader {
+            blockflag: switching && e == 1,
             windowtype: 0,
             transformtype: 0,
-            mapping: 0,
-        }],
+            mapping: e as u8,
+        })
+        .collect();
+    VorbisSetupHeader {
+        codebooks: vec![scalar_book(256, 8), scalar_book(2, 1), coarse, fine],
+        time_placeholders: vec![0],
+        floors,
+        residues,
+        mappings,
+        modes,
         framing_flag: true,
     }
 }
@@ -644,12 +740,16 @@ pub struct EncodedVorbisStream {
     /// §4.2.4 setup-header packet.
     pub setup: Vec<u8>,
     /// §4.3 audio packets, each with the end-PCM-sample granule
-    /// position of the stream after it (packet `f` finishes `f · n/2`
-    /// samples; the final packet's granule is the exact input length —
-    /// the §A.2 end-trim).
+    /// position of the stream after it (packet `f` finishes
+    /// `(n_{f-1} + n_f) / 4` samples per the §4.3.8 lapping rule; the
+    /// final packet's granule is the exact input length — the §A.2
+    /// end-trim).
     pub audio: Vec<(Vec<u8>, u64)>,
-    /// The single blocksize `n` the stream uses.
+    /// The long blocksize (`blocksize_1`) the stream uses.
     pub blocksize: usize,
+    /// The short blocksize (`blocksize_0`); equal to
+    /// [`Self::blocksize`] when the stream does not block-switch.
+    pub short_blocksize: usize,
 }
 
 /// Encode per-channel PCM rows into a complete Ogg/Vorbis physical
@@ -703,110 +803,237 @@ pub fn encode_pcm_to_packets(
     if config.sample_rate == 0 {
         return Err(OggFileError::ZeroSampleRate);
     }
-    let n = config.blocksize;
-    if !n.is_power_of_two() || !(64..=8192).contains(&n) {
-        return Err(OggFileError::BadBlocksize(n));
+    let n1 = config.blocksize;
+    if !n1.is_power_of_two() || !(64..=8192).contains(&n1) {
+        return Err(OggFileError::BadBlocksize(n1));
     }
-    let half_n = n / 2;
+    let n0 = config.short_blocksize;
+    if !n0.is_power_of_two() || !(64..=8192).contains(&n0) {
+        return Err(OggFileError::BadBlocksize(n0));
+    }
+    if n0 > n1 {
+        return Err(OggFileError::BadBlocksizePair {
+            short_n: n0,
+            long_n: n1,
+        });
+    }
+    let switching = n0 < n1;
     let ch = config.channels as usize;
     let tuning = EncoderTuning::from_quality(config.quality)?;
 
+    // ---- §4.3.1 block-size schedule ----
+    // On a switching stream the per-packet blockflags come from the
+    // energy-envelope transient detector over a channel mixdown, and
+    // the granule positions from the §4.3.8 walk `(n_prev + n_cur)/4`
+    // per packet. A single-blocksize stream is the uniform walk: the
+    // priming packet plus one packet per n/2 finished samples.
+    let (flags, granules) = if switching {
+        let mut mix = pcm[0].clone();
+        for row in &pcm[1..] {
+            for (m, &v) in mix.iter_mut().zip(row) {
+                *m += v;
+            }
+        }
+        let scale = 1.0 / ch as f32;
+        for m in &mut mix {
+            *m *= scale;
+        }
+        let plan = plan_block_sequence(&mix, n0, n1, TRANSIENT_SUBFRAMES, TRANSIENT_PEAK_TO_MEAN)?;
+        (plan.blockflags, plan.granules)
+    } else {
+        let half = n1 / 2;
+        let frames = samples.div_ceil(half) + 1;
+        (
+            vec![false; frames],
+            (0..frames as u64).map(|f| f * (half as u64)).collect(),
+        )
+    };
+    let frames = flags.len();
+    let sizes: Vec<usize> = flags.iter().map(|&fl| if fl { n1 } else { n0 }).collect();
+
+    // ---- §4.3.1 packet preludes + analysis windows ----
+    // A long block's window flags mirror its neighbours' blockflags
+    // (§4.3.1 step 4a: a clear flag selects the hybrid short-slope
+    // edge that laps the adjacent short block). The stream-edge frames
+    // take `true` on their outward side: the priming frame's left half
+    // and the final frame's right half never reach the output (§4.3.8
+    // priming / §A.2 end-trim), so the full-width slope is free.
+    let headers: Vec<AudioPacketHeader> = (0..frames)
+        .map(|f| AudioPacketHeader {
+            mode_number: u32::from(switching && flags[f]),
+            blockflag: flags[f],
+            n: sizes[f],
+            previous_window_flag: flags[f] && (f == 0 || flags[f - 1]),
+            next_window_flag: flags[f] && (f + 1 == frames || flags[f + 1]),
+        })
+        .collect();
+    // The handful of distinct window shapes (the short window; the
+    // long window with each §4.3.1 edge combination) are built once.
+    let mut window_keys: Vec<(bool, bool, bool)> = Vec::new();
+    let mut windows: Vec<Vec<f32>> = Vec::new();
+    let mut window_of: Vec<usize> = Vec::with_capacity(frames);
+    for h in &headers {
+        let key = (h.blockflag, h.previous_window_flag, h.next_window_flag);
+        let idx = match window_keys.iter().position(|&k| k == key) {
+            Some(i) => i,
+            None => {
+                window_keys.push(key);
+                windows.push(h.build_window(n0)?);
+                window_keys.len() - 1
+            }
+        };
+        window_of.push(idx);
+    }
+
     // ---- §4.3.8-inverse framing + §4.3.7 forward MDCT ----
-    // P frames cover the stream: the priming frame plus one per n/2
-    // finished samples. The forward transform is scaled by 4/n so the
-    // decode-side bare-kernel IMDCT (scale 1.0) + §4.3.1 window +
-    // §4.3.8 overlap-add reconstruct unity PCM: the bare kernels
-    // compose as mdct(imdct(X)) == (n/2)·X, and the windowed TDAC
-    // overlap-add contributes the remaining factor of ½ (each output
-    // sample is reconstructed from its two half-overlapped frames
-    // under the w² + w'² = 1 window identity).
-    let frames = samples.div_ceil(half_n) + 1;
-    let window = vorbis_window(n, n, false, false, false)?;
-    let mdct_scale = 4.0 / n as f32;
+    // The forward transform is scaled by 4/n so the decode-side
+    // bare-kernel IMDCT (scale 1.0) + §4.3.1 window + §4.3.8
+    // overlap-add reconstruct unity PCM: the bare kernels compose as
+    // mdct(imdct(X)) == (n/2)·X, and the windowed TDAC overlap-add
+    // contributes the remaining factor of ½ (each output sample is
+    // reconstructed from its two half-overlapped frames under the
+    // w² + w'² = 1 window identity, which the §4.3.1 hybrid edges
+    // preserve across long↔short transitions). The per-frame scale
+    // keeps this per-frame-linear property on a switched stream.
     let mut spectra: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames); // [frame][channel][bin]
     {
+        // Zero-pad the tail so every frame's analysis span is covered:
+        // frame f is centred on granules[f] and spans ±sizes[f]/2.
+        let pad = (0..frames)
+            .map(|f| granules[f] as usize + sizes[f] / 2)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(samples);
         let mut splitters: Vec<FrameSplitter> = (0..ch).map(|_| FrameSplitter::new()).collect();
-        let pad = frames * half_n - samples;
         for (c, splitter) in splitters.iter_mut().enumerate() {
-            splitter.push_pcm(&vec![0.0f32; half_n]); // pre-stream silence
+            splitter.push_pcm(&vec![0.0f32; sizes[0] / 2]); // pre-stream silence
             splitter.push_pcm(&pcm[c]);
             splitter.push_pcm(&vec![0.0f32; pad]);
         }
-        for _ in 0..frames {
+        for f in 0..frames {
             let mut per_ch = Vec::with_capacity(ch);
             for splitter in splitters.iter_mut() {
-                // take_frame already applies the §4.3.1 analysis
-                // window, so the bare forward kernel follows.
-                let block = splitter.take_frame(n, &window)?;
-                let x = mdct_naive_vec(&block, mdct_scale)?;
-                per_ch.push(x);
+                // Apply the pending §4.3.8 stride between differing
+                // block sizes, then slice; take_frame applies the
+                // §4.3.1 analysis window, so the bare kernel follows.
+                splitter.advance_pending_stride(sizes[f]);
+                let block = splitter.take_frame(sizes[f], &windows[window_of[f]])?;
+                per_ch.push(mdct_naive_vec(&block, 4.0 / sizes[f] as f32)?);
             }
             spectra.push(per_ch);
         }
     }
 
-    // ---- psychoacoustics + floor-1 header design ----
-    // Per channel, the thresholds run through the temporal pipeline:
-    // post-masking decay across frames plus the one-frame-lookahead
-    // pre-masking lift (the encoder is whole-stream, so lookahead is
-    // free). On steady-state content this is exactly the per-frame
-    // model.
+    // ---- psychoacoustics ----
+    // On a stream whose frames all share one size, each channel's
+    // thresholds run through the temporal pipeline: post-masking decay
+    // across frames plus the one-frame-lookahead pre-masking lift (the
+    // encoder is whole-stream, so lookahead is free). A genuinely
+    // switched stream has a variable frame hop the temporal model does
+    // not define, so it uses the per-frame model — pre-echo control on
+    // such a stream rests on the short blocks themselves, which is the
+    // §1.3.2 mechanism for it.
     let psy_config = PsyConfig {
         threshold_offset_db: tuning.threshold_offset_db,
         ..PsyConfig::new(config.sample_rate)
     };
+    let uniform_sizes = sizes.windows(2).all(|w| w[0] == w[1]);
     let mut maskings: Vec<Vec<MaskingAnalysis>> = vec![Vec::with_capacity(ch); frames];
-    for c in 0..ch {
-        let mut temporal = TemporalMasking::new(&TemporalMaskingConfig::new(half_n), &psy_config)?;
-        let mut emitted = 0usize;
-        for per_ch in &spectra {
-            if let Some(analysis) = temporal.push_frame(&per_ch[c], &psy_config)? {
+    if uniform_sizes {
+        for c in 0..ch {
+            let mut temporal =
+                TemporalMasking::new(&TemporalMaskingConfig::new(sizes[0] / 2), &psy_config)?;
+            let mut emitted = 0usize;
+            for per_ch in &spectra {
+                if let Some(analysis) = temporal.push_frame(&per_ch[c], &psy_config)? {
+                    maskings[emitted].push(analysis);
+                    emitted += 1;
+                }
+            }
+            if let Some(analysis) = temporal.finish() {
                 maskings[emitted].push(analysis);
-                emitted += 1;
             }
         }
-        if let Some(analysis) = temporal.finish() {
-            maskings[emitted].push(analysis);
+    } else {
+        for (f, per_ch) in spectra.iter().enumerate() {
+            for x in per_ch {
+                maskings[f].push(compute_masking(x, &psy_config)?);
+            }
         }
     }
+
+    // ---- floor-1 header design, per block size ----
+    // Setup-header entry e covers one block size (0 = short, 1 = long
+    // on a switching stream; the single entry otherwise): its floor is
+    // designed from the max psy envelope over that size's frames. A
+    // size the schedule never used still needs a legal floor — its
+    // design envelope is resampled from the used size.
+    let n_entries = if switching { 2 } else { 1 };
+    let entry_of = |f: usize| usize::from(switching && flags[f]);
+    let entry_half = |e: usize| if e == 1 { n1 / 2 } else { n0 / 2 };
     let mut envelopes = Vec::with_capacity(frames);
-    let mut envelope_max = vec![f32::MIN_POSITIVE; half_n];
-    for (per_ch, m_row) in spectra.iter().zip(&maskings) {
+    let mut env_max: Vec<Vec<f32>> = (0..n_entries)
+        .map(|e| vec![f32::MIN_POSITIVE; entry_half(e)])
+        .collect();
+    let mut env_seen = vec![false; n_entries];
+    for (f, (per_ch, m_row)) in spectra.iter().zip(&maskings).enumerate() {
+        let e = entry_of(f);
+        env_seen[e] = true;
         let mut e_row = Vec::with_capacity(ch);
         for (x, masking) in per_ch.iter().zip(m_row) {
             let envelope = plan_psy_floor_envelope(x, masking, tuning.floor_smooth_radius)?;
-            for (acc, &v) in envelope_max.iter_mut().zip(&envelope) {
+            for (acc, &v) in env_max[e].iter_mut().zip(&envelope) {
                 *acc = acc.max(v);
             }
             e_row.push(envelope);
         }
         envelopes.push(e_row);
     }
+    for e in 0..n_entries {
+        if !env_seen[e] {
+            let src = env_max[1 - e].clone();
+            env_max[e] = resample_envelope(&src, entry_half(e));
+        }
+    }
     let classes = floor_class_catalogue();
-    let floor_header =
-        design_floor1_header(&envelope_max, tuning.floor_post_budget, 0.0, 1, &classes)?;
     let floor_book = scalar_book(256, 8);
-    let floor_decoder = Floor1Decoder::new(&floor_header, std::slice::from_ref(&floor_book))?;
+    let mut floor_headers = Vec::with_capacity(n_entries);
+    let mut floor_decoders = Vec::with_capacity(n_entries);
+    for (e, env) in env_max.iter().enumerate() {
+        // The short floor gets a reduced post budget: its packets
+        // recur up to (n1/n0)× as often per second of PCM and cover
+        // proportionally fewer bins.
+        let budget = if switching && e == 0 {
+            (tuning.floor_post_budget / 2).max(4)
+        } else {
+            tuning.floor_post_budget
+        };
+        let header = design_floor1_header(env, budget, 0.0, 1, &classes)?;
+        let decoder = Floor1Decoder::new(&header, std::slice::from_ref(&floor_book))?;
+        floor_headers.push(header);
+        floor_decoders.push(decoder);
+    }
 
     // ---- per-frame floor fit + residue targets + NMR weights ----
     let mut floor_ys: Vec<Vec<Vec<u32>>> = Vec::with_capacity(frames);
     let mut targets: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames);
     let mut weights: Vec<Vec<Vec<f64>>> = Vec::with_capacity(frames);
     for f in 0..frames {
+        let e = entry_of(f);
+        let half = sizes[f] / 2;
         let mut y_row = Vec::with_capacity(ch);
         let mut t_row = Vec::with_capacity(ch);
         let mut w_row = Vec::with_capacity(ch);
         for c in 0..ch {
-            let posts = plan_floor1_envelope(&envelopes[f][c], &floor_header)?;
-            let floor1_y = plan_floor1_y(&posts, &floor_header)?;
-            let rendered = floor_decoder.render_curve(&floor1_y, half_n);
+            let posts = plan_floor1_envelope(&envelopes[f][c], &floor_headers[e])?;
+            let floor1_y = plan_floor1_y(&posts, &floor_headers[e])?;
+            let rendered = floor_decoders[e].render_curve(&floor1_y, half);
             let target: Vec<f32> = spectra[f][c]
                 .iter()
                 .zip(&rendered)
                 .map(|(&xv, &fv)| xv / fv)
                 .collect();
-            let w =
-                residue_partition_weights(&rendered, &maskings[f][c], 0, half_n, PARTITION_SIZE)?;
+            let w = residue_partition_weights(&rendered, &maskings[f][c], 0, half, PARTITION_SIZE)?;
             y_row.push(floor1_y);
             t_row.push(target);
             w_row.push(w);
@@ -891,12 +1118,14 @@ pub fn encode_pcm_to_packets(
     // therefore packable whenever the step is.
     let coarse = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 24.0));
     let fine = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 192.0));
+    let half_ns: Vec<u32> = (0..n_entries).map(|e| entry_half(e) as u32).collect();
     let mut setup = build_setup(
-        floor_header.clone(),
+        floor_headers.clone(),
         coarse,
         fine,
-        half_n as u32,
+        &half_ns,
         coupling_steps,
+        switching,
     );
 
     // ---- optional closed-loop codebook training ----
@@ -904,24 +1133,39 @@ pub fn encode_pcm_to_packets(
     // residue targets (codeword lengths from usage, reconstruction
     // values at the observed centroids, re-snapped §9.2.2-packable);
     // the trained table replaces the seeds in the setup header and
-    // the weighted per-frame planning below runs under it.
+    // the weighted per-frame planning below runs under it. On a
+    // switching stream the two residue corpora (short-block and
+    // long-block targets) train the shared ladders in sequence — the
+    // second pass starts from the first pass's books, the classic
+    // chained alternating descent.
     if config.training_iterations > 0 {
-        let residuals: Vec<Vec<f32>> = targets.iter().flat_map(|row| row.iter().cloned()).collect();
-        let outcome = crate::book_design::train_residue_books_rd_ladder(
-            &residuals,
-            &setup.residues[0],
-            &setup.codebooks,
-            tuning.lambda,
-            config.training_iterations,
-        )?;
-        setup.codebooks = outcome.codebooks;
-        // The trainer plans *unweighted*; the final packets below are
-        // planned with the NMR weights, which can legitimately select
-        // a class the unweighted pass never used. Keep the flat seed
-        // classbook (both classwords stay encodable at 1 bit each —
-        // there is nothing to win on a 2-entry book) and take only
-        // the trained value ladders.
-        setup.codebooks[1] = scalar_book(2, 1);
+        for e in 0..n_entries {
+            let residuals: Vec<Vec<f32>> = targets
+                .iter()
+                .enumerate()
+                .filter(|(f, _)| entry_of(*f) == e)
+                .flat_map(|(_, row)| row.iter().cloned())
+                .collect();
+            if residuals.is_empty() {
+                continue;
+            }
+            let outcome = crate::book_design::train_residue_books_rd_ladder(
+                &residuals,
+                &setup.residues[e],
+                &setup.codebooks,
+                tuning.lambda,
+                config.training_iterations,
+            )?;
+            setup.codebooks = outcome.codebooks;
+            // The trainer plans *unweighted*; both the next entry's
+            // training pass and the final packets below can
+            // legitimately select a class this pass never used (it may
+            // have pruned the classword). Keep the flat seed classbook
+            // (both classwords stay encodable at 1 bit each — there is
+            // nothing to win on a 2-entry book) and take only the
+            // trained value ladders.
+            setup.codebooks[1] = scalar_book(2, 1);
+        }
     }
     let coarse = setup.codebooks[2].clone();
     let fine = setup.codebooks[3].clone();
@@ -934,8 +1178,8 @@ pub fn encode_pcm_to_packets(
         bitrate_maximum: 0,
         bitrate_nominal: 0,
         bitrate_minimum: 0,
-        blocksize_0: n as u16,
-        blocksize_1: n as u16,
+        blocksize_0: n0 as u16,
+        blocksize_1: n1 as u16,
     })?;
     let comment_packet = write_comment_header(&VorbisCommentHeader {
         vendor: "oxideav-vorbis clean-room encoder".into(),
@@ -951,14 +1195,8 @@ pub fn encode_pcm_to_packets(
     let value_books = [empty_row, cascade_row];
 
     let mut audio_packets: Vec<(Vec<u8>, u64)> = Vec::with_capacity(frames);
-    let packet_header = AudioPacketHeader {
-        mode_number: 0,
-        blockflag: false,
-        n,
-        previous_window_flag: false,
-        next_window_flag: false,
-    };
     for f in 0..frames {
+        let e = entry_of(f);
         let mut floors = Vec::with_capacity(ch);
         let mut plans = Vec::with_capacity(ch);
         for c in 0..ch {
@@ -973,7 +1211,7 @@ pub fn encode_pcm_to_packets(
             floors.push(AudioChannelFloor::Type1(Floor1Packet {
                 nonzero: true,
                 floor1_y: floor_ys[f][c].clone(),
-                partition_cvals: vec![0u32; floor_header.partition_class_list.len()],
+                partition_cvals: vec![0u32; floor_headers[e].partition_class_list.len()],
             }));
             plans.push(ResidueVectorPlan {
                 classifications: scored.classifications,
@@ -982,21 +1220,21 @@ pub fn encode_pcm_to_packets(
         }
         let submap_plans = [plans];
         let packet = write_audio_packet(
-            &packet_header,
+            &headers[f],
             &setup,
-            n,
-            n,
+            n0,
+            n1,
             config.channels,
             &floors,
             &submap_plans,
         )?;
-        // §4.3.8: packet f finishes f · n/2 samples; the final packet's
-        // granule is the true sample count (§A.2 end-trim).
-        let natural = (f * half_n) as u64;
+        // §4.3.8: packet f finishes (n_{f-1} + n_f) / 4 samples — the
+        // schedule's granule walk; the final packet's granule is the
+        // true sample count (§A.2 end-trim).
         let granule = if f + 1 == frames {
             samples as u64
         } else {
-            natural
+            granules[f]
         };
         audio_packets.push((packet, granule));
     }
@@ -1005,7 +1243,8 @@ pub fn encode_pcm_to_packets(
         comment: comment_packet,
         setup: setup_packet,
         audio: audio_packets,
-        blocksize: n,
+        blocksize: n1,
+        short_blocksize: n0,
     })
 }
 

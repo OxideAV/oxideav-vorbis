@@ -191,7 +191,10 @@ pub use audio::{
     decode_one_packet, decode_one_packet_windowed, AudioDecoderState, AudioPacketError,
     AudioPacketOutcome, WindowedPacketOutcome,
 };
-pub use blocksize::{choose_blocksize, detect_transient, BlocksizeError, TransientAnalysis};
+pub use blocksize::{
+    choose_blocksize, detect_transient, plan_block_sequence, BlockSequencePlan, BlocksizeError,
+    TransientAnalysis,
+};
 pub use book_design::{
     design_codeword_lengths, design_codeword_lengths_dense, design_entropy_codebook,
     design_value_ladder, redesign_codebook, stream_cost_bits, tally_floor0_packet,
