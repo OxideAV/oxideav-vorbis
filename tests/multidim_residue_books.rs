@@ -1,0 +1,194 @@
+//! Multi-dimensional residue value books in the integrated encoder
+//! (`StreamEncoderConfig::vq_dims`).
+//!
+//! At `vq_dims > 1` the whole-stream encoder designs its two §8.6.2
+//! cascade value books from the stream's own residue corpus
+//! (`book_design::design_vq_codebook`): `vq_dims`-dimensional §3.2.1
+//! lookup-type-2 tessellation books — the coarse book over the raw
+//! dims-element residue sub-vectors, the fine book over the
+//! post-coarse leftovers — with occupancy-trained sparse codeword
+//! lengths, so one codeword jointly codes `vq_dims` neighbouring
+//! spectral bins. This suite measures the payoff and pins the
+//! contract:
+//!
+//! * **fidelity ceiling** — at equal quality the dim-2 designed
+//!   books clear the scalar-ladder (`vq_dims = 1`) encode's SNR by a
+//!   pinned margin at bounded extra rate: the corpus-fitted joint
+//!   books reach reconstruction points the generic ladders don't
+//!   have (a per-scalar two-stage ladder caps out; the designed
+//!   books adapt their entire value set to the stream);
+//! * **carriage** — the produced setup header carries the designed
+//!   multi-dimensional books (parseable, `dimensions == vq_dims`,
+//!   tessellation lookup, non-uniform trained lengths);
+//! * **coverage** — every legal `vq_dims` (1 / 2 / 4 / 8 / 16)
+//!   encodes and decodes end-trim-exact through the crate's own
+//!   decoder above a pinned SNR floor, coupling and block switching
+//!   included;
+//! * **guards** — an illegal `vq_dims` (zero, non-power-of-two, or
+//!   not dividing the partition size) is refused up front.
+//!
+//! Fully synthetic — no fixtures required.
+
+use oxideav_vorbis::codebook::VqLookup;
+use oxideav_vorbis::{
+    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, parse_setup_header, OggFileError,
+    StreamEncoderConfig,
+};
+
+const RATE: u32 = 44_100;
+
+/// A deterministic tones + noise-floor test signal (the same shape
+/// the whole-stream round-trip suite measures).
+fn test_signal(samples: usize, seed: u32) -> Vec<f32> {
+    (0..samples)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            let mut v = 0.42 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                + 0.21 * (2.0 * std::f32::consts::PI * 1370.0 * t).sin()
+                + 0.10 * (2.0 * std::f32::consts::PI * 31.0 * t).cos();
+            let h = (i as u32 + seed).wrapping_mul(2_654_435_761) >> 8;
+            v += ((h & 0xffff) as f32 / 32768.0 - 1.0) * 0.003;
+            v
+        })
+        .collect()
+}
+
+/// A second, spectrally distinct signal for the right channel.
+fn test_signal_alt(samples: usize) -> Vec<f32> {
+    (0..samples)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            let mut v = 0.38 * (2.0 * std::f32::consts::PI * 523.25 * t).sin()
+                + 0.19 * (2.0 * std::f32::consts::PI * 2093.0 * t).sin();
+            let h = (i as u32 + 77).wrapping_mul(2_654_435_761) >> 8;
+            v += ((h & 0xffff) as f32 / 32768.0 - 1.0) * 0.003;
+            v
+        })
+        .collect()
+}
+
+fn snr_db(reference: &[f32], decoded: &[f32]) -> f64 {
+    assert_eq!(reference.len(), decoded.len());
+    let mut sig = 0.0f64;
+    let mut err = 0.0f64;
+    for (&r, &d) in reference.iter().zip(decoded) {
+        sig += f64::from(r) * f64::from(r);
+        let e = f64::from(r) - f64::from(d);
+        err += e * e;
+    }
+    if err == 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (sig / err).log10()
+}
+
+fn encode_at(pcm: &[Vec<f32>], vq_dims: u16, quality: f32) -> (Vec<u8>, f64) {
+    let mut config = StreamEncoderConfig::new(RATE, pcm.len() as u8);
+    config.vq_dims = vq_dims;
+    config.quality = quality;
+    let ogg = encode_pcm_to_ogg(pcm, &config).expect("encodes");
+    let decoded = decode_ogg_to_pcm(&ogg).expect("decodes");
+    assert_eq!(decoded.channels as usize, pcm.len());
+    let mut worst = f64::INFINITY;
+    for (c, input) in pcm.iter().enumerate() {
+        assert_eq!(decoded.pcm[c].len(), input.len(), "end-trim exact");
+        worst = worst.min(snr_db(input, &decoded.pcm[c]));
+    }
+    (ogg, worst)
+}
+
+/// The headline measurement: at equal quality the corpus-designed
+/// dim-2 books clear the generic scalar ladders' SNR by a pinned
+/// margin at bounded extra rate (measured on this corpus:
+/// ≈ 28 → 32 dB for ≈ 1.3× the bytes — a reconstruction ceiling the
+/// per-scalar ladder cannot reach at any nearby operating point).
+#[test]
+fn dim2_books_lift_the_quality_ceiling() {
+    let samples = 22_000;
+    let mono = vec![test_signal(samples, 1)];
+    let (ogg1, snr1) = encode_at(&mono, 1, 0.7);
+    let (ogg2, snr2) = encode_at(&mono, 2, 0.7);
+    eprintln!(
+        "mono q0.7: dim-1 {} B / {snr1:.2} dB, dim-2 {} B / {snr2:.2} dB",
+        ogg1.len(),
+        ogg2.len()
+    );
+    assert!(
+        snr2 >= snr1 + 2.0,
+        "dim-2 SNR {snr2:.2} dB must clear the dim-1 {snr1:.2} dB by >= 2 dB"
+    );
+    assert!(
+        ogg2.len() <= ogg1.len() * 3 / 2,
+        "dim-2 rate {} B must stay within 1.5x the dim-1 {} B",
+        ogg2.len(),
+        ogg1.len()
+    );
+}
+
+/// The produced setup header carries the designed multi-dimensional
+/// books: `dimensions == vq_dims`, tessellation (lookup type 2)
+/// values, and occupancy-trained (non-uniform) codeword lengths.
+#[test]
+fn setup_header_carries_designed_multidim_books() {
+    let pcm = vec![test_signal(16_000, 5)];
+    let mut config = StreamEncoderConfig::new(RATE, 1);
+    config.vq_dims = 4;
+    let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
+    let packets = ogg_packets(&ogg).expect("packets assemble");
+    let setup = parse_setup_header(&packets[2], 1).expect("setup parses");
+
+    // Books 2 and 3 are the cascade's coarse + fine value books.
+    for book in &setup.codebooks[2..=3] {
+        assert_eq!(book.dimensions, 4, "designed book dimensionality");
+        assert!(
+            matches!(book.lookup, VqLookup::Tessellation { .. }),
+            "designed books are §3.2.1 lookup type 2"
+        );
+        let used: Vec<u8> = book
+            .codeword_lengths
+            .iter()
+            .copied()
+            .filter(|&l| l != 0)
+            .collect();
+        assert!(!used.is_empty());
+        let first = used[0];
+        assert!(
+            used.len() == 1 || used.iter().any(|&l| l != first),
+            "trained lengths are occupancy-shaped, not uniform"
+        );
+    }
+}
+
+/// Every legal `vq_dims` encodes and decodes end-trim-exact above a
+/// pinned SNR floor (block switching + coupling live, stereo).
+#[test]
+fn vq_dims_sweep_decodes_cleanly() {
+    let samples = 14_000;
+    let stereo = vec![test_signal(samples, 9), test_signal_alt(samples)];
+    for dims in [1u16, 2, 4, 8, 16] {
+        let (ogg, snr) = encode_at(&stereo, dims, 0.7);
+        eprintln!(
+            "dims {dims}: {} B, worst-channel SNR {snr:.2} dB",
+            ogg.len()
+        );
+        assert!(
+            snr >= 15.0,
+            "dims {dims}: SNR {snr:.2} dB under the 15 dB floor"
+        );
+    }
+}
+
+/// Illegal `vq_dims` values are refused up front with the typed error.
+#[test]
+fn illegal_vq_dims_is_refused() {
+    let pcm = vec![test_signal(2_000, 3)];
+    for bad in [0u16, 3, 6, 32] {
+        let mut config = StreamEncoderConfig::new(RATE, 1);
+        config.vq_dims = bad;
+        assert_eq!(
+            encode_pcm_to_ogg(&pcm, &config).unwrap_err(),
+            OggFileError::BadVqDims(bad),
+            "vq_dims {bad} must be refused"
+        );
+    }
+}

@@ -6,6 +6,30 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Multi-dimensional residue value books in the integrated encoder**
+  (`StreamEncoderConfig::vq_dims`, default `1`): at `vq_dims > 1` the
+  whole-stream encoder designs its two §8.6.2 cascade value books
+  from the stream's own residue corpus via `design_vq_codebook` —
+  `vq_dims`-dimensional §3.2.1 lookup-type-2 tessellation books, the
+  coarse book over the raw dims-element residue sub-vectors and the
+  fine book over the post-coarse leftovers (exactly the second
+  stage's targets, since the cascade planner subtracts the chosen
+  entry's decoded reconstruction), on a bounded deterministic
+  stride-subsample of the corpus. Every legal dimensionality
+  (`1 | 2 | 4 | 8 | 16` — a power of two dividing the partition
+  size; anything else is refused with the new
+  `OggFileError::BadVqDims`) encodes and decodes end-trim-exact
+  through the crate's own decoder with coupling + block switching
+  live, and the closed-loop trainer refines the designed books
+  unchanged. Measured (`tests/multidim_residue_books.rs`): at
+  `q = 0.7` on the synthetic tones + noise corpus the dim-2 designed
+  books lift the reconstruction ceiling ≈ 28 → 32 dB SNR at ≈ 1.3×
+  the bytes — corpus-fitted joint reconstruction points the generic
+  per-scalar ladders cannot reach — while real-audio re-encodes keep
+  the scalar default (a fixed entry budget spreads over
+  `entries^(1/dims)` levels per scalar, so high-rate content favours
+  `vq_dims = 1` until the residue class set can adapt per partition).
+
 - **Multi-dimensional VQ residue codebook designer**
   (`book_design::design_vq_codebook` + `VqCodebookDesign`): designs a
   `dims`-dimensional §3.2.1 lookup-type-2 value book from a flat

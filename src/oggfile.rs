@@ -79,6 +79,31 @@ use oxideav_ogg::page::Page;
 /// §8.6.1 residue partition size the integrated encoder uses.
 const PARTITION_SIZE: u32 = 16;
 
+/// Cap on the stride-subsampled training corpus handed to
+/// [`crate::book_design::design_vq_codebook`] (in sub-vectors): the
+/// designer's refinement passes are O(vectors × entries), so a long
+/// stream trains on a bounded, deterministic sample of its residue.
+const VQ_DESIGN_MAX_VECTORS: usize = 6144;
+
+/// Designed coarse-book entries per value-book dimension
+/// ([`StreamEncoderConfig::vq_dims`]): the coarse stage spans the raw
+/// residue range, so its cell budget grows with the joint space.
+const VQ_COARSE_ENTRIES_PER_DIM: u32 = 64;
+
+/// Designed fine-book entries per dimension — the fine stage covers
+/// the (much smaller) post-coarse leftover, where extra cells buy
+/// reconstruction accuracy for the top of the quality range.
+const VQ_FINE_ENTRIES_PER_DIM: u32 = 128;
+
+/// Ceiling on either designed book's entry count (quantisation scans
+/// every used entry per §8.6.2 read).
+const VQ_MAX_ENTRIES: u32 = 256;
+
+/// Codeword-length cap handed to the VQ designer's occupancy-optimal
+/// length assignment (well under the §3.2.1 hard 32-bit limit; a
+/// longer codeword than this prices an entry out of use anyway).
+const VQ_DESIGN_MAX_CODEWORD_LEN: u8 = 24;
+
 /// The §4.3.5 coupling gate: a candidate channel pair is coupled when
 /// its whole-stream square-polar angle energy is at most this fraction
 /// of its magnitude energy ([`CouplingEnergy::angle_ratio`] semantics,
@@ -165,6 +190,19 @@ pub struct StreamEncoderConfig {
     /// §9.2.2-packable grid — before the packets are planned. `0`
     /// disables training (the fixed seed ladders are used verbatim).
     pub training_iterations: usize,
+    /// Residue value-book dimensionality: how many consecutive
+    /// spectral residue scalars each §8.6.2 VQ codeword covers. A
+    /// power of two dividing the residue partition size (16), i.e.
+    /// `1 | 2 | 4 | 8 | 16`. At `1` the two cascade value books are
+    /// generic scalar ladders sized to the residue range; above it
+    /// they are **designed from the stream's own residue corpus**
+    /// ([`crate::book_design::design_vq_codebook`]) as
+    /// `vq_dims`-dimensional §3.2.1 lookup-type-2 tessellation books
+    /// (the coarse book from the raw targets, the fine book from the
+    /// post-coarse leftovers), so one trained codeword jointly codes
+    /// `vq_dims` neighbouring bins — the shape/correlation gain a
+    /// per-scalar ladder cannot reach.
+    pub vq_dims: u16,
 }
 
 impl StreamEncoderConfig {
@@ -183,6 +221,7 @@ impl StreamEncoderConfig {
             short_blocksize: 256,
             serial: 0x6F78_7662,
             training_iterations: 4,
+            vq_dims: 1,
         }
     }
 }
@@ -211,6 +250,10 @@ pub enum OggFileError {
         /// The configured long (`blocksize_1`) size.
         long_n: usize,
     },
+    /// `vq_dims` was not a power of two dividing the residue
+    /// partition size (§8.6.3 step 1 / §8.6.4: a stage's value-book
+    /// dimensions must tile the partition exactly).
+    BadVqDims(u16),
     /// The §4.3.1 block-size schedule planner failed.
     Blocksize(BlocksizeError),
     /// The quality knob was rejected.
@@ -273,6 +316,10 @@ impl core::fmt::Display for OggFileError {
             OggFileError::BadBlocksizePair { short_n, long_n } => write!(
                 f,
                 "ogg encode: short blocksize {short_n} exceeds long blocksize {long_n}"
+            ),
+            OggFileError::BadVqDims(d) => write!(
+                f,
+                "ogg encode: vq_dims {d} is not a power of two dividing the residue partition size {PARTITION_SIZE}"
             ),
             OggFileError::Blocksize(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Quality(e) => write!(f, "ogg encode: {e}"),
@@ -827,6 +874,9 @@ pub fn encode_pcm_to_packets(
             long_n: n1,
         });
     }
+    if !config.vq_dims.is_power_of_two() || PARTITION_SIZE % u32::from(config.vq_dims) != 0 {
+        return Err(OggFileError::BadVqDims(config.vq_dims));
+    }
     let switching = n0 < n1;
     let ch = config.channels as usize;
     let tuning = EncoderTuning::from_quality(config.quality)?;
@@ -1128,13 +1178,73 @@ pub fn encode_pcm_to_packets(
         max_abs = 1.0; // all-silent input: any positive ladder scale works
     }
 
-    // ---- setup: value ladders sized to the residue range ----
+    // ---- setup: the two cascade value books ----
+    // vq_dims == 1: generic scalar ladders sized to the residue range.
     // The ladder steps must be exactly §9.2.2-packable (the codebook
     // header carries them as 21-bit-mantissa floats); the book minimum
     // is −32·step, which shares the step's mantissa (× 2⁵) and is
     // therefore packable whenever the step is.
-    let coarse = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 24.0));
-    let fine = signed_value_book(6, crate::book_design::pack_nearest(max_abs / 192.0));
+    // vq_dims > 1: multi-dimensional tessellation books designed from
+    // the stream's own residue corpus — the coarse book from the raw
+    // dims-element sub-vectors, the fine book from the post-coarse
+    // leftovers (exactly the targets the §8.6.2 cascade's second stage
+    // will see, since plan_partition_cascade subtracts the chosen
+    // entry's decoded reconstruction).
+    let (coarse, fine) = if config.vq_dims > 1 {
+        let d = config.vq_dims as usize;
+        // Bounded, deterministic stride subsample of the corpus: the
+        // designer is O(vectors × entries) per refinement pass.
+        let total_chunks: usize = targets
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|t| t.len() / d)
+            .sum();
+        let stride = total_chunks.div_ceil(VQ_DESIGN_MAX_VECTORS).max(1);
+        let mut corpus: Vec<f32> = Vec::with_capacity((total_chunks / stride + 1) * d);
+        let mut chunk_idx = 0usize;
+        for t_row in &targets {
+            for target in t_row {
+                for chunk in target.chunks_exact(d) {
+                    if chunk_idx % stride == 0 {
+                        corpus.extend_from_slice(chunk);
+                    }
+                    chunk_idx += 1;
+                }
+            }
+        }
+        let coarse_entries = (VQ_COARSE_ENTRIES_PER_DIM * d as u32).min(VQ_MAX_ENTRIES);
+        let fine_entries = (VQ_FINE_ENTRIES_PER_DIM * d as u32).min(VQ_MAX_ENTRIES);
+        let coarse = crate::book_design::design_vq_codebook(
+            &corpus,
+            config.vq_dims,
+            coarse_entries,
+            8,
+            VQ_DESIGN_MAX_CODEWORD_LEN,
+        )?
+        .codebook;
+        // The fine corpus is the coarse stage's leftover: target minus
+        // the chosen entry's decoded reconstruction, per sub-vector.
+        let mut leftovers: Vec<f32> = Vec::with_capacity(corpus.len());
+        for chunk in corpus.chunks_exact(d) {
+            let q = crate::vq::quantize_vector(&coarse, chunk)
+                .expect("a freshly designed coarse book has >= 1 used entry and matching dims");
+            leftovers.extend(chunk.iter().zip(&q.vector).map(|(&t, &v)| t - v));
+        }
+        let fine = crate::book_design::design_vq_codebook(
+            &leftovers,
+            config.vq_dims,
+            fine_entries,
+            8,
+            VQ_DESIGN_MAX_CODEWORD_LEN,
+        )?
+        .codebook;
+        (coarse, fine)
+    } else {
+        (
+            signed_value_book(6, crate::book_design::pack_nearest(max_abs / 24.0)),
+            signed_value_book(6, crate::book_design::pack_nearest(max_abs / 192.0)),
+        )
+    };
     let half_ns: Vec<u32> = (0..n_entries).map(|e| entry_half(e) as u32).collect();
     let mut setup = build_setup(
         floor_headers.clone(),
