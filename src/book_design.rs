@@ -1090,8 +1090,17 @@ pub fn train_residue_books_rd(
         }
 
         // Train step: sparse retrain (exactly optimal for the
-        // observed frequencies — see the policy note above).
+        // observed frequencies — see the policy note above), except
+        // the **classbook**, which retrains dense: the rate-distortion
+        // planner's per-partition class choice ranges over the
+        // header's whole class set without consulting classword
+        // availability, so a class this pass never picked must keep a
+        // (long) codeword for a later pass to emit.
         books = tallies.retrain(&books, MAX_CODEWORD_LEN, false)?;
+        if let Some(freqs) = tallies.counts(classbook_idx) {
+            books[classbook_idx] =
+                redesign_codebook(&books[classbook_idx], freqs, MAX_CODEWORD_LEN, true)?;
+        }
         prev_plans = Some(plans);
     }
 
@@ -1493,8 +1502,16 @@ pub fn train_residue_books_rd_ladder(
             break;
         }
 
-        // Length retrain (sparse — exactly optimal for the plans).
-        let books_len = tallies.retrain(&books, MAX_CODEWORD_LEN, false)?;
+        // Length retrain (sparse — exactly optimal for the plans),
+        // except the **classbook**, which retrains dense: the planner
+        // picks classes without consulting classword availability, so
+        // every class must keep a codeword (see the identical policy
+        // in `train_residue_books_rd`).
+        let mut books_len = tallies.retrain(&books, MAX_CODEWORD_LEN, false)?;
+        if let Some(freqs) = tallies.counts(classbook_idx) {
+            books_len[classbook_idx] =
+                redesign_codebook(&books_len[classbook_idx], freqs, MAX_CODEWORD_LEN, true)?;
+        }
         // Ladder candidate values from the same plans. The length
         // retrain preserves every lookup, so the replayed
         // reconstructions are exactly the ones the plans were made
@@ -3813,6 +3830,89 @@ mod tests {
         assert_eq!(
             design_vq_codebook(&[1.0, 2.0], 2, 4, 8, 0),
             Err(BookDesignError::InvalidMaxLength { max_len: 0 })
+        );
+    }
+
+    /// Regression: the trainers' length-retrain step must keep every
+    /// **classword** encodable. The rate-distortion planner's
+    /// per-partition class choice ranges over the header's whole class
+    /// set without consulting the classbook, so a class no plan picked
+    /// this iteration (here: a decoy class whose value book sits far
+    /// from the corpus) must keep a codeword — a sparse-pruned
+    /// classword made a later pass (or the final packets) unencodable
+    /// (`UnusedSymbolHasFrequency`).
+    #[test]
+    fn trainer_keeps_every_classword_encodable() {
+        // 3-class header: silence / a usable book / a decoy book the
+        // planner never picks.
+        let classbook = VorbisCodebook {
+            dimensions: 1,
+            entries: 3,
+            codeword_lengths: vec![1, 2, 2],
+            lookup: VqLookup::None,
+        };
+        let usable = VorbisCodebook {
+            dimensions: 1,
+            entries: 8,
+            codeword_lengths: vec![3; 8],
+            lookup: VqLookup::Tessellation {
+                minimum_value: -2.0,
+                delta_value: 0.5,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: (0..8).collect(),
+            },
+        };
+        let decoy = VorbisCodebook {
+            dimensions: 1,
+            entries: 2,
+            codeword_lengths: vec![1, 1],
+            lookup: VqLookup::Tessellation {
+                minimum_value: 900.0,
+                delta_value: 100.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1],
+            },
+        };
+        let mut usable_row: [Option<u8>; 8] = Default::default();
+        usable_row[0] = Some(1);
+        let mut decoy_row: [Option<u8>; 8] = Default::default();
+        decoy_row[0] = Some(2);
+        let header = crate::setup::ResidueHeader {
+            residue_type: 1,
+            residue_begin: 0,
+            residue_end: 16,
+            partition_size: 8,
+            classifications: 3,
+            classbook: 0,
+            cascade: vec![0, 0b1, 0b1],
+            books: vec![Default::default(), usable_row, decoy_row],
+        };
+        let books = vec![classbook, usable, decoy];
+        let residuals: Vec<Vec<f32>> = (0..5)
+            .map(|k| (0..16).map(|i| 0.5 * ((i + k) % 5) as f32 - 1.0).collect())
+            .collect();
+
+        let outcome = train_residue_books_rd(&residuals, &header, &books, 0.1, 3).expect("trains");
+        assert!(
+            outcome.codebooks[0]
+                .codeword_lengths
+                .iter()
+                .all(|&l| l != UNUSED_ENTRY),
+            "rd trainer: every classword stays encodable: {:?}",
+            outcome.codebooks[0].codeword_lengths
+        );
+
+        let outcome =
+            train_residue_books_rd_ladder(&residuals, &header, &books, 0.1, 3).expect("trains");
+        assert!(
+            outcome.codebooks[0]
+                .codeword_lengths
+                .iter()
+                .all(|&l| l != UNUSED_ENTRY),
+            "ladder trainer: every classword stays encodable: {:?}",
+            outcome.codebooks[0].codeword_lengths
         );
     }
 

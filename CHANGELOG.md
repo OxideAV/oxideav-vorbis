@@ -4,6 +4,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closed-loop trainers could prune a classword the planner later
+  emits.** `train_residue_books_rd` / `train_residue_books_rd_ladder`
+  length-retrained *every* book with the sparse policy, including the
+  residue **classbook** — but the rate-distortion planner's
+  per-partition class choice ranges over the header's whole class set
+  without consulting classword availability, so a class no plan
+  picked in one iteration lost its codeword and a later iteration (or
+  the final packets) that selected it failed with
+  `UnusedSymbolHasFrequency`. Reachable with any residue whose class
+  set offers a candidate the early iterations never pick (e.g. a
+  fine-only class whose book span starts smaller than the targets).
+  The classbook now retrains with the **dense** policy — every class
+  keeps a (long) codeword, still occupancy-shaped — while value books
+  keep the exactly-optimal sparse policy; regression-pinned by
+  `trainer_keeps_every_classword_encodable`.
+
 ### Added
 
 - **Multi-dimensional residue value books in the integrated encoder**
