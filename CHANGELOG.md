@@ -24,6 +24,20 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Occupancy-trained floor-post codeword lengths in the integrated
+  encoder.** The shared §7.2.3 floor post book shipped uniform
+  8-bit codewords for its 256 entries; the encode path now tallies
+  the exact fitted `floor1_y` emissions (`tally_floor1_packet`, the
+  writer's own §7.2.3 walk) alongside the residue classwords and
+  retrains the post book's lengths occupancy-optimal (dense policy —
+  every post amplitude stays encodable). Pure entropy win: packets
+  decode to bit-identical PCM. Measured on the staged real-audio
+  corpus at the default configuration (on top of the classword win
+  below): mono-q5 8310 → 7763 B, stereo-q5 14 767 → 13 486 B,
+  transient 8844 → 8137 B — cumulatively **−8.7 / −10.8 / −10.0 %**
+  against the previous round's encoder at identical PCM, closing the
+  re-encode ratio to ×1.27 / ×1.47 / ×1.23 of the reference streams.
+
 - **Grouped, occupancy-trained residue classwords in the integrated
   encoder.** The residue classbook now packs four partitions per
   §8.6.2 classword (`dimensions = 4`, radix-packed — the classword

@@ -1365,12 +1365,16 @@ pub fn encode_pcm_to_packets(
         frame_plans.push(plans);
     }
 
-    // ---- classword lengths from the final grouped class usage ----
+    // ---- classword + floor-post lengths from the final emissions ----
     // Tally the exact classword emissions the packets below make (the
-    // writer's own §8.6.2 grouping, via tally_residue_plans) and make
-    // the classbook's codeword lengths occupancy-optimal for them —
-    // dense policy, so a class group the corpus never picked keeps a
-    // (long) codeword and the book stays whole-alphabet-encodable.
+    // writer's own §8.6.2 grouping, via tally_residue_plans) and the
+    // exact §7.2.3 floor-post emissions (tally_floor1_packet — the
+    // fitted `floor1_y` values through the shared post book), then
+    // make both books' codeword lengths occupancy-optimal — dense
+    // policy, so a symbol the corpus never emitted keeps a (long)
+    // codeword and each book stays whole-alphabet-encodable. Codeword
+    // lengths carry no values, so the packets decode to bit-identical
+    // PCM; they only serialise into fewer bits.
     {
         let mut tallies = crate::book_design::BookTallies::new(&setup.codebooks);
         for (f, plans) in frame_plans.iter().enumerate() {
@@ -1381,10 +1385,23 @@ pub fn encode_pcm_to_packets(
                 &setup.residues[e],
                 &setup.codebooks,
             )?;
+            for y_row in floor_ys[f].iter().take(ch) {
+                crate::book_design::tally_floor1_packet(
+                    &mut tallies,
+                    &Floor1Packet {
+                        nonzero: true,
+                        floor1_y: y_row.clone(),
+                        partition_cvals: vec![0u32; floor_headers[e].partition_class_list.len()],
+                    },
+                    &floor_headers[e],
+                )?;
+            }
         }
-        if let Some(freqs) = tallies.counts(1) {
-            setup.codebooks[1] =
-                crate::book_design::redesign_codebook(&setup.codebooks[1], freqs, 16, true)?;
+        for book in [0usize, 1] {
+            if let Some(freqs) = tallies.counts(book) {
+                setup.codebooks[book] =
+                    crate::book_design::redesign_codebook(&setup.codebooks[book], freqs, 16, true)?;
+            }
         }
     }
 
