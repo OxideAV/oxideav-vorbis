@@ -104,6 +104,16 @@ const VQ_MAX_ENTRIES: u32 = 256;
 /// longer codeword than this prices an entry out of use anyway).
 const VQ_DESIGN_MAX_CODEWORD_LEN: u8 = 24;
 
+/// §8.6.1 residue classification count (class 0 = silence, class 1 =
+/// the full two-stage cascade).
+const RESIDUE_CLASSES: u32 = 2;
+
+/// Partitions per §8.6.2 classword (the classbook's dimensions):
+/// grouping lets the trained classword lengths price a common run —
+/// e.g. four consecutive silent partitions — at a couple of bits
+/// total instead of one codeword per partition.
+const CLASS_GROUP_DIMS: u16 = 4;
+
 /// The §4.3.5 coupling gate: a candidate channel pair is coupled when
 /// its whole-stream square-polar angle energy is at most this fraction
 /// of its magnitude energy ([`CouplingEnergy::angle_ratio`] semantics,
@@ -677,6 +687,26 @@ fn scalar_book(entries: u32, length: u8) -> VorbisCodebook {
     }
 }
 
+/// The residue classbook seed: a `CLASS_GROUP_DIMS`-dimensional
+/// entropy-only book whose `classes^dims` entries radix-pack one
+/// classification per dimension (§8.6.2 classword decode), with
+/// uniform codeword lengths (`dims · log2(classes)` bits — Kraft
+/// exactly 1 since `classes` is a power of two). Grouping `dims`
+/// partitions per classword is what makes a rich class set affordable:
+/// the trained (occupancy-optimal) lengths assigned after planning
+/// price a common group — e.g. a run of silent partitions — at a few
+/// bits total instead of `dims` separate per-partition codewords.
+fn class_group_book(classes: u32, dims: u16) -> VorbisCodebook {
+    let entries = classes.pow(u32::from(dims));
+    let length = (dims as u32 * classes.ilog2()) as u8;
+    VorbisCodebook {
+        dimensions: dims,
+        entries,
+        codeword_lengths: vec![length; entries as usize],
+        lookup: VqLookup::None,
+    }
+}
+
 /// The floor-1 class catalogue the header designer may tile with:
 /// 1-, 2- and 4-dimension classes, no subclasses, all posts on book 0.
 fn floor_class_catalogue() -> Vec<Floor1Class> {
@@ -713,13 +743,17 @@ fn resample_envelope(src: &[f32], dst_len: usize) -> Vec<f32> {
 }
 
 /// The stream's setup header: 4 shared codebooks (floor posts, residue
-/// classwords, coarse + fine value ladders) plus, **per block size**
+/// classwords, coarse + fine value books) plus, **per block size**
 /// (one entry when `blocksize_0 == blocksize_1`, two — short then long
 /// — when the stream switches), a floor, a two-class residue (class 0
-/// = silence, class 1 = two-stage cascade over the shared ladders,
+/// = silence, class 1 = two-stage cascade over the shared value books,
 /// `residue_end` at that size's `n/2`), a mapping carrying the gated
 /// §4.3.5 coupling steps under a single submap, and a mode
 /// (`blockflag` clear on the short entry, set on the long one).
+///
+/// The classbook groups [`CLASS_GROUP_DIMS`] partitions per §8.6.2
+/// classword (radix-packed); its seed lengths are uniform and the
+/// encode path retrains them occupancy-optimal for the final plans.
 fn build_setup(
     floor_headers: Vec<crate::setup::Floor1Header>,
     coarse: VorbisCodebook,
@@ -735,9 +769,9 @@ fn build_setup(
             kind: FloorKind::Type1(h),
         })
         .collect();
-    let mut stages: [Option<u8>; 8] = Default::default();
-    stages[0] = Some(2);
-    stages[1] = Some(3);
+    let mut both: [Option<u8>; 8] = Default::default();
+    both[0] = Some(2);
+    both[1] = Some(3);
     let residues = half_ns
         .iter()
         .map(|&half_n| ResidueHeader {
@@ -745,10 +779,10 @@ fn build_setup(
             residue_begin: 0,
             residue_end: half_n,
             partition_size: PARTITION_SIZE,
-            classifications: 2,
+            classifications: RESIDUE_CLASSES as u8,
             classbook: 1,
             cascade: vec![0, 0b11],
-            books: vec![Default::default(), stages],
+            books: vec![Default::default(), both],
         })
         .collect();
     let mappings = (0..half_ns.len())
@@ -775,7 +809,12 @@ fn build_setup(
         })
         .collect();
     VorbisSetupHeader {
-        codebooks: vec![scalar_book(256, 8), scalar_book(2, 1), coarse, fine],
+        codebooks: vec![
+            scalar_book(256, 8),
+            class_group_book(RESIDUE_CLASSES, CLASS_GROUP_DIMS),
+            coarse,
+            fine,
+        ],
         time_placeholders: vec![0],
         floors,
         residues,
@@ -1284,18 +1323,70 @@ pub fn encode_pcm_to_packets(
                 config.training_iterations,
             )?;
             setup.codebooks = outcome.codebooks;
-            // The trainer plans *unweighted*; both the next entry's
-            // training pass and the final packets below can
-            // legitimately select a class this pass never used (it may
-            // have pruned the classword). Keep the flat seed classbook
-            // (both classwords stay encodable at 1 bit each — there is
-            // nothing to win on a 2-entry book) and take only the
-            // trained value ladders.
-            setup.codebooks[1] = scalar_book(2, 1);
+            // The trainer plans *unweighted*, so its classword
+            // statistics do not match the weighted plans the packets
+            // below emit. Reset the flat seed classbook — the final
+            // classword lengths are trained below from the actual
+            // grouped class choices — and take only the trained value
+            // books.
+            setup.codebooks[1] = class_group_book(RESIDUE_CLASSES, CLASS_GROUP_DIMS);
         }
     }
     let coarse = setup.codebooks[2].clone();
     let fine = setup.codebooks[3].clone();
+
+    // ---- §8.6.2 residue planning (all frames) ----
+    // The class rows mirror build_setup: class 0 silence, class 1 the
+    // full two-stage cascade. The rate-distortion chooser picks per
+    // partition.
+    let empty_row: [Option<&VorbisCodebook>; 8] = [None; 8];
+    let mut both_row: [Option<&VorbisCodebook>; 8] = [None; 8];
+    both_row[0] = Some(&coarse);
+    both_row[1] = Some(&fine);
+    let value_books = [empty_row, both_row];
+
+    let mut frame_plans: Vec<Vec<ResidueVectorPlan>> = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let mut plans = Vec::with_capacity(ch);
+        for c in 0..ch {
+            let scored = plan_vector_residue_rd_weighted(
+                &targets[f][c],
+                &value_books,
+                1,
+                PARTITION_SIZE,
+                tuning.lambda,
+                &weights[f][c],
+            )?;
+            plans.push(ResidueVectorPlan {
+                classifications: scored.classifications,
+                partition_entries: scored.partition_entries,
+            });
+        }
+        frame_plans.push(plans);
+    }
+
+    // ---- classword lengths from the final grouped class usage ----
+    // Tally the exact classword emissions the packets below make (the
+    // writer's own §8.6.2 grouping, via tally_residue_plans) and make
+    // the classbook's codeword lengths occupancy-optimal for them —
+    // dense policy, so a class group the corpus never picked keeps a
+    // (long) codeword and the book stays whole-alphabet-encodable.
+    {
+        let mut tallies = crate::book_design::BookTallies::new(&setup.codebooks);
+        for (f, plans) in frame_plans.iter().enumerate() {
+            let e = entry_of(f);
+            crate::book_design::tally_residue_plans(
+                &mut tallies,
+                plans,
+                &setup.residues[e],
+                &setup.codebooks,
+            )?;
+        }
+        if let Some(freqs) = tallies.counts(1) {
+            setup.codebooks[1] =
+                crate::book_design::redesign_codebook(&setup.codebooks[1], freqs, 16, true)?;
+        }
+    }
 
     // ---- the three §4.2 header packets ----
     let id_packet = write_identification_header(&VorbisIdentificationHeader {
@@ -1315,35 +1406,16 @@ pub fn encode_pcm_to_packets(
     let setup_packet = write_setup_header(&setup, config.channels)?;
 
     // ---- §4.3 audio packets + §A.2 encapsulation ----
-    let empty_row: [Option<&VorbisCodebook>; 8] = [None; 8];
-    let mut cascade_row: [Option<&VorbisCodebook>; 8] = [None; 8];
-    cascade_row[0] = Some(&coarse);
-    cascade_row[1] = Some(&fine);
-    let value_books = [empty_row, cascade_row];
-
     let mut audio_packets: Vec<(Vec<u8>, u64)> = Vec::with_capacity(frames);
-    for f in 0..frames {
+    for (f, plans) in frame_plans.into_iter().enumerate() {
         let e = entry_of(f);
         let mut floors = Vec::with_capacity(ch);
-        let mut plans = Vec::with_capacity(ch);
-        for c in 0..ch {
-            let scored = plan_vector_residue_rd_weighted(
-                &targets[f][c],
-                &value_books,
-                1,
-                PARTITION_SIZE,
-                tuning.lambda,
-                &weights[f][c],
-            )?;
+        for y_row in floor_ys[f].iter().take(ch) {
             floors.push(AudioChannelFloor::Type1(Floor1Packet {
                 nonzero: true,
-                floor1_y: floor_ys[f][c].clone(),
+                floor1_y: y_row.clone(),
                 partition_cvals: vec![0u32; floor_headers[e].partition_class_list.len()],
             }));
-            plans.push(ResidueVectorPlan {
-                classifications: scored.classifications,
-                partition_entries: scored.partition_entries,
-            });
         }
         let submap_plans = [plans];
         let packet = write_audio_packet(

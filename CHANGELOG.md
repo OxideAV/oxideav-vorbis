@@ -24,6 +24,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Grouped, occupancy-trained residue classwords in the integrated
+  encoder.** The residue classbook now packs four partitions per
+  §8.6.2 classword (`dimensions = 4`, radix-packed — the classword
+  form the reference corpus streams carry) and, after the final
+  rate-distortion plans are made, its codeword lengths are retrained
+  occupancy-optimal for the exact classwords the packets emit (dense
+  policy via the writer's own `tally_residue_plans` grouping, so
+  every class group stays encodable). A common run — e.g. four
+  consecutive silent high-band partitions — now costs a couple of
+  bits instead of four separate codewords. Measured on the staged
+  real-audio corpus at the default configuration: −2.2 to −2.4 %
+  stream bytes at **bit-identical audio packets' PCM** (same plans,
+  same SNR — a pure classword-entropy win): mono-q5 8503 → 8310 B,
+  stereo-q5 15 126 → 14 767 B, transient 9043 → 8844 B. The encode
+  path now plans all frames first, trains the classbook, then writes
+  the setup + audio packets.
+
 - **Multi-dimensional residue value books in the integrated encoder**
   (`StreamEncoderConfig::vq_dims`, default `1`): at `vq_dims > 1` the
   whole-stream encoder designs its two §8.6.2 cascade value books
