@@ -232,6 +232,18 @@ fn encoder_factory_options_and_guards() {
     let mut bad = encoder_params();
     bad.options = bad.options.clone().set("coupling", "maybe");
     assert!(make_encoder(&bad).is_err(), "coupling must be a boolean");
+    let mut bad = encoder_params();
+    bad.options = bad.options.clone().set("vq_dims", "3");
+    assert!(make_encoder(&bad).is_err(), "vq_dims must be a power of 2");
+    let mut bad = encoder_params();
+    bad.options = bad.options.clone().set("vq_dims", "32");
+    assert!(
+        make_encoder(&bad).is_err(),
+        "vq_dims must divide the partition size 16"
+    );
+    let mut bad = encoder_params();
+    bad.options = bad.options.clone().set("vq_dims", "two");
+    assert!(make_encoder(&bad).is_err(), "vq_dims must be an integer");
 
     // A lone "blocksize" below the default short size clamps the short
     // size down (a single-blocksize request), rather than erroring.
@@ -239,11 +251,17 @@ fn encoder_factory_options_and_guards() {
     small.options = small.options.clone().set("blocksize", "128");
     assert!(make_encoder(&small).is_ok(), "blocksize=128 alone is legal");
 
-    // Explicit short_blocksize + coupling options build.
+    // Explicit short_blocksize + coupling + vq_dims options build (and
+    // the encoder round-trips under them — vq_dims=2 exercises the
+    // designed multi-dimensional books through the registry path).
     let mut opts = encoder_params();
     opts.options = opts.options.clone().set("short_blocksize", "512");
     opts.options = opts.options.clone().set("coupling", "false");
-    assert!(make_encoder(&opts).is_ok(), "short_blocksize/coupling set");
+    opts.options = opts.options.clone().set("vq_dims", "2");
+    assert!(
+        make_encoder(&opts).is_ok(),
+        "short_blocksize/coupling/vq_dims set"
+    );
 
     // Interleaved F32 input is accepted and matches planar output.
     let mut params = encoder_params();

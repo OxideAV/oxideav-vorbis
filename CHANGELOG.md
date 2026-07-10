@@ -24,6 +24,12 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Registry `"vq_dims"` encoder option**: the `make_encoder` factory
+  exposes `StreamEncoderConfig::vq_dims` (power of two in `1..=16`,
+  default `1`); shape guards refuse non-integers, non-powers-of-two
+  and values above the partition size. `tests/registry_wiring.rs`
+  pins the option matrix.
+
 - **Occupancy-trained floor-post codeword lengths in the integrated
   encoder.** The shared §7.2.3 floor post book shipped uniform
   8-bit codewords for its 256 entries; the encode path now tallies

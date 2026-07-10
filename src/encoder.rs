@@ -6683,9 +6683,13 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
 /// default `256` — equal to the long size disables §4.3.1 block
 /// switching; a `"blocksize"` below the default short size clamps the
 /// short size down, keeping a lone `"blocksize"` a single-blocksize
-/// request) and a `"coupling"` option (`true`/`false`, default `true`
+/// request), a `"coupling"` option (`true`/`false`, default `true`
 /// — offer §4.3.5 square-polar coupling on adjacent channel pairs,
-/// gated on profitability).
+/// gated on profitability) and a `"vq_dims"` option (power of two in
+/// `1..=16`, default `1` — the residue value books' dimensionality;
+/// above `1` the two cascade books are designed from the stream's own
+/// residue corpus as multi-dimensional §3.2.1 lookup-type-2
+/// tessellations).
 ///
 /// # Errors
 ///
@@ -6760,6 +6764,17 @@ pub fn make_encoder(
                 "vorbis encoder: coupling {c:?} not a boolean (true/false)"
             ))
         })?;
+    }
+    if let Some(d) = params.options.get("vq_dims") {
+        let dims: u16 = d.parse().map_err(|_| {
+            oxideav_core::Error::invalid(format!("vorbis encoder: vq_dims {d:?} not an integer"))
+        })?;
+        if !dims.is_power_of_two() || dims > 16 {
+            return Err(oxideav_core::Error::invalid(format!(
+                "vorbis encoder: vq_dims {dims} not a power of two dividing the residue partition size 16"
+            )));
+        }
+        config.vq_dims = dims;
     }
 
     let mut output_params =
