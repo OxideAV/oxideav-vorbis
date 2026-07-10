@@ -1,31 +1,30 @@
 //! Multi-dimensional residue value books in the integrated encoder
 //! (`StreamEncoderConfig::vq_dims`).
 //!
-//! At `vq_dims > 1` the whole-stream encoder designs its two §8.6.2
+//! At `vq_dims = 2` the whole-stream encoder designs its two §8.6.2
 //! cascade value books from the stream's own residue corpus
-//! (`book_design::design_vq_codebook`): `vq_dims`-dimensional §3.2.1
-//! lookup-type-2 tessellation books — the coarse book over the raw
-//! dims-element residue sub-vectors, the fine book over the
-//! post-coarse leftovers — with occupancy-trained sparse codeword
-//! lengths, so one codeword jointly codes `vq_dims` neighbouring
-//! spectral bins. This suite measures the payoff and pins the
-//! contract:
+//! (`book_design::design_lattice_vq_codebook`): 2-dimensional §3.2.1
+//! lookup-type-**1** lattice books — the widely interoperable lookup
+//! form (lookup type 2 is spec-legal but rejected by common black-box
+//! decoders) — over uniform full-span scalar ladders (coarse from the
+//! raw dims-element residue sub-vectors, fine from the post-coarse
+//! leftovers), with codeword lengths trained on the *joint* grid-cell
+//! occupancy, so one codeword jointly codes two neighbouring spectral
+//! bins. This suite pins the contract:
 //!
-//! * **fidelity ceiling** — at equal quality the dim-2 designed
-//!   books clear the scalar-ladder (`vq_dims = 1`) encode's SNR by a
-//!   pinned margin at bounded extra rate: the corpus-fitted joint
-//!   books reach reconstruction points the generic ladders don't
-//!   have (a per-scalar two-stage ladder caps out; the designed
-//!   books adapt their entire value set to the stream);
+//! * **parity** — at equal quality the dim-2 designed books hold the
+//!   scalar-ladder (`vq_dims = 1`) encode's SNR at comparable rate on
+//!   both a synthetic corpus and real audio (the joint form's rate
+//!   *win* additionally needs the per-partition residue class ladder —
+//!   see the crate README's known-gaps note);
 //! * **carriage** — the produced setup header carries the designed
-//!   multi-dimensional books (parseable, `dimensions == vq_dims`,
-//!   tessellation lookup, non-uniform trained lengths);
-//! * **coverage** — every legal `vq_dims` (1 / 2 / 4 / 8 / 16)
-//!   encodes and decodes end-trim-exact through the crate's own
-//!   decoder above a pinned SNR floor, coupling and block switching
-//!   included;
-//! * **guards** — an illegal `vq_dims` (zero, non-power-of-two, or
-//!   not dividing the partition size) is refused up front.
+//!   2-D books (parseable, `dimensions == 2`, **lattice** lookup,
+//!   occupancy-shaped trained lengths);
+//! * **coverage** — both legal `vq_dims` values encode and decode
+//!   end-trim-exact through the crate's own decoder above a pinned
+//!   SNR floor, coupling and block switching included;
+//! * **guards** — an illegal `vq_dims` (zero, above 2, or
+//!   non-power-of-two) is refused up front.
 //!
 //! Fully synthetic — no fixtures required.
 
@@ -97,13 +96,13 @@ fn encode_at(pcm: &[Vec<f32>], vq_dims: u16, quality: f32) -> (Vec<u8>, f64) {
     (ogg, worst)
 }
 
-/// The headline measurement: at equal quality the corpus-designed
-/// dim-2 books clear the generic scalar ladders' SNR by a pinned
-/// margin at bounded extra rate (measured on this corpus:
-/// ≈ 28 → 32 dB for ≈ 1.3× the bytes — a reconstruction ceiling the
-/// per-scalar ladder cannot reach at any nearby operating point).
+/// The headline parity pin: at equal quality the corpus-designed 2-D
+/// lattice books hold the scalar ladders' SNR (±1 dB) at comparable
+/// rate (within 15 %) — mono and coupled stereo. The interoperable
+/// joint form gives up nothing; its rate win is gated on the
+/// per-partition class ladder (a known gap).
 #[test]
-fn dim2_books_lift_the_quality_ceiling() {
+fn dim2_lattice_books_hold_parity_with_scalar_ladders() {
     let samples = 22_000;
     let mono = vec![test_signal(samples, 1)];
     let (ogg1, snr1) = encode_at(&mono, 1, 0.7);
@@ -114,35 +113,49 @@ fn dim2_books_lift_the_quality_ceiling() {
         ogg2.len()
     );
     assert!(
-        snr2 >= snr1 + 2.0,
-        "dim-2 SNR {snr2:.2} dB must clear the dim-1 {snr1:.2} dB by >= 2 dB"
+        snr2 >= snr1 - 1.0,
+        "dim-2 SNR {snr2:.2} dB must hold the dim-1 {snr1:.2} dB (1 dB slack)"
     );
     assert!(
-        ogg2.len() <= ogg1.len() * 3 / 2,
-        "dim-2 rate {} B must stay within 1.5x the dim-1 {} B",
+        ogg2.len() as f64 <= ogg1.len() as f64 * 1.15,
+        "dim-2 rate {} B must stay within 15% of the dim-1 {} B",
         ogg2.len(),
         ogg1.len()
     );
+
+    let stereo = vec![test_signal(samples, 1), test_signal_alt(samples)];
+    let (s1, ssnr1) = encode_at(&stereo, 1, 0.7);
+    let (s2, ssnr2) = encode_at(&stereo, 2, 0.7);
+    eprintln!(
+        "stereo q0.7: dim-1 {} B / {ssnr1:.2} dB, dim-2 {} B / {ssnr2:.2} dB",
+        s1.len(),
+        s2.len()
+    );
+    assert!(ssnr2 >= ssnr1 - 1.0, "stereo SNR held");
+    assert!(
+        s2.len() as f64 <= s1.len() as f64 * 1.15,
+        "stereo rate within 15%"
+    );
 }
 
-/// The produced setup header carries the designed multi-dimensional
-/// books: `dimensions == vq_dims`, tessellation (lookup type 2)
-/// values, and occupancy-trained (non-uniform) codeword lengths.
+/// The produced setup header carries the designed 2-D books:
+/// `dimensions == 2`, lattice (lookup type 1) values, and
+/// occupancy-trained (non-uniform) codeword lengths.
 #[test]
-fn setup_header_carries_designed_multidim_books() {
+fn setup_header_carries_designed_lattice_books() {
     let pcm = vec![test_signal(16_000, 5)];
     let mut config = StreamEncoderConfig::new(RATE, 1);
-    config.vq_dims = 4;
+    config.vq_dims = 2;
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
     let packets = ogg_packets(&ogg).expect("packets assemble");
     let setup = parse_setup_header(&packets[2], 1).expect("setup parses");
 
     // Books 2 and 3 are the cascade's coarse + fine value books.
     for book in &setup.codebooks[2..=3] {
-        assert_eq!(book.dimensions, 4, "designed book dimensionality");
+        assert_eq!(book.dimensions, 2, "designed book dimensionality");
         assert!(
-            matches!(book.lookup, VqLookup::Tessellation { .. }),
-            "designed books are §3.2.1 lookup type 2"
+            matches!(book.lookup, VqLookup::Lattice { .. }),
+            "designed books are §3.2.1 lookup type 1 (the interoperable form)"
         );
         let used: Vec<u8> = book
             .codeword_lengths
@@ -159,13 +172,13 @@ fn setup_header_carries_designed_multidim_books() {
     }
 }
 
-/// Every legal `vq_dims` encodes and decodes end-trim-exact above a
-/// pinned SNR floor (block switching + coupling live, stereo).
+/// Both legal `vq_dims` values encode and decode end-trim-exact above
+/// a pinned SNR floor (block switching + coupling live, stereo).
 #[test]
 fn vq_dims_sweep_decodes_cleanly() {
     let samples = 14_000;
     let stereo = vec![test_signal(samples, 9), test_signal_alt(samples)];
-    for dims in [1u16, 2, 4, 8, 16] {
+    for dims in [1u16, 2] {
         let (ogg, snr) = encode_at(&stereo, dims, 0.7);
         eprintln!(
             "dims {dims}: {} B, worst-channel SNR {snr:.2} dB",
@@ -182,7 +195,7 @@ fn vq_dims_sweep_decodes_cleanly() {
 #[test]
 fn illegal_vq_dims_is_refused() {
     let pcm = vec![test_signal(2_000, 3)];
-    for bad in [0u16, 3, 6, 32] {
+    for bad in [0u16, 3, 4, 8, 16, 32] {
         let mut config = StreamEncoderConfig::new(RATE, 1);
         config.vq_dims = bad;
         assert_eq!(

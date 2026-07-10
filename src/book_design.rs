@@ -2156,6 +2156,190 @@ pub fn design_vq_codebook(
     })
 }
 
+/// Build a **uniform** §3.2.1 value ladder: `levels` reconstruction
+/// points at `minimum + i · step`, `minimum` / `step` rounded
+/// §9.2.2-packable, identity multiplicands. Unlike
+/// [`design_value_ladder`] (whose Lloyd centroids concentrate where
+/// the training mass is, abandoning rare-but-loud outliers), a
+/// uniform ladder covers its whole span evenly — the right shape for
+/// a cascade's coarse stage, where the far tail is exactly the
+/// audible material that must stay reachable.
+///
+/// # Errors
+///
+/// * [`BookDesignError::ZeroLevels`] — `levels == 0`.
+/// * [`BookDesignError::InvalidValueBits`] — `value_bits` outside
+///   `1..=16`.
+/// * [`BookDesignError::LevelsExceedValueBits`] — more levels than a
+///   `value_bits`-wide multiplicand can address.
+/// * [`BookDesignError::NonFiniteTraining`] — `minimum` or `step` is
+///   not finite (reported at index 0/1).
+pub fn uniform_value_ladder(
+    minimum: f32,
+    step: f32,
+    levels: u32,
+    value_bits: u8,
+) -> Result<ValueLadderDesign, BookDesignError> {
+    if !minimum.is_finite() {
+        return Err(BookDesignError::NonFiniteTraining { index: 0 });
+    }
+    if !step.is_finite() {
+        return Err(BookDesignError::NonFiniteTraining { index: 1 });
+    }
+    if levels == 0 {
+        return Err(BookDesignError::ZeroLevels);
+    }
+    if !(1..=16).contains(&value_bits) {
+        return Err(BookDesignError::InvalidValueBits { value_bits });
+    }
+    if u64::from(levels) > (1u64 << value_bits) {
+        return Err(BookDesignError::LevelsExceedValueBits { levels, value_bits });
+    }
+    Ok(ValueLadderDesign {
+        minimum_value: pack_nearest(minimum),
+        delta_value: pack_nearest(step),
+        multiplicands: (0..levels).collect(),
+        value_bits,
+        mse: 0.0, // no training corpus was measured against
+    })
+}
+
+/// Design a multi-dimensional §3.2.1 **lookup-type-1 (lattice)** VQ
+/// codebook over a caller-supplied shared scalar ladder, with
+/// codeword lengths trained on a corpus of `dims`-element
+/// sub-vectors — the *interoperable* joint-quantisation form.
+///
+/// A lattice book's per-entry vectors are not free: entry `e`'s
+/// component `j` is `ladder value [(e / lookup1_values^j) mod
+/// lookup1_values]`, i.e. the entry set is the full Cartesian product
+/// grid of one shared scalar ladder (here `ladder`, e.g. from
+/// [`uniform_value_ladder`] or [`design_value_ladder`]). The
+/// joint-coding win therefore comes entirely from the **codeword
+/// lengths**: every training vector is mapped to its nearest grid
+/// point per component (exact for a full product grid) and the
+/// lengths are assigned occupancy-optimal over the *joint* cell
+/// populations, so a probable combination (e.g. two near-zero
+/// neighbours) codes in a couple of bits. `dense = false` prunes
+/// never-observed cells entirely (exactly optimal *for this corpus* —
+/// appropriate when the corpus is the whole stream;
+/// [`crate::vq::quantize_vector`] never selects a pruned cell);
+/// `dense = true` keeps every cell encodable with never-observed
+/// combinations priced longest (appropriate for a **seed** book
+/// designed on a subsample, where pruning a cell the full stream
+/// does reach would force a far-away reconstruction). This is the
+/// codebook shape widely deployed decoders accept — lookup type 2's
+/// per-entry-free tables are spec-legal but rejected by common
+/// black-box decoders.
+///
+/// `entries` is exactly `lookup1_values^dims`. The reported MSE is
+/// per component against the ladder grid, comparable with
+/// [`design_value_ladder`] / [`design_vq_codebook`].
+///
+/// # Errors
+///
+/// As [`design_vq_codebook`]; an empty ladder is
+/// [`BookDesignError::ZeroLevels`].
+pub fn design_lattice_vq_codebook(
+    training: &[f32],
+    dims: u16,
+    ladder: &ValueLadderDesign,
+    max_len: u8,
+    dense: bool,
+) -> Result<VqCodebookDesign, BookDesignError> {
+    if dims == 0 {
+        return Err(BookDesignError::ZeroVqDimensions);
+    }
+    if training.is_empty() {
+        return Err(BookDesignError::EmptyTraining);
+    }
+    if let Some(index) = training.iter().position(|v| !v.is_finite()) {
+        return Err(BookDesignError::NonFiniteTraining { index });
+    }
+    let d = dims as usize;
+    if training.len() % d != 0 {
+        return Err(BookDesignError::TrainingNotVectorAligned {
+            len: training.len(),
+            dims: d,
+        });
+    }
+    if !(1..=MAX_CODEWORD_LEN).contains(&max_len) {
+        return Err(BookDesignError::InvalidMaxLength { max_len });
+    }
+    let lookup1_values = u32::try_from(ladder.multiplicands.len()).unwrap_or(u32::MAX);
+    if lookup1_values == 0 {
+        return Err(BookDesignError::ZeroLevels);
+    }
+    let lv = lookup1_values as usize;
+    let entries = (u64::from(lookup1_values)).pow(u32::from(dims));
+    // §3.2.1 carries entries in 24 bits.
+    let entries = u32::try_from(entries.min(1 << 24)).expect("bounded above");
+
+    // Decoded ladder points (ascending by construction).
+    let points: Vec<f64> = (0..lv)
+        .map(|i| f64::from(ladder.level_value(i).expect("level in range")))
+        .collect();
+
+    // Joint occupancy: each vector maps to its nearest grid point per
+    // component (exact on a full product grid), accumulating the
+    // §3.2.1 entry index `Σ level_j · lookup1_values^j`.
+    let nearest_level = |s: f64| -> usize {
+        let mut best = 0usize;
+        let mut best_d = f64::INFINITY;
+        for (i, &p) in points.iter().enumerate() {
+            let dd = (s - p) * (s - p);
+            if dd < best_d {
+                best_d = dd;
+                best = i;
+            }
+        }
+        best
+    };
+    let mut freqs = vec![0u64; entries as usize];
+    let mut err = 0.0f64;
+    let nvec = training.len() / d;
+    for vec in training.chunks_exact(d) {
+        let mut entry = 0u64;
+        let mut stride = 1u64;
+        for &s in vec {
+            let s = f64::from(s);
+            let li = nearest_level(s);
+            let delta = s - points[li];
+            err += delta * delta;
+            entry += li as u64 * stride;
+            stride *= lookup1_values as u64;
+        }
+        if entry < u64::from(entries) {
+            freqs[entry as usize] += 1;
+        }
+    }
+    let codeword_lengths = if dense {
+        design_codeword_lengths_dense(&freqs, max_len)?
+    } else {
+        design_codeword_lengths(&freqs, max_len)?
+    };
+    let used_entries = codeword_lengths
+        .iter()
+        .filter(|&&l| l != UNUSED_ENTRY)
+        .count();
+
+    Ok(VqCodebookDesign {
+        codebook: VorbisCodebook {
+            dimensions: dims,
+            entries,
+            codeword_lengths,
+            lookup: VqLookup::Lattice {
+                minimum_value: ladder.minimum_value,
+                delta_value: ladder.delta_value,
+                value_bits: ladder.value_bits,
+                sequence_p: false,
+                multiplicands: ladder.multiplicands.clone(),
+            },
+        },
+        mse: err / (nvec as f64 * d as f64),
+        used_entries,
+    })
+}
+
 /// Package-merge (coin-collector) core: optimal length-limited prefix
 /// code lengths for `n >= 2` symbols whose frequencies arrive sorted
 /// ascending. Returns one length per symbol, aligned to the input
@@ -3829,6 +4013,123 @@ mod tests {
         );
         assert_eq!(
             design_vq_codebook(&[1.0, 2.0], 2, 4, 8, 0),
+            Err(BookDesignError::InvalidMaxLength { max_len: 0 })
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // uniform_value_ladder + design_lattice_vq_codebook — the
+    // interoperable (lookup-type-1) joint designer.
+    // ----------------------------------------------------------------
+
+    /// The uniform ladder is exactly `minimum + i · step`, packable,
+    /// with identity multiplicands; validation errors are typed.
+    #[test]
+    fn uniform_ladder_shape_and_validation() {
+        let ladder = uniform_value_ladder(-4.0, 0.5, 16, 8).expect("builds");
+        assert_eq!(ladder.multiplicands, (0..16).collect::<Vec<u32>>());
+        assert!(crate::codebook::float32_pack(ladder.minimum_value).is_some());
+        assert!(crate::codebook::float32_pack(ladder.delta_value).is_some());
+        assert_eq!(ladder.level_value(0), Some(-4.0));
+        assert_eq!(ladder.level_value(15), Some(-4.0 + 15.0 * 0.5));
+        assert_eq!(
+            uniform_value_ladder(-1.0, 0.5, 0, 8),
+            Err(BookDesignError::ZeroLevels)
+        );
+        assert_eq!(
+            uniform_value_ladder(-1.0, 0.5, 4, 0),
+            Err(BookDesignError::InvalidValueBits { value_bits: 0 })
+        );
+        assert_eq!(
+            uniform_value_ladder(-1.0, 0.5, 300, 8),
+            Err(BookDesignError::LevelsExceedValueBits {
+                levels: 300,
+                value_bits: 8
+            })
+        );
+        assert_eq!(
+            uniform_value_ladder(f32::NAN, 0.5, 4, 8),
+            Err(BookDesignError::NonFiniteTraining { index: 0 })
+        );
+    }
+
+    /// The designed lattice book is §3.2.1 carriage-legal, its entry
+    /// count is exactly `lookup1_values^dims` (so the decoder's
+    /// derived `lookup1_values` matches), the joint occupancy shapes
+    /// the lengths (a frequent pair codes shorter than a rare one),
+    /// and sparse vs dense policies differ exactly on never-observed
+    /// cells.
+    #[test]
+    fn lattice_book_designs_and_carries() {
+        use crate::encoder::write_codebook;
+        use oxideav_core::bits::BitReaderLsb;
+        // Corpus: pairs clustered at (0, 0) [common] and (2, -2) [rare].
+        let mut corpus = Vec::new();
+        for _ in 0..90 {
+            corpus.extend_from_slice(&[0.0f32, 0.0]);
+        }
+        for _ in 0..10 {
+            corpus.extend_from_slice(&[2.0f32, -2.0]);
+        }
+        let ladder = uniform_value_ladder(-2.0, 1.0, 5, 8).expect("builds");
+        let sparse = design_lattice_vq_codebook(&corpus, 2, &ladder, 16, false).expect("designs");
+        let dense = design_lattice_vq_codebook(&corpus, 2, &ladder, 16, true).expect("designs");
+        assert_eq!(sparse.codebook.entries, 25, "lookup1_values^dims");
+        assert_eq!(sparse.used_entries, 2, "sparse keeps only observed cells");
+        assert_eq!(dense.used_entries, 25, "dense keeps every cell");
+        assert!(sparse.mse < 1e-9, "on-grid corpus reconstructs exactly");
+
+        // Occupancy shapes the lengths: the common pair codes shorter.
+        let common = crate::vq::quantize_vector(&dense.codebook, &[0.0, 0.0]).expect("quantises");
+        let rare = crate::vq::quantize_vector(&dense.codebook, &[2.0, -2.0]).expect("quantises");
+        assert_ne!(common.entry, rare.entry);
+        assert!(
+            dense.codebook.codeword_lengths[common.entry as usize]
+                < dense.codebook.codeword_lengths[rare.entry as usize],
+            "common cell must code shorter"
+        );
+        // quantize == unpack on the designed book.
+        assert_eq!(
+            common.vector,
+            crate::vq::unpack_vector(&dense.codebook, common.entry).expect("unpacks")
+        );
+
+        // Carriage: write → parse round-trips both books, and the
+        // §3.2.1 tree builds.
+        for book in [&sparse.codebook, &dense.codebook] {
+            let bytes = write_codebook(book).expect("writes");
+            let mut r = BitReaderLsb::new(&bytes);
+            let parsed = crate::codebook::parse_codebook(&mut r).expect("parses");
+            assert_eq!(&parsed, book, "carriage round-trip");
+            HuffmanTree::from_lengths(&book.codeword_lengths).expect("builds");
+        }
+
+        // The sparse book never selects a pruned cell.
+        let q = crate::vq::quantize_vector(&sparse.codebook, &[2.0, 2.0]).expect("quantises");
+        assert_ne!(
+            sparse.codebook.codeword_lengths[q.entry as usize],
+            UNUSED_ENTRY
+        );
+
+        // Validation errors are typed.
+        assert_eq!(
+            design_lattice_vq_codebook(&corpus, 0, &ladder, 16, true),
+            Err(BookDesignError::ZeroVqDimensions)
+        );
+        assert_eq!(
+            design_lattice_vq_codebook(&[], 2, &ladder, 16, true),
+            Err(BookDesignError::EmptyTraining)
+        );
+        assert_eq!(
+            design_lattice_vq_codebook(&[1.0, 2.0, 3.0], 2, &ladder, 16, true),
+            Err(BookDesignError::TrainingNotVectorAligned { len: 3, dims: 2 })
+        );
+        assert_eq!(
+            design_lattice_vq_codebook(&[1.0, f32::NAN], 2, &ladder, 16, true),
+            Err(BookDesignError::NonFiniteTraining { index: 1 })
+        );
+        assert_eq!(
+            design_lattice_vq_codebook(&corpus, 2, &ladder, 0, true),
             Err(BookDesignError::InvalidMaxLength { max_len: 0 })
         );
     }

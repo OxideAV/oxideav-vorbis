@@ -62,28 +62,37 @@ All notable changes to `oxideav-vorbis` are recorded here.
   the setup + audio packets.
 
 - **Multi-dimensional residue value books in the integrated encoder**
-  (`StreamEncoderConfig::vq_dims`, default `1`): at `vq_dims > 1` the
-  whole-stream encoder designs its two §8.6.2 cascade value books
-  from the stream's own residue corpus via `design_vq_codebook` —
-  `vq_dims`-dimensional §3.2.1 lookup-type-2 tessellation books, the
-  coarse book over the raw dims-element residue sub-vectors and the
-  fine book over the post-coarse leftovers (exactly the second
-  stage's targets, since the cascade planner subtracts the chosen
-  entry's decoded reconstruction), on a bounded deterministic
-  stride-subsample of the corpus. Every legal dimensionality
-  (`1 | 2 | 4 | 8 | 16` — a power of two dividing the partition
-  size; anything else is refused with the new
-  `OggFileError::BadVqDims`) encodes and decodes end-trim-exact
-  through the crate's own decoder with coupling + block switching
-  live, and the closed-loop trainer refines the designed books
-  unchanged. Measured (`tests/multidim_residue_books.rs`): at
-  `q = 0.7` on the synthetic tones + noise corpus the dim-2 designed
-  books lift the reconstruction ceiling ≈ 28 → 32 dB SNR at ≈ 1.3×
-  the bytes — corpus-fitted joint reconstruction points the generic
-  per-scalar ladders cannot reach — while real-audio re-encodes keep
-  the scalar default (a fixed entry budget spreads over
-  `entries^(1/dims)` levels per scalar, so high-rate content favours
-  `vq_dims = 1` until the residue class set can adapt per partition).
+  (`StreamEncoderConfig::vq_dims`, `1` (default) or `2`; anything
+  else is refused with the new `OggFileError::BadVqDims`): at
+  `vq_dims = 2` the whole-stream encoder designs its two §8.6.2
+  cascade value books from the stream's own residue corpus as 2-D
+  §3.2.1 **lookup-type-1 lattice** books — new
+  `book_design::design_lattice_vq_codebook` + `uniform_value_ladder`
+  — over uniform full-span scalar ladders (coarse from the raw
+  two-element residue sub-vectors, fine from the post-coarse
+  leftovers, on a bounded deterministic stride-subsample), with
+  codeword lengths trained on the *joint* grid-cell occupancy (dense
+  for the subsample-designed seed; the closed-loop trainer
+  sparse-prunes against the full corpus). Black-box validated: a
+  common reference decoder binary **rejects lookup-type-2 codebooks
+  outright** ("lookup type not supported"), so the earlier
+  tessellation form — spec-legal, and kept as the unit-level
+  `design_vq_codebook` primitive — is not carried on the wire; the
+  lattice streams decode through the black-box decoder to the exact
+  declared frame counts at SNRs identical to the crate's own decoder.
+  Measured (`tests/multidim_residue_books.rs`): dim-2 holds strict
+  parity with the scalar ladders (mono q0.7 9949 vs 9951 B at an
+  identical 27.98 dB; stereo 19 504 vs 19 528 B at 34.76 dB) — the
+  joint form's rate *win* additionally needs the per-partition
+  residue class ladder (known gap, see README). Along the way three
+  design lessons are pinned in tests: seed lengths must be dense
+  (sparse-from-a-subsample prunes cells the full stream needs), the
+  shared ladder must be uniform (corpus-quantile centroids abandon
+  the rare-but-loud outliers), and a switching stream's two corpora
+  must train the shared books in **one combined pass** (sequential
+  per-size passes let the second corpus sparse-prune codewords the
+  first still needs — the trainer call in `encode_pcm_to_packets` now
+  trains once over all frames' targets).
 
 - **Multi-dimensional VQ residue codebook designer**
   (`book_design::design_vq_codebook` + `VqCodebookDesign`): designs a

@@ -80,24 +80,15 @@ use oxideav_ogg::page::Page;
 const PARTITION_SIZE: u32 = 16;
 
 /// Cap on the stride-subsampled training corpus handed to
-/// [`crate::book_design::design_vq_codebook`] (in sub-vectors): the
-/// designer's refinement passes are O(vectors × entries), so a long
+/// [`crate::book_design::design_lattice_vq_codebook`] (in
+/// sub-vectors): the designer is O(vectors × levels), so a long
 /// stream trains on a bounded, deterministic sample of its residue.
 const VQ_DESIGN_MAX_VECTORS: usize = 6144;
 
-/// Designed coarse-book entries per value-book dimension
-/// ([`StreamEncoderConfig::vq_dims`]): the coarse stage spans the raw
-/// residue range, so its cell budget grows with the joint space.
-const VQ_COARSE_ENTRIES_PER_DIM: u32 = 64;
-
-/// Designed fine-book entries per dimension — the fine stage covers
-/// the (much smaller) post-coarse leftover, where extra cells buy
-/// reconstruction accuracy for the top of the quality range.
-const VQ_FINE_ENTRIES_PER_DIM: u32 = 128;
-
-/// Ceiling on either designed book's entry count (quantisation scans
-/// every used entry per §8.6.2 read).
-const VQ_MAX_ENTRIES: u32 = 256;
+/// Ceiling on a designed lattice book's entry count
+/// (`lookup1_values^dims` — quantisation scans every used entry per
+/// §8.6.2 read, and the codeword-length table is carried per entry).
+const VQ_LATTICE_MAX_ENTRIES: u32 = 1024;
 
 /// Codeword-length cap handed to the VQ designer's occupancy-optimal
 /// length assignment (well under the §3.2.1 hard 32-bit limit; a
@@ -201,17 +192,18 @@ pub struct StreamEncoderConfig {
     /// disables training (the fixed seed ladders are used verbatim).
     pub training_iterations: usize,
     /// Residue value-book dimensionality: how many consecutive
-    /// spectral residue scalars each §8.6.2 VQ codeword covers. A
-    /// power of two dividing the residue partition size (16), i.e.
-    /// `1 | 2 | 4 | 8 | 16`. At `1` the two cascade value books are
-    /// generic scalar ladders sized to the residue range; above it
-    /// they are **designed from the stream's own residue corpus**
-    /// ([`crate::book_design::design_vq_codebook`]) as
-    /// `vq_dims`-dimensional §3.2.1 lookup-type-2 tessellation books
-    /// (the coarse book from the raw targets, the fine book from the
-    /// post-coarse leftovers), so one trained codeword jointly codes
-    /// `vq_dims` neighbouring bins — the shape/correlation gain a
-    /// per-scalar ladder cannot reach.
+    /// spectral residue scalars each §8.6.2 VQ codeword covers —
+    /// `1` (default) or `2`. At `1` the two cascade value books are
+    /// generic scalar ladders sized to the residue range; at `2` they
+    /// are **designed from the stream's own residue corpus**
+    /// ([`crate::book_design::design_lattice_vq_codebook`]) as
+    /// 2-dimensional §3.2.1 lookup-type-**1** lattice books — the
+    /// widely interoperable lookup form — over uniform full-span
+    /// ladders, with codeword lengths trained on the *joint*
+    /// grid-cell occupancy, so one trained codeword jointly codes two
+    /// neighbouring bins. Wider dimensionalities are refused: under
+    /// the lattice entry ceiling their per-scalar resolution
+    /// collapses (see [`OggFileError::BadVqDims`]).
     pub vq_dims: u16,
 }
 
@@ -260,9 +252,13 @@ pub enum OggFileError {
         /// The configured long (`blocksize_1`) size.
         long_n: usize,
     },
-    /// `vq_dims` was not a power of two dividing the residue
-    /// partition size (§8.6.3 step 1 / §8.6.4: a stage's value-book
-    /// dimensions must tile the partition exactly).
+    /// `vq_dims` was not `1` or `2`. A stage's value-book dimensions
+    /// must tile the partition exactly (§8.6.3 step 1 / §8.6.4), and
+    /// above 2 the designed lattice's `lookup1_values^dims` product
+    /// grid cannot carry a usable per-scalar resolution under the
+    /// entry ceiling (a 4-D grid at ≤1024 entries is 5 levels per
+    /// scalar — the joint form needs the per-partition class ladder
+    /// before wider dimensionalities pay).
     BadVqDims(u16),
     /// The §4.3.1 block-size schedule planner failed.
     Blocksize(BlocksizeError),
@@ -327,10 +323,7 @@ impl core::fmt::Display for OggFileError {
                 f,
                 "ogg encode: short blocksize {short_n} exceeds long blocksize {long_n}"
             ),
-            OggFileError::BadVqDims(d) => write!(
-                f,
-                "ogg encode: vq_dims {d} is not a power of two dividing the residue partition size {PARTITION_SIZE}"
-            ),
+            OggFileError::BadVqDims(d) => write!(f, "ogg encode: vq_dims {d} is not 1 or 2"),
             OggFileError::Blocksize(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Quality(e) => write!(f, "ogg encode: {e}"),
             OggFileError::Window(e) => write!(f, "ogg encode: {e}"),
@@ -913,7 +906,7 @@ pub fn encode_pcm_to_packets(
             long_n: n1,
         });
     }
-    if !config.vq_dims.is_power_of_two() || PARTITION_SIZE % u32::from(config.vq_dims) != 0 {
+    if !config.vq_dims.is_power_of_two() || config.vq_dims > 2 {
         return Err(OggFileError::BadVqDims(config.vq_dims));
     }
     let switching = n0 < n1;
@@ -1223,12 +1216,16 @@ pub fn encode_pcm_to_packets(
     // header carries them as 21-bit-mantissa floats); the book minimum
     // is −32·step, which shares the step's mantissa (× 2⁵) and is
     // therefore packable whenever the step is.
-    // vq_dims > 1: multi-dimensional tessellation books designed from
-    // the stream's own residue corpus — the coarse book from the raw
-    // dims-element sub-vectors, the fine book from the post-coarse
-    // leftovers (exactly the targets the §8.6.2 cascade's second stage
-    // will see, since plan_partition_cascade subtracts the chosen
-    // entry's decoded reconstruction).
+    // vq_dims > 1: multi-dimensional §3.2.1 lookup-type-1 lattice
+    // books designed from the stream's own residue corpus — the
+    // coarse book's shared scalar ladder from the raw dims-element
+    // sub-vectors, the fine book's from the post-coarse leftovers
+    // (exactly the targets the §8.6.2 cascade's second stage will
+    // see, since plan_partition_cascade subtracts the chosen entry's
+    // decoded reconstruction) — with sparse codeword lengths trained
+    // on the *joint* grid-cell occupancy. Lookup type 1 is the widely
+    // interoperable lookup form; a type-2 (per-entry-free) table is
+    // spec-legal but rejected by common black-box decoders.
     let (coarse, fine) = if config.vq_dims > 1 {
         let d = config.vq_dims as usize;
         // Bounded, deterministic stride subsample of the corpus: the
@@ -1251,30 +1248,62 @@ pub fn encode_pcm_to_packets(
                 }
             }
         }
-        let coarse_entries = (VQ_COARSE_ENTRIES_PER_DIM * d as u32).min(VQ_MAX_ENTRIES);
-        let fine_entries = (VQ_FINE_ENTRIES_PER_DIM * d as u32).min(VQ_MAX_ENTRIES);
-        let coarse = crate::book_design::design_vq_codebook(
+        // The widest shared scalar ladder whose full product grid
+        // stays under the entry ceiling: §3.2.1 lookup type 1 derives
+        // `lookup1_values` from `entries`, so the designed `entries`
+        // is exactly `lookup1_values^dims`.
+        let mut lv: u32 = 2;
+        while (u64::from(lv) + 1).pow(u32::from(config.vq_dims))
+            <= u64::from(VQ_LATTICE_MAX_ENTRIES)
+        {
+            lv += 1;
+        }
+        // Uniform full-span ladders, mirroring the proven scalar-seed
+        // proportions (a corpus-quantile ladder would concentrate its
+        // levels in the near-zero mass and abandon the rare-but-loud
+        // outliers — exactly the audible material). The joint-coding
+        // win comes from the occupancy-trained codeword lengths,
+        // dense so a cell the subsampled corpus missed stays
+        // reachable (the closed-loop trainer prunes against the full
+        // corpus below).
+        let coarse_step = crate::book_design::pack_nearest(8.0 * max_abs / (3.0 * lv as f32));
+        let coarse_ladder = crate::book_design::uniform_value_ladder(
+            -(lv as f32 / 2.0) * coarse_step,
+            coarse_step,
+            lv,
+            8,
+        )?;
+        let coarse = crate::book_design::design_lattice_vq_codebook(
             &corpus,
             config.vq_dims,
-            coarse_entries,
-            8,
+            &coarse_ladder,
             VQ_DESIGN_MAX_CODEWORD_LEN,
+            true,
         )?
         .codebook;
         // The fine corpus is the coarse stage's leftover: target minus
         // the chosen entry's decoded reconstruction, per sub-vector.
+        // Its ladder spans two coarse steps — the leftover is bounded
+        // by half a coarse step plus grid-snap slack.
         let mut leftovers: Vec<f32> = Vec::with_capacity(corpus.len());
         for chunk in corpus.chunks_exact(d) {
             let q = crate::vq::quantize_vector(&coarse, chunk)
                 .expect("a freshly designed coarse book has >= 1 used entry and matching dims");
             leftovers.extend(chunk.iter().zip(&q.vector).map(|(&t, &v)| t - v));
         }
-        let fine = crate::book_design::design_vq_codebook(
+        let fine_step = crate::book_design::pack_nearest(2.0 * coarse_step / lv as f32);
+        let fine_ladder = crate::book_design::uniform_value_ladder(
+            -(lv as f32 / 2.0) * fine_step,
+            fine_step,
+            lv,
+            8,
+        )?;
+        let fine = crate::book_design::design_lattice_vq_codebook(
             &leftovers,
             config.vq_dims,
-            fine_entries,
-            8,
+            &fine_ladder,
             VQ_DESIGN_MAX_CODEWORD_LEN,
+            true,
         )?
         .codebook;
         (coarse, fine)
@@ -1295,29 +1324,25 @@ pub fn encode_pcm_to_packets(
     );
 
     // ---- optional closed-loop codebook training ----
-    // The generic seed ladders are retrained on the stream's own
-    // residue targets (codeword lengths from usage, reconstruction
-    // values at the observed centroids, re-snapped §9.2.2-packable);
-    // the trained table replaces the seeds in the setup header and
-    // the weighted per-frame planning below runs under it. On a
-    // switching stream the two residue corpora (short-block and
-    // long-block targets) train the shared ladders in sequence — the
-    // second pass starts from the first pass's books, the classic
-    // chained alternating descent.
+    // The seed value books are retrained on the stream's own residue
+    // targets (codeword lengths from usage, reconstruction values at
+    // the observed centroids, re-snapped §9.2.2-packable); the
+    // trained table replaces the seeds in the setup header and the
+    // weighted per-frame planning below runs under it. On a switching
+    // stream the short- and long-block corpora train the shared books
+    // in ONE combined pass: the two setup entries share the class
+    // rows / value books / partition size (only `residue_end`
+    // differs, which the per-vector planner does not consult), and a
+    // sequential per-size pass would let the second corpus
+    // sparse-prune codewords the first corpus' partitions still need —
+    // catastrophic for a large joint lattice, where the two block
+    // sizes populate different grid cells.
     if config.training_iterations > 0 {
-        for e in 0..n_entries {
-            let residuals: Vec<Vec<f32>> = targets
-                .iter()
-                .enumerate()
-                .filter(|(f, _)| entry_of(*f) == e)
-                .flat_map(|(_, row)| row.iter().cloned())
-                .collect();
-            if residuals.is_empty() {
-                continue;
-            }
+        let residuals: Vec<Vec<f32>> = targets.iter().flat_map(|row| row.iter().cloned()).collect();
+        if !residuals.is_empty() {
             let outcome = crate::book_design::train_residue_books_rd_ladder(
                 &residuals,
-                &setup.residues[e],
+                &setup.residues[0],
                 &setup.codebooks,
                 tuning.lambda,
                 config.training_iterations,

@@ -19,10 +19,15 @@ psychoacoustic / floor / residue encode stack — **§4.3.1 short/long
 block switching** (transient-scheduled short blocks, per-size setup
 entries, hybrid window edges) and gated **§4.3.5 square-polar channel
 coupling** (a correlated stereo pair encodes −32 % vs dual-mono at
-equal SNR) included — behind one quality scalar, black-box verified
-(a switched `q = 0.7` encode decodes through ffmpeg to the exact
-declared duration, agreeing with the crate's own decoder to 134 dB /
-max sample delta 2.1 × 10⁻⁷). `register()` installs the codec —
+equal SNR) included — behind one quality scalar, with the wire-format
+entropy (residue classwords, floor-post codewords, value books)
+trained per stream, black-box verified: seven encoder outputs
+(mono/stereo, scalar and 2-D-lattice value books, real-audio
+re-encodes with block switching) decode through ffmpeg to the exact
+declared frame counts at SNRs matching the crate's own decoder (a
+switched `q = 0.7` encode agrees with it to 134 dB / max sample delta
+2.1 × 10⁻⁷; the staged mono-q5 corpus re-encodes at 47.1 dB /
+×1.27 of the reference stream's bytes). `register()` installs the codec —
 decoder and encoder factories plus the Matroska `A_VORBIS` tag —
 into `oxideav_core::RuntimeContext`, and the dual-API endpoints
 `decoder::make_decoder` / `encoder::make_encoder` are directly
@@ -460,6 +465,27 @@ reduces to optimal length assignment plus VQ value placement:
   `value_bits`-wide multiplicand grid whose `minimum` / `delta` are
   rounded to §9.2.2-packable floats, wrapped as a write-ready
   tessellation lookup.
+- **Multi-dimensional VQ codebook design** (`design_vq_codebook`) —
+  the joint-quantisation upgrade: a `dims`-dimensional lookup-type-2
+  book from a flat corpus of residue sub-vectors by the classic
+  split-and-refine construction (deterministic highest-distortion
+  cell splitting, nearest-neighbour/centroid fixed-point refinement
+  with starved-cell re-seeding), centroids snapped onto one shared
+  §9.2.2-packable grid, **sparse occupancy-optimal codeword lengths**
+  from the final cell populations. Per-component MSE is reported
+  against the snapped book; on a correlated-pair corpus the dim-2
+  design at equal bits/component clears half the scalar ladder's MSE.
+  Composes with the closed-loop trainer (whose centroid ladder step
+  is dimension-generic).
+- **Interoperable lattice variant**
+  (`design_lattice_vq_codebook` + `uniform_value_ladder`) — the same
+  joint-occupancy length training over a §3.2.1 **lookup-type-1**
+  product grid (a caller-supplied shared scalar ladder), the codebook
+  shape widely deployed decoders accept: black-box, a common
+  reference decoder binary rejects lookup type 2 outright, so this is
+  the form the integrated encoder carries on the wire. Sparse or
+  dense length policy (dense for subsample-designed seeds, so no
+  grid cell the full stream reaches is ever pruned).
 - **Whole-stream capstone** (`tests/trained_stream_roundtrip.rs`) — a
   20-frame mono PCM corpus through the full §4.3 audio-packet writer,
   floor + residue emissions tallied together, the entire codebook
@@ -677,9 +703,21 @@ edges included), the bare §4.3.7 forward MDCT at the derived `4/n`
 unity-reconstruction scale, per-channel psychoacoustics, per-size
 floor-1 design/fit, the gated §4.3.5 forward channel coupling,
 NMR-weighted RD residue planning, §9.2.2-packable lattice value
-ladders, the three §4.2 header writers and the §A.2 encapsulation with
-the mixed-size `(n_prev + n_cur)/4` granule walk end-trimmed to the
-exact input length — all behind the one `quality ∈ [0, 1]` scalar.
+ladders (or, behind the `vq_dims = 2` knob, corpus-designed 2-D
+lookup-type-1 lattice books — `design_lattice_vq_codebook` over the
+stream's own residue sub-vectors with jointly-trained codeword
+lengths, at strict rate/SNR parity with the scalar ladders), the
+three §4.2 header writers and the
+§A.2 encapsulation with the mixed-size `(n_prev + n_cur)/4` granule
+walk end-trimmed to the exact input length — all behind the one
+`quality ∈ [0, 1]` scalar. The wire-format entropy is trained per
+stream: the residue classbook groups **four partitions per §8.6.2
+classword** and, after the final rate-distortion plans are made, both
+the classword lengths and the §7.2.3 **floor-post book lengths** are
+retrained occupancy-optimal for the exact emissions the packets make
+(dense policy — decode-identical PCM, strictly fewer bits; measured
+−8.7 % / −10.8 % / −10.0 % on the staged mono-q5 / stereo-q5 /
+transient corpus at identical PCM).
 `decode_ogg_to_pcm` is the inverse convenience (de-frame, header
 parse, streaming decode, end-trim). `tests/ogg_encode_roundtrip.rs`
 pins the §A.2 structure of the produced stream and the round-trip
@@ -772,12 +810,19 @@ the §1.3.2 mechanism).
   loudness-adaptive, and the block schedule is decided on a channel
   mixdown, so a transient confined to one channel of an uncoupled pair
   still switches both.
-- **The re-encoded rate trails the reference corpus** — re-encoding the
-  staged `q5` fixtures' PCM at the default quality spends ~1.4–1.6× the
-  original stream's bytes (`tests/fixture_reencode.rs` measurements):
-  the residue books are 1-D trained lattices, not the multi-dimensional
-  trained VQ tessellations a mature encoder ships. Multi-dim residue
-  book design is the natural next rate frontier.
+- **The re-encoded rate trails the reference corpus** — re-encoding
+  the staged fixtures' PCM at the default quality spends ~1.3–1.5×
+  the original stream's bytes (mono-q5 ×1.27, stereo-q5 ×1.47,
+  transient ×1.28 after the trained classword + floor-post entropy).
+  The 2-D designed lattice books (`vq_dims = 2`, black-box
+  interoperable — lookup type 2 is rejected outright by a common
+  reference decoder binary, so the wire carries type 1) hold strict
+  parity with the scalar ladders but do not yet *win*: making joint
+  books pay needs a per-partition residue **class ladder**
+  (intermediate cascade densities — the reference streams carry 10
+  classes) with the quality→lambda map recalibrated for it, plus
+  `residue_end` band-limiting and a long-block partition size of 32.
+  Those are the remaining rate levers.
 
 ## Clean-room provenance
 
