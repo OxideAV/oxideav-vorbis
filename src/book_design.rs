@@ -232,6 +232,21 @@ pub enum BookDesignError {
         /// The multiplicand width.
         value_bits: u8,
     },
+    /// [`design_vq_codebook`]: `dims` was zero — a VQ book quantises
+    /// `dims`-element sub-vectors, so it needs at least one dimension.
+    ZeroVqDimensions,
+    /// [`design_vq_codebook`]: `entries` was zero — a codebook needs
+    /// at least one entry (§3.2.1 / errata 20150226 admit a
+    /// single-entry book, never an empty one).
+    ZeroEntries,
+    /// [`design_vq_codebook`]: the flat training corpus does not split
+    /// into whole `dims`-element vectors.
+    TrainingNotVectorAligned {
+        /// `training.len()`.
+        len: usize,
+        /// The requested vector dimensionality.
+        dims: usize,
+    },
 }
 
 impl fmt::Display for BookDesignError {
@@ -346,6 +361,16 @@ impl fmt::Display for BookDesignError {
             BookDesignError::LevelsExceedValueBits { levels, value_bits } => write!(
                 f,
                 "vorbis book design: {levels} levels cannot be addressed by {value_bits}-bit multiplicands"
+            ),
+            BookDesignError::ZeroVqDimensions => {
+                write!(f, "vorbis book design: a VQ book needs dims >= 1")
+            }
+            BookDesignError::ZeroEntries => {
+                write!(f, "vorbis book design: a codebook needs at least one entry")
+            }
+            BookDesignError::TrainingNotVectorAligned { len, dims } => write!(
+                f,
+                "vorbis book design: training corpus of {len} scalars does not split into whole {dims}-element vectors"
             ),
         }
     }
@@ -1771,6 +1796,346 @@ pub fn design_value_ladder(
         multiplicands,
         value_bits,
         mse,
+    })
+}
+
+/// A designed multi-dimensional §3.2.1 VQ value book, produced by
+/// [`design_vq_codebook`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct VqCodebookDesign {
+    /// The write-ready codebook: a `dims`-dimensional lookup-type-2
+    /// (tessellation) value table on a §9.2.2-packable
+    /// `minimum/delta` grid, with occupancy-trained **sparse**
+    /// codeword lengths (`crate::encoder::write_codebook` accepts it
+    /// and `crate::codebook::parse_codebook` reproduces it).
+    pub codebook: VorbisCodebook,
+    /// Per-**component** mean squared quantisation error of the
+    /// training corpus against the final (grid-snapped) book — the
+    /// reconstruction points a decoder will actually produce, not the
+    /// ideal centroids. Comparable across dimensionalities.
+    pub mse: f64,
+    /// How many entries carry a codeword (nonzero training
+    /// occupancy). At most `min(entries, training vector count)`.
+    pub used_entries: usize,
+}
+
+/// Design a multi-dimensional §3.2.1 VQ value codebook from a training
+/// corpus of `dims`-element sub-vectors — the joint-quantisation
+/// upgrade over the scalar [`design_value_ladder`].
+///
+/// `training` is the flat corpus: every consecutive run of `dims`
+/// scalars is one training vector (exactly the sub-vectors a §8.6.2
+/// residue cascade stage hands a `dims`-dimensional value book — the
+/// §8.6.3 strided gather for format 0, the §8.6.4 contiguous gather
+/// for formats 1/2). The designer places `entries` reconstruction
+/// vectors by the classic split-and-refine vector-quantiser design:
+///
+/// 1. start from the corpus centroid;
+/// 2. repeatedly **split** the highest-distortion cells (each centroid
+///    perturbed ± a per-component step scaled to its cell's spread)
+///    and re-run the nearest-neighbour / centroid-update fixed-point
+///    iteration until the target entry count is reached — every step
+///    deterministic, no randomness (ties to the lower entry index, a
+///    starved cell re-seeded at its farthest corpus vector);
+/// 3. snap the converged centroids onto one shared
+///    `value_bits`-wide multiplicand grid whose `minimum` / `delta`
+///    are §9.2.2-packable ([`float32_pack`] accepts them, so
+///    `crate::encoder::write_codebook` carries the table exactly);
+/// 4. assign **sparse, occupancy-optimal codeword lengths**
+///    ([`design_codeword_lengths`] over the final cell populations):
+///    a dense cell codes short, a starved cell long, an empty cell is
+///    [`UNUSED_ENTRY`] (no codeword — [`crate::vq::quantize_vector`]
+///    never selects it).
+///
+/// Requesting more `entries` than there are distinct training vectors
+/// simply leaves the surplus entries unused. The returned
+/// [`VqCodebookDesign::mse`] is measured per component against the
+/// snapped book, so a `dims = 2` design is directly comparable to a
+/// scalar ladder over the same corpus.
+///
+/// # Errors
+///
+/// * [`BookDesignError::ZeroVqDimensions`] — `dims == 0`.
+/// * [`BookDesignError::ZeroEntries`] — `entries == 0`.
+/// * [`BookDesignError::EmptyTraining`] — empty corpus.
+/// * [`BookDesignError::NonFiniteTraining`] — a NaN/infinite sample.
+/// * [`BookDesignError::TrainingNotVectorAligned`] — `training.len()`
+///   is not a multiple of `dims`.
+/// * [`BookDesignError::InvalidValueBits`] — `value_bits` outside
+///   `1..=16` (§3.2.1 stores `value_bits − 1` in 4 bits).
+/// * [`BookDesignError::InvalidMaxLength`] — `max_len` outside
+///   `1..=32`.
+///
+/// [`float32_pack`]: crate::codebook::float32_pack
+pub fn design_vq_codebook(
+    training: &[f32],
+    dims: u16,
+    entries: u32,
+    value_bits: u8,
+    max_len: u8,
+) -> Result<VqCodebookDesign, BookDesignError> {
+    if dims == 0 {
+        return Err(BookDesignError::ZeroVqDimensions);
+    }
+    if entries == 0 {
+        return Err(BookDesignError::ZeroEntries);
+    }
+    if training.is_empty() {
+        return Err(BookDesignError::EmptyTraining);
+    }
+    if let Some(index) = training.iter().position(|v| !v.is_finite()) {
+        return Err(BookDesignError::NonFiniteTraining { index });
+    }
+    let d = dims as usize;
+    if training.len() % d != 0 {
+        return Err(BookDesignError::TrainingNotVectorAligned {
+            len: training.len(),
+            dims: d,
+        });
+    }
+    if !(1..=16).contains(&value_bits) {
+        return Err(BookDesignError::InvalidValueBits { value_bits });
+    }
+    if !(1..=MAX_CODEWORD_LEN).contains(&max_len) {
+        return Err(BookDesignError::InvalidMaxLength { max_len });
+    }
+
+    let nvec = training.len() / d;
+    let vec_at = |i: usize| &training[i * d..(i + 1) * d];
+    // A codeword must exist for every used entry, so the used-cell
+    // count is capped by the codeword space (relevant only for tiny
+    // `max_len`) and by the corpus size (more cells than vectors can
+    // never all be populated).
+    let addressable_codewords = if max_len >= 24 {
+        usize::MAX
+    } else {
+        1usize << max_len
+    };
+    let k_target = (entries as usize).min(nvec).min(addressable_codewords);
+
+    // ---- split-and-refine centroid placement (f64 throughout). ----
+    let mut centers: Vec<f64> = vec![0.0; d];
+    for i in 0..nvec {
+        for (dst, &s) in centers.iter_mut().zip(vec_at(i)) {
+            *dst += f64::from(s);
+        }
+    }
+    for c in centers.iter_mut() {
+        *c /= nvec as f64;
+    }
+
+    let mut assign = vec![0usize; nvec];
+    // One refine pass: nearest-centroid assignment + centroid update,
+    // starved cells re-seeded at the farthest-from-centroid vectors.
+    // Returns (total distortion, per-cell distortion, per-cell count).
+    let refine_pass =
+        |centers: &mut Vec<f64>, assign: &mut Vec<usize>| -> (f64, Vec<f64>, Vec<usize>) {
+            let k = centers.len() / d;
+            let mut cell_err = vec![0.0f64; k];
+            let mut sums = vec![0.0f64; k * d];
+            let mut counts = vec![0usize; k];
+            let mut worst: Vec<(f64, usize)> = Vec::with_capacity(nvec);
+            for (i, slot) in assign.iter_mut().enumerate() {
+                let v = vec_at(i);
+                let mut best = f64::INFINITY;
+                let mut best_c = 0usize;
+                for c in 0..k {
+                    let mut dist = 0.0f64;
+                    for (j, &s) in v.iter().enumerate() {
+                        let delta = f64::from(s) - centers[c * d + j];
+                        dist += delta * delta;
+                        if dist >= best {
+                            break;
+                        }
+                    }
+                    // Strict `<` keeps the lowest index on an exact tie.
+                    if dist < best {
+                        best = dist;
+                        best_c = c;
+                    }
+                }
+                *slot = best_c;
+                cell_err[best_c] += best;
+                counts[best_c] += 1;
+                for (j, &s) in v.iter().enumerate() {
+                    sums[best_c * d + j] += f64::from(s);
+                }
+                worst.push((best, i));
+            }
+            // Centroid update for populated cells.
+            for c in 0..k {
+                if counts[c] > 0 {
+                    for j in 0..d {
+                        centers[c * d + j] = sums[c * d + j] / counts[c] as f64;
+                    }
+                }
+            }
+            // Starved cells: re-seed each at a distinct worst-quantised
+            // corpus vector (largest error first) — the classic rescue.
+            if counts.contains(&0) {
+                worst.sort_by(|a, b| b.0.partial_cmp(&a.0).expect("finite").then(a.1.cmp(&b.1)));
+                let mut take = worst.iter();
+                for c in 0..k {
+                    if counts[c] == 0 {
+                        if let Some(&(_, i)) = take.next() {
+                            for (j, &s) in vec_at(i).iter().enumerate() {
+                                centers[c * d + j] = f64::from(s);
+                            }
+                        }
+                    }
+                }
+            }
+            (cell_err.iter().sum(), cell_err, counts)
+        };
+
+    let lloyd = |centers: &mut Vec<f64>, assign: &mut Vec<usize>| -> (f64, Vec<f64>, Vec<usize>) {
+        let mut last = f64::INFINITY;
+        let mut out = refine_pass(centers, assign);
+        for _ in 0..24 {
+            if out.0 <= 0.0 || (last - out.0) <= 1e-9 * last.max(1e-30) {
+                break;
+            }
+            last = out.0;
+            out = refine_pass(centers, assign);
+        }
+        out
+    };
+
+    // Corpus per-component span, the split-perturbation fallback scale.
+    let mut span = vec![0.0f64; d];
+    for (j, out) in span.iter_mut().enumerate() {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for i in 0..nvec {
+            let s = f64::from(vec_at(i)[j]);
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+        *out = hi - lo;
+    }
+
+    let (mut total_err, mut cell_err, mut counts) = lloyd(&mut centers, &mut assign);
+    // A fully-degenerate corpus (every vector identical, `total_err`
+    // already 0) never separates: splitting would only produce
+    // starved duplicates, so surplus entries stay unused.
+    while total_err > 0.0 && centers.len() / d < k_target {
+        let k = centers.len() / d;
+        let budget = k_target - k;
+        // Split the highest-distortion cells first (each split adds
+        // one centroid), up to the remaining budget.
+        let mut order: Vec<usize> = (0..k).collect();
+        order.sort_by(|&a, &b| {
+            cell_err[b]
+                .partial_cmp(&cell_err[a])
+                .expect("finite")
+                .then(a.cmp(&b))
+        });
+        for &c in order.iter().take(budget) {
+            // Per-component step: the cell's spread where measurable,
+            // else a small fraction of the corpus span (a point cell
+            // in a non-degenerate corpus still separates).
+            let mut child: Vec<f64> = Vec::with_capacity(d);
+            let spread = if counts[c] > 0 {
+                (cell_err[c] / (counts[c] as f64 * d as f64)).sqrt()
+            } else {
+                0.0
+            };
+            for j in 0..d {
+                let step = if spread > 0.0 {
+                    spread * 0.5
+                } else {
+                    span[j] * 1e-3
+                };
+                child.push(centers[c * d + j] + step);
+                centers[c * d + j] -= step;
+            }
+            centers.extend_from_slice(&child);
+        }
+        (total_err, cell_err, counts) = lloyd(&mut centers, &mut assign);
+    }
+    let k = centers.len() / d;
+
+    // ---- snap the centroids onto one shared multiplicand grid. ----
+    let addressable = 1u64 << value_bits;
+    let lo = centers.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = centers.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (minimum_value, delta_value) = if hi - lo <= 0.0 {
+        (pack_nearest(lo as f32), 0.0f32)
+    } else {
+        let raw_delta = ((hi - lo) / (addressable - 1) as f64) as f32;
+        (
+            pack_nearest(lo as f32),
+            pack_nearest(raw_delta).max(f32::MIN_POSITIVE),
+        )
+    };
+    let snap = |v: f64| -> u32 {
+        if delta_value == 0.0 {
+            0
+        } else {
+            let m = ((v - f64::from(minimum_value)) / f64::from(delta_value)).round();
+            (m.max(0.0) as u64).min(addressable - 1) as u32
+        }
+    };
+    let mut multiplicands: Vec<u32> = centers.iter().map(|&c| snap(c)).collect();
+    // Surplus entries past the designed centroids carry the grid
+    // origin; they get no codeword below, so their value is inert.
+    multiplicands.resize(entries as usize * d, 0);
+
+    // ---- occupancy-optimal sparse codeword lengths. ----
+    // Re-assign against the *snapped* reconstruction points so the
+    // occupancy (and the reported MSE) describe the book as decoded.
+    let points: Vec<f64> = multiplicands
+        .iter()
+        .map(|&m| f64::from(m) * f64::from(delta_value) + f64::from(minimum_value))
+        .collect();
+    let mut freqs = vec![0u64; entries as usize];
+    let mut err = 0.0f64;
+    for i in 0..nvec {
+        let v = vec_at(i);
+        let mut best = f64::INFINITY;
+        let mut best_e = 0usize;
+        for e in 0..k {
+            let mut dist = 0.0f64;
+            for (j, &s) in v.iter().enumerate() {
+                let delta = f64::from(s) - points[e * d + j];
+                dist += delta * delta;
+                if dist >= best {
+                    break;
+                }
+            }
+            if dist < best {
+                best = dist;
+                best_e = e;
+            }
+        }
+        freqs[best_e] += 1;
+        err += best;
+    }
+    let codeword_lengths = design_codeword_lengths(&freqs, max_len)?;
+    let used_entries = codeword_lengths
+        .iter()
+        .filter(|&&l| l != UNUSED_ENTRY)
+        .count();
+    let mse = err / (nvec as f64 * d as f64);
+
+    debug_assert!(crate::codebook::float32_pack(minimum_value).is_some());
+    debug_assert!(crate::codebook::float32_pack(delta_value).is_some());
+
+    Ok(VqCodebookDesign {
+        codebook: VorbisCodebook {
+            dimensions: dims,
+            entries,
+            codeword_lengths,
+            lookup: VqLookup::Tessellation {
+                minimum_value,
+                delta_value,
+                value_bits,
+                sequence_p: false,
+                multiplicands,
+            },
+        },
+        mse,
+        used_entries,
     })
 }
 
@@ -3230,5 +3595,258 @@ mod tests {
         let designed_cost = stream_cost_bits(&lengths, &freqs).unwrap();
         let total: u64 = freqs.iter().sum();
         assert!(designed_cost < total * 12, "must beat the flat 12-bit code");
+    }
+
+    // ----------------------------------------------------------------
+    // design_vq_codebook — the multi-dimensional VQ designer.
+    // ----------------------------------------------------------------
+
+    /// Deterministic correlated-pair corpus: the second component
+    /// tracks the first (`y ≈ 0.9·x`), the shape a joint quantiser
+    /// exploits and a per-scalar ladder cannot.
+    fn correlated_pairs(n: usize) -> Vec<f32> {
+        let mut rng = Rng(0x5eed_600d);
+        let mut out = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            let x = ((rng.next() % 2001) as f32 - 1000.0) / 250.0;
+            let wiggle = ((rng.next() % 201) as f32 - 100.0) / 1000.0;
+            out.push(x);
+            out.push(0.9 * x + wiggle);
+        }
+        out
+    }
+
+    /// The joint dim-2 book must beat the scalar ladder at equal
+    /// bits/component on correlated data: 16 dim-2 entries (≤ 2
+    /// bits/component uniform) against a 4-level scalar ladder
+    /// (exactly 2 bits/component).
+    #[test]
+    fn vq_book_beats_scalar_ladder_on_correlated_pairs() {
+        let corpus = correlated_pairs(600);
+        let vq = design_vq_codebook(&corpus, 2, 16, 8, 16).expect("designs");
+        let ladder = design_value_ladder(&corpus, 4, 8).expect("designs");
+        assert!(
+            vq.mse < ladder.mse * 0.5,
+            "joint VQ mse {} must clear half the scalar-ladder mse {}",
+            vq.mse,
+            ladder.mse
+        );
+        assert!(vq.used_entries >= 2);
+    }
+
+    /// The designed book is §3.2.1 carriage-legal and decodes: it
+    /// serialises through `write_codebook`, parses back identically,
+    /// builds a Huffman tree, and every used entry unpacks to the
+    /// snapped grid values (`quantize_vector` agrees bit-for-bit).
+    #[test]
+    fn designed_vq_book_is_carriage_legal_and_decodes() {
+        use crate::encoder::write_codebook;
+        use oxideav_core::bits::BitReaderLsb;
+        let corpus = correlated_pairs(300);
+        let vq = design_vq_codebook(&corpus, 2, 12, 6, 16).expect("designs");
+        let book = &vq.codebook;
+        assert_eq!(book.dimensions, 2);
+        assert_eq!(book.entries, 12);
+        assert!(crate::codebook::float32_pack(min_of(book)).is_some());
+        assert!(crate::codebook::float32_pack(delta_of(book)).is_some());
+
+        let bytes = write_codebook(book).expect("writes");
+        let mut r = BitReaderLsb::new(&bytes);
+        let parsed = crate::codebook::parse_codebook(&mut r).expect("parses");
+        assert_eq!(&parsed, book, "carriage round-trip");
+        HuffmanTree::from_lengths(&book.codeword_lengths).expect("builds");
+
+        // Every training vector quantises to a used entry whose
+        // reconstruction is exactly the §3.2.1 unpack of that entry.
+        for pair in corpus.chunks(2).take(32) {
+            let q = crate::vq::quantize_vector(book, pair).expect("quantises");
+            assert_ne!(book.codeword_lengths[q.entry as usize], UNUSED_ENTRY);
+            let unpacked = crate::vq::unpack_vector(book, q.entry).expect("unpacks");
+            assert_eq!(q.vector, unpacked);
+        }
+    }
+
+    fn min_of(book: &VorbisCodebook) -> f32 {
+        match &book.lookup {
+            VqLookup::Tessellation { minimum_value, .. } => *minimum_value,
+            _ => panic!("designed book must be a tessellation"),
+        }
+    }
+
+    fn delta_of(book: &VorbisCodebook) -> f32 {
+        match &book.lookup {
+            VqLookup::Tessellation { delta_value, .. } => *delta_value,
+            _ => panic!("designed book must be a tessellation"),
+        }
+    }
+
+    /// Occupancy-driven lengths: a corpus with most of its mass in one
+    /// tight cluster gives that cluster's entry a strictly shorter
+    /// codeword than a rare cluster's (three clusters — a two-entry
+    /// book has no length freedom, Kraft forces 1 + 1).
+    #[test]
+    fn vq_book_lengths_follow_occupancy() {
+        let mut corpus = Vec::new();
+        for i in 0..84 {
+            let eps = (i % 7) as f32 * 1e-3;
+            corpus.extend_from_slice(&[1.0 + eps, 1.0 - eps]);
+        }
+        for i in 0..8 {
+            let eps = (i % 5) as f32 * 1e-3;
+            corpus.extend_from_slice(&[-3.0 - eps, -3.0 + eps]);
+        }
+        for i in 0..8 {
+            let eps = (i % 3) as f32 * 1e-3;
+            corpus.extend_from_slice(&[5.0 + eps, -5.0 - eps]);
+        }
+        let vq = design_vq_codebook(&corpus, 2, 3, 8, 16).expect("designs");
+        let book = &vq.codebook;
+        assert_eq!(vq.used_entries, 3);
+        // Identify the entry nearest each cluster.
+        let dense = crate::vq::quantize_vector(book, &[1.0, 1.0]).expect("quantises");
+        let rare = crate::vq::quantize_vector(book, &[-3.0, -3.0]).expect("quantises");
+        assert_ne!(dense.entry, rare.entry, "clusters must separate");
+        assert!(
+            book.codeword_lengths[dense.entry as usize]
+                < book.codeword_lengths[rare.entry as usize],
+            "dense cluster must code shorter: {:?}",
+            book.codeword_lengths
+        );
+    }
+
+    /// Surplus entries (more entries than distinct training vectors)
+    /// are unused: no codeword, never selected by the quantiser.
+    #[test]
+    fn vq_book_surplus_entries_are_unused() {
+        let corpus = [1.0f32, 2.0, -1.0, -2.0, 1.0, 2.0]; // 3 vectors, 2 distinct
+        let vq = design_vq_codebook(&corpus, 2, 8, 8, 16).expect("designs");
+        assert!(vq.used_entries <= 3);
+        assert!(
+            vq.codebook
+                .codeword_lengths
+                .iter()
+                .filter(|&&l| l == UNUSED_ENTRY)
+                .count()
+                >= 5
+        );
+        // Captured to within the shared multiplicand grid's resolution
+        // (span 4 over 255 rungs ≈ 1.6e-2 per component).
+        let q = crate::vq::quantize_vector(&vq.codebook, &[1.0, 2.0]).expect("quantises");
+        assert!(
+            q.distance_sq < 1e-3,
+            "distinct vectors must be captured to grid resolution: {}",
+            q.distance_sq
+        );
+    }
+
+    /// A fully-degenerate (constant) corpus designs the errata
+    /// single-used-entry book: length 1, near-zero MSE.
+    #[test]
+    fn vq_book_constant_corpus_designs_single_entry() {
+        let corpus = [0.75f32; 24];
+        let vq = design_vq_codebook(&corpus, 4, 16, 8, 16).expect("designs");
+        assert_eq!(vq.used_entries, 1);
+        let used: Vec<usize> = vq
+            .codebook
+            .codeword_lengths
+            .iter()
+            .enumerate()
+            .filter(|(_, &l)| l != UNUSED_ENTRY)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(vq.codebook.codeword_lengths[used[0]], 1, "errata 20150226");
+        assert!(vq.mse < 1e-9, "constant corpus must reconstruct exactly");
+    }
+
+    /// Dimensionality sweep: the designer stays healthy across the
+    /// dims a §8.6.2 cascade stage would use, and MSE (per component)
+    /// never explodes as dims grow at a fixed entry budget.
+    #[test]
+    fn vq_book_dims_sweep_stays_finite() {
+        let corpus = correlated_pairs(512); // 1024 scalars
+        for dims in [1u16, 2, 4, 8] {
+            let vq = design_vq_codebook(&corpus, dims, 32, 8, 16).expect("designs");
+            assert!(vq.mse.is_finite());
+            assert!(vq.used_entries >= 1);
+            assert_eq!(
+                vq.codebook.entries as usize * dims as usize,
+                match &vq.codebook.lookup {
+                    VqLookup::Tessellation { multiplicands, .. } => multiplicands.len(),
+                    _ => 0,
+                }
+            );
+        }
+    }
+
+    /// Input validation: every malformed request is refused with its
+    /// typed error.
+    #[test]
+    fn vq_book_input_validation() {
+        assert_eq!(
+            design_vq_codebook(&[1.0, 2.0], 0, 4, 8, 16),
+            Err(BookDesignError::ZeroVqDimensions)
+        );
+        assert_eq!(
+            design_vq_codebook(&[1.0, 2.0], 2, 0, 8, 16),
+            Err(BookDesignError::ZeroEntries)
+        );
+        assert_eq!(
+            design_vq_codebook(&[], 2, 4, 8, 16),
+            Err(BookDesignError::EmptyTraining)
+        );
+        assert_eq!(
+            design_vq_codebook(&[1.0, f32::NAN], 2, 4, 8, 16),
+            Err(BookDesignError::NonFiniteTraining { index: 1 })
+        );
+        assert_eq!(
+            design_vq_codebook(&[1.0, 2.0, 3.0], 2, 4, 8, 16),
+            Err(BookDesignError::TrainingNotVectorAligned { len: 3, dims: 2 })
+        );
+        assert_eq!(
+            design_vq_codebook(&[1.0, 2.0], 2, 4, 0, 16),
+            Err(BookDesignError::InvalidValueBits { value_bits: 0 })
+        );
+        assert_eq!(
+            design_vq_codebook(&[1.0, 2.0], 2, 4, 17, 16),
+            Err(BookDesignError::InvalidValueBits { value_bits: 17 })
+        );
+        assert_eq!(
+            design_vq_codebook(&[1.0, 2.0], 2, 4, 8, 0),
+            Err(BookDesignError::InvalidMaxLength { max_len: 0 })
+        );
+    }
+
+    /// The designed book composes with the closed-loop trainer: a
+    /// dim-2 designed book seeds a two-class residue, plans, and the
+    /// ladder trainer's Lagrangian stays monotone non-increasing.
+    #[test]
+    fn vq_designed_book_feeds_ladder_trainer() {
+        let corpus = correlated_pairs(64);
+        let vq = design_vq_codebook(&corpus, 2, 8, 8, 16).expect("designs");
+        let classbook = VorbisCodebook {
+            dimensions: 1,
+            entries: 2,
+            codeword_lengths: vec![1, 1],
+            lookup: VqLookup::None,
+        };
+        let mut stages: [Option<u8>; 8] = Default::default();
+        stages[0] = Some(1);
+        let header = crate::setup::ResidueHeader {
+            residue_type: 1,
+            residue_begin: 0,
+            residue_end: 16,
+            partition_size: 8,
+            classifications: 2,
+            classbook: 0,
+            cascade: vec![0, 0b1],
+            books: vec![Default::default(), stages],
+        };
+        let books = vec![classbook, vq.codebook];
+        let residuals: Vec<Vec<f32>> = corpus.chunks(16).map(|c| c.to_vec()).collect();
+        let outcome =
+            train_residue_books_rd_ladder(&residuals, &header, &books, 0.05, 4).expect("trains");
+        for w in outcome.lagrangian_per_iteration.windows(2) {
+            assert!(w[1] <= w[0] + 1e-9, "monotone descent");
+        }
     }
 }

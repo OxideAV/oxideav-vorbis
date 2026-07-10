@@ -6,6 +6,28 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Multi-dimensional VQ residue codebook designer**
+  (`book_design::design_vq_codebook` + `VqCodebookDesign`): designs a
+  `dims`-dimensional §3.2.1 lookup-type-2 value book from a flat
+  corpus of residue sub-vectors by the classic split-and-refine
+  vector-quantiser construction — deterministic highest-distortion
+  cell splitting, nearest-neighbour/centroid fixed-point refinement
+  with starved-cell re-seeding, converged centroids snapped onto one
+  shared §9.2.2-packable `minimum/delta` multiplicand grid, and
+  **sparse occupancy-optimal codeword lengths**
+  (`design_codeword_lengths` over the final cell populations, empty
+  cells left `UNUSED_ENTRY`). The per-component MSE is reported
+  against the snapped book, directly comparable to
+  `design_value_ladder`; on a correlated-pair corpus the dim-2 design
+  at equal bits/component clears half the scalar ladder's MSE. New
+  `BookDesignError::{ZeroVqDimensions, ZeroEntries,
+  TrainingNotVectorAligned}` variants type the new validation. The
+  designed books are carriage-legal (`write_codebook` →
+  `parse_codebook` identical), quantise through `vq::quantize_vector`
+  to their exact §3.2.1 unpacks, and compose with the closed-loop
+  `train_residue_books_rd_ladder` trainer (its centroid ladder step
+  was already dimension-generic).
+
 - **Energy-rise transient criterion + fixture-corpus re-encode.**
   `plan_block_sequence` gains a second, independent transient
   criterion (new `energy_rise_threshold` parameter): the lookahead's
