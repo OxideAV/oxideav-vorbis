@@ -18,16 +18,19 @@ container crate's RFC 3533 page transport, and the whole
 psychoacoustic / floor / residue encode stack — **§4.3.1 short/long
 block switching** (transient-scheduled short blocks, per-size setup
 entries, hybrid window edges) and gated **§4.3.5 square-polar channel
-coupling** (a correlated stereo pair encodes −32 % vs dual-mono at
+coupling** (a correlated stereo pair encodes −33 % vs dual-mono at
 equal SNR) included — behind one quality scalar, with the wire-format
 entropy (residue classwords, floor-post codewords, value books)
-trained per stream, black-box verified: seven encoder outputs
-(mono/stereo, scalar and 2-D-lattice value books, real-audio
-re-encodes with block switching) decode through ffmpeg to the exact
-declared frame counts at SNRs matching the crate's own decoder (a
-switched `q = 0.7` encode agrees with it to 134 dB / max sample delta
-2.1 × 10⁻⁷; the staged mono-q5 corpus re-encodes at 47.1 dB /
-×1.27 of the reference stream's bytes). `register()` installs the codec —
+trained per stream, and a **four-class residue ladder** (silence /
+joint 4-D noise book / coarse / coarse + fine) chosen per partition
+by the NMR-weighted rate-distortion planner — black-box verified:
+swept encoder outputs (mono/stereo, real-audio re-encodes with block
+switching, `q ∈ {0.4, 0.7, 1.0}`) decode through ffmpeg to the exact
+declared frame counts at SNRs matching the crate's own decoder to
+0.01 dB (the staged mono-q5 corpus re-encodes monotonically from
+2.9 kB / 30.6 dB at `q = 0.4` through 7.1 kB / 41.6 dB at the
+default to 11.0 kB / 55.6 dB at `q = 1`, against the 6.1 kB
+reference stream). `register()` installs the codec —
 decoder and encoder factories plus the Matroska `A_VORBIS` tag —
 into `oxideav_core::RuntimeContext`, and the dual-API endpoints
 `decoder::make_decoder` / `encoder::make_encoder` are directly
@@ -542,20 +545,30 @@ alone) at least halves the final Lagrangian.
 
 **Quality targeting** (`quality` module) ties the levers to one
 scalar: `EncoderTuning::from_quality(q ∈ [0, 1])` expands to the
-residue `lambda` (log-linear `1.0 → 10⁻⁴`, pricing bits in
-noise-to-mask units under the weighted chooser), the psy margin
-(−12 → +12 dB) and the floor post budget (8 → 32), monotone by
-construction; `solve_lambda_for_bits` bisects any monotone
-`rate(lambda)` measurement to the cheapest lambda inside a bit
-budget. `tests/quality_rate_curve.rs` measures the whole stack on an
-8-frame stream: rate 488 → 776 → 2264 → 2480 → 2600 B, spectral SNR
-7.2 → 32.8 → 36.4 → 36.9 → 37.3 dB, and mean NMR 5.8 → 0.58 → 0.002 →
+residue `lambda` (log-linear `10⁻¹·⁴ → 10⁻⁴`, recalibrated for the
+four-class ladder — pricing bits in noise-to-mask units under the
+weighted chooser), the psy margin (−12 dB rising to a measured
+**+6 dB cap**: past it, the threshold-riding floor envelope drags
+onto `|X|` across the quiet bins and the full-scale residue targets
+quantise poorly — SNR stops rising while bytes climb), the floor
+post budget (8 → 32), and the **fine value-ladder divisor** (192
+through `q ≤ 0.7`, log-linear to 768 at `q = 1` — the top of the
+knob lowers the encoder's reconstruction noise floor instead of
+buying saturated-SNR density), all monotone by construction;
+`solve_lambda_for_bits` bisects any monotone `rate(lambda)`
+measurement to the cheapest lambda inside a bit budget.
+`tests/quality_rate_curve.rs` measures the lever stack on an 8-frame
+stream: rate 704 → 2048 → 2312 → 2528 → 2600 B, spectral SNR 32.7 →
+35.6 → 36.6 → 37.1 → 37.3 dB, and mean NMR 0.62 → 0.013 → 0.0006 →
 0.0005 → 0.0005 across `q ∈ {0, ¼, ½, ¾, 1}` — monotone in every
 metric, transparent at the top; the budget solver lands the real
-stream's halfway byte budget exactly (12 672 / 12 672 bits), and the
-ladder trainer composes with the psy stack — retraining the seed
-books on the psy targets cuts the stream 2 288 → 1 473 B (−36%) at
-unchanged NMR, the trained setup header §4.2.4 carriage-legal.
+stream's halfway byte budget, and the ladder trainer composes with
+the psy stack. `tests/encoder_quality_headroom.rs` pins the
+whole-encoder knob: rate and SNR monotone across
+`q ∈ {0.5, 0.7, 0.85, 1}` and `q = 1` clearing the default by
+≥ 6 dB — the regression guard for the two root causes above (the
+fixed fine ladder and the uncapped margin each made the top of the
+knob wobble around a saturated ceiling while bytes tripled).
 
 Two further integration tests close the encode→decode loop on the residue
 and the time domain. `tests/residue_cascade_roundtrip.rs` drives a real
@@ -697,35 +710,38 @@ pagination by 128–350 samples that the remux recovers).
 
 The **whole-stream encoder** (`oggfile` module) is the integrated
 `encode(pcm) → .ogg` path: `encode_pcm_to_ogg` (and its packet-level
-form `encode_pcm_to_packets`) composes the §4.3.1 block-size schedule,
-the §4.3.8-inverse framing splitter (per-frame §4.3.1 windows, hybrid
-edges included), the bare §4.3.7 forward MDCT at the derived `4/n`
+form `encode_pcm_to_packets`) composes the §4.3.1 block-size schedule
+(default `2048/256` — the staged corpus geometry), the §4.3.8-inverse
+framing splitter (per-frame §4.3.1 windows, hybrid edges included),
+the bare §4.3.7 forward MDCT at the derived `4/n`
 unity-reconstruction scale, per-channel psychoacoustics, per-size
-floor-1 design/fit, the gated §4.3.5 forward channel coupling,
-NMR-weighted RD residue planning, §9.2.2-packable lattice value
-ladders (or, behind the `vq_dims = 2` knob, corpus-designed 2-D
-lookup-type-1 lattice books — `design_lattice_vq_codebook` over the
-stream's own residue sub-vectors with jointly-trained codeword
-lengths, at strict rate/SNR parity with the scalar ladders), the
-three §4.2 header writers and the
-§A.2 encapsulation with the mixed-size `(n_prev + n_cur)/4` granule
-walk end-trimmed to the exact input length — all behind the one
-`quality ∈ [0, 1]` scalar. The wire-format entropy is trained per
-stream: the residue classbook groups **four partitions per §8.6.2
-classword** and, after the final rate-distortion plans are made, both
-the classword lengths and the §7.2.3 **floor-post book lengths** are
-retrained occupancy-optimal for the exact emissions the packets make
-(dense policy — decode-identical PCM, strictly fewer bits; measured
-−8.7 % / −10.8 % / −10.0 % on the staged mono-q5 / stereo-q5 /
-transient corpus at identical PCM).
+floor-1 design/fit, the gated §4.3.5 forward channel coupling, and
+NMR-weighted RD residue planning over a **four-class §8.6.1 ladder**
+per partition: silence, a joint **4-dimensional ternary noise book**
+(one codeword per four bins — near-threshold texture at a fraction
+of the scalar cost; designed per stream from its own quiet
+partitions), coarse-only, and the coarse + fine two-stage cascade.
+The residue partitions scale with the spectrum (16 short / 32 long);
+the value ladders are §9.2.2-packable (with the fine ladder's step
+following the quality knob — see below; `vq_dims = 2` swaps the
+cascade books for corpus-designed 2-D lookup-type-1 lattices), and
+the three §4.2 header writers plus §A.2 encapsulation carry the
+mixed-size `(n_prev + n_cur)/4` granule walk end-trimmed to the
+exact input length — all behind the one `quality ∈ [0, 1]` scalar.
+The wire-format entropy is trained per stream: the residue classbook
+groups **four partitions per §8.6.2 classword** and, after the final
+rate-distortion plans are made, both the classword lengths and the
+§7.2.3 **floor-post book lengths** are retrained occupancy-optimal
+for the exact emissions the packets make (dense policy —
+decode-identical PCM, strictly fewer bits).
 `decode_ogg_to_pcm` is the inverse convenience (de-frame, header
 parse, streaming decode, end-trim). `tests/ogg_encode_roundtrip.rs`
 pins the §A.2 structure of the produced stream and the round-trip
-fidelity; on a switched+coupled stereo transient corpus the knob
-sweeps 3.6 kB / 0 dB → 32.4 kB / 17.6 dB monotone across
-`q ∈ {0, ¼, ½, ¾, 1}`; black-box, a 1 s coupled stereo `q = 0.8`
-encode decodes through ffmpeg to exactly 44100 frames at **46.3 dB
-SNR** against the input.
+fidelity (knob spread 1.8 kB / 21.3 dB at `q = 0.2` → 5.4 kB /
+34.1 dB at `q = 0.9` on its tonal corpus; codebook training cuts a
+stream 15.2 → 8.1 kB at +3 dB); black-box, the swept fixture
+re-encodes decode through ffmpeg to their exact declared frame
+counts at SNRs matching the crate's own decoder to 0.01 dB.
 
 **§4.3.1 block switching** is wired through that whole chain
 (`tests/ogg_block_switching.rs`): `blocksize::plan_block_sequence`
@@ -741,14 +757,16 @@ FrameSplitter → OverlapAdd chain that reconstructs the input exactly),
 and codebook training chains the short- and long-block residue corpora
 over the shared ladders. Measured: on an attack-after-silence corpus,
 switching cuts the pre-attack noise energy beyond the short block's
-intrinsic `n0/2` reach by **220×** against a forced-long encode at
-equal quality; ffmpeg decodes a switched stream to the exact declared
-length, agreeing with the crate's own decoder to **134 dB**. The
-real-audio corpus re-encodes cleanly (`tests/fixture_reencode.rs`):
-the `transient-blocksize-switch` fixture schedules shorts at its
+intrinsic `n0/2` reach by **~180×** against a forced-long encode at
+equal quality; black-box, ffmpeg decodes the switched fixture
+re-encodes to their exact declared lengths at SNRs matching the
+crate's own decoder to 0.01 dB. The real-audio corpus re-encodes
+cleanly (`tests/fixture_reencode.rs`): the
+`transient-blocksize-switch` fixture schedules shorts at its
 noise-burst onset (the energy-rise criterion), steady music stays
-all-long at 47.1 dB, and the decorrelated stereo fixture is correctly
-left uncoupled — all end-trim-exact through the crate's own decoder.
+all-long at 41.6 dB at the default quality (55.6 dB at `q = 1`), and
+the decorrelated stereo fixture is correctly left uncoupled — all
+end-trim-exact through the crate's own decoder.
 
 **§4.3.5 channel coupling** is likewise wired
 (`tests/ogg_coupled_stream.rs`): adjacent channel pairs are gated on
@@ -758,8 +776,8 @@ kept steps land in every mapping and are forward-coupled over the
 residue targets (`X / rendered_floor`, the exact vectors the decoder
 inverse-couples), and each coupled pair's per-partition NMR weights
 merge to the element-wise max. Measured: a correlated stereo corpus at
-`q = 0.7` encodes to **14.0 kB coupled vs 20.6 kB dual-mono (−32 %)**
-at equal per-channel SNR (32.2 dB / 32.2 dB); an anti-correlated pair
+`q = 0.7` encodes to **12.4 kB coupled vs 18.6 kB dual-mono (−33 %)**
+at equal per-channel SNR (32.8 dB / 32.7 dB); an anti-correlated pair
 fails the gate and stays uncoupled; a 4-channel stream gates each pair
 independently.
 
@@ -810,19 +828,29 @@ the §1.3.2 mechanism).
   loudness-adaptive, and the block schedule is decided on a channel
   mixdown, so a transient confined to one channel of an uncoupled pair
   still switches both.
-- **The re-encoded rate trails the reference corpus** — re-encoding
-  the staged fixtures' PCM at the default quality spends ~1.3–1.5×
-  the original stream's bytes (mono-q5 ×1.27, stereo-q5 ×1.47,
-  transient ×1.28 after the trained classword + floor-post entropy).
-  The 2-D designed lattice books (`vq_dims = 2`, black-box
-  interoperable — lookup type 2 is rejected outright by a common
-  reference decoder binary, so the wire carries type 1) hold strict
-  parity with the scalar ladders but do not yet *win*: making joint
-  books pay needs a per-partition residue **class ladder**
-  (intermediate cascade densities — the reference streams carry 10
-  classes) with the quality→lambda map recalibrated for it, plus
-  `residue_end` band-limiting and a long-block partition size of 32.
-  Those are the remaining rate levers.
+- **The re-encoded audio rate still trails the reference corpus at
+  the knee.** Whole-file ratios flatter the comparison (the reference
+  streams carry ~3.9 kB of setup header against our ~0.9 kB); on
+  audio-packet bytes alone the default-quality re-encode spends
+  ~2.5–3× the reference stream's audio bytes at its measured SNR
+  (mono-q5: 6.1 kB vs 2.1 kB), and reaches audio-parity only near
+  `q ≈ 0.55–0.6` at ~35 dB. The remaining structural gap is residue
+  density on *loud* partitions: the coarse scalar book spends ~3.5
+  trained bits per bin where the reference's richer class set
+  (10 classes, per-band multi-dimensional books up to 8-D) spends
+  well under 1. Next levers: widen the class ladder with per-band
+  book assignments, wider joint books for the mid classes, and
+  `residue_end` band-limiting (the reference caps its long residue
+  at 960 of 1024 bins — worth a few classwords once classes are
+  cheap).
+- **The stereo quiet-channel top end trades against the +6 dB margin
+  cap.** The old uncapped margin (+12 dB at `q = 1`) pushed the psy
+  floor onto `|X|`, switching the encoder into waveform coding — on
+  the decorrelated stereo fixture that lifted the quiet channel's
+  `q = 1` SNR to ~56 dB at +37 % bytes; with the cap the min channel
+  reads ~31 dB (mean 43 dB, −30 % bytes vs the old encoder's top).
+  A per-channel (or content-adaptive) margin that deepens only where
+  waveform coding pays is the follow-up.
 
 ## Clean-room provenance
 
