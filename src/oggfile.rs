@@ -134,11 +134,16 @@ const RESIDUE_CLASSES: u32 = 4;
 const NOISE_BOOK_DIMS: u16 = 4;
 
 /// Scalar levels per dimension of the noise book's shared uniform
-/// ladder (entries = `levels^dims`, §3.2.1 lookup type 1). Five
-/// levels span `{−2s, −s, 0, s, 2s}`: enough to carry near-threshold
-/// texture, small enough that the 625-entry joint grid stays cheap to
-/// quantise and to carry in the setup header.
-const NOISE_BOOK_LEVELS: u32 = 5;
+/// ladder (entries = `levels^dims`, §3.2.1 lookup type 1). Three
+/// levels span `{−s, 0, s}` — a ternary texture code. Measured
+/// against a five-level (625-entry) variant on the staged corpus,
+/// ternary wins across the board: the 81-entry grid's occupancy
+/// concentrates (shorter trained codewords, −4…−11 % stream bytes at
+/// identical SNR through the low and middle of the knob), its
+/// codeword-length table costs ~300 B less setup header, and
+/// quantisation scans 8× fewer entries; what a ±2s reach carried
+/// better is instead picked up by the coarse classes.
+const NOISE_BOOK_LEVELS: u32 = 3;
 
 /// Partitions per §8.6.2 classword (the classbook's dimensions):
 /// grouping lets the trained classword lengths price a common run —

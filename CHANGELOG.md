@@ -18,8 +18,11 @@ All notable changes to `oxideav-vorbis` are recorded here.
     class 3 the coarse + fine two-stage cascade. The weighted
     rate-distortion chooser picks per partition; the noise book is
     designed per stream from its own quiet partitions
-    (`design_lattice_vq_codebook` over a five-level uniform ladder,
-    entries 5⁴, dense occupancy-trained lengths).
+    (`design_lattice_vq_codebook` over a ternary `{−s, 0, s}` uniform
+    ladder, entries 3⁴ = 81, dense occupancy-trained lengths —
+    measured better than a five-level 625-entry variant at every
+    tested knob point, with a ~300 B leaner setup header and 8× fewer
+    entries to scan).
   - The default long blocksize is **2048** (was 1024; short stays
     256), matching the staged corpus geometry: half the per-second
     packet overhead (floor fits, classwords, preludes) and double the
