@@ -186,6 +186,36 @@ fn steady_music_fixture_reencode_stays_long_at_high_fidelity() {
 }
 
 #[test]
+fn steady_music_fixture_top_of_knob_delivers_real_headroom() {
+    // Real-corpus pin of the round-413 headroom fix: under the old
+    // fixed fine ladder + uncapped margin, q = 1 on this corpus spent
+    // 22.7 kB for 47.6 dB (SNR saturated from the mid-knob); the
+    // quality-scaled ladder + capped margin reach well past 50 dB in
+    // materially fewer bytes.
+    if !fixtures_available() {
+        eprintln!("fixtures not staged; skipping");
+        return;
+    }
+    let (rate, pcm) = wav_pcm(&format!(
+        "{}/mono-44100-q5-typical/expected.wav",
+        fixtures_root()
+    ));
+    let mut config = StreamEncoderConfig::new(rate, 1);
+    config.quality = 1.0;
+    let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
+    let decoded = decode_ogg_to_pcm(&ogg).expect("decodes");
+    assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
+    let snr = snr_db(&pcm[0], &decoded.pcm[0]);
+    eprintln!("steady fixture q=1: {} B, SNR {snr:.2} dB", ogg.len());
+    assert!(snr >= 52.0, "q=1 SNR {snr:.2} dB below 52 dB");
+    assert!(
+        ogg.len() <= 14_000,
+        "q=1 spends {} B, above the 14 kB regression bound",
+        ogg.len()
+    );
+}
+
+#[test]
 fn decorrelated_stereo_fixture_reencode_stays_uncoupled() {
     if !fixtures_available() {
         eprintln!("fixtures not staged; skipping");
