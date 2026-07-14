@@ -34,8 +34,13 @@ pub struct EncoderTuning {
     /// The rate-distortion Lagrange multiplier for the residue
     /// choosers. In the perceptually weighted chooser the distortion
     /// term is on the noise-to-mask scale, so `lambda` prices bits in
-    /// audibility units: `1.0` at `q = 0` down to `10⁻⁴` at `q = 1`,
-    /// log-linear in between.
+    /// audibility units: `10⁻¹·⁴` at `q = 0` down to `10⁻⁴` at
+    /// `q = 1`, log-linear in between. (The law was recalibrated for
+    /// the four-class residue ladder: under the old `10⁰ → 10⁻⁴` law
+    /// the intermediate classes made the whole low half of the knob
+    /// collapse onto near-identical cheap plans and the `q ≈ 0.75`
+    /// step a cliff; 2.6 decades spread over the knob place each
+    /// measured rate point on its own step of the frontier.)
     pub lambda: f64,
     /// The masking-margin lever for
     /// [`crate::psy::PsyConfig::threshold_offset_db`]: −12 dB (coarse,
@@ -50,6 +55,20 @@ pub struct EncoderTuning {
     /// [`crate::psy::plan_psy_floor_envelope`] (constant `2`: the
     /// guard against inter-post floor dips is quality-independent).
     pub floor_smooth_radius: usize,
+    /// The **fine value-ladder divisor**: the integrated encoder's
+    /// second-stage residue book quantises with step
+    /// `max_abs / fine_step_divisor`, so this divisor sets the
+    /// encoder's reconstruction **noise floor** — the SNR ceiling no
+    /// amount of extra rate can pass. It is `192` through the low and
+    /// middle of the quality range and rises fourfold toward `768` at
+    /// `q = 1` (log-linear above `q = 0.7`), giving the top of the
+    /// knob genuine SNR headroom: with a fixed divisor the whole-
+    /// stream SNR *saturates* near `q ≈ 0.7` (the residue error is
+    /// pinned at the ladder step) and the further rate the falling
+    /// `lambda` buys only densifies class choices — measured SNR then
+    /// wobbles non-monotonically around the fixed ceiling while bytes
+    /// triple. Monotone non-decreasing in `q`.
+    pub fine_step_divisor: f32,
 }
 
 /// Errors from the quality → tuning map.
@@ -86,11 +105,15 @@ impl EncoderTuning {
         }
         let qf = f64::from(q);
         Ok(EncoderTuning {
-            // 10^0 = 1.0 at q=0 → 10^-4 at q=1.
-            lambda: 10f64.powf(-4.0 * qf),
+            // 10^-1.4 at q=0 → 10^-4 at q=1.
+            lambda: 10f64.powf(-1.4 - 2.6 * qf),
             threshold_offset_db: -12.0 + 24.0 * q,
             floor_post_budget: 8 + (24.0 * qf).round() as usize,
             floor_smooth_radius: 2,
+            // 192 up to q = 0.7, then log-linear to 4 × 192 = 768 at
+            // q = 1 — the top of the knob lowers the ladder noise
+            // floor instead of buying more saturated-SNR density.
+            fine_step_divisor: 192.0 * 4f32.powf(((q - 0.7) / 0.3).max(0.0)),
         })
     }
 }
@@ -269,13 +292,17 @@ mod tests {
     fn tuning_endpoints_are_pinned() {
         let lo = EncoderTuning::from_quality(0.0).unwrap();
         let hi = EncoderTuning::from_quality(1.0).unwrap();
-        assert!((lo.lambda - 1.0).abs() < 1e-12);
+        assert!((lo.lambda - 10f64.powf(-1.4)).abs() < 1e-12);
         assert!((hi.lambda - 1e-4).abs() < 1e-12);
         assert_eq!(lo.threshold_offset_db, -12.0);
         assert_eq!(hi.threshold_offset_db, 12.0);
         assert_eq!(lo.floor_post_budget, 8);
         assert_eq!(hi.floor_post_budget, 32);
         assert_eq!(lo.floor_smooth_radius, 2);
+        assert_eq!(lo.fine_step_divisor, 192.0);
+        let mid = EncoderTuning::from_quality(0.7).unwrap();
+        assert_eq!(mid.fine_step_divisor, 192.0);
+        assert!((hi.fine_step_divisor - 768.0).abs() < 1e-3);
     }
 
     #[test]
@@ -292,6 +319,10 @@ mod tests {
                 assert!(
                     t.floor_post_budget >= p.floor_post_budget,
                     "post budget never falls"
+                );
+                assert!(
+                    t.fine_step_divisor >= p.fine_step_divisor,
+                    "fine ladder resolution never falls"
                 );
             }
             prev = Some(t);

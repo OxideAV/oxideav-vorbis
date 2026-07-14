@@ -150,7 +150,11 @@ fn anti_correlated_stereo_fails_the_profitability_gate() {
     let right: Vec<f32> = left.iter().map(|&v| -v).collect();
     let pcm = vec![left, right];
 
-    let config = StreamEncoderConfig::new(RATE, 2);
+    // q = 0.8: the gate under test is quality-independent; the
+    // fidelity spot-check below wants a point past the recalibrated
+    // knob's mid-knee so the 20 dB bar has margin.
+    let mut config = StreamEncoderConfig::new(RATE, 2);
+    config.quality = 0.8;
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
     assert!(
         coupling_steps_of(&ogg, 2).is_empty(),

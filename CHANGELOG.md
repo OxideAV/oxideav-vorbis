@@ -4,7 +4,57 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
-### Fixed
+### Changed
+
+- **Encoder rate/quality overhaul: per-partition residue class
+  ladder, joint noise book, 2048-sample long blocks, size-scaled
+  partitions, and a recalibrated quality map.** Five co-designed
+  changes to the integrated encoder:
+  - The residue now carries a **four-class ladder** (§8.6.1
+    `classifications = 4`): class 0 silence, class 1 a **joint
+    4-dimensional low-amplitude "noise" book** (one codeword per four
+    bins — a scalar book charges a near-silent partition ≥ 16
+    codewords just to spell almost-nothing), class 2 coarse-only,
+    class 3 the coarse + fine two-stage cascade. The weighted
+    rate-distortion chooser picks per partition; the noise book is
+    designed per stream from its own quiet partitions
+    (`design_lattice_vq_codebook` over a five-level uniform ladder,
+    entries 5⁴, dense occupancy-trained lengths).
+  - The default long blocksize is **2048** (was 1024; short stays
+    256), matching the staged corpus geometry: half the per-second
+    packet overhead (floor fits, classwords, preludes) and double the
+    spectral resolution for steady content.
+  - The residue **partition size scales with the spectrum**: 32 for
+    ≥ 512-bin residues (long blocks), 16 below — the corpus streams'
+    own geometry; halves long-block classword count and planner work.
+  - The **fine value ladder follows the quality knob**
+    (`EncoderTuning::fine_step_divisor`: 192 through `q ≤ 0.7`,
+    log-linear to 768 at `q = 1`). Root cause of the old
+    non-monotone whole-stream SNR above `q ≈ 0.7`: the fixed
+    `max_abs/192` fine step pinned the reconstruction noise floor, so
+    the rate the falling `lambda` bought only densified class choices
+    while SNR wobbled around a fixed ~47 dB ceiling (bytes tripled
+    for +0.5 dB). The top of the knob now buys resolution: SNR is
+    monotone through `q = 1`.
+  - The **quality → lambda law is recalibrated** for the class ladder
+    (`10^(−1.4 − 2.6 q)`, was `10^(−4 q)`): with intermediate classes
+    available, the old law collapsed the knob's lower half onto
+    near-identical cheap plans and made `q ≈ 0.75` a cliff.
+
+  Measured on the staged real-audio corpus (whole-file bytes, SNR via
+  the crate's own decoder against `expected.wav`), old default →
+  new sweep: mono-q5 was 7763 B / 47.1 dB at `q = 0.7` with SNR
+  *saturated* (22 717 B / 47.6 dB at `q = 1`); now 7476 B / 41.6 dB at
+  `q = 0.7` rising monotonically to 13 413 B / **55.9 dB** at `q = 1`
+  (−41 % bytes and +8.4 dB against the old top), with the low knob
+  reaching 3210 B / 30.6 dB at `q = 0.4` (old: 4044 B / 24.5 dB).
+  Stereo-q5's mean SNR at `q = 1` rises 35.0 → 54.0 dB at −7 % bytes
+  (min-channel 33.1 → 52.1 dB); the switched transient corpus is
+  unchanged-to-better across the sweep. The produced setup headers
+  stay lean (~0.9–1.2 kB against the reference streams' ~3.9 kB). All
+  streams remain externally decodable: black-box, the produced
+  streams decode through a reference decoder binary to their exact
+  declared frame counts.
 
 - **Closed-loop trainers could prune a classword the planner later
   emits.** `train_residue_books_rd` / `train_residue_books_rd_ladder`

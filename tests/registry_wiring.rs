@@ -224,7 +224,7 @@ fn encoder_factory_options_and_guards() {
         "short_blocksize shape enforced"
     );
     let mut bad = encoder_params();
-    bad.options = bad.options.clone().set("short_blocksize", "2048");
+    bad.options = bad.options.clone().set("short_blocksize", "4096");
     assert!(
         make_encoder(&bad).is_err(),
         "an explicit short size above the long size is refused"

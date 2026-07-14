@@ -98,14 +98,14 @@ fn transient_corpus_switches_with_conformant_structure_and_granules() {
     let pcm = vec![transient_signal(samples)];
     let config = StreamEncoderConfig::new(RATE, 1);
     assert_eq!(config.short_blocksize, 256, "switching on by default");
-    assert_eq!(config.blocksize, 1024);
+    assert_eq!(config.blocksize, 2048);
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
     let packets = ogg_packets(&ogg).expect("de-frames");
 
     // ---- identification header carries the pair ----
     let id = parse_identification_header(&packets[0]).expect("id parses");
     assert_eq!(id.blocksize_0, 256);
-    assert_eq!(id.blocksize_1, 1024);
+    assert_eq!(id.blocksize_1, 2048);
 
     // ---- setup header: two modes, per-size floors/residues ----
     let setup = parse_setup_header(&packets[2], 1).expect("setup parses");
@@ -116,7 +116,7 @@ fn transient_corpus_switches_with_conformant_structure_and_granules() {
     assert_eq!(setup.residues.len(), 2);
     assert_eq!(setup.mappings.len(), 2);
     assert_eq!(setup.residues[0].residue_end, 128, "short residue at n0/2");
-    assert_eq!(setup.residues[1].residue_end, 512, "long residue at n1/2");
+    assert_eq!(setup.residues[1].residue_end, 1024, "long residue at n1/2");
 
     // ---- packet preludes: both flags present, window flags mirror ----
     let preludes = packet_preludes(&ogg);
@@ -132,7 +132,7 @@ fn transient_corpus_switches_with_conformant_structure_and_granules() {
     assert!(shorts > 0, "the attacks must force short blocks");
     assert!(longs > 0, "the steady beds must stay long");
     for (f, &(flag, n, prev_flag, next_flag)) in preludes.iter().enumerate() {
-        assert_eq!(n, if flag { 1024 } else { 256 });
+        assert_eq!(n, if flag { 2048 } else { 256 });
         if flag {
             // §4.3.1 step 4a: a long block's window flags mirror the
             // neighbour blockflags (stream edges take `true`).
@@ -285,7 +285,13 @@ fn all_transient_content_stays_all_short_and_roundtrips() {
         k += 300;
     }
     let input = vec![pcm];
-    let config = StreamEncoderConfig::new(RATE, 1);
+    // The impulse spacing (300 samples) is dense relative to a 1024
+    // lookahead (an impulse in every fourth-or-so 64-sample sub-frame
+    // keeps the peak-to-mean concentration high); the default 2048
+    // window would dilute the same train into quasi-steady content,
+    // so the test pins its long size explicitly.
+    let mut config = StreamEncoderConfig::new(RATE, 1);
+    config.blocksize = 1024;
     let ogg = encode_pcm_to_ogg(&input, &config).expect("encodes");
     let preludes = packet_preludes(&ogg);
     // Every interior packet is short; only the stream tail — whose
