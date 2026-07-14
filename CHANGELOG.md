@@ -43,21 +43,34 @@ All notable changes to `oxideav-vorbis` are recorded here.
     (`10^(−1.4 − 2.6 q)`, was `10^(−4 q)`): with intermediate classes
     available, the old law collapsed the knob's lower half onto
     near-identical cheap plans and made `q ≈ 0.75` a cliff.
+  - The **masking-margin lever is capped at +6 dB** (reached at
+    `q = 0.75`; the law was `−12 + 24 q` uncapped to +12). This is
+    the *second* root cause of the old non-monotone SNR: the psy
+    floor envelope rides `max(peak-held |X|, threshold)`, so pushing
+    the threshold ever lower drags the floor onto `|X|` across the
+    quiet bins and the residue targets `X/floor` approach full scale
+    — poorly served by ladders sized to the loud partitions. Measured
+    on a tonal corpus, offsets past +6 dB stopped buying SNR (+12
+    lost 0.35 dB while spending 4 % more bytes), and the mid-knob
+    dipped 5 dB at `q = 0.85`; capped, every measured sweep is
+    monotone.
 
   Measured on the staged real-audio corpus (whole-file bytes, SNR via
   the crate's own decoder against `expected.wav`), old default →
   new sweep: mono-q5 was 7763 B / 47.1 dB at `q = 0.7` with SNR
-  *saturated* (22 717 B / 47.6 dB at `q = 1`); now 7476 B / 41.6 dB at
-  `q = 0.7` rising monotonically to 13 413 B / **55.9 dB** at `q = 1`
-  (−41 % bytes and +8.4 dB against the old top), with the low knob
-  reaching 3210 B / 30.6 dB at `q = 0.4` (old: 4044 B / 24.5 dB).
-  Stereo-q5's mean SNR at `q = 1` rises 35.0 → 54.0 dB at −7 % bytes
-  (min-channel 33.1 → 52.1 dB); the switched transient corpus is
-  unchanged-to-better across the sweep. The produced setup headers
-  stay lean (~0.9–1.2 kB against the reference streams' ~3.9 kB). All
-  streams remain externally decodable: black-box, the produced
-  streams decode through a reference decoder binary to their exact
-  declared frame counts.
+  *saturated* (22 717 B / 47.6 dB at `q = 1`); now 7143 B / 41.6 dB at
+  `q = 0.7` rising monotonically to 10 973 B / **55.6 dB** at `q = 1`
+  (−52 % bytes and +8.1 dB against the old top), with the low knob
+  reaching 2866 B / 30.6 dB at `q = 0.4` (old: 4044 B / 24.5 dB).
+  Stereo-q5's mean SNR at `q = 1` rises 35.0 → 43.1 dB at −30 %
+  bytes (its min channel trades 33.1 → 30.6 dB — the deep-margin
+  waveform-coding mode that lifted the quiet channel further is
+  priced out by the cap; see the README gap list); the switched
+  transient corpus spends −28 % at its top at unchanged SNR. The
+  produced setup headers stay lean (~0.9 kB against the reference
+  streams' ~3.9 kB). All streams remain externally decodable:
+  black-box, the produced streams decode through a reference decoder
+  binary to their exact declared frame counts.
 
 - **Closed-loop trainers could prune a classword the planner later
   emits.** `train_residue_books_rd` / `train_residue_books_rd_ladder`

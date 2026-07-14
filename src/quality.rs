@@ -16,7 +16,7 @@
 //!   `q ∈ [0, 1]` to a coherent lever set: `lambda` falls
 //!   log-linearly with `q` (each step of `q` buys a constant-ratio
 //!   drop in the bits→audibility exchange rate), the masking margin
-//!   rises linearly (−12 dB at `q = 0`, +12 dB at `q = 1`), and the
+//!   rises linearly (−12 dB at `q = 0`, capped at +6 dB), and the
 //!   floor post budget grows with the fidelity the residue will
 //!   carry. Monotone by construction: a higher `q` never spends fewer
 //!   bits or raises the modelled audible noise.
@@ -44,7 +44,17 @@ pub struct EncoderTuning {
     pub lambda: f64,
     /// The masking-margin lever for
     /// [`crate::psy::PsyConfig::threshold_offset_db`]: −12 dB (coarse,
-    /// aggressive masking) at `q = 0`, +12 dB (strict) at `q = 1`.
+    /// aggressive masking) at `q = 0`, rising linearly and **capped at
+    /// +6 dB** (reached at `q = 0.75`). The cap is measured, not
+    /// aesthetic: the psy floor envelope rides
+    /// `max(peak-held |X|, threshold)`, so pushing the threshold ever
+    /// lower drags the floor onto `|X|` in every quiet bin — the
+    /// residue targets `X/floor` then approach full scale across the
+    /// noise floor, which the ladders sized by the loud partitions
+    /// quantise poorly. Beyond +6 dB the measured whole-stream SNR
+    /// stops rising (and at +12 dB falls) while bytes keep climbing;
+    /// the old uncapped law was the second cause of the non-monotone
+    /// SNR above `q ≈ 0.7`.
     pub threshold_offset_db: f32,
     /// The floor-1 explicit-post budget for
     /// [`crate::floor1_layout::design_floor1_header`]: 8 posts at
@@ -107,7 +117,7 @@ impl EncoderTuning {
         Ok(EncoderTuning {
             // 10^-1.4 at q=0 → 10^-4 at q=1.
             lambda: 10f64.powf(-1.4 - 2.6 * qf),
-            threshold_offset_db: -12.0 + 24.0 * q,
+            threshold_offset_db: (-12.0 + 24.0 * q).min(6.0),
             floor_post_budget: 8 + (24.0 * qf).round() as usize,
             floor_smooth_radius: 2,
             // 192 up to q = 0.7, then log-linear to 4 × 192 = 768 at
@@ -295,7 +305,7 @@ mod tests {
         assert!((lo.lambda - 10f64.powf(-1.4)).abs() < 1e-12);
         assert!((hi.lambda - 1e-4).abs() < 1e-12);
         assert_eq!(lo.threshold_offset_db, -12.0);
-        assert_eq!(hi.threshold_offset_db, 12.0);
+        assert_eq!(hi.threshold_offset_db, 6.0);
         assert_eq!(lo.floor_post_budget, 8);
         assert_eq!(hi.floor_post_budget, 32);
         assert_eq!(lo.floor_smooth_radius, 2);
