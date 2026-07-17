@@ -274,7 +274,7 @@ pub struct StreamEncoderConfig {
     pub training_iterations: usize,
     /// Residue value-book dimensionality: how many consecutive
     /// spectral residue scalars each §8.6.2 VQ codeword covers —
-    /// `1` (default) or `2`. At `1` the two cascade value books are
+    /// `2` (default) or `1`. At `1` the two cascade value books are
     /// generic scalar ladders sized to the residue range; at `2` they
     /// are **designed from the stream's own residue corpus**
     /// ([`crate::book_design::design_lattice_vq_codebook`]) as
@@ -282,9 +282,16 @@ pub struct StreamEncoderConfig {
     /// widely interoperable lookup form — over uniform full-span
     /// ladders, with codeword lengths trained on the *joint*
     /// grid-cell occupancy, so one trained codeword jointly codes two
-    /// neighbouring bins. Wider dimensionalities are refused: under
-    /// the lattice entry ceiling their per-scalar resolution
-    /// collapses (see [`OggFileError::BadVqDims`]).
+    /// neighbouring bins, **through the low and middle of the
+    /// quality knob**: past the lattice fine ladder's coverage cap
+    /// (`quality > 0.85`) the encoder races the scalar-ladder
+    /// geometry against the joint geometry frozen at its cap point
+    /// and keeps the higher own-decoded SNR (see
+    /// [`encode_pcm_to_packets`]), so the knob stays monotone where
+    /// the joint books' pinned resolution saturates. Wider
+    /// dimensionalities are refused: under the lattice entry ceiling
+    /// their per-scalar resolution collapses (see
+    /// [`OggFileError::BadVqDims`]).
     pub vq_dims: u16,
 }
 
@@ -292,14 +299,19 @@ impl StreamEncoderConfig {
     /// A nominal configuration: `quality = 0.7`, long blocksize
     /// `2048` with short blocksize `256` (block switching enabled),
     /// coupling offered on adjacent pairs, 4 codebook-training
-    /// iterations, serial `0x6F78_7662` (arbitrary fixed default).
+    /// iterations, serial `0x6F78_7662` (arbitrary fixed default),
+    /// `vq_dims = 2` (the corpus-designed joint lattice books, with
+    /// the per-band geometry selection described on [`Self::vq_dims`]).
     ///
     /// The `2048/256` block pair matches the corpus streams'
     /// geometry: against `1024/256` the doubled long transform halves
     /// the per-second packet overhead (floor fits, classwords,
     /// preludes) and doubles the spectral resolution steady content
     /// is coded at — measured on the staged real-audio corpus this is
-    /// a 20–40 % stream-byte cut at equal-or-better SNR.
+    /// a 20–40 % stream-byte cut at equal-or-better SNR. The
+    /// `vq_dims = 2` default is likewise measured: on the staged
+    /// mono corpus at the default quality the joint books spend
+    /// −22 % audio bytes at +6.3 dB SNR against the scalar ladders.
     #[must_use]
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         StreamEncoderConfig {
@@ -311,7 +323,7 @@ impl StreamEncoderConfig {
             short_blocksize: 256,
             serial: 0x6F78_7662,
             training_iterations: 4,
-            vq_dims: 1,
+            vq_dims: 2,
         }
     }
 }

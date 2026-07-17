@@ -6,6 +6,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **`vq_dims = 2` — the corpus-designed 2-D joint lattice books —
+  is now the integrated encoder's default** (with the per-band
+  geometry selection below). Measured on the staged real-audio
+  corpus at the default quality, audio bytes / SNR against the
+  scalar default: mono-44100 6072 B / 41.6 dB → 4741 B / 47.9 dB
+  (−22 % / +6.3 dB), stereo-44100 12100 B / 35.5 dB mean →
+  9654 B / 37.0 dB mean, transient 7875 B / 19.4 dB →
+  7797 B / 19.5 dB; the top of the knob (where the race keeps the
+  scalar candidate) is unchanged at 11.0 kB / 55.6 dB. The
+  audio-byte ratio to the reference stream at the default quality
+  falls ×2.9 → ×2.3 (mono corpus), with audio-parity near
+  `q ≈ 0.5`. `vq_dims = 1` remains available (config field and
+  registry `"vq_dims"` option) and forces the scalar geometry
+  throughout. The fixture re-encode suite now carries **two-sided
+  regression gates** (audio-byte ceiling AND SNR floor) at the
+  pinned quality points.
+
 - **`vq::quantize_vector` factorises over dense full-grid product
   lattices** (§3.2.1 lookup type 1, `sequence_p` clear, every entry
   used, `entries == lookup_values^dimensions`): squared-Euclidean

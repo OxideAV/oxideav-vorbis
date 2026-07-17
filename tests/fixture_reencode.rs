@@ -91,6 +91,12 @@ fn snr_db(reference: &[f32], decoded: &[f32]) -> f64 {
 
 struct Reencode {
     ogg: Vec<u8>,
+    /// Audio-packet bytes only (headers excluded): the rate figure the
+    /// two-sided regression gates pin — header size legitimately
+    /// varies with the residue geometry (the designed-lattice books
+    /// carry ~800 B of codeword-length tables the scalar ladders
+    /// don't), while audio bytes track the actual coding efficiency.
+    audio_bytes: usize,
     shorts: usize,
     longs: usize,
     coupling_steps: usize,
@@ -102,6 +108,7 @@ fn reencode(name: &str, pcm: &[Vec<f32>], rate: u32) -> Reencode {
     let config = StreamEncoderConfig::new(rate, pcm.len() as u8);
     let ogg = encode_pcm_to_ogg(pcm, &config).unwrap_or_else(|e| panic!("{name} encodes: {e}"));
     let packets = ogg_packets(&ogg).expect("de-frames");
+    let audio_bytes = packets[3..].iter().map(Vec::len).sum();
     let id = parse_identification_header(&packets[0]).expect("id parses");
     let setup = parse_setup_header(&packets[2], id.audio_channels).expect("setup parses");
     let coupling_steps = setup.mappings[0].coupling.len();
@@ -124,6 +131,7 @@ fn reencode(name: &str, pcm: &[Vec<f32>], rate: u32) -> Reencode {
     }
     Reencode {
         ogg,
+        audio_bytes,
         shorts,
         longs,
         coupling_steps,
@@ -156,7 +164,14 @@ fn transient_fixture_reencode_switches_and_roundtrips() {
     assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("transient fixture re-encode SNR: {snr:.2} dB");
+    // Two-sided r416 gates (measured 7797 audio B / 19.5 dB): neither
+    // rate nor fidelity may regress at the default quality point.
     assert!(snr >= 12.0, "SNR {snr:.2} dB below 12 dB");
+    assert!(
+        re.audio_bytes <= 8_800,
+        "default-quality audio bytes {} above the 8.8 kB regression bound",
+        re.audio_bytes
+    );
 }
 
 #[test]
@@ -182,7 +197,16 @@ fn steady_music_fixture_reencode_stays_long_at_high_fidelity() {
     assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("steady fixture re-encode SNR: {snr:.2} dB");
-    assert!(snr >= 40.0, "SNR {snr:.2} dB below 40 dB");
+    // Two-sided r416 gates for the default quality point (measured
+    // 4741 audio B / 47.9 dB under the default joint geometry — the
+    // r410 scalar encoder spent 6072 B for 41.6 dB here): neither
+    // rate nor fidelity may regress.
+    assert!(snr >= 46.0, "SNR {snr:.2} dB below 46 dB");
+    assert!(
+        re.audio_bytes <= 5_400,
+        "default-quality audio bytes {} above the 5.4 kB regression bound",
+        re.audio_bytes
+    );
 }
 
 #[test]
@@ -208,9 +232,11 @@ fn steady_music_fixture_top_of_knob_delivers_real_headroom() {
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("steady fixture q=1: {} B, SNR {snr:.2} dB", ogg.len());
     assert!(snr >= 52.0, "q=1 SNR {snr:.2} dB below 52 dB");
+    // Tightened r416 bound (measured 10973 B whole-stream: the
+    // top-band geometry race keeps the scalar candidate here).
     assert!(
-        ogg.len() <= 14_000,
-        "q=1 spends {} B, above the 14 kB regression bound",
+        ogg.len() <= 12_000,
+        "q=1 spends {} B, above the 12 kB regression bound",
         ogg.len()
     );
 }
@@ -241,4 +267,11 @@ fn decorrelated_stereo_fixture_reencode_stays_uncoupled() {
         eprintln!("stereo fixture re-encode ch{c}: SNR {snr:.2} dB");
         assert!(snr >= 25.0, "ch{c} SNR {snr:.2} dB below 25 dB");
     }
+    // Two-sided r416 rate gate (measured 9654 audio B at the default
+    // quality; the r410 scalar encoder spent 12100 B here).
+    assert!(
+        re.audio_bytes <= 10_800,
+        "default-quality audio bytes {} above the 10.8 kB regression bound",
+        re.audio_bytes
+    );
 }
