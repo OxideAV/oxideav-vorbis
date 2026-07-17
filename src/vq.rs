@@ -501,6 +501,76 @@ pub fn quantize_vector(
         });
     }
 
+    // Factorised fast path for a **dense full-grid product lattice**
+    // (§3.2.1 lookup type 1, `sequence_p` clear, every entry carrying
+    // a codeword, `entries == lookup_values^dimensions`): squared-
+    // Euclidean distance over such a book separates per dimension
+    // (`Σ_j (t_j − v_j(m_j))²` with each `m_j` free), so the nearest
+    // entry is the per-dimension nearest lattice level — an
+    // `O(lookup_values · dims)` scan instead of the general
+    // `O(entries · dims)` one (a 33× ratio for the integrated
+    // encoder's 31-level 2-D books, and the difference between the
+    // corpus-designed lattice path being CI-viable and not). Each
+    // per-dimension value uses the exact §3.2.1 reconstruction
+    // expression `unpack_vector` evaluates (`last = 0` without
+    // `sequence_p`), so the returned vector and distance are the ones
+    // the general scan computes; per-dimension ties break to the
+    // lowest level, and since §3.2.1 lookup-1 digits place dimension
+    // 0 in the least significant position, the jointly-lowest levels
+    // compose to the lowest tied entry index — the general scan's
+    // documented tie rule.
+    if let VqLookup::Lattice {
+        minimum_value,
+        delta_value,
+        sequence_p: false,
+        multiplicands,
+        ..
+    } = &codebook.lookup
+    {
+        let lv = crate::codebook::lookup1_values(codebook.entries, codebook.dimensions) as usize;
+        let dense = codebook.codeword_lengths.len() == codebook.entries as usize
+            && codebook
+                .codeword_lengths
+                .iter()
+                .all(|&len| len != UNUSED_ENTRY);
+        let full_grid = lv > 0
+            && multiplicands.len() == lv
+            && (lv as u64).checked_pow(u32::from(codebook.dimensions))
+                == Some(u64::from(codebook.entries));
+        if dense && full_grid {
+            let last = 0.0f32; // §3.2.1 step 5's accumulator, inert without sequence_p
+            let mut entry: u32 = 0;
+            let mut stride: u32 = 1;
+            let mut vector = Vec::with_capacity(dims);
+            let mut distance_sq = 0.0f64;
+            for &t in target {
+                let mut best_m = 0usize;
+                let mut best_v = 0.0f32;
+                let mut best_d = f64::INFINITY;
+                for (m, &mult) in multiplicands.iter().enumerate() {
+                    let v = (mult as f32) * *delta_value + *minimum_value + last;
+                    let d = f64::from(t) - f64::from(v);
+                    let d = d * d;
+                    // Strict `<` keeps the lowest level on an exact tie.
+                    if d < best_d {
+                        best_m = m;
+                        best_v = v;
+                        best_d = d;
+                    }
+                }
+                entry += (best_m as u32) * stride;
+                stride = stride.saturating_mul(lv as u32);
+                vector.push(best_v);
+                distance_sq += best_d;
+            }
+            return Ok(QuantizedEntry {
+                entry,
+                vector,
+                distance_sq,
+            });
+        }
+    }
+
     let mut best: Option<QuantizedEntry> = None;
     for entry in 0..codebook.entries {
         // Sparse-codebook fence: the decoder can never emit an entry
@@ -1243,5 +1313,120 @@ mod tests {
         let q = quantize_vector(&cb, &[1.0, 2.0]).unwrap();
         assert_eq!(q.entry, 0);
         assert_eq!(q.distance_sq, 5.0);
+    }
+
+    /// The general per-entry scan, test-local: the reference the
+    /// factorised dense-lattice fast path must reproduce.
+    fn brute_force_nearest(cb: &VorbisCodebook, target: &[f32]) -> QuantizedEntry {
+        let mut best: Option<QuantizedEntry> = None;
+        for entry in 0..cb.entries {
+            if cb.codeword_lengths[entry as usize] == crate::codebook::UNUSED_ENTRY {
+                continue;
+            }
+            let vector = unpack_vector(cb, entry).unwrap();
+            let mut distance_sq = 0.0f64;
+            for (t, v) in target.iter().zip(&vector) {
+                let d = f64::from(*t) - f64::from(*v);
+                distance_sq += d * d;
+            }
+            if best.as_ref().is_none_or(|b| distance_sq < b.distance_sq) {
+                best = Some(QuantizedEntry {
+                    entry,
+                    vector,
+                    distance_sq,
+                });
+            }
+        }
+        best.unwrap()
+    }
+
+    /// A dense full-grid 2-D lattice book (the integrated encoder's
+    /// designed-book shape): the factorised fast path must return the
+    /// identical entry, vector and distance as the per-entry scan, on
+    /// on-grid, off-grid, out-of-span and exact-tie targets.
+    #[test]
+    fn dense_lattice_fast_path_matches_the_general_scan() {
+        let cb = VorbisCodebook {
+            dimensions: 2,
+            entries: 25,
+            codeword_lengths: vec![5; 25],
+            lookup: VqLookup::Lattice {
+                minimum_value: -2.5,
+                delta_value: 1.25,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2, 3, 4],
+            },
+        };
+        let mut targets: Vec<[f32; 2]> = Vec::new();
+        for i in 0..9 {
+            for j in 0..9 {
+                targets.push([-3.0 + 0.8 * i as f32, -3.2 + 0.9 * j as f32]);
+            }
+        }
+        // Exact midpoints between adjacent levels: the tie must break
+        // to the lower level in each dimension → the lower entry index.
+        targets.push([-2.5 + 0.625, -2.5 + 1.25 + 0.625]);
+        for t in &targets {
+            let fast = quantize_vector(&cb, t).unwrap();
+            let brute = brute_force_nearest(&cb, t);
+            assert_eq!(fast.entry, brute.entry, "target {t:?}");
+            assert_eq!(fast.vector, brute.vector, "target {t:?}");
+            assert_eq!(fast.distance_sq, brute.distance_sq, "target {t:?}");
+        }
+    }
+
+    /// A sparse lattice book (a pruned grid cell) must take the general
+    /// scan — the factorised choice could land on the hole — and still
+    /// never return the unused entry.
+    #[test]
+    fn sparse_lattice_falls_back_to_the_general_scan() {
+        let mut lengths = vec![5u8; 25];
+        // Prune the exact centre cell (levels (2, 2) → entry 2 + 2·5).
+        lengths[12] = crate::codebook::UNUSED_ENTRY;
+        let cb = VorbisCodebook {
+            dimensions: 2,
+            entries: 25,
+            codeword_lengths: lengths,
+            lookup: VqLookup::Lattice {
+                minimum_value: -2.5,
+                delta_value: 1.25,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2, 3, 4],
+            },
+        };
+        // The pruned cell's own centre: the factorised answer would be
+        // entry 12; the correct answer is a used neighbour.
+        let q = quantize_vector(&cb, &[0.0, 0.0]).unwrap();
+        assert_ne!(q.entry, 12, "the unused entry must never be selected");
+        let brute = brute_force_nearest(&cb, &[0.0, 0.0]);
+        assert_eq!(q.entry, brute.entry);
+        assert_eq!(q.distance_sq, brute.distance_sq);
+    }
+
+    /// `sequence_p` couples the dimensions (each element offsets the
+    /// next), so the factorised path must not fire: pin against the
+    /// general scan on a book where the prefix-sum matters.
+    #[test]
+    fn sequence_p_lattice_matches_the_general_scan() {
+        let cb = VorbisCodebook {
+            dimensions: 2,
+            entries: 9,
+            codeword_lengths: vec![4; 9],
+            lookup: VqLookup::Lattice {
+                minimum_value: 0.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: true,
+                multiplicands: vec![0, 1, 2],
+            },
+        };
+        for t in [[0.6f32, 1.2], [2.0, 4.0], [1.4, 1.4], [0.0, 3.0]] {
+            let q = quantize_vector(&cb, &t).unwrap();
+            let brute = brute_force_nearest(&cb, &t);
+            assert_eq!(q.entry, brute.entry, "target {t:?}");
+            assert_eq!(q.distance_sq, brute.distance_sq, "target {t:?}");
+        }
     }
 }
