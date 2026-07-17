@@ -6,6 +6,28 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **The closed-loop residue codebook trainer now optimises the same
+  perceptually weighted objective the packets are emitted under**
+  (`train_residue_books_rd_ladder_weighted`; the integrated encoder
+  hands it one NMR weight row per corpus residual, short-frame rows
+  coarsened to the training partition size by pairwise max). The
+  unweighted trainer routed partitions by numeric error while the
+  final packet planning routes by audibility: the trained codeword
+  lengths priced the wrong emission statistics, and sparse pruning
+  deleted entries the weighted plans would have chosen — the
+  mechanism behind the measured 13 dB in-ladder-hybrid collapse,
+  operating chronically at smaller scale. Measured on the staged
+  corpus at the default quality (whole-stream bytes at equal-or-
+  better SNR): mono-44100 6612 → 6217 B, mono-22050 6446 → 6036 B
+  (and its top-band knob point improves from the frozen 9776 B /
+  50.3 dB plateau to 7962 B / 51.7 dB — the weighted-trained scalar
+  candidate now wins the geometry race there), stereo-44100
+  11617 → 11385 B; the scalar geometry improves too (mono default
+  6072 → 5790 audio B at +6.3 dB). Unit-weight rows reproduce the
+  unweighted trainer bit-for-bit (pinned), and a rigged
+  loud-but-masked corpus pins the steering (weighted-trained books
+  strictly beat unweighted-trained books on the weighted objective).
+
 - **`vq_dims = 2` — the corpus-designed 2-D joint lattice books —
   is now the integrated encoder's default** (with the per-band
   geometry selection below). Measured on the staged real-audio

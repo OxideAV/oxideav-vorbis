@@ -204,6 +204,16 @@ pub enum BookDesignError {
     /// [`train_residue_books_rd`]: the rate-distortion planner rejected
     /// a corpus vector (carried verbatim).
     ResidueEncode(crate::residue_encode::ResidueEncodeError),
+    /// [`train_residue_books_rd_ladder_weighted`]: the weight table
+    /// does not carry one row per corpus residual (each row's
+    /// per-partition length is validated downstream by the weighted
+    /// planner).
+    WeightRowsMismatch {
+        /// `weights.len()`.
+        rows: usize,
+        /// `residuals.len()`.
+        residuals: usize,
+    },
     /// [`train_residue_books_rd`]: `max_iterations` was zero — the
     /// trainer must run at least one plan→retrain pass.
     ZeroIterations,
@@ -338,6 +348,10 @@ impl fmt::Display for BookDesignError {
             BookDesignError::ResidueEncode(source) => write!(
                 f,
                 "vorbis book design: rate-distortion residue planning failed: {source}"
+            ),
+            BookDesignError::WeightRowsMismatch { rows, residuals } => write!(
+                f,
+                "vorbis book design: {rows} weight rows for {residuals} corpus residuals"
             ),
             BookDesignError::ZeroIterations => write!(
                 f,
@@ -1066,7 +1080,7 @@ pub fn train_residue_books_rd(
 
     for _ in 0..max_iterations {
         // Plan step: rate-distortion planning under the current books.
-        let (plans, lagrangian, value_bits) = plan_corpus(residuals, header, &books, lambda)?;
+        let (plans, lagrangian, value_bits) = plan_corpus(residuals, None, header, &books, lambda)?;
 
         // Measure the classword bits of these plans under the current
         // classbook (the tally routes classwords through it, so the
@@ -1150,11 +1164,14 @@ pub struct ResidueLadderTrainingOutcome {
 
 /// One corpus plan pass: rate-distortion plans for every residual
 /// under the given books, plus the summed Lagrangian
-/// `Σ error_sq + lambda · value_bits` and the value-bit total.
+/// (`Σ error_sq + lambda · value_bits`, the distortion term
+/// per-partition **weighted** when `weights` supplies one row per
+/// residual) and the value-bit total.
 type CorpusPlan = (Vec<crate::encoder::ResidueVectorPlan>, f64, u64);
 
 fn plan_corpus(
     residuals: &[Vec<f32>],
+    weights: Option<&[Vec<f64>]>,
     header: &crate::setup::ResidueHeader,
     books: &[VorbisCodebook],
     lambda: f64,
@@ -1180,21 +1197,53 @@ fn plan_corpus(
     let mut plans = Vec::with_capacity(residuals.len());
     let mut lagrangian = 0.0f64;
     let mut value_bits = 0u64;
-    for residual in residuals {
-        let scored = crate::residue_encode::plan_vector_residue_rd(
-            residual,
-            &rows,
-            header.residue_type,
-            header.partition_size,
-            lambda,
-        )
-        .map_err(BookDesignError::ResidueEncode)?;
-        lagrangian += scored.total_error_sq + lambda * scored.total_value_bits as f64;
-        value_bits += scored.total_value_bits;
-        plans.push(crate::encoder::ResidueVectorPlan {
-            classifications: scored.classifications,
-            partition_entries: scored.partition_entries,
-        });
+    for (v, residual) in residuals.iter().enumerate() {
+        match weights {
+            Some(rows_w) => {
+                // Weighted pass: the same per-partition choices —
+                // and the same objective — the integrated encoder's
+                // final packet planning makes, so the trained lengths
+                // and pruning follow the emission statistics the
+                // packets will actually have.
+                let choices = crate::residue_encode::plan_vector_classifications_rd_weighted(
+                    residual,
+                    &rows,
+                    header.residue_type,
+                    header.partition_size,
+                    lambda,
+                    &rows_w[v],
+                )
+                .map_err(BookDesignError::ResidueEncode)?;
+                let mut classifications = Vec::with_capacity(choices.len());
+                let mut partition_entries = Vec::with_capacity(choices.len());
+                for (p, choice) in choices.into_iter().enumerate() {
+                    lagrangian += rows_w[v][p] * choice.error_sq + lambda * choice.bit_cost as f64;
+                    value_bits += choice.bit_cost;
+                    classifications.push(choice.classification);
+                    partition_entries.push(choice.entries);
+                }
+                plans.push(crate::encoder::ResidueVectorPlan {
+                    classifications,
+                    partition_entries,
+                });
+            }
+            None => {
+                let scored = crate::residue_encode::plan_vector_residue_rd(
+                    residual,
+                    &rows,
+                    header.residue_type,
+                    header.partition_size,
+                    lambda,
+                )
+                .map_err(BookDesignError::ResidueEncode)?;
+                lagrangian += scored.total_error_sq + lambda * scored.total_value_bits as f64;
+                value_bits += scored.total_value_bits;
+                plans.push(crate::encoder::ResidueVectorPlan {
+                    classifications: scored.classifications,
+                    partition_entries: scored.partition_entries,
+                });
+            }
+        }
     }
     Ok((plans, lagrangian, value_bits))
 }
@@ -1461,6 +1510,65 @@ pub fn train_residue_books_rd_ladder(
     lambda: f64,
     max_iterations: usize,
 ) -> Result<ResidueLadderTrainingOutcome, BookDesignError> {
+    train_residue_books_rd_ladder_inner(residuals, None, header, codebooks, lambda, max_iterations)
+}
+
+/// [`train_residue_books_rd_ladder`] with a **per-partition
+/// distortion weight** row per corpus residual — the same
+/// noise-to-mask weights the integrated encoder's final packet
+/// planning uses ([`crate::residue_encode::plan_vector_residue_rd_weighted`]).
+///
+/// The unweighted trainer optimises `Σ error² + λ·bits` while the
+/// weighted packet planner emits under `Σ w·error² + λ·bits`; when
+/// the two objectives route partitions to different classes, the
+/// trained codeword lengths price the wrong emission statistics and —
+/// worse — sparse pruning can delete the entries the weighted plans
+/// would have chosen, leaving the final packets to route onto
+/// degraded books at a real fidelity cost. This variant plans,
+/// retrains, prunes, and accept-if-improves every candidate under the
+/// **weighted** Lagrangian, so the trained table matches the packets
+/// that will actually be emitted. `weights` must carry one row per
+/// residual; each row one weight per §8.6.2 partition (all-`1.0`
+/// rows reproduce [`train_residue_books_rd_ladder`] exactly — the
+/// weighted planner is documented to reduce to the unweighted one).
+///
+/// # Errors
+///
+/// As [`train_residue_books_rd_ladder`], plus
+/// [`BookDesignError::WeightRowsMismatch`] for a weight table without
+/// one row per residual (row lengths are validated by the planner).
+pub fn train_residue_books_rd_ladder_weighted(
+    residuals: &[Vec<f32>],
+    weights: &[Vec<f64>],
+    header: &crate::setup::ResidueHeader,
+    codebooks: &[VorbisCodebook],
+    lambda: f64,
+    max_iterations: usize,
+) -> Result<ResidueLadderTrainingOutcome, BookDesignError> {
+    if weights.len() != residuals.len() {
+        return Err(BookDesignError::WeightRowsMismatch {
+            rows: weights.len(),
+            residuals: residuals.len(),
+        });
+    }
+    train_residue_books_rd_ladder_inner(
+        residuals,
+        Some(weights),
+        header,
+        codebooks,
+        lambda,
+        max_iterations,
+    )
+}
+
+fn train_residue_books_rd_ladder_inner(
+    residuals: &[Vec<f32>],
+    weights: Option<&[Vec<f64>]>,
+    header: &crate::setup::ResidueHeader,
+    codebooks: &[VorbisCodebook],
+    lambda: f64,
+    max_iterations: usize,
+) -> Result<ResidueLadderTrainingOutcome, BookDesignError> {
     if max_iterations == 0 {
         return Err(BookDesignError::ZeroIterations);
     }
@@ -1480,7 +1588,7 @@ pub fn train_residue_books_rd_ladder(
         // current books, when one exists).
         let (plans, lagrangian, value_bits) = match carried.take() {
             Some(t) => t,
-            None => plan_corpus(residuals, header, &books, lambda)?,
+            None => plan_corpus(residuals, weights, header, &books, lambda)?,
         };
 
         // Measure the classword bits under the current classbook.
@@ -1529,7 +1637,7 @@ pub fn train_residue_books_rd_ladder(
         // the best strict improvement over the length-only books (the
         // remaining books catch up on later iterations, against
         // re-derived targets).
-        let eval_len = plan_corpus(residuals, header, &books_len, lambda)?;
+        let eval_len = plan_corpus(residuals, weights, header, &books_len, lambda)?;
         let mut best_books = books_len;
         let mut best_eval = eval_len;
         let mut adopted = false;
@@ -1538,7 +1646,7 @@ pub fn train_residue_books_rd_ladder(
                         best_eval: &mut CorpusPlan,
                         adopted: &mut bool|
          -> Result<(), BookDesignError> {
-            let eval = plan_corpus(residuals, header, &cand, lambda)?;
+            let eval = plan_corpus(residuals, weights, header, &cand, lambda)?;
             if eval.1 < best_eval.1 {
                 *best_books = cand;
                 *best_eval = eval;
@@ -3637,6 +3745,110 @@ mod tests {
             train_residue_books_rd_ladder(&residuals, &header, &books, f64::NAN, 2),
             Err(BookDesignError::ResidueEncode(_))
         ));
+    }
+
+    /// All-`1.0` weight rows must reproduce the unweighted ladder
+    /// trainer bit-for-bit (the weighted planner is documented to
+    /// reduce to the unweighted one at unit weights, and the trainer's
+    /// bookkeeping sums the same Lagrangian).
+    #[test]
+    fn weighted_ladder_training_with_unit_weights_matches_unweighted() {
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        let residuals: Vec<Vec<f32>> = (0..6)
+            .map(|k| {
+                (0..16)
+                    .map(|i| {
+                        let sign = if (i + k) % 2 == 0 { 1.0f32 } else { -1.0 };
+                        sign * (5.0 + 0.02 * ((i * 7 + k) % 5) as f32)
+                    })
+                    .collect()
+            })
+            .collect();
+        let parts = 16 / header.partition_size as usize;
+        let unit: Vec<Vec<f64>> = vec![vec![1.0; parts]; residuals.len()];
+        let unweighted =
+            train_residue_books_rd_ladder(&residuals, &header, &books, 0.25, 8).expect("trains");
+        let weighted =
+            train_residue_books_rd_ladder_weighted(&residuals, &unit, &header, &books, 0.25, 8)
+                .expect("trains");
+        assert_eq!(weighted.codebooks, unweighted.codebooks);
+        assert_eq!(weighted.plans, unweighted.plans);
+        assert_eq!(
+            weighted.lagrangian_per_iteration,
+            unweighted.lagrangian_per_iteration
+        );
+    }
+
+    /// The weighted trainer optimises the weighted objective. The
+    /// steering only appears where the weights flip a class decision,
+    /// so the corpus is rigged exactly there: the light partition is
+    /// numerically loud (±3 — the unweighted objective pays to code
+    /// it, so the unweighted trainer's shared ladder must also serve
+    /// the ±3 clusters) but perceptually irrelevant (weight 1e-4 —
+    /// the weighted planner silences it, so the weighted trainer's
+    /// ladder concentrates every entry on the heavy ±5 clusters).
+    /// Evaluated under the weighted objective, the weighted-trained
+    /// books must then score strictly better.
+    #[test]
+    fn weighted_ladder_training_steers_toward_heavy_partitions() {
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        // Partition 0 (bins 0..8): ±5 clusters, weight 100.
+        // Partition 1 (bins 8..16): ±3 clusters, weight 1e-4.
+        let residuals: Vec<Vec<f32>> = (0..6)
+            .map(|k| {
+                (0..16)
+                    .map(|i| {
+                        let sign = if (i + k) % 2 == 0 { 1.0f32 } else { -1.0 };
+                        let base = if i < 8 { 5.0 } else { 3.0 };
+                        sign * (base + 0.02 * ((i * 7 + k) % 5) as f32)
+                    })
+                    .collect()
+            })
+            .collect();
+        let w: Vec<Vec<f64>> = vec![vec![100.0, 1e-4]; residuals.len()];
+        let lambda = 0.25;
+        let unweighted =
+            train_residue_books_rd_ladder(&residuals, &header, &books, lambda, 12).expect("trains");
+        let weighted =
+            train_residue_books_rd_ladder_weighted(&residuals, &w, &header, &books, lambda, 12)
+                .expect("trains");
+        // Weighted descent is monotone in its own objective.
+        for win in weighted.lagrangian_per_iteration.windows(2) {
+            assert!(
+                win[1] <= win[0] + 1e-9,
+                "weighted Lagrangian must never rise: {:?}",
+                weighted.lagrangian_per_iteration
+            );
+        }
+        // Evaluate both final book tables under the weighted objective.
+        let (_, l_weighted, _) =
+            plan_corpus(&residuals, Some(&w), &header, &weighted.codebooks, lambda).expect("plans");
+        let (_, l_unweighted, _) =
+            plan_corpus(&residuals, Some(&w), &header, &unweighted.codebooks, lambda)
+                .expect("plans");
+        assert!(
+            l_weighted < l_unweighted,
+            "weighted-trained books ({l_weighted}) must beat unweighted-trained \
+             books ({l_unweighted}) on the weighted objective"
+        );
+    }
+
+    /// The weight table must carry one row per residual.
+    #[test]
+    fn weighted_ladder_training_rejects_row_mismatch() {
+        let header = residue_tally_header();
+        let books = ladder_test_books();
+        let residuals = vec![vec![0.25f32; 16]; 3];
+        let w = vec![vec![1.0f64; 2]; 2];
+        assert_eq!(
+            train_residue_books_rd_ladder_weighted(&residuals, &w, &header, &books, 0.5, 2),
+            Err(BookDesignError::WeightRowsMismatch {
+                rows: 2,
+                residuals: 3,
+            })
+        );
     }
 
     // ----------------------------------------------------------------

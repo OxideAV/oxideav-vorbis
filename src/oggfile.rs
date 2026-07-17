@@ -1639,21 +1639,48 @@ fn encode_pcm_to_packets_geometry(
     // different grid cells.
     if config.training_iterations > 0 {
         let residuals: Vec<Vec<f32>> = targets.iter().flat_map(|row| row.iter().cloned()).collect();
+        // The trainer plans under the **weighted** objective the
+        // final packet planning below uses — one NMR weight row per
+        // corpus residual. The training header is the last entry's
+        // (the long size on a switching stream), whose partition size
+        // can be double a short frame's: a short frame's weight row
+        // is coarsened by pairwise max (quantisation error anywhere
+        // in the merged span is bounded by its most sensitive half —
+        // the same conservative merge the coupling path uses).
+        // Under the unweighted trainer the two objectives routed
+        // partitions differently, so the trained lengths priced the
+        // wrong emissions and sparse pruning deleted entries the
+        // weighted plans wanted.
+        let train_ps = setup.residues[n_entries - 1].partition_size as usize;
+        let train_weights: Vec<Vec<f64>> = weights
+            .iter()
+            .enumerate()
+            .flat_map(|(f, w_row)| {
+                let frame_ps = partition_size_for((sizes[f] / 2) as u32) as usize;
+                let ratio = (train_ps / frame_ps).max(1);
+                w_row.iter().map(move |w| {
+                    w.chunks(ratio)
+                        .map(|chunk| chunk.iter().cloned().fold(0.0f64, f64::max))
+                        .collect::<Vec<f64>>()
+                })
+            })
+            .collect();
         if !residuals.is_empty() {
-            let outcome = crate::book_design::train_residue_books_rd_ladder(
+            let outcome = crate::book_design::train_residue_books_rd_ladder_weighted(
                 &residuals,
+                &train_weights,
                 &setup.residues[n_entries - 1],
                 &setup.codebooks,
                 tuning.lambda,
                 config.training_iterations,
             )?;
             setup.codebooks = outcome.codebooks;
-            // The trainer plans *unweighted*, so its classword
-            // statistics do not match the weighted plans the packets
-            // below emit. Reset the flat seed classbook — the final
-            // classword lengths are trained below from the actual
-            // grouped class choices — and take only the trained value
-            // books.
+            // The trainer's classword statistics come from whole-size
+            // corpus rows planned under the long header; the packets
+            // below re-plan per frame (per-size partition geometry).
+            // Reset the flat seed classbook — the final classword
+            // lengths are trained below from the actual grouped class
+            // choices — and take only the trained value books.
             setup.codebooks[1] = class_group_book(RESIDUE_CLASSES, CLASS_GROUP_DIMS);
         }
     }
