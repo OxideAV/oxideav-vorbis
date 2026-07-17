@@ -357,14 +357,14 @@ pub fn mdct_naive_vec(block: &[f32], scale: f32) -> Result<Vec<f32>, MdctError> 
 /// composition primitive.
 ///
 /// This wraps the two underlying error types — the §4.3.6 window
-/// pre-multiplication's [`WindowPremultiplyError`] and the §4.3.7
+/// pre-multiplication's [`WindowPremultiplyError`](crate::synthesis::WindowPremultiplyError) and the §4.3.7
 /// forward MDCT's [`MdctError`] — so a caller composing the encoder
 /// transform stage gets a single result type and a single match arm
 /// per failure mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyWindowAndMdctError {
     /// The window slice's length disagrees with the time-domain
-    /// block's length. Mirrors [`WindowPremultiplyError::LengthMismatch`]
+    /// block's length. Mirrors [`WindowPremultiplyError::LengthMismatch`](crate::synthesis::WindowPremultiplyError::LengthMismatch)
     /// from the decode side; the encoder-side composition has the same
     /// invariant (one window sample per input PCM sample, both sourced
     /// from the same §4.3.1 `n`).

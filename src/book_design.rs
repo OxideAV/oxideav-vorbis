@@ -939,7 +939,7 @@ pub fn tally_residue_plans(
 /// The `[amplitude]` and `[booknumber]` fields themselves are raw
 /// fixed-width reads (`floor0_amplitude_bits` /
 /// `ilog(floor0_number_of_books)` wide), not codewords, so they are
-/// not tallied; an [`Floor0Packet::Unused`] packet
+/// not tallied; an [`Floor0Packet::Unused`](crate::encoder::Floor0Packet::Unused) packet
 /// (`crate::encoder::Floor0Packet::Unused`) emits only the zero
 /// amplitude field and tallies nothing.
 ///

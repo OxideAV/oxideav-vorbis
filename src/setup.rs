@@ -73,10 +73,14 @@ use oxideav_core::bits::BitReaderLsb;
 use crate::codebook::{self, ilog, parse_codebook, VorbisCodebook};
 
 /// Common-header packet-type byte for the setup header (Vorbis I §4.2.1).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SETUP_PACKET_TYPE: u8 = 0x05;
 
 /// The six magic bytes that follow the packet-type byte in every Vorbis
 /// header packet (Vorbis I §4.2.1).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SETUP_PACKET_MAGIC: [u8; 6] = *b"vorbis";
 
 /// Parsed structural shell of a Vorbis I setup header (Vorbis I §4.2.4)
@@ -126,6 +130,8 @@ pub struct VorbisSetupHeader {
 /// `mapping_type` field is always `0` after a successful parse. Any
 /// nonzero value is rejected per step 2b of the spec algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct MappingHeader {
     /// The 16-bit `mapping_type` field that the encoder wrote. Always
     /// `0` for a well-formed Vorbis I stream.
@@ -151,6 +157,8 @@ pub struct MappingHeader {
 /// One coupling step of a mapping configuration (§4.2.4 "Mappings"
 /// step 2c.ii.A).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct MappingCouplingStep {
     /// `vorbis_mapping_magnitude[j]` — channel index used as the
     /// magnitude channel for coupling step `j`.
@@ -163,6 +171,8 @@ pub struct MappingCouplingStep {
 /// Per-submap fields of a mapping configuration (§4.2.4 "Mappings"
 /// step 2c.v).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct MappingSubmap {
     /// `vorbis_mapping_submap_time_placeholder[j]` — 8 bits the spec
     /// instructs the decoder to "read and discard" (the unused time
@@ -181,6 +191,8 @@ pub struct MappingSubmap {
 
 /// A parsed mode configuration (§4.2.4 "Modes").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ModeHeader {
     /// `vorbis_mode_blockflag` — 1 bit. `false` selects `blocksize_0`
     /// (short block), `true` selects `blocksize_1` (long block).
@@ -206,6 +218,8 @@ pub struct ModeHeader {
 /// `kind` payload. A floor type strictly greater than 1 is rejected at
 /// parse time per §4.2.4 step 2d.
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct FloorHeader {
     /// The 16-bit `floor_type` field that the encoder wrote.
     pub floor_type: u16,
@@ -215,6 +229,8 @@ pub struct FloorHeader {
 
 /// Per-type floor structural fields.
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum FloorKind {
     /// `floor_type = 0` — line-spectrum-pair representation (§6.2.1).
     /// libvorbis does not emit this type; a conformant parser must
@@ -228,6 +244,8 @@ pub enum FloorKind {
 
 /// Floor 0 setup header fields per §6.2.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct Floor0Header {
     /// `floor0_order` — LSP filter order (8-bit unsigned).
     pub order: u8,
@@ -250,6 +268,8 @@ pub struct Floor0Header {
 
 /// Floor 1 setup header fields per §7.2.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct Floor1Header {
     /// `floor1_partitions` — number of partitions in the x-coordinate
     /// list (5 bits in the header).
@@ -272,6 +292,8 @@ pub struct Floor1Header {
 
 /// One partition-class entry of a floor 1 header (§7.2.2 steps 7..12).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct Floor1Class {
     /// `floor1_class_dimensions[i]` — number of Y values this class
     /// encodes at once (read 3 bits + 1, so 1..=8).
@@ -293,6 +315,8 @@ pub struct Floor1Class {
 /// A parsed residue header (§8.6.1 — common across all three residue
 /// types).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ResidueHeader {
     /// The 16-bit `residue_type` field that the encoder wrote. Must be
     /// in {0, 1, 2} per §4.2.4 step 2c.
@@ -323,6 +347,8 @@ pub struct ResidueHeader {
 /// Errors that may arise while walking the round-5 portion of a Vorbis
 /// I setup header.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum ParseError {
     /// The supplied packet was shorter than the 7-byte common header.
     PacketTooShort(usize),
@@ -618,6 +644,8 @@ impl std::error::Error for ParseError {
 ///
 /// The function validates the 7-byte common header per §4.2.1 then
 /// delegates to [`parse_setup_header_body`] for the bit-packed body.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_setup_header(
     packet: &[u8],
     audio_channels: u8,
@@ -647,6 +675,8 @@ pub fn parse_setup_header(
 /// On successful return, the reader is positioned immediately after the
 /// trailing 1-bit framing flag (so the bit cursor is byte-aligned only
 /// by coincidence — the spec does not pad).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_setup_header_body(
     reader: &mut BitReaderLsb<'_>,
     audio_channels: u8,

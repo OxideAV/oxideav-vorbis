@@ -6,6 +6,15 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- Marked the crate's internal surface `#[doc(hidden)]` (floor / residue
+  / codebook / IMDCT decode primitives and the trained-entropy encoder
+  write plumbing exposed for tests/fuzz), so cargo-semver-checks no
+  longer tracks those internals as public API. The stable surface —
+  the packet decode entry point, the Ogg encode/decode family, the
+  registry `make_decoder` / `make_encoder` / `register` factories and
+  the `VorbisDecoder` / `VorbisStreamEncoder` trait objects, plus the
+  frame/error types named in their signatures — stays visible.
+  Attributes and comments only; no behavioural change.
 - **Encoder rate/quality overhaul: per-partition residue class
   ladder, joint noise book, 2048-sample long blocks, size-scaled
   partitions, and a recalibrated quality map.** Five co-designed

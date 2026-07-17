@@ -195,6 +195,8 @@ use crate::setup::{
 /// error) rather than emit a packet the corresponding parser would
 /// reject — this keeps the bit-exact roundtrip guarantee defensible.
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteError {
     /// `vorbis_version` was non-zero. Vorbis I §4.2.2 mandates
     /// `vorbis_version == 0` for any conformant Vorbis I stream.
@@ -276,6 +278,8 @@ pub enum WriteError {
 /// without emitting any bits, preserving the bit-exact roundtrip
 /// guarantee `parse_codebook(&write_codebook(&book)?)? == book`.
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteCodebookError {
     /// `codebook_entries == 0`. §3.2.1's parser rejects this on
     /// input; the writer mirrors the rule.
@@ -445,6 +449,8 @@ impl std::error::Error for WriteCodebookError {}
 /// guarantee
 /// `parse_floor1_header(&mut BitReaderLsb::new(&write_floor1_header(&h)?))? == h`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteFloor1Error {
     /// `partitions` exceeds the 5-bit `floor1_partitions` field's
     /// representable range (`0..=31`).
@@ -652,6 +658,8 @@ impl std::error::Error for WriteFloor1Error {}
 /// guarantee
 /// `parse_floor0_header(&mut BitReaderLsb::new(&write_floor0_header(&h)?))? == h`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteFloor0Error {
     /// `amplitude_bits` exceeded the 6-bit `floor0_amplitude_bits`
     /// field's representable range (`0..=63`).
@@ -697,6 +705,8 @@ impl std::error::Error for WriteFloor0Error {}
 /// guarantee
 /// `parse_residue_header(&write_residue_header(&h)?, h.residue_type)? == h`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteResidueError {
     /// `residue_type` was a value outside `{0, 1, 2}`. §8.6 only
     /// defines those three formats; the §4.2.4 setup walker rejects
@@ -817,6 +827,8 @@ impl std::error::Error for WriteResidueError {}
 /// emitting any bits, preserving the bit-exact roundtrip guarantee
 /// against [`crate::setup::MappingHeader`]-shaped input.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteMappingError {
     /// `mapping_type` was nonzero. §4.2.4 step 2b only defines
     /// `mapping_type = 0` in Vorbis I and the round-5 parser rejects
@@ -1001,6 +1013,8 @@ impl std::error::Error for WriteMappingError {}
 /// emitting any bits, preserving the bit-exact roundtrip guarantee
 /// against [`crate::setup::ModeHeader`]-shaped input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteModeError {
     /// `windowtype` was nonzero. §4.2.4 step 2e specifies "zero is
     /// the only legal value in Vorbis I for [vorbis_mode_windowtype]";
@@ -1065,6 +1079,8 @@ impl std::error::Error for WriteModeError {}
 /// returns them through the umbrella [`WriteError`] when invoked via
 /// [`write_setup_header`]).
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteSetupError {
     /// `audio_channels` (the value sourced from the identification
     /// header and supplied to [`write_setup_header`]) was zero. §4.2.2
@@ -1247,6 +1263,8 @@ impl std::error::Error for WriteSetupError {}
 /// supplied `Floor1Header` + codebook table — see
 /// [`write_floor1_packet`] for the consistency rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct Floor1Packet {
     /// `[nonzero]` flag (§7.2.3 step 1). Clear when the channel is
     /// unused this frame, set when an endpoint + per-partition body
@@ -1278,6 +1296,8 @@ pub struct Floor1Packet {
 /// bits, preserving the round-trip guarantee that the floor 1 decoder
 /// reads the same `[floor1_Y]` back.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteFloor1PacketError {
     /// `floor1_y.len()` does not match the decoder's `floor1_values`
     /// count (= `header.x_list.len() + 2`). §7.2.3 reads exactly that
@@ -1502,6 +1522,8 @@ impl From<crate::huffman::BuildError> for WriteFloor1PacketError {
 /// guarantee
 /// `read_packet_header(&write_audio_packet_header(&h, &setup, b0, b1)?, &setup, b0, b1)? == h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteAudioPacketHeaderError {
     /// The supplied [`crate::setup::VorbisSetupHeader::modes`] list was
     /// empty. A well-formed Vorbis I stream always has at least one mode
@@ -1782,6 +1804,8 @@ fn exponent_of_power_of_two(n: u16) -> Option<u8> {
 /// Returns [`WriteError`] without emitting any bytes if any field
 /// fails its §4.2.2 invariant. On success the returned [`Vec<u8>`] is
 /// exactly [`VorbisIdentificationHeader::PACKET_LEN`] bytes long.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_identification_header(
     header: &VorbisIdentificationHeader,
 ) -> Result<Vec<u8>, WriteError> {
@@ -1874,6 +1898,8 @@ pub fn write_identification_header(
 /// first), which is the order [`VorbisCommentHeader::comments`]
 /// preserves — `write_comment_header(parse_comment_header(&p)?)?`
 /// reproduces the original comment order bit-exactly.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_comment_header(header: &VorbisCommentHeader) -> Result<Vec<u8>, WriteError> {
     // §5.2.1 length-prefix invariants — guard the casts to u32 so we
     // refuse the call rather than wrap silently.
@@ -2003,6 +2029,8 @@ fn pick_length_encoding(book: &VorbisCodebook) -> CodebookLengthEncoding {
 ///
 /// Returns [`WriteCodebookError`] without emitting any bits if the
 /// supplied codebook violates a §3.2.1 invariant.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_codebook(book: &VorbisCodebook) -> Result<Vec<u8>, WriteCodebookError> {
     let mut writer = BitWriterLsb::with_capacity(64);
     write_codebook_into_writer(book, &mut writer)?;
@@ -2276,6 +2304,8 @@ fn write_lookup_block(
 ///
 /// Returns [`WriteFloor1Error`] without emitting any bits if the
 /// supplied header violates a §7.2.2 invariant.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_floor1_header(header: &Floor1Header) -> Result<Vec<u8>, WriteFloor1Error> {
     let mut writer = BitWriterLsb::with_capacity(16);
     write_floor1_header_into_writer(header, &mut writer)?;
@@ -2481,6 +2511,8 @@ pub(crate) fn write_floor1_header_into_writer(
 ///
 /// Returns [`WriteFloor0Error`] without emitting any bits if the
 /// supplied header violates a §6.2.1 invariant.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_floor0_header(header: &Floor0Header) -> Result<Vec<u8>, WriteFloor0Error> {
     let mut writer = BitWriterLsb::with_capacity(16);
     write_floor0_header_into_writer(header, &mut writer)?;
@@ -2580,6 +2612,8 @@ pub(crate) fn write_floor0_header_into_writer(
 /// header decode" — the residue-header field list common to all three
 /// formats), §4.2.4 step 2c (the `residue_type ∈ {0, 1, 2}`
 /// constraint), and §2.1.4 (LSB-first packing).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_residue_header(header: &ResidueHeader) -> Result<Vec<u8>, WriteResidueError> {
     let mut writer = BitWriterLsb::with_capacity(16);
     write_residue_header_into_writer(header, &mut writer)?;
@@ -2802,6 +2836,8 @@ pub(crate) fn write_residue_header_into_writer(
 /// `mux[ch]` slot, and the per-submap `(time_placeholder, floor,
 /// residue)` triples), §9.2.1 "ilog" (the per-channel-number field
 /// width), and §2.1.4 (LSB-first packing).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_mapping_header(
     header: &MappingHeader,
     audio_channels: u8,
@@ -3050,6 +3086,8 @@ pub(crate) fn write_mapping_header_into_writer(
 /// 16-bit window and transform fields and the
 /// `mapping < vorbis_mapping_count` constraint at step 2e; §2.1.4
 /// (LSB-first packing).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_mode_header(
     header: &ModeHeader,
     mapping_count: usize,
@@ -3180,6 +3218,8 @@ pub(crate) fn write_mode_header_into_writer(
 /// blocks plus the trailing framing flag); §2.1.4 (LSB-first packing);
 /// §2.1.8 (end-of-packet alignment — the final byte's trailing bits are
 /// zero padding).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_setup_header(
     header: &VorbisSetupHeader,
     audio_channels: u8,
@@ -3446,6 +3486,8 @@ pub fn write_setup_header(
 /// [`WriteAudioPacketHeaderError::ShortBlockHasWindowFlag`] if
 /// `header.blockflag` is `false` but a window flag is set (no bit
 /// pattern would round-trip to that struct on the short-block path).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_audio_packet_header(
     header: &AudioPacketHeader,
     setup: &VorbisSetupHeader,
@@ -3592,6 +3634,8 @@ pub(crate) fn write_audio_packet_header_into_writer(
 /// // when nonzero: curve == Curve(expected_curve_from_p.floor1_y)
 /// // when !nonzero: curve == Unused
 /// ```
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_floor1_packet(
     packet: &Floor1Packet,
     header: &crate::setup::Floor1Header,
@@ -3903,6 +3947,8 @@ const RANGE_TABLE_FLOOR1: [u32; 4] = [256, 128, 86, 64];
 /// `len(coefficients) >= order`, so a trailing partial vector is read in
 /// full and its surplus scalars discarded).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum Floor0Packet {
     /// The channel carried no audio energy this frame: the `[amplitude]`
     /// field is zero and the §6.2.2 step-2 short-circuit returns
@@ -3937,6 +3983,8 @@ pub enum Floor0Packet {
 /// preserving the round-trip guarantee that the floor 0 decoder reads
 /// the same amplitude / booknumber / coefficients back.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteFloor0PacketError {
     /// `floor0_amplitude_bits` was zero. §6.2.1 stores it as a `read 6
     /// bits` field; a zero width makes the `[amplitude]` read always
@@ -4179,6 +4227,8 @@ impl From<crate::huffman::BuildError> for WriteFloor0PacketError {
 /// (the header field bounds the writer mirrors), §3.2.1 (canonical
 /// Huffman codewords), §3.3 (the VQ-context lookup_type gate), §2.1.4
 /// (LSB-first packing).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_floor0_packet(
     packet: &Floor0Packet,
     header: &Floor0Header,
@@ -4361,6 +4411,8 @@ pub(crate) fn write_floor0_packet_into_writer(
 /// loop would reproduce, so it refuses the call rather than emit a value
 /// that fails to round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum PackResidueClassError {
     /// `num_classifications` was zero. §8.6.1 stores
     /// `residue_classifications` as a `read 6 bits + 1` field, so the
@@ -4500,6 +4552,8 @@ impl std::error::Error for PackResidueClassError {}
 /// classification index is `>= num_classifications`, or the packed
 /// index would exceed `u32::MAX`. Validation precedes any arithmetic;
 /// the function is a pure value-to-value transform with no side effects.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn pack_residue_classifications(
     classifications: &[u32],
     num_classifications: u32,
@@ -4565,6 +4619,8 @@ pub fn pack_residue_classifications(
 /// entry sequence the decode loop would reproduce, so it refuses the
 /// call rather than emit a value that fails to round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum PackResidueClassGroupsError {
     /// `classwords_per_codeword` was zero. §8.6.2 derives it from the
     /// classbook's `dimensions`, which is `>= 1` for any decodable
@@ -4659,6 +4715,8 @@ impl std::error::Error for PackResidueClassGroupsError {
 /// overflow). Validation precedes any output allocation growth past the
 /// failing group; the function is a pure value-to-value transform with no
 /// side effects.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn pack_residue_classification_groups(
     classifications: &[u32],
     num_classifications: u32,
@@ -4713,6 +4771,8 @@ pub fn pack_residue_classification_groups(
 /// input that cannot serialise to a partition body the decoder would
 /// read back, so the call is refused before any bits are emitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteResiduePartitionError {
     /// `residue_type` was a value other than 0, 1, or 2. §8.6 defines
     /// only the three formats.
@@ -4856,6 +4916,8 @@ impl From<crate::huffman::BuildError> for WriteResiduePartitionError {
 /// Returns a [`WriteResiduePartitionError`] for a `residue_type`
 /// outside {0, 1, 2}, a zero `partition_size`, zero `dimensions`, or a
 /// format-0 divisibility failure.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn residue_partition_codeword_count(
     residue_type: u16,
     partition_size: u32,
@@ -4931,6 +4993,8 @@ pub fn residue_partition_codeword_count(
 /// vector lookup (§8.6.1), an entry-count mismatch, a Huffman build
 /// failure, or an entry with no canonical codeword. Validation
 /// precedes emission; on error no bits are written.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_residue_partition(
     entries: &[u32],
     book: &VorbisCodebook,
@@ -5017,6 +5081,8 @@ pub(crate) fn write_residue_partition_into_writer(
 /// the writer serialises exactly what it is told, bit-exact by
 /// construction, and a future VQ-encode stage picks the values.
 #[derive(Debug, Clone, Default, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ResidueVectorPlan {
     /// `classifications[partition]` for this decode vector — exactly
     /// the `[classifications]` row the §8.6.2 step-11 unpack rebuilds.
@@ -5039,6 +5105,8 @@ pub struct ResidueVectorPlan {
 /// decode vectors [`write_residue_body`] expects plans for, and how
 /// many partitions each plan spans. Returned by [`residue_body_shape`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ResidueBodyShape {
     /// The number of §8.6.2 decode vectors: `do_not_decode.len()` for
     /// formats 0 and 1 (one per channel, 'do not decode' ones
@@ -5062,6 +5130,8 @@ pub struct ResidueBodyShape {
 /// residue decoder would read back, so the call is refused before any
 /// bits are emitted (validation precedes emission in full).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteResidueBodyError {
     /// `residue_type` was a value other than 0, 1, or 2 (§8.6).
     UnsupportedResidueType(u16),
@@ -5371,6 +5441,8 @@ impl From<crate::huffman::BuildError> for WriteResidueBodyError {
 ///
 /// Returns a [`WriteResidueBodyError`] for a `residue_type` outside
 /// {0, 1, 2} or a zero `partition_size`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn residue_body_shape(
     header: &ResidueHeader,
     blocksize: usize,
@@ -5458,6 +5530,8 @@ pub fn residue_body_shape(
 /// absent against the cascade, or any per-partition failure (carried
 /// verbatim). Validation precedes emission in full; on error nothing
 /// is written.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_residue_body(
     plans: &[ResidueVectorPlan],
     header: &ResidueHeader,
@@ -5753,6 +5827,8 @@ pub(crate) fn write_residue_body_into_writer(
 /// ("residue vector for channel `j` is set to decoded residue vector
 /// `ch`") is recoverable from [`Self::channels`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct SubmapResidueBundle {
     /// The submap index (`i` in §4.3.4) this bundle decodes.
     pub submap: usize,
@@ -5781,6 +5857,8 @@ pub struct SubmapResidueBundle {
 /// to gather the per-channel residue plans and
 /// [`SubmapResidueBundle::do_not_decode`] as the body's flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct ResidueBundlePlan {
     /// `no_residue` after §4.3.3 nonzero-vector propagation. Index `i`
     /// is channel `i`; `true` means the channel's residue is not coded
@@ -5796,6 +5874,8 @@ pub struct ResidueBundlePlan {
 
 /// Errors from [`plan_residue_bundles`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum PlanResidueBundlesError {
     /// The mapping declared zero submaps. A well-formed Vorbis I
     /// mapping has `submaps >= 1` (the `submaps_flag`-unset path pins
@@ -5910,6 +5990,8 @@ impl std::error::Error for PlanResidueBundlesError {}
 /// On any error nothing is returned; the function is pure (no side
 /// effects on its inputs — `no_residue` is taken by value and the
 /// propagated copy is returned inside the plan).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn plan_residue_bundles(
     mapping: &MappingHeader,
     no_residue: &[bool],
@@ -6008,6 +6090,8 @@ enum ResolvedFloor<'a> {
 /// rejected with [`WriteAudioPacketError::FloorTypeMismatch`] before any
 /// bits are emitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum AudioChannelFloor {
     /// A §6.2.2 floor 0 packet body, written by
     /// [`write_floor0_packet_into_writer`].
@@ -6038,6 +6122,8 @@ impl AudioChannelFloor {
 /// before emitting a single bit, so a caller's `writer` is bit-exactly
 /// untouched on every error path.
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WriteAudioPacketError {
     /// The §4.3.1 prelude failed a [`write_audio_packet_header`]
     /// invariant.
@@ -6272,6 +6358,8 @@ impl std::error::Error for WriteAudioPacketError {
 /// verbatim). Validation precedes emission in full; on error nothing is
 /// written.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn write_audio_packet(
     header: &AudioPacketHeader,
     setup: &VorbisSetupHeader,

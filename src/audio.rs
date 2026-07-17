@@ -220,6 +220,8 @@ fn build_floor(
 /// ([`Self::PreImdct`]) or the §4.3.2 "zero every output vector"
 /// short-circuit ([`Self::Zeroed`]).
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum AudioPacketOutcome {
     /// The driver completed §4.3.2..§4.3.6 normally and produced one
     /// length-`n/2` audio-spectrum vector per channel, ready for the
@@ -278,6 +280,8 @@ pub enum AudioPacketOutcome {
 /// length-`n` frames (the IMDCT of zero is zero by linearity, times any
 /// window is still zero).
 #[derive(Debug, Clone, PartialEq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum WindowedPacketOutcome {
     /// The driver completed §4.3.2..§4.3.6 normally, ran the §4.3.7 IMDCT
     /// per channel, and multiplied each length-`n` time-domain frame by
@@ -444,6 +448,8 @@ impl AudioPacketOutcome {
 ///   failure ([`CouplingError`]).
 /// * [`AudioPacketError::Packet`] for a §4.3.3 / §4.3.6 driver failure
 ///   ([`PacketError`]).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_audio_packet_pre_imdct(
     reader: &mut BitReaderLsb<'_>,
     setup: &VorbisSetupHeader,
@@ -605,6 +611,8 @@ pub fn decode_audio_packet_pre_imdct(
 /// the corresponding [`AudioPacketError`] variant. The function never
 /// returns `Ok(_)`; it is shaped that way so the public signature does
 /// not need to change.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_one_packet(
     reader: &mut BitReaderLsb<'_>,
     setup: &VorbisSetupHeader,
@@ -680,6 +688,8 @@ pub fn decode_one_packet(
 ///   spectrum per channel and `n` is power-of-two-validated by the
 ///   identification header, so this should not arise in practice; the
 ///   variant exists for defensive surfacing.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_audio_packet_windowed(
     reader: &mut BitReaderLsb<'_>,
     setup: &VorbisSetupHeader,
@@ -710,6 +720,8 @@ pub fn decode_audio_packet_windowed(
 /// # Errors
 ///
 /// See [`decode_audio_packet_windowed`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn apply_imdct_and_window(
     outcome: AudioPacketOutcome,
     blocksize_0: usize,
@@ -807,6 +819,8 @@ pub fn apply_imdct_and_window(
 /// # Errors
 ///
 /// See [`decode_audio_packet_windowed`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_one_packet_windowed(
     reader: &mut BitReaderLsb<'_>,
     setup: &VorbisSetupHeader,
@@ -851,6 +865,8 @@ fn submap_for_channel(mapping: &MappingHeader, channel: usize) -> Result<u8, Aud
 
 /// Errors that can arise while driving §4.3.2..§4.3.6.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub enum AudioPacketError {
     /// §4.3.1 packet-prelude read failed (see [`PacketError`]).
     Header(PacketError),

@@ -151,50 +151,127 @@
 
 use oxideav_core::RuntimeContext;
 
+// `audio` holds the decode-driver internals; only `AudioDecoderState`
+// (named in the public `decode_packet` signature) is part of the stable
+// API — the rest of the module is hidden item-by-item below.
 pub mod audio;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod blocksize;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod book_design;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod channel_order;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod codebook;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod comment;
 pub mod decoder;
+// `encoder` holds the trained-entropy write plumbing; only
+// `make_encoder` and `VorbisStreamEncoder` are part of the stable API —
+// the rest of the module is hidden item-by-item within the module.
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor0;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor0_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor0_envelope;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor0_layout;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor0_lsp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor1;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor1_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor1_envelope;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod floor1_layout;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod framing;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod huffman;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod identification;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod imdct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mdct;
 pub mod oggfile;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod overlap;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod packet;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod packet_kind;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod psy;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod quality;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod residue;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod residue_encode;
+// `setup` holds the parsed setup-header structures; only
+// `VorbisSetupHeader` (named in the public `decode_packet` signature) is
+// part of the stable API — the rest of the module is hidden item-by-item
+// within the module.
 pub mod setup;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod streaming;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod synthesis;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vq;
 
+// `AudioDecoderState` is named in the public `decode_packet` signature;
+// the rest of the `audio` re-exports are internal decode-driver plumbing.
+pub use audio::AudioDecoderState;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use audio::{
     apply_imdct_and_window, decode_audio_packet_pre_imdct, decode_audio_packet_windowed,
-    decode_one_packet, decode_one_packet_windowed, AudioDecoderState, AudioPacketError,
-    AudioPacketOutcome, WindowedPacketOutcome,
+    decode_one_packet, decode_one_packet_windowed, AudioPacketError, AudioPacketOutcome,
+    WindowedPacketOutcome,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use blocksize::{
     choose_blocksize, detect_transient, plan_block_sequence, BlockSequencePlan, BlocksizeError,
     TransientAnalysis,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use book_design::{
     design_codeword_lengths, design_codeword_lengths_dense, design_entropy_codebook,
     design_value_ladder, redesign_codebook, stream_cost_bits, tally_floor0_packet,
@@ -202,54 +279,89 @@ pub use book_design::{
     train_residue_books_rd_ladder, BookDesignError, BookTallies, ResidueLadderTrainingOutcome,
     ResidueRdTrainingOutcome, ValueLadderDesign, MAX_CODEWORD_LEN,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use channel_order::{speaker_at, speaker_layout, Speaker};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use codebook::{
     float32_pack, float32_unpack, ilog, lookup1_values, parse_codebook,
     ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use comment::{
     parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
 };
 pub use decoder::{make_decoder, VorbisDecoder, OUTPUT_SAMPLE_FORMAT};
+// `make_encoder` and `VorbisStreamEncoder` are the stable encoder entry
+// points; every other `encoder` re-export is internal write plumbing.
+pub use encoder::{make_encoder, VorbisStreamEncoder};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use encoder::{
-    make_encoder, pack_residue_classification_groups, pack_residue_classifications,
-    plan_residue_bundles, residue_body_shape, residue_partition_codeword_count, write_audio_packet,
+    pack_residue_classification_groups, pack_residue_classifications, plan_residue_bundles,
+    residue_body_shape, residue_partition_codeword_count, write_audio_packet,
     write_audio_packet_header, write_codebook, write_comment_header, write_floor0_header,
     write_floor0_packet, write_floor1_header, write_floor1_packet, write_identification_header,
     write_mapping_header, write_mode_header, write_residue_body, write_residue_header,
     write_residue_partition, AudioChannelFloor, Floor0Packet, Floor1Packet, PackResidueClassError,
     PackResidueClassGroupsError, PlanResidueBundlesError, ResidueBodyShape, ResidueBundlePlan,
-    ResidueVectorPlan, SubmapResidueBundle, VorbisStreamEncoder, WriteAudioPacketError,
-    WriteAudioPacketHeaderError, WriteCodebookError, WriteError, WriteFloor0Error,
-    WriteFloor0PacketError, WriteFloor1Error, WriteFloor1PacketError, WriteMappingError,
-    WriteModeError, WriteResidueBodyError, WriteResidueError, WriteResiduePartitionError,
+    ResidueVectorPlan, SubmapResidueBundle, WriteAudioPacketError, WriteAudioPacketHeaderError,
+    WriteCodebookError, WriteError, WriteFloor0Error, WriteFloor0PacketError, WriteFloor1Error,
+    WriteFloor1PacketError, WriteMappingError, WriteModeError, WriteResidueBodyError,
+    WriteResidueError, WriteResiduePartitionError,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor0_encode::{floor0_vector_count, plan_floor0_coefficients, Floor0EncodeError};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor0_layout::{
     score_floor0_orders, select_floor0_order, select_floor0_order_rd, suggest_floor0_params,
     Floor0LayoutError, Floor0OrderFit,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor1::{
     high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor1_encode::{
     full_x_list as floor1_full_x_list, plan_floor1_packet, plan_floor1_partition_cvals,
     plan_floor1_y, Floor1CvalError, Floor1EncodeError, Floor1PacketPlanError,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use floor1_layout::{
     design_floor1_header, floor1_x_list_distortion, min_rangebits, plan_floor1_partition_layout,
     plan_floor1_x_list, select_floor1_post_budget, Floor1LayoutError, Floor1PartitionLayout,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use framing::{FrameSplitter, FramingError};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use huffman::{
     BuildError as HuffmanBuildError, DecodeError as HuffmanDecodeError, HuffmanNode, HuffmanTree,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use identification::{
     parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use imdct::{imdct_naive, imdct_naive_vec, ImdctError};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mdct::{
     apply_window_and_mdct, apply_window_and_mdct_vec, mdct_naive, mdct_naive_vec,
     ApplyWindowAndMdctError, MdctError,
@@ -259,23 +371,37 @@ pub use oggfile::{
     mux_vorbis_stream, ogg_packets, DecodedOggStream, EncodedVorbisStream, MuxError, OggFileError,
     StreamEncoderConfig,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use overlap::{OverlapAdd, OverlapError};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use packet::{
     dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
     PacketError, PacketHeaderStage, VectorKind,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use packet_kind::{
     classify_packet, parse_header_packet, ClassifyError, HeaderDispatchError, HeaderPacket,
     PacketKind,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use psy::{
     ath_db, compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
     PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use quality::{
     solve_lambda_for_bits, EncoderTuning, LambdaSolution, LambdaSolveError, QualityError,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use residue::{ResidueDecoder, ResidueError};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use residue_encode::{
     plan_partition_cascade, plan_partition_cascade_scored, plan_vector_classifications,
     plan_vector_classifications_rd, plan_vector_classifications_rd_weighted,
@@ -284,19 +410,29 @@ pub use residue_encode::{
     PartitionClassChoice, ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade,
     ScoredVectorResidue, SelectedResidueConfig,
 };
+// `VorbisSetupHeader` is named in the public `decode_packet` signature;
+// the rest of the `setup` re-exports are internal parsed-header types.
+pub use setup::VorbisSetupHeader;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use setup::{
     parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
     FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap, ModeHeader,
-    ParseError as SetupParseError, ResidueHeader, VorbisSetupHeader, SETUP_PACKET_MAGIC,
-    SETUP_PACKET_TYPE,
+    ParseError as SetupParseError, ResidueHeader, SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use streaming::{StreamingDecoder, StreamingError, StreamingFrame};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use synthesis::{
     couple_scalar, coupling_energy, factor_spectrum, factor_spectrum_all, forward_couple,
     forward_couple_all, forward_couple_scalar, inverse_couple, inverse_couple_all,
     prune_coupling_steps, should_couple, slope, vorbis_window, window_premultiply, CouplingEnergy,
     CouplingError, FactorSpectrumError, WindowError, WindowPremultiplyError,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use vq::{
     quantize_vector, unpack_vector, QuantizeError as VqQuantizeError, QuantizedEntry,
     UnpackError as VqUnpackError,
