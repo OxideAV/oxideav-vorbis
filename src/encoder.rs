@@ -5022,6 +5022,27 @@ pub(crate) fn write_residue_partition_into_writer(
     partition_size: u32,
     writer: &mut BitWriterLsb,
 ) -> Result<(), WriteResiduePartitionError> {
+    // The book's lengths must build a canonical §3.2.1 tree. Callers
+    // emitting many partitions against the same book (the §8.6.2 body
+    // writer) build the tree once and call the `_with_tree` core —
+    // per-partition tree construction over a large designed lattice
+    // book was a measured integrated-encoder hot spot.
+    let tree = crate::huffman::HuffmanTree::from_codebook(book)?;
+    write_residue_partition_with_tree(entries, book, &tree, residue_type, partition_size, writer)
+}
+
+/// [`write_residue_partition_into_writer`] with the book's canonical
+/// §3.2.1 Huffman tree supplied by the caller (built once per book,
+/// not once per partition). `tree` must be built from `book`'s
+/// codeword lengths — the two travel together at every call site.
+pub(crate) fn write_residue_partition_with_tree(
+    entries: &[u32],
+    book: &VorbisCodebook,
+    tree: &crate::huffman::HuffmanTree,
+    residue_type: u16,
+    partition_size: u32,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteResiduePartitionError> {
     // ---- fail-closed invariant gate (no bits emitted on error). ----
     // (1) The (residue_type, partition_size, dimensions) triple pins the
     // codeword count the decoder will read for this partition.
@@ -5040,11 +5061,9 @@ pub(crate) fn write_residue_partition_into_writer(
         });
     }
 
-    // (4) The book's lengths must build a canonical §3.2.1 tree, and
-    // every entry must be one of its leaves. The encodability pre-check
-    // runs against a scratch writer so the caller's stream is untouched
-    // if any entry is refused.
-    let tree = crate::huffman::HuffmanTree::from_codebook(book)?;
+    // (4) Every entry must be a leaf of the book's canonical tree. The
+    // encodability pre-check runs against a scratch writer so the
+    // caller's stream is untouched if any entry is refused.
     for (index, &entry) in entries.iter().enumerate() {
         let mut scratch = BitWriterLsb::new();
         tree.encode_entry(entry, &mut scratch).map_err(|e| {
@@ -5590,10 +5609,18 @@ pub(crate) fn write_residue_body_into_writer(
 
     // (3) §8.6.1: resolve and validate every configured (class, stage)
     // value book, mirroring the decoder's construction-time checks.
+    // Each referenced book's canonical §3.2.1 Huffman tree is built
+    // exactly once here (`trees`, indexed like `codebooks`) — the
+    // partition loops below emit hundreds of partitions against the
+    // same handful of books, and rebuilding a large designed lattice
+    // book's tree per partition was a measured hot spot.
     let class_count = header.classifications as usize;
-    let mut value_books: Vec<[Option<&VorbisCodebook>; 8]> = Vec::with_capacity(class_count);
+    let mut trees: Vec<Option<crate::huffman::HuffmanTree>> = Vec::new();
+    trees.resize_with(codebooks.len(), || None);
+    let mut value_books: Vec<[Option<(&VorbisCodebook, usize)>; 8]> =
+        Vec::with_capacity(class_count);
     for (class, stage_books) in header.books.iter().take(class_count).enumerate() {
-        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        let mut row: [Option<(&VorbisCodebook, usize)>; 8] = [None; 8];
         for (stage, slot) in stage_books.iter().enumerate() {
             let Some(book_idx) = slot else { continue };
             let book = codebooks.get(*book_idx as usize).ok_or({
@@ -5611,7 +5638,10 @@ pub(crate) fn write_residue_body_into_writer(
                     book: *book_idx,
                 });
             }
-            row[stage] = Some(book);
+            if trees[*book_idx as usize].is_none() {
+                trees[*book_idx as usize] = Some(crate::huffman::HuffmanTree::from_codebook(book)?);
+            }
+            row[stage] = Some((book, *book_idx as usize));
         }
         value_books.push(row);
     }
@@ -5684,11 +5714,12 @@ pub(crate) fn write_residue_body_into_writer(
                     // §8.6.2 step 19: this (partition, pass) pair emits
                     // a partition body — validate it via the round-37
                     // per-partition writer against a scratch stream.
-                    (Some(book), Some(entries)) => {
+                    (Some((book, tree_idx)), Some(entries)) => {
                         let mut scratch = BitWriterLsb::new();
-                        write_residue_partition_into_writer(
+                        write_residue_partition_with_tree(
                             entries,
                             book,
+                            trees[*tree_idx].as_ref().expect("tree built with the row"),
                             header.residue_type,
                             header.partition_size,
                             &mut scratch,
@@ -5789,14 +5820,15 @@ pub(crate) fn write_residue_body_into_writer(
                     }
                     // §8.6.2 steps 16..18: classification → stage book.
                     let class = plans[j].classifications[partition_count] as usize;
-                    if let Some(book) = value_books[class][pass] {
+                    if let Some((book, tree_idx)) = value_books[class][pass] {
                         // §8.6.2 step 19 inverse: the partition body.
                         let entries = plans[j].partition_entries[partition_count][pass]
                             .as_ref()
                             .expect("entry-list presence pre-validated against the cascade");
-                        write_residue_partition_into_writer(
+                        write_residue_partition_with_tree(
                             entries,
                             book,
+                            trees[tree_idx].as_ref().expect("tree built with the row"),
                             header.residue_type,
                             header.partition_size,
                             writer,
