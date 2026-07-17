@@ -6,6 +6,21 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **The `vq_dims = 2` designed-lattice fine book now follows the
+  quality knob** (`EncoderTuning::fine_resolution_scale`, the r413
+  monotone-knob law applied to the lattice geometry): the fine
+  ladder's step divides by the knob's fine-resolution scale, capped
+  at the ladder's **coverage bound** of 2× — the lattice's
+  per-dimension level count is pinned by the entry ceiling, so its
+  base span carries exactly 2× headroom over the coarse-leftover
+  bound, and shrinking further clips the leftover extremes (measured:
+  uncapped 4× shrink collapses the mono corpus q = 1 SNR 48 → 36 dB;
+  the capped law is monotone 31.5 → 47.9 → 52.6 → 52.7 dB across
+  q ∈ {0.5, 0.7, 0.85, 1}, against the fixed-step book's wobble
+  around ≈ 48 dB with near-tripled bytes). Black-box: the swept
+  `vq_dims = 2` re-encodes decode through the reference decoder
+  binary to their exact declared frame counts at SNRs matching the
+  crate's own decoder.
 - Marked the crate's internal surface `#[doc(hidden)]` (floor / residue
   / codebook / IMDCT decode primitives and the trained-entropy encoder
   write plumbing exposed for tests/fuzz), so cargo-semver-checks no

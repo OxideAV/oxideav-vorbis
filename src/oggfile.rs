@@ -1352,15 +1352,32 @@ pub fn encode_pcm_to_packets(
         .codebook;
         // The fine corpus is the coarse stage's leftover: target minus
         // the chosen entry's decoded reconstruction, per sub-vector.
-        // Its ladder spans two coarse steps — the leftover is bounded
-        // by half a coarse step plus grid-snap slack.
+        // Its base ladder spans two coarse steps — the leftover is
+        // bounded by half a coarse step plus grid-snap slack, so the
+        // base span carries 2× coverage headroom. The quality knob's
+        // fine-resolution scale divides the step — exactly like the
+        // scalar seed ladder below, the top of the knob must lower
+        // the reconstruction noise floor (with a fixed step the
+        // whole-stream SNR saturates near q ≈ 0.7 while the falling
+        // lambda only buys saturated-SNR density — measured on the
+        // staged corpus the fixed-step lattice fine book wobbled at
+        // ≈ 48 dB from q = 0.7 to q = 1 while bytes near-tripled) —
+        // but only down to the coverage bound: past 2× the shrunk
+        // span clips the leftover extremes and the SNR *collapses*
+        // (measured 48 → 36 dB at 4×). The scalar ladder has no such
+        // cap because its 64 levels always span two full coarse
+        // steps; the lattice's per-dimension level count is pinned by
+        // the entry ceiling, so resolution past the cap must come
+        // from a third cascade stage, not a finer second.
         let mut leftovers: Vec<f32> = Vec::with_capacity(corpus.len());
         for chunk in corpus.chunks_exact(d) {
             let q = crate::vq::quantize_vector(&coarse, chunk)
                 .expect("a freshly designed coarse book has >= 1 used entry and matching dims");
             leftovers.extend(chunk.iter().zip(&q.vector).map(|(&t, &v)| t - v));
         }
-        let fine_step = crate::book_design::pack_nearest(2.0 * coarse_step / lv as f32);
+        let fine_step = crate::book_design::pack_nearest(
+            2.0 * coarse_step / lv as f32 / tuning.fine_resolution_scale().min(2.0),
+        );
         let fine_ladder = crate::book_design::uniform_value_ladder(
             -(lv as f32 / 2.0) * fine_step,
             fine_step,

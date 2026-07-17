@@ -101,6 +101,26 @@ impl core::fmt::Display for QualityError {
 impl std::error::Error for QualityError {}
 
 impl EncoderTuning {
+    /// The [`Self::fine_step_divisor`] law's base value — the divisor
+    /// through the low and middle of the quality range (`q <= 0.7`).
+    /// [`Self::fine_resolution_scale`] is the divisor normalised to
+    /// this base.
+    pub const FINE_STEP_DIVISOR_BASE: f32 = 192.0;
+
+    /// The quality knob's fine-ladder **resolution scale**: `1.0`
+    /// through `q <= 0.7`, rising log-linearly to `4.0` at `q = 1`
+    /// (the [`Self::fine_step_divisor`] law normalised to its base).
+    /// A residue fine ladder of *any* geometry divides its step by
+    /// this scale so the top of the knob lowers the encoder's
+    /// reconstruction noise floor instead of buying saturated-SNR
+    /// density — the r413 monotone-knob fix, applicable to the
+    /// designed multi-dimensional lattice ladders as well as the
+    /// scalar seed ladder.
+    #[must_use]
+    pub fn fine_resolution_scale(&self) -> f32 {
+        self.fine_step_divisor / Self::FINE_STEP_DIVISOR_BASE
+    }
+
     /// Expand a quality setting `q ∈ [0, 1]` into the lever set (see
     /// the struct fields for each lever's law). Monotone: `lambda` is
     /// strictly decreasing in `q`; `threshold_offset_db` and
