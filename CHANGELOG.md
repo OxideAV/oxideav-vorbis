@@ -27,6 +27,12 @@ All notable changes to `oxideav-vorbis` are recorded here.
   unweighted trainer bit-for-bit (pinned), and a rigged
   loud-but-masked corpus pins the steering (weighted-trained books
   strictly beat unweighted-trained books on the weighted objective).
+  The in-ladder scalar/joint hybrid was re-measured under the
+  aligned trainer and remains rejected: the routing collapse is
+  gone, but the perceptual Lagrangian still densifies the joint
+  class instead of buying scalar resolution, so the knob's top
+  saturates at ≈ 52.7 dB with +50 % bytes against the candidate
+  race's 55.4 dB — the race stays.
 
 - **`vq_dims = 2` — the corpus-designed 2-D joint lattice books —
   is now the integrated encoder's default** (with the per-band

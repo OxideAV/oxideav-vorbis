@@ -31,8 +31,8 @@ verified: swept encoder outputs (mono/stereo, real-audio re-encodes
 with block switching, `q ∈ {0.4, 0.7, 0.85, 0.9, 1.0}`) decode
 through ffmpeg to the exact declared frame counts at SNRs matching
 the crate's own decoder to 0.01 dB (the staged mono-q5 corpus
-re-encodes monotonically from 3.4 kB / 27.8 dB at `q = 0.4` through
-6.6 kB / 47.9 dB at the default to 11.0 kB / 55.6 dB at `q = 1`,
+re-encodes monotonically from 2.9 kB / 27.9 dB at `q = 0.4` through
+6.2 kB / 47.9 dB at the default to 10.7 kB / 55.4 dB at `q = 1`,
 against the 6.1 kB reference stream — the r410 scalar encoder spent
 7.1 kB for 41.6 dB at the default). `register()` installs the codec —
 decoder and encoder factories plus the Matroska `A_VORBIS` tag —
@@ -752,11 +752,11 @@ decode-identical PCM, strictly fewer bits).
 `decode_ogg_to_pcm` is the inverse convenience (de-frame, header
 parse, streaming decode, end-trim). `tests/ogg_encode_roundtrip.rs`
 pins the §A.2 structure of the produced stream and the round-trip
-fidelity (knob spread 2.6 kB / 16.6 dB at `q = 0.2` → 5.4 kB /
-34.1 dB at `q = 0.9` on its tonal corpus; closed-loop codebook
-training cuts a stream 9.9 → 8.5 kB — the designed lattice seeds
-already sit near the trained optimum, where the old scalar seeds
-took a 15.2 → 8.1 kB cut); black-box, the swept fixture re-encodes
+fidelity (knob spread 2.1 kB / 16.6 dB at `q = 0.2` → 5.4 kB /
+34.1 dB at `q = 0.9` on its tonal corpus; the weighted closed-loop
+codebook training cuts a stream 9.9 → 8.4 kB at identical SNR — the
+designed lattice seeds already sit near the trained optimum, where
+the old scalar seeds took a 15.2 → 8.1 kB cut); black-box, the swept fixture re-encodes
 decode through ffmpeg to their exact declared frame counts at SNRs
 matching the crate's own decoder to 0.01 dB.
 
@@ -795,7 +795,7 @@ kept steps land in every mapping and are forward-coupled over the
 residue targets (`X / rendered_floor`, the exact vectors the decoder
 inverse-couples), and each coupled pair's per-partition NMR weights
 merge to the element-wise max. Measured: a correlated stereo corpus at
-`q = 0.7` encodes to **12.0 kB coupled vs 17.9 kB dual-mono (−33 %)**
+`q = 0.7` encodes to **12.0 kB coupled vs 18.0 kB dual-mono (−33 %)**
 at equal per-channel SNR (32.8 dB / 32.7 dB); an anti-correlated pair
 fails the gate and stays uncoupled; a 4-channel stream gates each pair
 independently.
@@ -852,8 +852,8 @@ the §1.3.2 mechanism).
   audio-packet bytes the default-quality re-encode now spends ~2.3×
   the reference stream's audio bytes (mono-q5: 4.7 kB vs 2.1 kB —
   down from 6.1 kB scalar) at a measured 47.9 dB, and reaches
-  audio-parity near `q ≈ 0.5` at ~32 dB (`q = 0.6` re-encodes at
-  ×1.34 / 47 dB). The remaining structural gap versus the
+  audio-parity near `q ≈ 0.55` at ~35 dB (`q = 0.6` re-encodes at
+  ×1.38 / 47 dB). The remaining structural gap versus the
   reference's richer class set (10 classes, per-band
   multi-dimensional books up to 8-D) is per-band book assignment —
   one shared book pair serves the whole spectrum — plus
