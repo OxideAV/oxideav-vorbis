@@ -125,6 +125,41 @@ const VQ_DESIGN_MAX_CODEWORD_LEN: u8 = 24;
 /// the old all-or-nothing silence/full choice.
 const RESIDUE_CLASSES: u32 = 4;
 
+/// The designed lattice fine ladder's **coverage cap**: the largest
+/// fine-resolution scale (see
+/// [`EncoderTuning::fine_resolution_scale`]) the `vq_dims = 2` joint
+/// geometry can follow. The lattice's per-dimension level count is
+/// pinned by the entry ceiling, so its base span carries exactly 2×
+/// headroom over the coarse-leftover bound — shrinking the step
+/// further clips the leftover extremes and the fidelity *collapses*
+/// (measured 48 → 36 dB at 4×). Past the cap the integrated encoder
+/// brings the scalar-ladder geometry into play, whose 64 levels span
+/// two full coarse steps at any knob-scaled step: the two geometries'
+/// rate/SNR frontiers cross near the cap (measured on the staged mono
+/// corpus, 8.2 kB / 52.7 dB scalar vs 8.6 kB / 52.6 dB joint at
+/// `q = 0.85`), but *where* is stream-dependent, so the top band
+/// encodes both candidates and keeps the better — see the geometry
+/// selector in [`encode_pcm_to_packets`]. An in-ladder hybrid (both
+/// geometries as competing residue classes, chosen per partition) was
+/// measured and rejected: the closed-loop trainer plans *unweighted*,
+/// routing the loud partitions to the scalar classes and
+/// sparse-pruning the joint books' loud cells, after which the final
+/// *weighted* plans route those partitions back onto the pruned joint
+/// books — whose (perceptually masked but numerically huge)
+/// reconstruction error collapsed the measured stream SNR by 13 dB at
+/// `q = 0.9`.
+const LATTICE_FINE_COVERAGE_CAP: f32 = 2.0;
+
+/// The quality setting whose fine-resolution scale sits exactly at
+/// [`LATTICE_FINE_COVERAGE_CAP`] — the joint geometry's cap point
+/// (the `fine_step_divisor` law is `192 · 4^((q − 0.7) / 0.3)`, so
+/// scale 2 lands at `q = 0.7 + 0.3 · log₄ 2 = 0.85`). The top-band
+/// selector encodes its joint candidate at this setting: past it the
+/// joint books' resolution is pinned, and a lower `lambda` only buys
+/// saturated-SNR density (measured +59 % audio bytes for +0.13 dB
+/// from `q = 0.85` to `q = 1` on the staged mono corpus).
+const LATTICE_SEAM_QUALITY: f32 = 0.85;
+
 /// Dimensionality of the class-1 noise book: how many consecutive
 /// residue bins one noise codeword covers. Quiet partitions are the
 /// bulk of a typical spectrum, and a scalar book charges them one
@@ -744,7 +779,11 @@ fn scalar_book(entries: u32, length: u8) -> VorbisCodebook {
 /// bits total instead of `dims` separate per-partition codewords.
 fn class_group_book(classes: u32, dims: u16) -> VorbisCodebook {
     let entries = classes.pow(u32::from(dims));
-    let length = (dims as u32 * classes.ilog2()) as u8;
+    // Ceil log2: for a non-power-of-two class count the uniform seed
+    // lengths under-fill the Kraft sum — legal as a planning proxy
+    // (the seed never reaches the wire; the occupancy-optimal dense
+    // retrain below replaces it with exact-Kraft lengths).
+    let length = (dims as u32 * classes.next_power_of_two().ilog2()) as u8;
     VorbisCodebook {
         dimensions: dims,
         entries,
@@ -941,6 +980,101 @@ pub fn encode_pcm_to_packets(
     pcm: &[Vec<f32>],
     config: &StreamEncoderConfig,
 ) -> Result<EncodedVorbisStream, OggFileError> {
+    let tuning = EncoderTuning::from_quality(config.quality)?;
+    let past_cap = tuning.fine_resolution_scale() > LATTICE_FINE_COVERAGE_CAP * 1.0001;
+    if config.vq_dims > 1 && past_cap {
+        // ---- top-of-knob geometry selection (vq_dims = 2 only) ----
+        // Past the lattice fine ladder's coverage cap the joint
+        // geometry saturates, so the scalar geometry (whose fine step
+        // follows the knob everywhere) takes over — but *which* knob
+        // setting the two frontiers cross at is stream-dependent (on
+        // the staged corpus the mono-44100 seam is clean while the
+        // mono-22050 joint encode at the cap still leads the scalar
+        // encode by ≈ 5 dB one knob step past it). So the top band
+        // encodes both candidates — the scalar geometry at the
+        // requested quality, and the joint geometry *frozen at its
+        // cap point* (its cheapest saturated setting; running it past
+        // the cap only buys saturated-SNR density) — and keeps the
+        // one whose own-decoded whole-stream SNR is higher, ties to
+        // fewer bytes. Monotone by construction: the joint
+        // candidate's SNR is a constant in `q`, the scalar
+        // candidate's is non-decreasing, and `max` preserves both.
+        let seam_tuning = EncoderTuning::from_quality(LATTICE_SEAM_QUALITY)?;
+        debug_assert!(
+            (seam_tuning.fine_resolution_scale() - LATTICE_FINE_COVERAGE_CAP).abs() < 1e-3,
+            "LATTICE_SEAM_QUALITY must sit exactly at the coverage cap"
+        );
+        let scalar = encode_pcm_to_packets_geometry(pcm, config, &tuning, false)?;
+        let joint = encode_pcm_to_packets_geometry(pcm, config, &seam_tuning, true)?;
+        let scalar_snr = decoded_stream_snr(&scalar, pcm)?;
+        let joint_snr = decoded_stream_snr(&joint, pcm)?;
+        let scalar_bytes: usize = scalar.audio.iter().map(|(p, _)| p.len()).sum();
+        let joint_bytes: usize = joint.audio.iter().map(|(p, _)| p.len()).sum();
+        let keep_scalar =
+            scalar_snr > joint_snr || (scalar_snr == joint_snr && scalar_bytes <= joint_bytes);
+        return Ok(if keep_scalar { scalar } else { joint });
+    }
+    encode_pcm_to_packets_geometry(pcm, config, &tuning, config.vq_dims > 1)
+}
+
+/// Own-decode a packet stream and report the whole-stream SNR (dB)
+/// against the input PCM (`10·log10(Σ signal² / Σ error²)` across all
+/// channels) — the top-band geometry selector's ground truth.
+fn decoded_stream_snr(stream: &EncodedVorbisStream, pcm: &[Vec<f32>]) -> Result<f64, OggFileError> {
+    let id = parse_identification_header(&stream.identification)
+        .map_err(|e| OggFileError::Header(e.to_string()))?;
+    let setup = parse_setup_header(&stream.setup, id.audio_channels)
+        .map_err(|e| OggFileError::Header(e.to_string()))?;
+    let state =
+        AudioDecoderState::new(&setup).map_err(|e| OggFileError::Header(format!("{e:?}")))?;
+    let ch = id.audio_channels as usize;
+    let mut decoder = StreamingDecoder::new(
+        id.audio_channels,
+        id.blocksize_0 as usize,
+        id.blocksize_1 as usize,
+        1.0,
+    );
+    let mut decoded: Vec<Vec<f32>> = vec![Vec::new(); ch];
+    for (packet, _) in &stream.audio {
+        let mut reader = oxideav_core::bits::BitReaderLsb::new(packet);
+        if let StreamingFrame::Pcm {
+            per_channel_pcm, ..
+        } = decoder.push_packet(&mut reader, &setup, &state)?
+        {
+            for (row, samples) in decoded.iter_mut().zip(&per_channel_pcm) {
+                row.extend_from_slice(samples);
+            }
+        }
+    }
+    let mut sig = 0.0f64;
+    let mut err = 0.0f64;
+    for (reference, out) in pcm.iter().zip(&decoded) {
+        let n = reference.len().min(out.len());
+        for (&r, &d) in reference[..n].iter().zip(&out[..n]) {
+            sig += f64::from(r) * f64::from(r);
+            let e = f64::from(r) - f64::from(d);
+            err += e * e;
+        }
+    }
+    Ok(if err == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (sig / err).log10()
+    })
+}
+
+/// The single-geometry encode under [`encode_pcm_to_packets`]:
+/// `joint_geometry` selects the corpus-designed 2-D lattice books
+/// (`true`) or the scalar ladders (`false`), and `tuning` carries the
+/// expanded quality levers (the top-band selector deliberately hands
+/// the joint candidate its cap-point tuning rather than the requested
+/// quality's).
+fn encode_pcm_to_packets_geometry(
+    pcm: &[Vec<f32>],
+    config: &StreamEncoderConfig,
+    tuning: &EncoderTuning,
+    joint_geometry: bool,
+) -> Result<EncodedVorbisStream, OggFileError> {
     // ---- validation ----
     if config.channels == 0 || pcm.len() != config.channels as usize {
         return Err(OggFileError::BadChannelCount {
@@ -974,7 +1108,6 @@ pub fn encode_pcm_to_packets(
     }
     let switching = n0 < n1;
     let ch = config.channels as usize;
-    let tuning = EncoderTuning::from_quality(config.quality)?;
 
     // ---- §4.3.1 block-size schedule ----
     // On a switching stream the per-packet blockflags come from the
@@ -1295,7 +1428,7 @@ pub fn encode_pcm_to_packets(
     // on the *joint* grid-cell occupancy. Lookup type 1 is the widely
     // interoperable lookup form; a type-2 (per-entry-free) table is
     // spec-legal but rejected by common black-box decoders.
-    let (coarse, fine) = if config.vq_dims > 1 {
+    let (coarse, fine) = if joint_geometry {
         let d = config.vq_dims as usize;
         // Bounded, deterministic stride subsample of the corpus: the
         // designer is O(vectors × entries) per refinement pass.
@@ -1362,13 +1495,15 @@ pub fn encode_pcm_to_packets(
         // lambda only buys saturated-SNR density — measured on the
         // staged corpus the fixed-step lattice fine book wobbled at
         // ≈ 48 dB from q = 0.7 to q = 1 while bytes near-tripled) —
-        // but only down to the coverage bound: past 2× the shrunk
-        // span clips the leftover extremes and the SNR *collapses*
+        // but only down to the coverage bound
+        // ([`LATTICE_FINE_COVERAGE_CAP`]): past 2× the shrunk span
+        // clips the leftover extremes and the SNR *collapses*
         // (measured 48 → 36 dB at 4×). The scalar ladder has no such
         // cap because its 64 levels always span two full coarse
         // steps; the lattice's per-dimension level count is pinned by
-        // the entry ceiling, so resolution past the cap must come
-        // from a third cascade stage, not a finer second.
+        // the entry ceiling, which is why the whole geometry hands
+        // over to the scalar ladders past the cap (see
+        // `joint_geometry` above).
         let mut leftovers: Vec<f32> = Vec::with_capacity(corpus.len());
         for chunk in corpus.chunks_exact(d) {
             let q = crate::vq::quantize_vector(&coarse, chunk)
@@ -1376,7 +1511,11 @@ pub fn encode_pcm_to_packets(
             leftovers.extend(chunk.iter().zip(&q.vector).map(|(&t, &v)| t - v));
         }
         let fine_step = crate::book_design::pack_nearest(
-            2.0 * coarse_step / lv as f32 / tuning.fine_resolution_scale().min(2.0),
+            2.0 * coarse_step
+                / lv as f32
+                / tuning
+                    .fine_resolution_scale()
+                    .min(LATTICE_FINE_COVERAGE_CAP),
         );
         let fine_ladder = crate::book_design::uniform_value_ladder(
             -(lv as f32 / 2.0) * fine_step,
@@ -1397,7 +1536,10 @@ pub fn encode_pcm_to_packets(
         // The coarse span is fixed (it must reach the loudest residue
         // target); the fine step follows the quality knob — the top
         // of the knob lowers the encoder's reconstruction noise floor
-        // (see [`EncoderTuning::fine_step_divisor`]).
+        // (see [`EncoderTuning::fine_step_divisor`]). The scalar fine
+        // ladder's 64 levels span two full coarse steps at any
+        // knob-scaled step, so the whole knob is reachable in this
+        // geometry.
         (
             signed_value_book(6, crate::book_design::pack_nearest(max_abs / 24.0)),
             signed_value_book(

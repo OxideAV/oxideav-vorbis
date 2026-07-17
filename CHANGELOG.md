@@ -6,6 +6,51 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **`vq::quantize_vector` factorises over dense full-grid product
+  lattices** (§3.2.1 lookup type 1, `sequence_p` clear, every entry
+  used, `entries == lookup_values^dimensions`): squared-Euclidean
+  distance separates per dimension on such a grid, so the nearest
+  entry is the per-dimension nearest level — `O(levels · dims)`
+  instead of `O(entries · dims)`, a 33× operation cut for the
+  integrated encoder's 31-level 2-D designed books (measured whole-
+  encode 93 s → 34 s debug / 7.7 s → 3.0 s release on the staged mono
+  corpus at `q = 0.7`, byte-identical output). Reconstruction values,
+  distances, and the lowest-index tie rule match the general scan
+  (per-dimension lowest-level ties compose to the lowest §3.2.1 entry
+  index because dimension 0 occupies the least significant digit);
+  sparse or `sequence_p` books take the general scan unchanged.
+- **The §8.6.2 residue-body writer builds each value book's Huffman
+  tree once per body** instead of once per `(partition, pass)` in
+  both its validation and emission walks
+  (`write_residue_partition_with_tree`, the tree-supplied core the
+  per-partition writer now delegates to). Rebuilding a 1024-entry
+  designed lattice book's canonical tree per partition was the
+  integrated encoder's top measured hot spot after the quantiser
+  fix.
+- **The `vq_dims = 2` encoder selects its residue geometry per band
+  of the quality knob, closing the knob's top end.** Through
+  `q <= 0.85` the corpus-designed 2-D lattice books hold the better
+  rate/SNR frontier (measured on the staged mono corpus at `q = 0.7`:
+  4741 audio B / 47.9 dB against the scalar ladders' 6072 B /
+  41.6 dB); past the lattice fine ladder's 2× coverage cap the joint
+  geometry saturates, so the top band encodes **two candidates** —
+  the scalar-ladder geometry (whose fine step follows the knob
+  everywhere) at the requested quality, and the joint geometry frozen
+  at its cap point (`q = 0.85`, its cheapest saturated setting) — and
+  keeps the higher own-decoded whole-stream SNR, ties to fewer bytes.
+  Monotone by construction (`max` of a constant and a non-decreasing
+  curve), and measured monotone across the whole knob on all four
+  staged corpora, including the mono-22050 stream whose joint cap
+  point leads the scalar geometry by ≈ 5 dB one knob step past the
+  seam. Two alternatives were measured and rejected: a third-stage
+  "ultra" lattice (+36 % audio bytes for +0.1 dB — refinement stages
+  add codewords per partition and the weighted Lagrangian prices them
+  out on masked-loud partitions), and an in-ladder hybrid carrying
+  both geometries as competing residue classes (the unweighted
+  closed-loop trainer routes loud partitions to the scalar classes
+  and sparse-prunes the joint books' loud cells, after which the
+  weighted final plans route those partitions back onto the pruned
+  books — a measured 13 dB SNR collapse at `q = 0.9`).
 - **The `vq_dims = 2` designed-lattice fine book now follows the
   quality knob** (`EncoderTuning::fine_resolution_scale`, the r413
   monotone-knob law applied to the lattice geometry): the fine
