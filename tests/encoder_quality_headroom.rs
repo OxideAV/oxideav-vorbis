@@ -129,10 +129,17 @@ fn produced_setup_carries_the_class_ladder_and_scaled_partitions() {
     assert_eq!(setup.residues[0].partition_size, 16, "short partitions");
     assert_eq!(setup.residues[1].partition_size, 32, "long partitions");
 
+    let classes = setup.residues[0].classifications as usize;
     for residue in &setup.residues {
-        // The four-class ladder: silence / noise / coarse / both.
-        assert_eq!(residue.classifications, 4);
-        assert_eq!(residue.cascade.len(), 4);
+        // The base class ladder — silence / noise / coarse / both —
+        // plus, when the corpus' amplitude bands separate (this tonal
+        // corpus does), the 4-D mid band class appended after it.
+        assert_eq!(residue.classifications as usize, classes);
+        assert!(
+            classes == 4 || classes == 5,
+            "base ladder or base + mid band, got {classes}"
+        );
+        assert_eq!(residue.cascade.len(), classes);
         assert_eq!(residue.cascade[0], 0, "class 0 is silence");
         assert_eq!(residue.cascade[1], 0b01, "class 1 reads pass 0 only");
         assert_eq!(residue.cascade[2], 0b01, "class 2 reads pass 0 only");
@@ -156,11 +163,26 @@ fn produced_setup_carries_the_class_ladder_and_scaled_partitions() {
             ),
             "coarse book carries a lattice lookup"
         );
+        if classes == 5 {
+            // The mid band class: single pass, a 4-D five-level book.
+            assert_eq!(residue.cascade[4], 0b01, "mid class reads pass 0 only");
+            let mid_book = residue.books[4][0].expect("mid class carries a book") as usize;
+            assert_eq!(setup.codebooks[mid_book].dimensions, 4);
+            assert_eq!(setup.codebooks[mid_book].entries, 625);
+            assert!(
+                matches!(setup.codebooks[mid_book].lookup, VqLookup::Lattice { .. }),
+                "mid band book carries a lattice lookup"
+            );
+        }
     }
 
     // The classbook groups four partitions per classword over the
-    // four-class alphabet: 4^4 entries, dimensions 4.
+    // class alphabet: classes^4 entries, dimensions 4.
     let classbook = setup.residues[0].classbook as usize;
     assert_eq!(setup.codebooks[classbook].dimensions, 4);
-    assert_eq!(setup.codebooks[classbook].entries, 256);
+    assert_eq!(
+        setup.codebooks[classbook].entries,
+        (classes as u32).pow(4),
+        "classes^4 grouped classwords"
+    );
 }

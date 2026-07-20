@@ -4,6 +4,72 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Amplitude-band residue class ladder — per-band value-book
+  assignment in the integrated encoder.** The residue now carries a
+  **five-class ladder** when the corpus separates: silence, the joint
+  4-D ternary noise book, a new **4-D 625-entry mid band book** (five
+  levels per dimension, ladder reach at the corpus' median
+  above-noise partition peak), coarse-only, and coarse + fine. Each
+  §8.6.2 classword is thereby a per-partition, per-pass value-book
+  assignment across amplitude bands, priced by the rate-distortion
+  chooser against the books' exact codeword costs. The band gate is
+  statistical (median above-noise partition peak ≤ `max_abs / 4` with
+  ≥ 32 such partitions; a separation-free corpus keeps the base
+  four-class ladder), and the band books are designed from the
+  stream's own partitions inside each band. Measured (staged corpus,
+  audio bytes / SNR against the base ladder at the same build):
+  stereo-44100 default quality 9.7 → 10.5 kB at **+2.9 dB** mean
+  (37.0 → 39.9; the fixture gate observes the decorrelated pair's
+  quiet channel at **26.3 → 29.6 dB**), q = 1 19.1 → 18.7 kB at
+  **+4.5 dB** (43.2 → 47.7); mono-22050 q = 1 9.8 → 9.1 kB at
+  +1.7 dB; mono-44100 q = 1 −0.9 % bytes at equal SNR; the mid of
+  the knob trades ≤ +4 % audio bytes at equal-or-better SNR (the
+  4-second fixtures also carry the mid book's ~0.5 kB setup table,
+  amortised on real-length streams). A same-dimensionality narrower-span
+  **coarse + fine pair** per band was measured first and **rejected**
+  (+4…+13 % audio bytes at identical SNR across the whole knob): the
+  occupancy-trained codeword lengths already price the amplitude
+  statistics *inside* one book, so a per-band win must come from
+  higher joint dimensionality — one codeword per four bins instead of
+  per two — exactly the noise class's mechanism, one tier up.
+- **Classword-aware residue class pricing**
+  (`plan_vector_classifications_rd_weighted_biased` /
+  `plan_vector_residue_rd_weighted_biased`): the weighted
+  rate-distortion chooser gains a per-class **classword bit bias**,
+  charging `weights[p] · error² + λ · (value_bits + bias[class])`.
+  The plain chooser prices only value codewords, but §8.6.2 spends
+  classwords too, and their trained lengths depend on the class
+  statistics — unpriced, a class adopted for a marginal value-bit win
+  can inflate the classword entropy by more than it saves (measured
+  +200…+300 B on the mono corpora when the band ladder landed without
+  it). The integrated encoder now plans in two passes: value-bit-only
+  first, then one re-plan with each class priced at `-log2 p(class)`
+  from the first pass's histogram (capped at 24 bits, unseen classes
+  floored at one count) — alternating plan ↔ re-price in the classic
+  entropy-constrained-quantiser shape, stopping early at a plan fixed
+  point. An all-zero bias reproduces the unbiased chooser bit-for-bit
+  and `λ = 0` makes any bias inert (both pinned); the reported
+  `bit_cost` stays the exact value bits.
+- **§8.6.1 coded-band cap (`residue_end` band-limiting).** The
+  produced streams now leave the spectrum above 20 kHz uncoded — the
+  §8.6 bandpass: `residue_end` stops at the first partition boundary
+  at or above the cutoff and the decoder zeroes every bin past it.
+  The bound is the crate's own psychoacoustic model: the analytic
+  threshold-in-quiet rises as `10⁻³·(f/kHz)⁴` dB, ≥ 160 dB at
+  20 kHz — unreachable by any program material — so residue there
+  can never be audible. At 44.1 kHz the long (1024-bin) residue caps
+  at **960 bins — the same coded-band cap the staged reference
+  streams carry**; a stream whose Nyquist sits at or below the
+  cutoff stays uncapped (the cap rounds *up* to a partition boundary,
+  so no bin under the cutoff is ever cut). Ladder spans, band
+  corpora, NMR weight rows, trainer rows, and the planner all follow
+  the coded band (a loud ultrasonic bin no longer widens any value
+  ladder). `tests/banded_residue_books.rs` pins the 960-bin cap, the
+  uncapped low-rate stream, the five-class ladder structure + gate
+  refusal, and end-trim-exact decode of every produced stream.
+
 ### Changed
 
 - **The closed-loop residue codebook trainer now optimises the same

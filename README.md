@@ -21,24 +21,28 @@ entries, hybrid window edges) and gated **§4.3.5 square-polar channel
 coupling** (a correlated stereo pair encodes −33 % vs dual-mono at
 equal SNR) included — behind one quality scalar, with the wire-format
 entropy (residue classwords, floor-post codewords, value books)
-trained per stream, a **four-class residue ladder** (silence /
-joint 4-D noise book / coarse / coarse + fine) chosen per partition
-by the NMR-weighted rate-distortion planner, and the cascade value
-books **corpus-designed as 2-D joint lattices by default** (per-band
-geometry: the scalar ladders take over past the lattice fine
-ladder's coverage cap via a top-of-knob candidate race) — black-box
-verified: swept encoder outputs (mono/stereo, real-audio re-encodes
-with block switching, `q ∈ {0.4, 0.7, 0.85, 0.9, 1.0}`) decode
-through ffmpeg to the exact declared frame counts at SNRs matching
-the crate's own decoder to 0.01 dB (the staged mono-q5 corpus
-re-encodes monotonically from 2.9 kB / 27.9 dB at `q = 0.4` through
-6.2 kB / 47.9 dB at the default to 10.7 kB / 55.4 dB at `q = 1`,
-against the 6.1 kB reference stream — the r410 scalar encoder spent
-7.1 kB for 41.6 dB at the default). `register()` installs the codec —
-decoder and encoder factories plus the Matroska `A_VORBIS` tag —
-into `oxideav_core::RuntimeContext`, and the dual-API endpoints
-`decoder::make_decoder` / `encoder::make_encoder` are directly
-callable without a registry.
+trained per stream, an **amplitude-banded residue class ladder**
+(silence / joint 4-D noise book / a corpus-gated 4-D **mid band
+book** / coarse / coarse + fine — per-partition, per-pass value-book
+assignment priced by the classword-aware rate-distortion planner),
+the §8.6.1 **coded-band cap** (`residue_end` stops at the 20 kHz
+ATH bound — 960 of 1024 long-block bins at 44.1 kHz, the reference
+streams' own cap), and the cascade value books **corpus-designed as
+2-D joint lattices by default** (the scalar ladders take over past
+the lattice fine ladder's coverage cap via a top-of-knob candidate
+race) — black-box verified: swept encoder outputs (mono/stereo,
+real-audio re-encodes with block switching,
+`q ∈ {0.4, 0.7, 0.85, 0.9, 1.0}`) decode through ffmpeg to the
+exact declared frame counts at SNRs matching the crate's own decoder
+to 0.01 dB (the staged mono-q5 corpus re-encodes from ~2.9 kB /
+27.9 dB at `q = 0.4` through ~7.0 kB / 47.9 dB at the default to
+~11 kB / 55.4 dB at `q = 1`, against the 6.1 kB reference stream;
+the banded ladder lifts the stereo corpus +2.9 dB at the default
+and +4.5 dB at −2 % bytes at `q = 1`). `register()` installs the
+codec — decoder and encoder factories plus the Matroska `A_VORBIS`
+tag — into `oxideav_core::RuntimeContext`, and the dual-API
+endpoints `decoder::make_decoder` / `encoder::make_encoder` are
+directly callable without a registry.
 
 The §4.3 decode chain is sample-exact end to end: twelve staged fixtures
 (`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1 through q10,
@@ -720,11 +724,26 @@ framing splitter (per-frame §4.3.1 windows, hybrid edges included),
 the bare §4.3.7 forward MDCT at the derived `4/n`
 unity-reconstruction scale, per-channel psychoacoustics, per-size
 floor-1 design/fit, the gated §4.3.5 forward channel coupling, and
-NMR-weighted RD residue planning over a **four-class §8.6.1 ladder**
-per partition: silence, a joint **4-dimensional ternary noise book**
-(one codeword per four bins — near-threshold texture at a fraction
-of the scalar cost; designed per stream from its own quiet
-partitions), coarse-only, and the coarse + fine two-stage cascade.
+NMR-weighted RD residue planning over an **amplitude-banded §8.6.1
+class ladder** per partition: silence, a joint **4-dimensional
+ternary noise book** (one codeword per four bins — near-threshold
+texture at a fraction of the scalar cost; designed per stream from
+its own quiet partitions), a corpus-gated **4-D 625-entry mid band
+book** (five levels per dimension, ladder reach at the median
+above-noise partition peak — the same joint-dimensionality rate
+mechanism one amplitude tier up; carried only when the corpus
+separates, so a uniform-loudness stream keeps the base four
+classes), coarse-only, and the coarse + fine two-stage cascade.
+Class choice is **priced against the codebook cost model end to
+end**: the chooser charges each candidate's exact value-codeword
+bits *plus* a per-class marginal classword price (`-log2 p(class)`
+from a first planning pass, re-planned once — without it, a class
+adopted for a marginal value-bit win inflates the trained classword
+entropy by more than it saves). The §8.6.1 `residue_end` caps the
+coded band at the 20 kHz ATH bound (960 of 1024 long bins at
+44.1 kHz — the reference streams' own cap; uncapped when Nyquist
+sits below the cutoff), and every design/training/planning stage
+follows the coded band.
 The residue partitions scale with the spectrum (16 short / 32 long);
 the value ladders are §9.2.2-packable with the fine ladder's step
 following the quality knob (see below), and the cascade books are
@@ -848,23 +867,25 @@ the §1.3.2 mechanism).
   mixdown, so a transient confined to one channel of an uncoupled pair
   still switches both.
 - **The re-encoded audio rate still trails the reference corpus at
-  the knee, though the 2-D joint books closed much of it.** On
-  audio-packet bytes the default-quality re-encode now spends ~2.3×
-  the reference stream's audio bytes (mono-q5: 4.7 kB vs 2.1 kB —
-  down from 6.1 kB scalar) at a measured 47.9 dB, and reaches
-  audio-parity near `q ≈ 0.55` at ~35 dB (`q = 0.6` re-encodes at
-  ×1.38 / 47 dB). The remaining structural gap versus the
-  reference's richer class set (10 classes, per-band
-  multi-dimensional books up to 8-D) is per-band book assignment —
-  one shared book pair serves the whole spectrum — plus
-  `residue_end` band-limiting (the reference caps its long residue
-  at 960 of 1024 bins). Measured and rejected this round: a
-  third-stage ultra lattice (+36 % audio bytes for +0.1 dB — extra
-  cascade stages are RD-priced out on masked-loud partitions) and an
-  in-ladder scalar/joint hybrid class (the unweighted trainer
-  sparse-prunes whichever geometry the weighted planner later
-  routes onto; 13 dB collapse at `q = 0.9`) — a **weighted**
-  closed-loop trainer is the unblock for in-ladder geometry mixing.
+  the knee.** On audio-packet bytes the default-quality re-encode
+  spends ~2.4× the reference stream's audio bytes (mono-q5: ~4.9 kB
+  vs 2.1 kB — down from 6.1 kB scalar) at a measured 47.9 dB, with
+  audio-parity near `q ≈ 0.55` at ~35 dB. The amplitude-band mid
+  class and the coded-band cap landed (the banded ladder pays mostly
+  above the knee: stereo default +2.9 dB, `q = 1` +1.7…+4.5 dB at
+  fewer bytes; the knee itself trades ≤ +4 % bytes at equal SNR);
+  the remaining structural gap versus the reference's class set
+  (10 classes, per-band books up to 8-D) is **deeper band tiers**
+  (an 8-D near-silence tier, per-band coarse dimensionality) and
+  cross-frame entropy. Measured and rejected across r416–r420: a
+  third-stage ultra lattice (+36 % audio bytes for +0.1 dB), an
+  in-ladder scalar/joint hybrid class (routing collapse under the
+  unweighted trainer; still byte-dominated under the weighted one),
+  and a same-dimensionality narrower-span per-band coarse + fine
+  pair (+4…+13 % audio bytes at identical SNR — occupancy-trained
+  lengths already price amplitude statistics inside one book; the
+  per-band win must come from joint dimensionality, which is what
+  the mid band book does).
 - **The stereo quiet-channel top end trades against the +6 dB margin
   cap.** The old uncapped margin (+12 dB at `q = 1`) pushed the psy
   floor onto `|X|`, switching the encoder into waveform coding — on

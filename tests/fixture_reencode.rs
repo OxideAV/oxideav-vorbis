@@ -265,7 +265,9 @@ fn decorrelated_stereo_fixture_reencode_stays_uncoupled() {
         assert_eq!(decoded.pcm[c].len(), input.len(), "end-trim exact");
         let snr = snr_db(input, &decoded.pcm[c]);
         eprintln!("stereo fixture re-encode ch{c}: SNR {snr:.2} dB");
-        assert!(snr >= 25.0, "ch{c} SNR {snr:.2} dB below 25 dB");
+        // r420 floor: the amplitude-band mid class lifts the quiet
+        // channel 26.3 → 29.6 dB at the default quality.
+        assert!(snr >= 28.0, "ch{c} SNR {snr:.2} dB below 28 dB");
     }
     // Two-sided r416 rate gate (measured 9654 audio B at the default
     // quality; the r410 scalar encoder spent 12100 B here).

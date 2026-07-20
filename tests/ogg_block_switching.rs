@@ -116,7 +116,13 @@ fn transient_corpus_switches_with_conformant_structure_and_granules() {
     assert_eq!(setup.residues.len(), 2);
     assert_eq!(setup.mappings.len(), 2);
     assert_eq!(setup.residues[0].residue_end, 128, "short residue at n0/2");
-    assert_eq!(setup.residues[1].residue_end, 1024, "long residue at n1/2");
+    // The long residue carries the §8.6.1 coded-band cap: at 44.1 kHz
+    // the first partition-size-32 boundary at or above the 20 kHz ATH
+    // bound is bin 960 of 1024 (the decoder zeroes the bins past it).
+    assert_eq!(
+        setup.residues[1].residue_end, 960,
+        "long residue at the coded-band cap"
+    );
 
     // ---- packet preludes: both flags present, window flags mirror ----
     let preludes = packet_preludes(&ogg);
