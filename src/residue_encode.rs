@@ -196,6 +196,24 @@ pub enum ResidueEncodeError {
         /// The offending weight.
         value: f64,
     },
+    /// [`plan_vector_classifications_rd_weighted_biased`] was given a
+    /// class-bias slice whose length did not match the classification
+    /// count (`value_books.len()`).
+    BiasLengthMismatch {
+        /// The classification count (expected bias count).
+        expected: usize,
+        /// The supplied bias count.
+        actual: usize,
+    },
+    /// A per-classification bit bias was NaN, infinite, or negative.
+    /// A bias is a marginal classword bit price, so it must be a
+    /// finite non-negative bit count.
+    BadBias {
+        /// The classification whose bias was rejected.
+        class: usize,
+        /// The offending bias.
+        value: f64,
+    },
 }
 
 impl core::fmt::Display for ResidueEncodeError {
@@ -260,6 +278,14 @@ impl core::fmt::Display for ResidueEncodeError {
             ResidueEncodeError::BadWeight { partition, value } => write!(
                 f,
                 "vorbis residue encode: partition-{partition} weight {value} is not a finite non-negative factor"
+            ),
+            ResidueEncodeError::BiasLengthMismatch { expected, actual } => write!(
+                f,
+                "vorbis residue encode: {actual} class bit biases supplied for {expected} classifications"
+            ),
+            ResidueEncodeError::BadBias { class, value } => write!(
+                f,
+                "vorbis residue encode: class-{class} bit bias {value} is not a finite non-negative bit count"
             ),
         }
     }
@@ -917,6 +943,7 @@ pub fn plan_vector_classifications_rd(
         partition_size,
         lambda,
         None,
+        None,
     )
 }
 
@@ -973,12 +1000,64 @@ pub fn plan_vector_classifications_rd_weighted(
         partition_size,
         lambda,
         Some(weights),
+        None,
+    )
+}
+
+/// [`plan_vector_classifications_rd_weighted`] with a per-class
+/// **classword bit bias**: each candidate classification `c` is
+/// priced at `weights[p] · error_sq + lambda · (bit_cost +
+/// class_bit_bias[c])`.
+///
+/// The plain choosers charge only the value codewords, but §8.6.2
+/// spends a classword codeword per partition group too — a cost that
+/// *depends on the class chosen* once the classbook's codeword
+/// lengths are trained on the emission statistics. Ignoring it
+/// misprices the choice: a class adopted for a marginal value-bit win
+/// can inflate the classword entropy by more than it saves. The bias
+/// closes the loop: the caller estimates each class's marginal
+/// classword cost (canonically `-log2(p(class))` from a previous
+/// plan's class histogram — the per-partition share of an
+/// entropy-optimal classword under an independence model) and
+/// re-plans; alternating plan ↔ re-estimate passes converge exactly
+/// like entropy-constrained quantiser design. An all-zero bias
+/// reproduces [`plan_vector_classifications_rd_weighted`] bit-for-bit,
+/// and at `lambda == 0` the bias has no effect (rate is free).
+///
+/// The returned [`PartitionClassChoice::bit_cost`] stays the exact
+/// **value** codeword bits (the bias is pricing-only and never
+/// reaches the wire).
+///
+/// # Errors
+///
+/// As [`plan_vector_classifications_rd_weighted`], plus
+/// [`ResidueEncodeError::BiasLengthMismatch`] for a bias slice
+/// without one entry per classification and
+/// [`ResidueEncodeError::BadBias`] for a NaN/±∞/negative bias.
+pub fn plan_vector_classifications_rd_weighted_biased(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    weights: &[f64],
+    class_bit_bias: &[f64],
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    plan_vector_classifications_rd_impl(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        Some(weights),
+        Some(class_bit_bias),
     )
 }
 
 /// Shared core of the unweighted and weighted rate-distortion
 /// classification choosers. `weights == None` charges every partition's
-/// distortion at factor `1.0` (the unweighted Lagrangian).
+/// distortion at factor `1.0` (the unweighted Lagrangian);
+/// `class_bit_bias == None` charges no per-class classword bias.
 fn plan_vector_classifications_rd_impl(
     scalars: &[f32],
     value_books: &[[Option<&VorbisCodebook>; 8]],
@@ -986,6 +1065,7 @@ fn plan_vector_classifications_rd_impl(
     partition_size: u32,
     lambda: f64,
     weights: Option<&[f64]>,
+    class_bit_bias: Option<&[f64]>,
 ) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
     if residue_type > 2 {
         return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
@@ -1022,6 +1102,20 @@ fn plan_vector_classifications_rd_impl(
             });
         }
     }
+    if let Some(bias) = class_bit_bias {
+        if bias.len() != value_books.len() {
+            return Err(ResidueEncodeError::BiasLengthMismatch {
+                expected: value_books.len(),
+                actual: bias.len(),
+            });
+        }
+        if let Some(c) = bias.iter().position(|v| !v.is_finite() || *v < 0.0) {
+            return Err(ResidueEncodeError::BadBias {
+                class: c,
+                value: bias[c],
+            });
+        }
+    }
 
     let mut choices = Vec::with_capacity(num_partitions);
     for p in 0..num_partitions {
@@ -1042,10 +1136,13 @@ fn plan_vector_classifications_rd_impl(
             // Lagrangian rate-distortion cost. `bit_cost` is exact bits;
             // `error_sq` is squared sample distortion (scaled by the
             // partition's perceptual weight, 1.0 when unweighted);
-            // `lambda` is the bits→distortion exchange rate. The
-            // accumulation is in f64 to keep the comparison stable
-            // across a wide dynamic range.
-            let cost = weight * scored.error_sq + lambda * scored.bit_cost as f64;
+            // `lambda` is the bits→distortion exchange rate; the class
+            // bias adds the caller's marginal classword price for this
+            // classification (0.0 when unbiased). The accumulation is
+            // in f64 to keep the comparison stable across a wide
+            // dynamic range.
+            let cost = weight * scored.error_sq
+                + lambda * (scored.bit_cost as f64 + class_bit_bias.map_or(0.0, |b| b[class]));
 
             // Lexicographic preference: (cost ↑, populated stages ↑,
             // classification index ↑). `<` keeps the first-seen
@@ -1212,6 +1309,53 @@ pub fn plan_vector_residue_rd_weighted(
         partition_size,
         lambda,
         weights,
+    )?;
+    let mut classifications = Vec::with_capacity(choices.len());
+    let mut partition_entries = Vec::with_capacity(choices.len());
+    let mut total_error_sq = 0.0f64;
+    let mut total_value_bits = 0u64;
+    for choice in choices {
+        total_error_sq += choice.error_sq;
+        total_value_bits += choice.bit_cost;
+        classifications.push(choice.classification);
+        partition_entries.push(choice.entries);
+    }
+    Ok(ScoredVectorResidue {
+        classifications,
+        partition_entries,
+        total_error_sq,
+        total_value_bits,
+    })
+}
+
+/// [`plan_vector_residue_rd_weighted`] under the **classword-biased**
+/// chooser ([`plan_vector_classifications_rd_weighted_biased`]): each
+/// partition's classification additionally pays its class's marginal
+/// classword bit price. The reported totals stay the unweighted
+/// physical distortion and the exact **value** bits (the bias never
+/// reaches the wire).
+///
+/// # Errors
+///
+/// Identical to [`plan_vector_classifications_rd_weighted_biased`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_vector_residue_rd_weighted_biased(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    weights: &[f64],
+    class_bit_bias: &[f64],
+) -> Result<ScoredVectorResidue, ResidueEncodeError> {
+    let choices = plan_vector_classifications_rd_weighted_biased(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        weights,
+        class_bit_bias,
     )?;
     let mut classifications = Vec::with_capacity(choices.len());
     let mut partition_entries = Vec::with_capacity(choices.len());
@@ -2094,6 +2238,151 @@ mod tests {
         .unwrap();
         assert_eq!(choices[0].classification, 0, "masked partition → cheap");
         assert_eq!(choices[1].classification, 1, "audible partition → dense");
+    }
+
+    /// An all-zero class bias reproduces the weighted chooser
+    /// bit-for-bit, and at `lambda == 0` any bias is inert (the bias
+    /// is a bit price and rate is free).
+    #[test]
+    fn zero_bias_and_zero_lambda_are_inert() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0, 8.0, 8.0, 1.0, 1.0];
+        let ones = vec![1.0f64; 3];
+
+        for lambda in [0.0, 0.5, 2.0, 10.0] {
+            let plain = plan_vector_classifications_rd_weighted(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                lambda,
+                &ones,
+            )
+            .unwrap();
+            let biased = plan_vector_classifications_rd_weighted_biased(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                lambda,
+                &ones,
+                &[0.0, 0.0],
+            )
+            .unwrap();
+            assert_eq!(plain, biased, "all-zero bias, lambda {lambda}");
+        }
+
+        // λ = 0: even a huge bias changes nothing.
+        let free =
+            plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 0.0, &ones)
+                .unwrap();
+        let free_biased = plan_vector_classifications_rd_weighted_biased(
+            &scalars,
+            &value_books,
+            1,
+            2,
+            0.0,
+            &ones,
+            &[1000.0, 1000.0],
+        )
+        .unwrap();
+        assert_eq!(free, free_biased);
+    }
+
+    /// The class bias prices a marginal adoption out: the class the
+    /// plain chooser picks for a small value-bit-vs-distortion win
+    /// loses once its marginal classword bits are charged — and the
+    /// reported `bit_cost` stays the exact **value** bits (the bias is
+    /// pricing-only).
+    #[test]
+    fn class_bias_prices_a_marginal_class_out() {
+        let (coarse, fine) = coarse_fine_books();
+        let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row0[0] = Some(&coarse);
+        let mut row1: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row1[0] = Some(&coarse);
+        row1[1] = Some(&fine);
+        let value_books = vec![row0, row1];
+        let scalars = vec![3.0, 3.0];
+
+        // Unbiased at λ = 0.1 the dense class wins (0 + 0.2 vs 2 + 0.1).
+        let plain =
+            plan_vector_classifications_rd_weighted(&scalars, &value_books, 1, 2, 0.1, &[1.0])
+                .unwrap();
+        assert_eq!(plain[0].classification, 1);
+
+        // Charging the dense class 100 classword bits flips it:
+        // 0 + 0.1·(2 + 100) = 10.2 vs 2 + 0.1·(1 + 0) = 2.1.
+        let biased = plan_vector_classifications_rd_weighted_biased(
+            &scalars,
+            &value_books,
+            1,
+            2,
+            0.1,
+            &[1.0],
+            &[0.0, 100.0],
+        )
+        .unwrap();
+        assert_eq!(biased[0].classification, 0);
+        assert_eq!(biased[0].bit_cost, 1, "bias never inflates the exact bits");
+    }
+
+    #[test]
+    fn biased_rejects_bad_bias_vectors() {
+        let (coarse, _) = coarse_fine_books();
+        let mut row: [Option<&VorbisCodebook>; 8] = [None; 8];
+        row[0] = Some(&coarse);
+        let value_books = vec![row];
+        let scalars = vec![3.0, 3.0];
+
+        assert_eq!(
+            plan_vector_classifications_rd_weighted_biased(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                0.1,
+                &[1.0],
+                &[0.0, 0.0],
+            ),
+            Err(ResidueEncodeError::BiasLengthMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert!(matches!(
+            plan_vector_classifications_rd_weighted_biased(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                0.1,
+                &[1.0],
+                &[f64::NAN],
+            ),
+            Err(ResidueEncodeError::BadBias { class: 0, value }) if value.is_nan()
+        ));
+        assert_eq!(
+            plan_vector_classifications_rd_weighted_biased(
+                &scalars,
+                &value_books,
+                1,
+                2,
+                0.1,
+                &[1.0],
+                &[-1.0],
+            ),
+            Err(ResidueEncodeError::BadBias {
+                class: 0,
+                value: -1.0,
+            })
+        );
     }
 
     #[test]

@@ -405,8 +405,9 @@ pub use residue::{ResidueDecoder, ResidueError};
 pub use residue_encode::{
     plan_partition_cascade, plan_partition_cascade_scored, plan_vector_classifications,
     plan_vector_classifications_rd, plan_vector_classifications_rd_weighted,
-    plan_vector_partition_entries, plan_vector_residue, plan_vector_residue_rd,
-    plan_vector_residue_rd_weighted, replay_partition_cascade, select_residue_config,
+    plan_vector_classifications_rd_weighted_biased, plan_vector_partition_entries,
+    plan_vector_residue, plan_vector_residue_rd, plan_vector_residue_rd_weighted,
+    plan_vector_residue_rd_weighted_biased, replay_partition_cascade, select_residue_config,
     PartitionClassChoice, ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade,
     ScoredVectorResidue, SelectedResidueConfig,
 };
