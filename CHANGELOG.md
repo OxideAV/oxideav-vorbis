@@ -4,6 +4,129 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.11...v0.0.12) - 2026-07-20
+
+### Other
+
+- amplitude-band residue ladder + SS8.6.1 coded-band cap
+- classword-aware residue class pricing in the RD chooser
+- vorbis README/CHANGELOG: final r416 measured numbers + hybrid retry ruling
+- closed-loop trainer optimises the weighted (NMR) objective
+- corpus-designed 2-D joint lattice books are the encoder default
+- per-band residue geometry with a top-of-knob candidate race
+- build residue value-book Huffman trees once per SS8.6.2 body
+- factorised nearest-entry search over dense full-grid lattices
+- quality-scaled lattice fine ladder with a coverage-bound cap
+- Mark internal public surface #[doc(hidden)] for semver-checks
+- real-corpus regression pin for the top-of-knob headroom
+- vorbis README: round-413 encoder overhaul documented — class ladder, noise book, 2048/32 geometry, recalibrated + capped quality map
+- cap the masking-margin lever at +6 dB — second root cause of the non-monotone SNR
+- ternary noise book — 81-entry joint grid beats the 625-entry five-level variant
+- residue class ladder + joint noise book + 2048/32 geometry + recalibrated quality map
+- interoperable 2-D lattice residue books — black-box finding: lookup type 2 rejected by reference decoder
+- registry vq_dims encoder option
+- occupancy-trained floor-post codeword lengths (-6.6..-8.7% at identical PCM)
+- grouped occupancy-trained residue classwords (-2.2..-2.4% at identical PCM)
+- trainers keep every classword encodable (dense classbook retrain)
+- designed multi-dimensional residue books in the integrated encoder (vq_dims)
+- multi-dimensional VQ residue codebook designer (design_vq_codebook)
+- vorbis README: energy-rise criterion + real-audio re-encode results documented
+- energy-rise transient criterion + real-audio fixture re-encode suite
+- depth tests — trained books under coupling+switching, all-short schedule
+- vorbis README: round-396 subsystems documented — block switching + channel coupling in the integrated encoder
+- registry encoder options for block switching + coupling
+- §4.3.1 block switching wired into the integrated encoder
+- §4.3.5 channel coupling wired into the integrated encoder
+- vorbis README/CHANGELOG: document the oxideav-ogg dependency and the removed in-crate page layer
+- Ogg carriage through the oxideav-ogg container crate — in-crate page layer removed
+- closed-loop codebook training wired into encode_pcm_to_ogg — 1-D lattice ladder step, −56% black-box stream
+- vorbis README: Ogg carriage + wired-codec status — round-391 subsystem documented
+- oxideav-core registration + dual-API endpoints — the crate is now a wired codec
+- vorbis psy: temporal masking — pre/post-masking across frames, NMR-validated, wired into the encoder
+- whole-stream encoder — encode_pcm_to_ogg produces a playable .ogg (ffmpeg-verified)
+- vorbis §A.2: Ogg encapsulation muxer — header-page rules, granulepos, fixture remux conformance
+- vorbis RFC 3533: Ogg page framing layer — CRC/parse/assemble/write, fixture byte-exact
+- add CI / crates.io / docs.rs / MIT-license badges
+- vorbis README: psychoacoustic + quality-targeting stack documented; both encoder-quality followups closed
+- psy × training composition capstone — trained books cut the psy stream 36% at equal NMR
+- vorbis quality: measured rate/SNR/NMR curve + real-stream bit-budget targeting
+- vorbis quality: EncoderTuning quality knob + solve_lambda_for_bits bit-budget bisection
+- vorbis §8.6.2/§3.2.1: distortion-aware value-ladder step inside the closed RD training loop
+- vorbis psy: continuous masking skirts + raw capped NMR weights + measured encode round-trip
+- vorbis §8.6.2: perceptually weighted residue RD chooser — NMR-vs-bits Lagrangian
+- vorbis psy: clean-room masking model — Bark-band spreading + tonality + ATH, floor/residue glue
+- vorbis README: codebook content-design + training stack documented; both floor content followups closed
+- vorbis §3.2.1/§9.2.2: VQ value-ladder design — Lloyd centroids snapped to packable multiplicand grid
+- vorbis §4.3/§4.2.4: whole-stream trained-books round-trip — joint floor+residue training capstone
+- vorbis §8.6.2/§3.2.1: closed-loop rate-aware residue training — alternating RD-plan/retrain descent
+- drop unused import in floor0_trained_books suite (clippy)
+- vorbis §6.2.2/§3.2.1: floor-0 value-codebook-content trainer — emission tally + trained-book round-trip
+- vorbis §8.6.2/§3.2.1: residue codebook-content trainer — emission tally + trained-books round-trip
+- vorbis §7.2.3/§3.2.1: floor-1 codebook-content trainer — emission tally + trained-books round-trip
+- vorbis §3.2.1: design_entropy_codebook + redesign_codebook + BookTallies retraining loop
+- vorbis §3.2.1: book_design — optimal length-limited codeword-length assignment (package-merge)
+- vorbis §7.2.2/§7.2.4: select_floor1_post_budget — RD post-count selection + README rollup
+- vorbis §6.2.1/§6.2.3: floor0_layout — LSP order selection + fmt fix
+- vorbis §4.3/§7.2.2: designed-floor-1-header PCM round-trip suite
+- vorbis §7.2.2: design_floor1_header — one-call envelope→Floor1Header
+- vorbis §7.2.2: plan_floor1_partition_layout — DP exact post tiling
+- vorbis §7.2.2/§7.2.4: floor1_layout — adaptive x-list post-placement designer
+- README — rate-distortion residue + stereo coupling decision + block-size selection rollup
+- vorbis §1.3.2: blocksize module — long/short block-size transient decision
+- vorbis §4.3.5: prune_coupling_steps — channel-pair coupling decision driver
+- vorbis §4.3.5: coupling_energy + should_couple — stereo coupling decision heuristic
+- vorbis §4.3/§8.6: rate-distortion residue PCM round-trip suite
+- vorbis §8.6: plan_vector_residue_rd + select_residue_config — RD residue-config selection
+- vorbis §8.6.2: plan_vector_classifications_rd — rate-distortion residue classification
+- vorbis §8.6.2: ScoredPartitionCascade::bit_cost — exact value-codeword rate term
+- scrub libvorbis naming from floor-0 fixture-gap prose (Hat-2 hygiene)
+- vorbis §8.6.3: residue format-0 strided-scatter full-packet PCM round-trip
+- vorbis §8.6.5: residue format-2 multi-channel encode→decode→PCM round-trip
+- vorbis §4.3.5: stereo channel-coupling encode→decode→PCM round-trip
+- README + CHANGELOG — floor-0 envelope-fit chain (§6.2.3 inverse) rollup
+- vorbis §4.3: floor-0 PCM→encode→decode→PCM full-packet round-trip
+- vorbis §6.2.2/§6.2.3: plan_floor0_packet — one-call envelope→Floor0Packet + parity-aware LSP
+- vorbis §6.2.3: plan_floor0_lsp — envelope→LSP via autocorrelation/Levinson/LSP
+- vorbis §6.2.3: fit_floor0_amplitude — log-domain amplitude inverse from a target curve
+- README + CHANGELOG — floor-1 partition-packing + one-call packet planner rollup
+- vorbis §7.2.3/§7.2.4/§10.1: plan_floor1_packet — linear envelope to write-ready Floor1Packet
+- vorbis §7.2.3: plan_floor1_partition_cvals — derive master-selector cvals from fitted floor1_Y
+- vorbis §4.3/§8.6.2: adaptive-classification PCM encode->decode round-trip
+- vorbis §8.6.2: from-spectrum residue classification round-trip + SNR
+- vorbis §8.6.2: residue classification-selection from spectrum (encode)
+- vorbis §6.2.3/§4.3.6: cross-check Floor0Decoder::render_curve vs full driver
+- vorbis §6.2.3: Floor0Decoder::render_curve encoder-side LSP-floor primitive
+- vorbis §7.2.4/§4.3.6: non-flat floor-1 PCM round-trip fidelity suite
+- vorbis §7.2.4: Floor1Decoder::render_curve encoder-side floor primitive
+- vorbis §4.3.8: overlap-add output-geometry conformance over the full fixture decode
+- vorbis §4.2.2/§4.2.4: setup-header structural trace conformance across all fixtures
+- vorbis §4.3.1: per-packet header-decision trace conformance across all fixtures
+- scrub external-impl reference from floor0 test doc comment
+- README + CHANGELOG — floor-0 decode-path coverage rollup
+- vorbis §4.3.2/§6.2: floor-0 driven through the full audio-packet driver
+- vorbis §8.6.3: residue format-0 strided-scatter encode→decode round-trip
+- vorbis §6.2.2/§6.2.3: floor-0 LSP end-to-end packet round-trip + curve oracle
+- vorbis §4.3: PCM roundtrip block-size sweep + README/CHANGELOG rollup
+- vorbis §4.3: full PCM→encode→decode→PCM time-domain roundtrip test
+- vorbis §8.6.2: residue cascade encode→decode spectral roundtrip test
+- README + CHANGELOG — floor-1 envelope-fit + end-to-end round-trip
+- forward-MDCT → floor-1 envelope-fit → encode → decode round-trip
+- vorbis §7.2.4/§10.1: floor-1 envelope→posts dB-table inverse (encode)
+- vorbis §4.3: decode-driver robustness against malformed packets
+- vorbis §5.2: comment-header parse + decode over the metadata fixtures
+- vorbis §4.3: chained-Ogg decode across a logical-bitstream boundary
+- scrub decorative reference-impl naming from r338 decode comments
+- skip fixture-PCM tests when docs/ submodule absent (standalone CI)
+- vorbis §4.3: sample-exact PCM decode + pin IMDCT normalization to 1.0
+- vorbis §3.2.1: fix canonical Huffman assignment for non-monotonic books
+- §7.2.4 step-1 amplitude-unwrap encode glue (plan_floor1_y)
+- §6.2.2 floor-0 VQ-encode glue (coefficient → entry run)
+- §8.6.2 residue VQ-encode cascade planner (encode glue)
+- §3.2.1 VQ-encode quantiser (nearest-entry, encode inverse of unpack_vector)
+- vorbis §4.3.9 output channel order — mapping-type-0 speaker layout
+- vorbis §4.3 fixture-anchored end-to-end silence-decode integration test
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **Amplitude-band residue class ladder — per-band value-book
