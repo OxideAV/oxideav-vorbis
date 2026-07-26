@@ -9,16 +9,20 @@
 //!   threshold-in-quiet is unreachable by any program material); a
 //!   stream whose Nyquist sits under the cutoff stays uncapped.
 //! * **Band ladder** — a corpus whose above-noise partition peaks
-//!   separate from its loud peaks carries the five-class ladder
-//!   (silence / noise / mid / coarse / coarse + fine): a 4-D 625-entry
-//!   mid band book, a 5⁴-entry classbook. A corpus without the
-//!   separation (or with `residue_bands` off) stays at the base four
-//!   classes.
+//!   separate from its loud peaks makes the band tiers *candidates*
+//!   (the 4-D 625-entry mid book plus the two ternary 8-D deep
+//!   tiers); the measured Lagrangian adoption then keeps only the
+//!   tiers that pay for their own setup table + classword-alphabet
+//!   growth, so a short stream ships the base four classes while a
+//!   longer corpus (the tiled staged fixture below) genuinely
+//!   carries the mid band class. `residue_bands = false` pins the
+//!   base four-class ladder outright.
 //!
 //! Behaviour pins: every produced stream still decodes end-trim exact
-//! through the crate's own decoder, and the band ladder never lowers
-//! the decoded SNR (the rate-distortion chooser only adopts the mid
-//! class where the classword-aware Lagrangian improves).
+//! through the crate's own decoder, and the candidate machinery never
+//! costs — a stream with the bands lever on serialises no larger
+//! than the base-ladder stream (the adoption only keeps measured
+//! improvements) at no measured fidelity cost.
 
 use oxideav_vorbis::{
     decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets, parse_identification_header,
@@ -177,28 +181,21 @@ fn nyquist_under_the_cutoff_stays_uncapped() {
 }
 
 #[test]
-fn banded_corpus_carries_the_five_class_ladder_and_roundtrips() {
+fn short_banded_corpus_measures_the_candidates_out_again() {
+    // The 1-second banded corpus separates (the ~0.1-scale mid bed
+    // vs the loud tone partitions), so the mid + deep tiers are all
+    // *candidates* — but one second of audio cannot amortise any
+    // band book's setup table + classword-alphabet growth, and the
+    // measured Lagrangian adoption must ship the base four classes.
     let pcm = banded_corpus(44_100, 1.0);
     let config = StreamEncoderConfig::new(44_100, 1);
     let stream = encode_pcm_to_packets(&pcm, &config).expect("encodes");
     let setup = setup_of(&stream, 1);
-
-    // The amplitude-band gate fires: the above-noise partition peaks
-    // (the ~0.1-scale mid bed) separate from the loud tone partitions
-    // by far more than the 4× gate.
     let long = setup.residues.last().expect("long residue");
-    assert_eq!(long.classifications, 5, "the mid band class is carried");
-    // Class 4 is the mid band class: single pass, its own book.
-    assert_eq!(long.cascade.len(), 5);
-    assert_eq!(long.cascade[4], 0b01);
-    let mid_book_index = long.books[4][0].expect("mid class pass-0 book") as usize;
-    let mid_book = &setup.codebooks[mid_book_index];
-    assert_eq!(mid_book.dimensions, 4, "mid band book is 4-D joint");
-    assert_eq!(mid_book.entries, 625, "5 levels per dimension");
-    // The classbook covers the 5-class alphabet: 5^4 grouped entries.
-    let classbook = &setup.codebooks[long.classbook as usize];
-    assert_eq!(classbook.dimensions, 4);
-    assert_eq!(classbook.entries, 625);
+    assert_eq!(
+        long.classifications, 4,
+        "a 1-second corpus cannot pay for a band class"
+    );
 
     // The produced stream still decodes end-trim exact.
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("muxes");
@@ -211,10 +208,11 @@ fn banded_corpus_carries_the_five_class_ladder_and_roundtrips() {
     );
     assert!(snr >= 30.0, "banded roundtrip SNR {snr:.2} dB below 30 dB");
 
-    // And the ladder never loses to the base four classes: at the
-    // default quality the banded encode spends no more audio bytes at
-    // equal-or-better SNR (the classword-aware chooser only adopts
-    // the mid class where the priced Lagrangian improves).
+    // The candidate machinery never costs: against the explicit base
+    // ladder (`residue_bands = false`) the full stream serialises to
+    // (near-)identical size at no measured fidelity cost. (The two
+    // encodes are not bit-identical — the closed-loop trainer runs
+    // with the candidate classes present — so allow routing noise.)
     let mut base_config = config.clone();
     base_config.residue_bands = false;
     let base = encode_pcm_to_packets(&pcm, &base_config).expect("base encodes");
@@ -228,12 +226,14 @@ fn banded_corpus_carries_the_five_class_ladder_and_roundtrips() {
         4,
         "residue_bands = false keeps the base ladder"
     );
-    let banded_audio: usize = stream.audio.iter().map(|(p, _)| p.len()).sum();
-    let base_audio: usize = base.audio.iter().map(|(p, _)| p.len()).sum();
-    eprintln!("banded audio {banded_audio} B vs base {base_audio} B");
+    let banded_total: usize =
+        stream.setup.len() + stream.audio.iter().map(|(p, _)| p.len()).sum::<usize>();
+    let base_total: usize =
+        base.setup.len() + base.audio.iter().map(|(p, _)| p.len()).sum::<usize>();
+    eprintln!("banded total {banded_total} B vs base {base_total} B");
     assert!(
-        banded_audio as f64 <= base_audio as f64 * 1.02,
-        "banded audio bytes {banded_audio} regress past base {base_audio}"
+        banded_total as f64 <= base_total as f64 * 1.02,
+        "band candidates cost bytes: {banded_total} vs base {base_total}"
     );
 }
 
@@ -263,7 +263,7 @@ fn separation_free_corpus_declines_the_mid_class() {
 }
 
 #[test]
-fn staged_corpus_carries_the_band_ladder_and_the_cap() {
+fn staged_corpus_carries_the_cap_and_adoption_scales_with_length() {
     if !fixtures_available() {
         eprintln!("fixtures not staged; skipping");
         return;
@@ -274,15 +274,71 @@ fn staged_corpus_carries_the_band_ladder_and_the_cap() {
     ));
     assert_eq!(rate, 44_100);
     let config = StreamEncoderConfig::new(rate, 1);
+
+    // The 4-second staged fixture: the coded-band cap holds, and the
+    // adoption measures the band candidates out — on this length the
+    // base four classes serialise smaller (the r430 measurement:
+    // −13 % total stream bytes against the always-carried five-class
+    // ladder at −0.03 dB).
     let stream = encode_pcm_to_packets(&pcm, &config).expect("encodes");
     let setup = setup_of(&stream, 1);
     let long = setup.residues.last().expect("long residue");
     assert_eq!(long.residue_end, 960, "44.1 kHz long coded-band cap");
-    assert_eq!(long.classifications, 5, "the staged corpus separates");
+    assert_eq!(
+        long.classifications, 4,
+        "4 s of audio does not amortise a band table"
+    );
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("muxes");
     let decoded = decode_ogg_to_pcm(&ogg).expect("decodes");
     assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("staged banded roundtrip: {} B, SNR {snr:.2} dB", ogg.len());
     assert!(snr >= 46.0, "staged SNR {snr:.2} dB below 46 dB");
+
+    // Doubled (8 s, the same material tiled): the same corpus now
+    // amortises the mid band book, and the adoption keeps it — the
+    // 4-D 625-entry tier, single pass, its own book, under the
+    // grown classword alphabet.
+    let tiled: Vec<Vec<f32>> = pcm
+        .iter()
+        .map(|row| {
+            let mut out = row.clone();
+            out.extend_from_slice(row);
+            out
+        })
+        .collect();
+    let stream = encode_pcm_to_packets(&tiled, &config).expect("tiled encodes");
+    let setup = setup_of(&stream, 1);
+    let long = setup.residues.last().expect("long residue");
+    assert_eq!(
+        long.classifications, 5,
+        "8 s of the same material amortises the mid band class"
+    );
+    assert_eq!(long.cascade.len(), 5);
+    assert_eq!(long.cascade[4], 0b01, "band class: single pass");
+    let mid_book_index = long.books[4][0].expect("band class pass-0 book") as usize;
+    let mid_book = &setup.codebooks[mid_book_index];
+    assert_eq!(mid_book.dimensions, 4, "the adopted tier is the 4-D mid");
+    assert_eq!(mid_book.entries, 625, "5 levels per dimension");
+    let classbook = &setup.codebooks[long.classbook as usize];
+    assert_eq!(classbook.dimensions, 4);
+    assert_eq!(classbook.entries, 625, "5-class alphabet, 5^4 groups");
+    // The adopted band book's codeword lengths are the sparse
+    // final-emission retrain's: only cells the packets actually
+    // reference keep codewords.
+    let used = mid_book
+        .codeword_lengths
+        .iter()
+        .filter(|&&l| l != 0)
+        .count();
+    assert!(
+        0 < used && used < 625,
+        "the band book table is emission-sparse (used {used} of 625)"
+    );
+    let ogg = encode_pcm_to_ogg(&tiled, &config).expect("tiled muxes");
+    let decoded = decode_ogg_to_pcm(&ogg).expect("tiled decodes");
+    assert_eq!(decoded.pcm[0].len(), tiled[0].len(), "end-trim exact");
+    let snr = snr_db(&tiled[0], &decoded.pcm[0]);
+    eprintln!("tiled banded roundtrip: {} B, SNR {snr:.2} dB", ogg.len());
+    assert!(snr >= 46.0, "tiled SNR {snr:.2} dB below 46 dB");
 }

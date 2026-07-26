@@ -65,7 +65,7 @@ use crate::psy::{
     PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 use crate::quality::{EncoderTuning, QualityError};
-use crate::residue_encode::{plan_vector_residue_rd_weighted, ResidueEncodeError};
+use crate::residue_encode::{plan_vector_classifications_rd_weighted, ResidueEncodeError};
 use crate::setup::{
     parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader,
     MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
@@ -155,6 +155,18 @@ const QUIET_BAND_MIN_PARTITIONS: usize = 32;
 /// one amplitude tier up.
 const MID_BOOK_LEVELS: u32 = 5;
 
+/// Dimensionality of the deep band tiers: how many contiguous §8.6.4
+/// residue bins one deep-tier codeword covers. Eight divides both
+/// §8.6.1 partition sizes ([`PARTITION_SIZE_SHORT`] /
+/// [`PARTITION_SIZE_LONG`]), so a partition is exactly two or four
+/// deep-tier reads — the next joint-dimensionality rung above the
+/// 4-D band books. At this dimensionality only a **ternary** ladder
+/// fits a full §3.2.1 product lattice (3⁸ = 6561 entries; the mid
+/// tier's five levels would need 5⁸ ≈ 391 k), so both deep tiers are
+/// ternary: the deep noise tier at the noise class's step, the deep
+/// mid tier at the full mid-band span.
+const BAND8_BOOK_DIMS: u16 = 8;
+
 /// Classword-aware planning refinements: after the value-bit-only
 /// first pass, how many plan ↔ re-price alternations the integrated
 /// encoder runs with the per-class marginal classword bias (see the
@@ -187,9 +199,11 @@ const VQ_DESIGN_MAX_CODEWORD_LEN: u8 = 24;
 
 // (The base four-class ladder — silence / noise / coarse /
 // coarse + fine — is built by `ResidueLadder::base`; the
-// amplitude-band designer appends a quiet coarse (+ fine) pair, so
-// the stream's `residue_classifications` is 4 or 5 depending on the
-// corpus statistics. See `ResidueLadder`.)
+// amplitude-band designer appends up to three band-class candidates
+// — the 4-D mid tier and the two 8-D deep tiers — and the
+// Lagrangian adoption loop keeps only the candidates that measure
+// smaller, so the stream's `residue_classifications` is 4..=7
+// depending on the corpus statistics. See `ResidueLadder`.)
 
 /// The designed lattice fine ladder's **coverage cap**: the largest
 /// fine-resolution scale (see
@@ -935,13 +949,17 @@ fn resample_envelope(src: &[f32], dst_len: usize) -> Vec<f32> {
 /// the classbook (1), i.e. the first ladder book is codebook 2).
 ///
 /// The base ladder is the four-class silence / noise / coarse /
-/// coarse + fine set; the amplitude-band designer appends a **mid
-/// band** class — a joint [`NOISE_BOOK_DIMS`]-dimensional book whose
-/// ladder reaches the corpus' median above-noise partition — giving
-/// the rate-distortion chooser a per-band value-book assignment:
-/// each partition's classword selects the band book whose span (and
-/// joint dimensionality) matches its amplitude, priced against the
-/// books' exact codeword costs.
+/// coarse + fine set; the amplitude-band designer appends the band
+/// tier **candidates** — the 4-D mid band book whose ladder reaches
+/// the corpus' median above-noise partition, and the two ternary
+/// [`BAND8_BOOK_DIMS`]-dimensional deep tiers (the noise step and the
+/// full mid span) — giving the rate-distortion chooser a per-band,
+/// per-dimensionality value-book assignment: each partition's
+/// classword selects the band book whose span **and** joint
+/// dimensionality match its texture, priced against the books' exact
+/// codeword costs. Candidates that cannot pay for themselves are
+/// measured out again by the adoption loop before packets are
+/// written.
 struct ResidueLadder {
     /// Value books, in codebook-table order starting at index 2.
     value_books: Vec<VorbisCodebook>,
@@ -1778,38 +1796,40 @@ fn encode_pcm_to_packets_geometry(
     // band; a stream with no such partition trains on the all-zero
     // vector (the class then simply loses to its neighbours in the RD
     // chooser).
-    let design_band_book = |levels: u32, step: f32| -> Result<VorbisCodebook, OggFileError> {
-        let d = NOISE_BOOK_DIMS as usize;
-        let reach = (levels / 2) as f32 * step;
-        let mut corpus: Vec<f32> = Vec::new();
-        for (f, t_row) in targets.iter().enumerate() {
-            let (end, ps) = (frame_res_end(f), frame_ps(f));
-            for target in t_row {
-                for partition in target[..end].chunks_exact(ps) {
-                    // 1.5×: include partitions the ladder can only
-                    // reach approximately — the RD chooser will weigh
-                    // the clipping error against the cheap rate.
-                    if partition.iter().all(|t| t.abs() <= 1.5 * reach) {
-                        corpus.extend_from_slice(partition);
+    let design_band_book =
+        |dims: u16, levels: u32, step: f32| -> Result<VorbisCodebook, OggFileError> {
+            let d = dims as usize;
+            let reach = (levels / 2) as f32 * step;
+            let mut corpus: Vec<f32> = Vec::new();
+            for (f, t_row) in targets.iter().enumerate() {
+                let (end, ps) = (frame_res_end(f), frame_ps(f));
+                for target in t_row {
+                    for partition in target[..end].chunks_exact(ps) {
+                        // 1.5×: include partitions the ladder can only
+                        // reach approximately — the RD chooser will weigh
+                        // the clipping error against the cheap rate.
+                        if partition.iter().all(|t| t.abs() <= 1.5 * reach) {
+                            corpus.extend_from_slice(partition);
+                        }
                     }
                 }
             }
-        }
-        let mut corpus = subsample_corpus(corpus, d, VQ_DESIGN_MAX_VECTORS);
-        if corpus.is_empty() {
-            corpus = vec![0.0; d];
-        }
-        let ladder = crate::book_design::uniform_value_ladder(-(reach), step, levels, 8)?;
-        Ok(crate::book_design::design_lattice_vq_codebook(
-            &corpus,
-            NOISE_BOOK_DIMS,
-            &ladder,
-            VQ_DESIGN_MAX_CODEWORD_LEN,
-            true,
-        )?
-        .codebook)
-    };
+            let mut corpus = subsample_corpus(corpus, d, VQ_DESIGN_MAX_VECTORS);
+            if corpus.is_empty() {
+                corpus = vec![0.0; d];
+            }
+            let ladder = crate::book_design::uniform_value_ladder(-(reach), step, levels, 8)?;
+            Ok(crate::book_design::design_lattice_vq_codebook(
+                &corpus,
+                dims,
+                &ladder,
+                VQ_DESIGN_MAX_CODEWORD_LEN,
+                true,
+            )?
+            .codebook)
+        };
     let noise = design_band_book(
+        NOISE_BOOK_DIMS,
         NOISE_BOOK_LEVELS,
         crate::book_design::pack_nearest(max_abs / 48.0),
     )?;
@@ -1819,28 +1839,87 @@ fn encode_pcm_to_packets_geometry(
     let mid = mid_span
         .map(|span| {
             design_band_book(
+                NOISE_BOOK_DIMS,
                 MID_BOOK_LEVELS,
                 crate::book_design::pack_nearest(span / (MID_BOOK_LEVELS / 2) as f32),
             )
         })
         .transpose()?;
+    // The deep 8-D tiers (§8.6.2 partition/dimension interplay: 8
+    // divides both partition sizes, so one codeword covers eight
+    // contiguous §8.6.4 bins — twice the noise class's joint span).
+    // A ternary 8-D grid is the only full-lattice shape that fits
+    // §3.2.1's entry space at this dimensionality (3⁸ = 6561 entries;
+    // five levels would need 5⁸ ≈ 391 k): each tier trades amplitude
+    // resolution for joint dimensionality one step further than its
+    // 4-D sibling, which pays exactly where partitions are *textured
+    // but patterned* — the trained joint occupancy prices the
+    // stream's actual eight-bin patterns, and the sparse
+    // final-emission retrain keeps the setup table proportional to
+    // the cells actually used. Both tiers are candidates only; the
+    // Lagrangian adoption below drops any tier that cannot buy its
+    // own setup table + classword-alphabet growth.
+    let noise8 = if config.residue_bands {
+        Some(design_band_book(
+            BAND8_BOOK_DIMS,
+            NOISE_BOOK_LEVELS,
+            crate::book_design::pack_nearest(max_abs / 48.0),
+        )?)
+    } else {
+        None
+    };
+    let mid8 = if config.residue_bands {
+        mid_span
+            .map(|span| {
+                design_band_book(
+                    BAND8_BOOK_DIMS,
+                    NOISE_BOOK_LEVELS,
+                    crate::book_design::pack_nearest(span),
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
     // ---- the class ladder + setup header ----
-    let mut ladder = ResidueLadder::base(coarse, fine, noise);
-    if let Some(mid_book) = mid {
-        ladder.push_band_class(mid_book);
+    // The appended band-class candidates, in ladder order after the
+    // four base classes. Candidacy is cheap: each candidate is
+    // adopted only if the exact post-training serialisation cost
+    // (setup table + classwords + value codewords) measures smaller
+    // with it than without it — see the adoption loop below.
+    let mut band_candidates: Vec<VorbisCodebook> = Vec::new();
+    if let Some(book) = mid {
+        band_candidates.push(book);
     }
-    let classifications = ladder.classifications();
+    if let Some(book) = noise8 {
+        band_candidates.push(book);
+    }
+    if let Some(book) = mid8 {
+        band_candidates.push(book);
+    }
+    let classifications = 4 + band_candidates.len() as u32;
     let half_ns: Vec<u32> = (0..n_entries).map(|e| entry_half(e) as u32).collect();
     let residue_ends_u32: Vec<u32> = residue_ends.iter().map(|&e| e as u32).collect();
-    let mut setup = build_setup(
-        floor_headers.clone(),
-        ladder,
-        &half_ns,
-        &residue_ends_u32,
-        coupling_steps,
-        switching,
-    );
+    let build = |coarse: &VorbisCodebook,
+                 fine: &VorbisCodebook,
+                 noise: &VorbisCodebook,
+                 bands: &[VorbisCodebook]|
+     -> VorbisSetupHeader {
+        let mut ladder = ResidueLadder::base(coarse.clone(), fine.clone(), noise.clone());
+        for book in bands {
+            ladder.push_band_class(book.clone());
+        }
+        build_setup(
+            floor_headers.clone(),
+            ladder,
+            &half_ns,
+            &residue_ends_u32,
+            coupling_steps.clone(),
+            switching,
+        )
+    };
+    let mut setup = build(&coarse, &fine, &noise, &band_candidates);
 
     // ---- optional closed-loop codebook training ----
     // The seed value books are retrained on the stream's own residue
@@ -1911,121 +1990,154 @@ fn encode_pcm_to_packets_geometry(
         }
     }
 
-    // ---- §8.6.2 residue planning (all frames) ----
-    // The per-class value-book rows are resolved generically from the
-    // setup header's own §8.6.1 `books` table (all entries share the
-    // class rows — only `residue_end` / partition size differ), so the
-    // rate-distortion chooser prices exactly the ladder the header
-    // declares: the base silence / noise / coarse / coarse + fine
-    // classes plus, when the corpus separates, the quiet band's pair.
-    // Each partition's classword is thereby a per-band value-book
-    // assignment, priced per partition per pass.
-    let planning_books = setup.codebooks.clone();
-    let value_rows: Vec<[Option<&VorbisCodebook>; 8]> = setup.residues[0]
-        .books
-        .iter()
-        .map(|row| {
-            let mut resolved: [Option<&VorbisCodebook>; 8] = Default::default();
-            for (pass, slot) in row.iter().enumerate() {
-                if let Some(book) = slot {
-                    resolved[pass] = Some(&planning_books[*book as usize]);
-                }
-            }
-            resolved
-        })
-        .collect();
-
-    let plan_all = |bias: Option<&[f64]>| -> Result<Vec<Vec<ResidueVectorPlan>>, OggFileError> {
-        let mut frame_plans: Vec<Vec<ResidueVectorPlan>> = Vec::with_capacity(frames);
-        for f in 0..frames {
-            let end = frame_res_end(f);
-            let mut plans = Vec::with_capacity(ch);
-            for c in 0..ch {
-                let scored = match bias {
-                    Some(bias) => crate::residue_encode::plan_vector_residue_rd_weighted_biased(
-                        &targets[f][c][..end],
-                        &value_rows,
-                        1,
-                        frame_ps(f) as u32,
-                        tuning.lambda,
-                        &weights[f][c],
-                        bias,
-                    )?,
-                    None => plan_vector_residue_rd_weighted(
-                        &targets[f][c][..end],
-                        &value_rows,
-                        1,
-                        frame_ps(f) as u32,
-                        tuning.lambda,
-                        &weights[f][c],
-                    )?,
-                };
-                plans.push(ResidueVectorPlan {
-                    classifications: scored.classifications,
-                    partition_entries: scored.partition_entries,
-                });
-            }
-            frame_plans.push(plans);
-        }
-        Ok(frame_plans)
-    };
-    // Classword-aware planning: pass 1 prices value bits alone; each
-    // refinement pass then prices every class's **marginal classword
-    // bits** from the previous pass's class histogram (`-log2 p(c)` —
-    // the per-partition share of an entropy-optimal classword under
-    // an independence model, which the dense occupancy retrain below
-    // approaches) and re-plans under the biased chooser. Without
-    // this, a class adopted for a marginal value-bit win can inflate
-    // the classword entropy by more than it saves — the mispricing
-    // that made a naive richer class ladder spend *more* audio bytes
-    // at identical fidelity. Alternating plan ↔ re-price converges
-    // like entropy-constrained quantiser design; two refinements are
-    // enough for the histogram to stabilise in practice (the loop
-    // stops early at a fixed point).
-    let mut frame_plans = plan_all(None)?;
-    for _ in 0..CLASSWORD_PRICE_PASSES {
-        let mut hist = vec![0u64; classifications as usize];
-        let mut total = 0u64;
-        for plans in &frame_plans {
-            for plan in plans {
-                for &c in &plan.classifications {
-                    hist[c as usize] += 1;
-                    total += 1;
-                }
-            }
-        }
-        if total == 0 {
-            break;
-        }
-        let bias: Vec<f64> = hist
+    // ---- §8.6.2 residue planning + band-class adoption ----
+    // `evaluate` runs the whole planning tail for one candidate band
+    // set: classword-aware rate-distortion planning under the trained
+    // books, the exact emission tallies, the occupancy-optimal length
+    // redesigns (floor-post + classbook dense — the planner picks
+    // classes without consulting availability, so every symbol keeps
+    // a codeword; the ladder value books **sparse** — the plans are
+    // final here, every emitted entry is tallied, and pruning the
+    // never-emitted cells is what keeps a deep band book's setup
+    // table proportional to its actual use), and the exact
+    // serialisation cost of everything the band choice can move: the
+    // setup header packet plus the classword and residue-value
+    // codewords (floor emissions are identical across sets).
+    let trained: Vec<VorbisCodebook> = setup.codebooks[2..].to_vec();
+    type Evaluated = (f64, VorbisSetupHeader, Vec<Vec<ResidueVectorPlan>>);
+    // A candidate set is a list of indices into the *trained* band
+    // books (`trained[3..]`), so every evaluation prices the exact
+    // codeword lengths the closed-loop trainer settled on.
+    let evaluate = |band_idx: &[usize]| -> Result<Evaluated, OggFileError> {
+        let bands: Vec<VorbisCodebook> = band_idx.iter().map(|&i| trained[3 + i].clone()).collect();
+        let mut setup = build(&trained[0], &trained[1], &trained[2], &bands);
+        let classifications = 4 + bands.len() as u32;
+        // The per-class value-book rows are resolved generically from
+        // the setup header's own §8.6.1 `books` table (all entries
+        // share the class rows — only `residue_end` / partition size
+        // differ), so the rate-distortion chooser prices exactly the
+        // ladder the header declares. Each partition's classword is
+        // thereby a per-band value-book assignment, priced per
+        // partition per pass.
+        let planning_books = setup.codebooks.clone();
+        let value_rows: Vec<[Option<&VorbisCodebook>; 8]> = setup.residues[0]
+            .books
             .iter()
-            .map(|&h| {
-                // Unseen classes are floored at one count (adopting
-                // one costs a fresh, long classword codeword), and
-                // the price is capped so a rare class stays
-                // *expensive* rather than unreachable.
-                let p = h.max(1) as f64 / total as f64;
-                (-p.log2()).clamp(0.0, f64::from(CLASSWORD_PRICE_CAP_BITS))
+            .map(|row| {
+                let mut resolved: [Option<&VorbisCodebook>; 8] = Default::default();
+                for (pass, slot) in row.iter().enumerate() {
+                    if let Some(book) = slot {
+                        resolved[pass] = Some(&planning_books[*book as usize]);
+                    }
+                }
+                resolved
             })
             .collect();
-        let replanned = plan_all(Some(&bias))?;
-        if replanned == frame_plans {
-            break;
+        // Plans one full pass and also accumulates the plans' **weighted
+        // distortion** `Σ w[p]·error²[p]` — the same noise-to-mask
+        // objective every chooser above optimises — so the adoption
+        // loop below can compare candidate band sets on the whole
+        // Lagrangian, not on bits alone (a band class that buys real
+        // fidelity must never be dropped for a byte win).
+        type Planned = (Vec<Vec<ResidueVectorPlan>>, f64);
+        let plan_all = |bias: Option<&[f64]>| -> Result<Planned, OggFileError> {
+            let mut frame_plans: Vec<Vec<ResidueVectorPlan>> = Vec::with_capacity(frames);
+            let mut weighted_error = 0.0f64;
+            for f in 0..frames {
+                let end = frame_res_end(f);
+                let mut plans = Vec::with_capacity(ch);
+                for c in 0..ch {
+                    let choices = match bias {
+                        Some(bias) => {
+                            crate::residue_encode::plan_vector_classifications_rd_weighted_biased(
+                                &targets[f][c][..end],
+                                &value_rows,
+                                1,
+                                frame_ps(f) as u32,
+                                tuning.lambda,
+                                &weights[f][c],
+                                bias,
+                            )?
+                        }
+                        None => plan_vector_classifications_rd_weighted(
+                            &targets[f][c][..end],
+                            &value_rows,
+                            1,
+                            frame_ps(f) as u32,
+                            tuning.lambda,
+                            &weights[f][c],
+                        )?,
+                    };
+                    let mut classifications = Vec::with_capacity(choices.len());
+                    let mut partition_entries = Vec::with_capacity(choices.len());
+                    for (p, choice) in choices.into_iter().enumerate() {
+                        weighted_error += weights[f][c][p] * choice.error_sq;
+                        classifications.push(choice.classification);
+                        partition_entries.push(choice.entries);
+                    }
+                    plans.push(ResidueVectorPlan {
+                        classifications,
+                        partition_entries,
+                    });
+                }
+                frame_plans.push(plans);
+            }
+            Ok((frame_plans, weighted_error))
+        };
+        // Classword-aware planning: pass 1 prices value bits alone;
+        // each refinement pass then prices every class's **marginal
+        // classword bits** from the previous pass's class histogram
+        // (`-log2 p(c)` — the per-partition share of an
+        // entropy-optimal classword under an independence model,
+        // which the dense occupancy retrain below approaches) and
+        // re-plans under the biased chooser. Without this, a class
+        // adopted for a marginal value-bit win can inflate the
+        // classword entropy by more than it saves — the mispricing
+        // that made a naive richer class ladder spend *more* audio
+        // bytes at identical fidelity. Alternating plan ↔ re-price
+        // converges like entropy-constrained quantiser design; the
+        // loop stops early at a plan fixed point.
+        let (mut frame_plans, mut weighted_error) = plan_all(None)?;
+        for _ in 0..CLASSWORD_PRICE_PASSES {
+            let mut hist = vec![0u64; classifications as usize];
+            let mut total = 0u64;
+            for plans in &frame_plans {
+                for plan in plans {
+                    for &c in &plan.classifications {
+                        hist[c as usize] += 1;
+                        total += 1;
+                    }
+                }
+            }
+            if total == 0 {
+                break;
+            }
+            let bias: Vec<f64> = hist
+                .iter()
+                .map(|&h| {
+                    // Unseen classes are floored at one count
+                    // (adopting one costs a fresh, long classword
+                    // codeword), and the price is capped so a rare
+                    // class stays *expensive* rather than
+                    // unreachable.
+                    let p = h.max(1) as f64 / total as f64;
+                    (-p.log2()).clamp(0.0, f64::from(CLASSWORD_PRICE_CAP_BITS))
+                })
+                .collect();
+            let (replanned, replanned_error) = plan_all(Some(&bias))?;
+            if replanned == frame_plans {
+                break;
+            }
+            frame_plans = replanned;
+            weighted_error = replanned_error;
         }
-        frame_plans = replanned;
-    }
 
-    // ---- classword + floor-post lengths from the final emissions ----
-    // Tally the exact classword emissions the packets below make (the
-    // writer's own §8.6.2 grouping, via tally_residue_plans) and the
-    // exact §7.2.3 floor-post emissions (tally_floor1_packet — the
-    // fitted `floor1_y` values through the shared post book), then
-    // make both books' codeword lengths occupancy-optimal — dense
-    // policy, so a symbol the corpus never emitted keeps a (long)
-    // codeword and each book stays whole-alphabet-encodable. Codeword
-    // lengths carry no values, so the packets decode to bit-identical
-    // PCM; they only serialise into fewer bits.
-    {
+        // Exact emission tallies for the final plans (the writer's
+        // own §8.6.2 grouping via tally_residue_plans; the §7.2.3
+        // floor-post emissions via tally_floor1_packet). Codeword
+        // lengths carry no values, so every redesign below leaves the
+        // packets decoding to bit-identical PCM; they only serialise
+        // into fewer bits.
         let mut tallies = crate::book_design::BookTallies::new(&setup.codebooks);
         for (f, plans) in frame_plans.iter().enumerate() {
             let e = entry_of(f);
@@ -2053,7 +2165,63 @@ fn encode_pcm_to_packets_geometry(
                     crate::book_design::redesign_codebook(&setup.codebooks[book], freqs, 16, true)?;
             }
         }
+        for book in 2..setup.codebooks.len() {
+            if let Some(freqs) = tallies.counts(book) {
+                if freqs.iter().any(|&f| f > 0) {
+                    setup.codebooks[book] = crate::book_design::redesign_codebook(
+                        &setup.codebooks[book],
+                        freqs,
+                        VQ_DESIGN_MAX_CODEWORD_LEN,
+                        false,
+                    )?;
+                }
+            }
+        }
+        // The exact serialised cost the band choice can move — the
+        // setup header packet plus every classword / residue-value
+        // codeword bit — folded with the plans' weighted distortion
+        // into the same `Σ w·error² + λ·bits` Lagrangian every
+        // chooser above optimises. Setup bits ride the same λ: a
+        // band book must buy its own table.
+        let setup_packet = write_setup_header(&setup, config.channels)?;
+        let mut bits = 8 * setup_packet.len() as u64;
+        for book in 1..setup.codebooks.len() {
+            if let Some(freqs) = tallies.counts(book) {
+                bits += freqs
+                    .iter()
+                    .zip(&setup.codebooks[book].codeword_lengths)
+                    .map(|(&f, &l)| f * u64::from(l))
+                    .sum::<u64>();
+            }
+        }
+        let objective = weighted_error + tuning.lambda * bits as f64;
+        Ok((objective, setup, frame_plans))
+    };
+
+    // Greedy adopt-if-improved over the appended band classes: start
+    // from the full candidate ladder the books were trained on and
+    // drop any band whose removal measures a strictly smaller
+    // Lagrangian. This is what keeps candidacy safe: a band the
+    // corpus wants pays its way through shorter classwords + value
+    // codewords or lower masked distortion; a band the plans barely
+    // touch cannot cover its own setup table (or the classword
+    // alphabet growth) and is measured out — the header never
+    // carries a dead book.
+    let mut kept: Vec<usize> = (0..band_candidates.len()).collect();
+    let mut best = evaluate(&kept)?;
+    let mut i = 0;
+    while i < kept.len() {
+        let mut reduced = kept.clone();
+        reduced.remove(i);
+        let candidate = evaluate(&reduced)?;
+        if candidate.0 < best.0 {
+            kept = reduced;
+            best = candidate;
+        } else {
+            i += 1;
+        }
     }
+    let (_, setup, frame_plans) = best;
 
     // ---- the three §4.2 header packets ----
     let id_packet = write_identification_header(&VorbisIdentificationHeader {

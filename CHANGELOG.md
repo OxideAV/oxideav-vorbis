@@ -6,6 +6,42 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Deep 8-D band tiers + measured Lagrangian band adoption + a
+  final-emission occupancy retrain** — the r430 encode tail. The
+  amplitude-band ladder's tiers are now *candidates*: alongside the
+  4-D mid book the designer stages two ternary
+  **8-dimensional** §3.2.1 full-lattice tiers (3⁸ = 6561 entries —
+  the only full-grid shape §3.2.1 affords at this dimensionality;
+  one codeword per eight contiguous §8.6.4 bins, twice the noise
+  class's joint span) at the noise step and at the full mid-band
+  span. After closed-loop training, a greedy **adopt-if-improved
+  loop** re-plans each candidate subset and keeps a band class only
+  when the whole measured Lagrangian — weighted (NMR) distortion
+  plus λ × (setup-header packet + classword + value-codeword bits) —
+  strictly improves, so **a band book must buy its own setup
+  table**; and the encode tail now redesigns *every* value book's
+  codeword lengths from the final plans' exact emission tallies
+  (sparse — never-emitted cells are pruned; decode is bit-identical,
+  the packets and the header just serialise smaller). Measured
+  against the r420 always-carry pipeline on the staged 4-s corpus
+  (total stream bytes at equal measured SNR unless noted): mono-44100
+  −21 %/−14 %/−3 % at q = 0.4/0.7/1, mono-22050 −13 %/−17 %/+6 %
+  (the q = 1 cell trades bytes for weighted-error headroom),
+  stereo-44100 −13 % at q = 0.4 and −16 % at q = 1 (−1.4 dB
+  unweighted SNR, inside the psy model's masked budget — the
+  weighted objective improves); synthetic multitone/noise cells move
+  ≤ ±1 % except noise-q0.4 (+5 %, a weighted-error win the SNR
+  metric does not see). Short streams now measure every band tier
+  *out* (4 s cannot amortise a table) while longer streams adopt
+  them: the ×2-tiled staged mono corpus re-adopts the 4-D mid tier,
+  and the ×8-tiled (32 s) stereo corpus at the default quality
+  adopts a **deep 8-D tier** — 218 of 6561 cells carrying codewords
+  — at **−5.1 % audio bytes** against the same build without the
+  8-D candidates. Black-box: 21 swept re-encodes (22.05/44.1 kHz,
+  mono/stereo, q ∈ {0.4, 0.7, 1.0}, 4/8/32 s, including the 8-D
+  stream) decode through the black-box reference decoder to their
+  exact declared frame counts, agreeing with the crate's own decoder
+  at 100.6–109.7 dB on a 16-bit compare.
 - **Exact branch-and-bound nearest-entry search for sparse
   full-grid lattices** (`vq::quantize_vector`): a §3.2.1 lookup-1
   book whose entries form a full product grid but whose trained

@@ -207,13 +207,18 @@ fn a_smaller_blocksize_also_roundtrips() {
 }
 
 #[test]
-fn codebook_training_cuts_the_stream_at_equal_fidelity() {
-    // The closed-loop ladder trainer (now covering the encoder's 1-D
-    // lattice value books) retrains the generic seed ladders on the
-    // stream's own residue targets; the trained stream must be
-    // smaller at no meaningful fidelity cost, and still §4.2.4
-    // carriage-legal (decode_ogg_to_pcm re-parses the trained setup
-    // header from the produced bytes).
+fn codebook_training_composes_with_the_final_occupancy_retrain() {
+    // Since r430 the encode tail redesigns *every* value book's
+    // codeword lengths from the final plans' exact emission tallies
+    // (sparse), so the length win the closed-loop trainer used to be
+    // measured by here now reaches trained and untrained streams
+    // alike — on this corpus the two serialise within a few percent
+    // of each other. What this pins instead: training composes with
+    // the final retrain (no double-optimisation blow-up), never
+    // costs materially against the retrained seed ladders, never
+    // costs meaningful fidelity, and the trained setup header stays
+    // §4.2.4 carriage-legal (decode_ogg_to_pcm re-parses it from the
+    // produced bytes).
     let samples = 16_384;
     let pcm = vec![test_signal(samples, 11)];
     let mut untrained = StreamEncoderConfig::new(RATE, 1);
@@ -231,8 +236,8 @@ fn codebook_training_cuts_the_stream_at_equal_fidelity() {
         ogg_trained.len()
     );
     assert!(
-        ogg_trained.len() < ogg_untrained.len(),
-        "trained stream {} B must undercut the seed stream {} B",
+        (ogg_trained.len() as f64) <= 1.03 * ogg_untrained.len() as f64,
+        "trained stream {} B must not cost against the retrained seed stream {} B",
         ogg_trained.len(),
         ogg_untrained.len()
     );
