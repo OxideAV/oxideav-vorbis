@@ -4,6 +4,13 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- Crate `description` no longer calls this an orphan-rebuild
+  scaffold: it is a sample-exact streaming decoder plus a
+  psychoacoustic whole-stream encoder, clean-room from the Vorbis I
+  specification.
+
 ### Added
 
 - **Deep 8-D band tiers + measured Lagrangian band adoption + a

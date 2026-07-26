@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-vorbis"
 authors = ["Mark Karpeles"]
-description = "Vorbis I audio codec — orphan-rebuild scaffold pending clean-room re-implementation."
+description = "Pure-Rust Ogg/Vorbis I audio codec — sample-exact streaming decoder and a psychoacoustic whole-stream encoder, clean-room from the Vorbis I specification."
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-vorbis"
