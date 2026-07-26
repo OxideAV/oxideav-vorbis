@@ -6,6 +6,19 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Exact branch-and-bound nearest-entry search for sparse
+  full-grid lattices** (`vq::quantize_vector`): a §3.2.1 lookup-1
+  book whose entries form a full product grid but whose trained
+  codeword lengths pruned some cells previously fell to the general
+  per-entry scan. The new path walks the grid depth-first with each
+  dimension's levels distance-sorted, pruning any partial assignment
+  whose bound exceeds the best used entry found — exactly the
+  general scan's result (lowest entry index on ties, pinned
+  exhaustively against the per-entry oracle), orders of magnitude
+  faster on the trained band books. Measured: the staged stereo
+  fixture's integrated encode at the default quality drops from
+  10.9 s to 1.45 s (7.5×); the deep 3⁸ tiers would be
+  planning-infeasible without it.
 - **Container-agnostic payload-magic declaration**: `register()` now
   declares `CodecInfo::payload_magic(b"\x01vorbis")` — the §4.2.1
   identification-header prefix that opens every Vorbis stream's first

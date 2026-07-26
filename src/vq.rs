@@ -569,6 +569,144 @@ pub fn quantize_vector(
                 distance_sq,
             });
         }
+        // Branch-and-bound exact path for a **sparse full-grid product
+        // lattice** — the same geometry as above but with some entries
+        // pruned to [`UNUSED_ENTRY`] (the occupancy-trained band books
+        // after a sparse length retrain). The distance still separates
+        // per dimension, but the nearest *used* entry is no longer the
+        // per-dimension nearest level, so the search walks the product
+        // space depth-first with each dimension's levels sorted by
+        // distance, pruning any partial assignment whose distance-so-
+        // far plus the remaining dimensions' best-possible distance
+        // already exceeds the best used entry found. The first leaf it
+        // reaches is the global nearest *grid point*, so a dense
+        // neighbourhood terminates almost immediately, while the worst
+        // case degrades to the general scan's entry count — never
+        // worse asymptotically, and orders of magnitude better on the
+        // near-full trained books the encoder actually carries (a
+        // 3⁸-entry band book would otherwise cost a 6561-entry scan
+        // per sub-vector in every rate-distortion candidate).
+        //
+        // The result is exactly the general scan's: the used entry
+        // with minimal squared distance, ties to the lowest entry
+        // index (the replacement rule below compares `(distance,
+        // entry)` and the pruning is strict, so an equal-distance
+        // lower-index entry is never cut).
+        if full_grid && codebook.codeword_lengths.len() == codebook.entries as usize {
+            let last = 0.0f32; // §3.2.1 step 5's accumulator, inert without sequence_p
+                               // Per-dimension levels sorted by squared distance to the
+                               // target component (ties to the lower level, which is the
+                               // lower §3.2.1 digit and thus the lower entry index).
+            let mut cands: Vec<Vec<(f64, u32, f32)>> = Vec::with_capacity(dims);
+            for &t in target {
+                let mut row: Vec<(f64, u32, f32)> = multiplicands
+                    .iter()
+                    .enumerate()
+                    .map(|(m, &mult)| {
+                        let v = (mult as f32) * *delta_value + *minimum_value + last;
+                        let d = f64::from(t) - f64::from(v);
+                        (d * d, m as u32, v)
+                    })
+                    .collect();
+                row.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                cands.push(row);
+            }
+            // suffix_min[j] = the least possible distance dimensions
+            // j.. can still contribute (their per-dimension minima).
+            let mut suffix_min = vec![0.0f64; dims + 1];
+            for j in (0..dims).rev() {
+                suffix_min[j] = suffix_min[j + 1] + cands[j][0].0;
+            }
+            // §3.2.1 lookup-1 digit strides: dimension j contributes
+            // `level · lv^j` to the entry index.
+            let mut strides = Vec::with_capacity(dims);
+            let mut s = 1u64;
+            for _ in 0..dims {
+                strides.push(s);
+                s *= lv as u64;
+            }
+            struct Best {
+                distance_sq: f64,
+                entry: u32,
+                vector: Vec<f32>,
+            }
+            struct Frame<'a> {
+                cands: &'a [Vec<(f64, u32, f32)>],
+                suffix_min: &'a [f64],
+                strides: &'a [u64],
+                lengths: &'a [u8],
+                dims: usize,
+            }
+            fn descend(
+                fr: &Frame<'_>,
+                j: usize,
+                dist: f64,
+                entry: u64,
+                path: &mut Vec<f32>,
+                best: &mut Option<Best>,
+            ) {
+                if j == fr.dims {
+                    let e = entry as usize;
+                    if fr.lengths[e] == UNUSED_ENTRY {
+                        return;
+                    }
+                    let replace = match best {
+                        None => true,
+                        Some(b) => {
+                            dist < b.distance_sq
+                                || (dist == b.distance_sq && (entry as u32) < b.entry)
+                        }
+                    };
+                    if replace {
+                        *best = Some(Best {
+                            distance_sq: dist,
+                            entry: entry as u32,
+                            vector: path.clone(),
+                        });
+                    }
+                    return;
+                }
+                for &(dj, level, value) in &fr.cands[j] {
+                    let nd = dist + dj;
+                    if let Some(b) = best {
+                        // Levels are distance-sorted: once this level's
+                        // bound strictly exceeds the best, every later
+                        // level's does too. Strict, so an equal-distance
+                        // lower-index entry can still be found.
+                        if nd + fr.suffix_min[j + 1] > b.distance_sq {
+                            break;
+                        }
+                    }
+                    path.push(value);
+                    descend(
+                        fr,
+                        j + 1,
+                        nd,
+                        entry + u64::from(level) * fr.strides[j],
+                        path,
+                        best,
+                    );
+                    path.pop();
+                }
+            }
+            let fr = Frame {
+                cands: &cands,
+                suffix_min: &suffix_min,
+                strides: &strides,
+                lengths: &codebook.codeword_lengths,
+                dims,
+            };
+            let mut best: Option<Best> = None;
+            let mut path = Vec::with_capacity(dims);
+            descend(&fr, 0, 0.0, 0, &mut path, &mut best);
+            return best
+                .map(|b| QuantizedEntry {
+                    entry: b.entry,
+                    vector: b.vector,
+                    distance_sq: b.distance_sq,
+                })
+                .ok_or(QuantizeError::NoUsableEntries);
+        }
     }
 
     let mut best: Option<QuantizedEntry> = None;
@@ -1376,9 +1514,9 @@ mod tests {
         }
     }
 
-    /// A sparse lattice book (a pruned grid cell) must take the general
-    /// scan — the factorised choice could land on the hole — and still
-    /// never return the unused entry.
+    /// A sparse lattice book (a pruned grid cell): the factorised
+    /// choice could land on the hole, so the branch-and-bound path
+    /// must route around it and never return the unused entry.
     #[test]
     fn sparse_lattice_falls_back_to_the_general_scan() {
         let mut lengths = vec![5u8; 25];
@@ -1403,6 +1541,140 @@ mod tests {
         let brute = brute_force_nearest(&cb, &[0.0, 0.0]);
         assert_eq!(q.entry, brute.entry);
         assert_eq!(q.distance_sq, brute.distance_sq);
+    }
+
+    /// The sparse full-grid branch-and-bound path against the
+    /// per-entry oracle, exhaustively over deterministic sparsity
+    /// patterns: every used-entry subset the LCG produces must yield
+    /// the identical `(entry, vector, distance)` on a grid of on-grid,
+    /// off-grid, midpoint-tie and out-of-span targets.
+    #[test]
+    fn sparse_lattice_branch_and_bound_matches_the_scan() {
+        let mut lcg: u64 = 0x2545F491_4F6CDD1D;
+        let mut next = move || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        let mut targets: Vec<[f32; 2]> = Vec::new();
+        for i in 0..7 {
+            for j in 0..7 {
+                targets.push([-3.4 + 1.1 * i as f32, -3.1 + 0.95 * j as f32]);
+            }
+        }
+        // Exact level midpoints: ties must break to the lower entry.
+        targets.push([-2.5 + 0.625, 0.625]);
+        targets.push([0.625, -2.5 + 0.625]);
+        for pattern in 0..40 {
+            let mut lengths = vec![5u8; 25];
+            let mut used = 0;
+            for l in lengths.iter_mut() {
+                if next() % 3 == pattern % 3 {
+                    *l = crate::codebook::UNUSED_ENTRY;
+                } else {
+                    used += 1;
+                }
+            }
+            if used == 0 {
+                continue;
+            }
+            let cb = VorbisCodebook {
+                dimensions: 2,
+                entries: 25,
+                codeword_lengths: lengths,
+                lookup: VqLookup::Lattice {
+                    minimum_value: -2.5,
+                    delta_value: 1.25,
+                    value_bits: 8,
+                    sequence_p: false,
+                    multiplicands: vec![0, 1, 2, 3, 4],
+                },
+            };
+            for t in &targets {
+                let bb = quantize_vector(&cb, t).unwrap();
+                let brute = brute_force_nearest(&cb, t);
+                assert_eq!(bb.entry, brute.entry, "pattern {pattern} target {t:?}");
+                assert_eq!(bb.vector, brute.vector, "pattern {pattern} target {t:?}");
+                assert_eq!(
+                    bb.distance_sq, brute.distance_sq,
+                    "pattern {pattern} target {t:?}"
+                );
+            }
+        }
+    }
+
+    /// The 8-dimensional ternary band-book shape (3⁸ = 6561 entries)
+    /// with heavy sparsity — the exact geometry the integrated
+    /// encoder's 8-D residue tiers carry after the occupancy retrain.
+    #[test]
+    fn sparse_8d_ternary_lattice_matches_the_scan() {
+        let entries = 3u32.pow(8);
+        let mut lcg: u64 = 0x9E3779B9_7F4A7C15;
+        let mut next = move || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        let mut lengths = vec![crate::codebook::UNUSED_ENTRY; entries as usize];
+        // Keep ~8 % of cells, plus the all-zero-level cell (entry 3280
+        // = the centre of the ternary grid, digit 1 in every place).
+        for l in lengths.iter_mut() {
+            if next() % 12 == 0 {
+                *l = 10;
+            }
+        }
+        let centre: u32 = (0..8).map(|j| 3u32.pow(j)).sum();
+        lengths[centre as usize] = 2;
+        let cb = VorbisCodebook {
+            dimensions: 8,
+            entries,
+            codeword_lengths: lengths,
+            lookup: VqLookup::Lattice {
+                minimum_value: -0.5,
+                delta_value: 0.5,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2],
+            },
+        };
+        let targets: Vec<[f32; 8]> = vec![
+            [0.0; 8],
+            [0.4, -0.4, 0.0, 0.1, -0.1, 0.5, -0.5, 0.2],
+            [1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 0.0, 0.0],
+            [0.25; 8], // every component an exact midpoint tie
+            [-2.0, 2.0, -2.0, 2.0, -2.0, 2.0, -2.0, 2.0], // out of span
+        ];
+        for t in &targets {
+            let bb = quantize_vector(&cb, t).unwrap();
+            let brute = brute_force_nearest(&cb, t);
+            assert_eq!(bb.entry, brute.entry, "target {t:?}");
+            assert_eq!(bb.vector, brute.vector, "target {t:?}");
+            assert_eq!(bb.distance_sq, brute.distance_sq, "target {t:?}");
+        }
+    }
+
+    /// An all-unused full-grid lattice must report `NoUsableEntries`
+    /// from the branch-and-bound path, same as the general scan.
+    #[test]
+    fn sparse_full_grid_all_unused_is_rejected() {
+        let cb = VorbisCodebook {
+            dimensions: 2,
+            entries: 9,
+            codeword_lengths: vec![crate::codebook::UNUSED_ENTRY; 9],
+            lookup: VqLookup::Lattice {
+                minimum_value: -1.0,
+                delta_value: 1.0,
+                value_bits: 8,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2],
+            },
+        };
+        assert!(matches!(
+            quantize_vector(&cb, &[0.0, 0.0]),
+            Err(QuantizeError::NoUsableEntries)
+        ));
     }
 
     /// `sequence_p` couples the dimensions (each element offsets the
