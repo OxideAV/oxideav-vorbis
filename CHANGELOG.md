@@ -6,6 +6,12 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Container-agnostic payload-magic declaration**: `register()` now
+  declares `CodecInfo::payload_magic(b"\x01vorbis")` — the §4.2.1
+  identification-header prefix that opens every Vorbis stream's first
+  packet — so `CodecRegistry::resolve_payload_magic_ref` (core
+  0.1.33) identifies Vorbis from payload bytes alone, without a
+  container tag.
 - **Amplitude-band residue class ladder — per-band value-book
   assignment in the integrated encoder.** The residue now carries a
   **five-class ladder** when the corpus separates: silence, the joint

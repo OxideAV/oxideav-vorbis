@@ -770,15 +770,22 @@ pub fn decode_packet(
 /// one `"vorbis"` registration carrying both the packet-to-frame
 /// decoder factory ([`decoder::make_decoder`]) and the frame-to-packet
 /// encoder factory ([`encoder::make_encoder`]), claiming the Matroska
-/// `A_VORBIS` codec tag. The direct factory endpoints remain callable
-/// without a registry (the workspace dual-API convention).
+/// `A_VORBIS` codec tag and the container-agnostic payload magic
+/// `"\x01vorbis"` — the §4.2.1 identification-header prefix (packet
+/// type 1 + the six-byte `vorbis` pattern) that opens every Vorbis
+/// stream's first packet, so resolvers can identify the codec from
+/// payload bytes alone via
+/// [`CodecRegistry::resolve_payload_magic_ref`](oxideav_core::CodecRegistry::resolve_payload_magic_ref).
+/// The direct factory endpoints remain callable without a registry
+/// (the workspace dual-API convention).
 pub fn register(ctx: &mut RuntimeContext) {
     ctx.codecs.register(
         oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("vorbis"))
             .capabilities(oxideav_core::CodecCapabilities::audio("vorbis_sw"))
             .decoder(decoder::make_decoder)
             .encoder(encoder::make_encoder)
-            .tags([oxideav_core::CodecTag::matroska("A_VORBIS")]),
+            .tags([oxideav_core::CodecTag::matroska("A_VORBIS")])
+            .payload_magic(b"\x01vorbis"),
     );
 }
 

@@ -85,6 +85,56 @@ fn registry_carries_decoder_encoder_and_the_matroska_tag() {
     );
 }
 
+#[test]
+fn registry_resolves_the_payload_magic_from_a_first_packet() {
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+
+    // The declared magic itself: the §4.2.1 identification-header
+    // prefix (packet type 0x01 + ASCII "vorbis").
+    assert_eq!(
+        ctx.codecs
+            .resolve_payload_magic_ref(b"\x01vorbis")
+            .map(|c| c.as_str()),
+        Some("vorbis"),
+        "the bare magic resolves"
+    );
+
+    // A *real* first packet: the encoder's own emitted identification
+    // header (packet 0 of any stream) must resolve, prefix-keyed.
+    let params = encoder_params();
+    let mut enc = make_encoder(&params).expect("encoder builds");
+    let pcm = test_signal(3);
+    let frame = Frame::Audio(AudioFrame {
+        samples: pcm.len() as u32,
+        pts: Some(0),
+        data: vec![f32_plane(&pcm)],
+    });
+    enc.send_frame(&frame).expect("frame accepted");
+    enc.flush().expect("flush");
+    let first = enc.receive_packet().expect("identification header");
+    assert!(first.flags.header);
+    assert_eq!(
+        ctx.codecs
+            .resolve_payload_magic_ref(&first.data)
+            .map(|c| c.as_str()),
+        Some("vorbis"),
+        "the encoder's first packet resolves by payload magic"
+    );
+
+    // Non-matching prefixes stay unresolved: an audio packet (type
+    // LSB clear), a comment header (0x03), and a truncated magic.
+    assert!(ctx
+        .codecs
+        .resolve_payload_magic_ref(&[0x00, 0x55])
+        .is_none());
+    assert!(ctx
+        .codecs
+        .resolve_payload_magic_ref(b"\x03vorbis")
+        .is_none());
+    assert!(ctx.codecs.resolve_payload_magic_ref(b"\x01vorbi").is_none());
+}
+
 /// Drive the full encode→decode loop through boxed trait objects.
 fn roundtrip_through(
     mut encoder: Box<dyn oxideav_core::Encoder>,
