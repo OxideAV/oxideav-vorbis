@@ -22,6 +22,21 @@ All notable changes to `oxideav-vorbis` are recorded here.
   extradata-configured decode is pinned bit-identical to the in-band
   decode of the same stream.
 
+- **End-to-end container → registry → PCM validation**
+  (`tests/ogg_registry_end_to_end.rs`) — the application-shaped
+  pipeline over public API only: `.ogg` bytes through the
+  `oxideav-ogg` demuxer with the registry as the codec resolver
+  (§4.2.1 payload-magic auto-resolution — Ogg has no codec tag), the
+  decoder built by the registered factory from the demuxer's own
+  `StreamInfo` (extradata-configured headers), the demuxed packet
+  feed decoded to PCM. All 15 staged single-stream fixtures decode
+  sample-exact (±1 s16) against their black-box `expected.wav`
+  references — the 5.1 stream through its §4.3.9 WAV permutation —
+  and the crate's own `encode_pcm_to_ogg` output round-trips through
+  the same chain (self-contained, runs on standalone CI). A
+  control pins that the registration is load-bearing: an empty
+  registry leaves the demuxed stream identified but undecodable.
+
 ### Changed
 
 - Crate `description` no longer calls this an orphan-rebuild
