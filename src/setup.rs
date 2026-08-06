@@ -23,7 +23,7 @@
 //!    rangebits, x-list — but **does not** evaluate the per-packet
 //!    floor curve, which lives in audio-packet decode and is a later
 //!    round). For floor type 0 (LSP), the §6.2.1 setup fields are
-//!    read; libvorbis encoders do not produce floor 0 streams but the
+//!    read; reference encoders do not produce floor 0 streams but the
 //!    spec mandates the parser handle them.
 //! 4. **Residues** (`u6 + 1` residues, each prefixed by a 16-bit
 //!    `residue_type` ∈ {0, 1, 2}; the structural header per §8.6.1 —
@@ -233,8 +233,8 @@ pub struct FloorHeader {
 #[doc(hidden)]
 pub enum FloorKind {
     /// `floor_type = 0` — line-spectrum-pair representation (§6.2.1).
-    /// libvorbis does not emit this type; a conformant parser must
-    /// still accept it.
+    /// Reference encoders do not emit this type; a conformant parser
+    /// must still accept it.
     Type0(Floor0Header),
     /// `floor_type = 1` — piecewise-linear representation (§7.2.2).
     /// The dominant format; every fixture in
@@ -1578,8 +1578,8 @@ mod tests {
         }
     }
 
-    /// Floor 0 (LSP) path — exercised even though libvorbis does not
-    /// produce it. §6.2.1 setup must still be parsable.
+    /// Floor 0 (LSP) path — exercised even though reference encoders
+    /// do not produce it. §6.2.1 setup must still be parsable.
     #[test]
     fn parses_floor0_setup() {
         let bytes = SetupBuilder::new()
@@ -1730,8 +1730,8 @@ mod tests {
         }
     }
 
-    /// Residue type 0 path (no libvorbis fixture exercises it, but
-    /// §4.2.4 step 2c requires the parser to accept it).
+    /// Residue type 0 path (no staged fixture exercised it at the
+    /// time, but §4.2.4 step 2c requires the parser to accept it).
     #[test]
     fn parses_residue_type_0() {
         let mut b = SetupBuilder::new()
@@ -1762,8 +1762,8 @@ mod tests {
     // ===== round-6 mapping + mode coverage =====
 
     /// A stereo mapping with a single coupling step (magnitude=0,
-    /// angle=1) — the trace-doc §6 "stereo libvorbis output always
-    /// uses one coupling step (magnitude=L, angle=R)" shape.
+    /// angle=1) — the trace-doc §6 shape: stereo reference-encoder
+    /// output always uses one coupling step (magnitude=L, angle=R).
     #[test]
     fn parses_stereo_coupling_mapping() {
         let mut b = SetupBuilder::new()

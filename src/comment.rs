@@ -58,8 +58,9 @@ use core::fmt;
 /// Parsed Vorbis I comment header (§5).
 ///
 /// The [`vendor`] field is the encoder's vendor identification string
-/// (e.g. `"Xiph.Org libVorbis I 20020717"` or, for FFmpeg-encoded
-/// streams, `"Lavf61.7.100"`). The [`comments`] vector contains the
+/// (e.g. the spec's own historical example `"Xiph.Org libVorbis I
+/// 20020717"`, or the `"Lavf61.7.100"` seen on the wire in staged
+/// fixture streams). The [`comments`] vector contains the
 /// raw comment entries as decoded UTF-8 strings; the spec encodes them
 /// in `KEY=value` form (§5.2.2) but this parser does not split or
 /// validate that shape — see [`split_key_value`] for an opt-in helper.
@@ -378,9 +379,9 @@ mod tests {
         }
     }
 
-    /// Spec example: historical libvorbis vendor string.
+    /// Spec example: the §5 historical vendor string (on-wire data).
     #[test]
-    fn parses_historical_libvorbis_vendor() {
+    fn parses_historical_example_vendor() {
         let packet = build_comment_packet("Xiph.Org libVorbis I 20020717", &[], 1);
         let header = parse_comment_header(&packet).expect("must parse");
         assert_eq!(header.vendor, "Xiph.Org libVorbis I 20020717");
