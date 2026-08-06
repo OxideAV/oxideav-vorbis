@@ -4,6 +4,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Codec-private extradata decoding** — `VorbisDecoder::with_extradata`
+  parses the Xiph-laced three-header blob container layers carry for
+  Vorbis (the `oxideav-ogg` demuxer's `CodecParameters::extradata`,
+  Matroska's `A_VORBIS` `CodecPrivate`), and `make_decoder` now honours
+  a non-empty `params.extradata` by pre-configuring the decoder from
+  it — so a demuxed stream, whose header packets were consumed at
+  container-open time and never reach `send_packet`, decodes through
+  the registry and direct factory paths. The blob is unlaced with the
+  container crate's `xiph_unlace` (the exact inverse of this crate's
+  `lace_vorbis_headers`, pinned by a round-trip test on real emitted
+  headers); malformed, short-count, or mis-ordered header blobs are
+  refused at build time with a typed error. Empty extradata keeps the
+  in-band self-configuring behaviour unchanged, and the
+  extradata-configured decode is pinned bit-identical to the in-band
+  decode of the same stream.
+
 ### Changed
 
 - Crate `description` no longer calls this an orphan-rebuild

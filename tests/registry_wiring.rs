@@ -339,3 +339,137 @@ fn decoder_rejects_out_of_order_headers() {
     );
     assert!(dec.send_packet(&packet).is_err());
 }
+
+/// Encode a mono test stream and split the emitted packets into the
+/// three flagged §4.2 headers and the audio tail.
+fn encoded_headers_and_audio() -> (Vec<oxideav_core::Packet>, Vec<oxideav_core::Packet>) {
+    let params = encoder_params();
+    let mut enc = make_encoder(&params).expect("encoder builds");
+    let pcm = test_signal(11);
+    let frame = Frame::Audio(AudioFrame {
+        samples: pcm.len() as u32,
+        pts: Some(0),
+        data: vec![f32_plane(&pcm)],
+    });
+    enc.send_frame(&frame).expect("frame accepted");
+    enc.flush().expect("flush");
+    let mut headers = Vec::new();
+    let mut audio = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) if p.flags.header => headers.push(p),
+            Ok(p) => audio.push(p),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e}"),
+        }
+    }
+    assert_eq!(headers.len(), 3, "the three §4.2 headers");
+    assert!(!audio.is_empty());
+    (headers, audio)
+}
+
+/// Decode a packet feed through a boxed decoder, collecting mono PCM.
+fn drain_decode(
+    decoder: &mut Box<dyn oxideav_core::Decoder>,
+    packets: &[oxideav_core::Packet],
+) -> Vec<f32> {
+    let mut decoded = Vec::new();
+    for p in packets {
+        decoder.send_packet(p).expect("packet accepted");
+        loop {
+            match decoder.receive_frame() {
+                Ok(Frame::Audio(a)) => decoded.extend(plane_f32(&a.data[0])),
+                Ok(other) => panic!("expected audio frame, got {other:?}"),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_frame: {e}"),
+            }
+        }
+    }
+    decoded
+}
+
+#[test]
+fn extradata_configured_decoder_matches_the_in_band_path() {
+    // The demuxer carriage shape: the three headers consumed at open
+    // time and republished as the Xiph-laced codec-private extradata,
+    // with only audio packets flowing through send_packet. The
+    // extradata-configured decoder must produce bit-identical PCM to
+    // the in-band decoder fed the same headers as packets.
+    let (headers, audio) = encoded_headers_and_audio();
+    let laced = oxideav_vorbis::oggfile::lace_vorbis_headers(
+        &headers[0].data,
+        &headers[1].data,
+        &headers[2].data,
+    );
+
+    // Registry path, extradata set: first_decoder must build the
+    // pre-configured decoder through the registered factory.
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let mut params = encoder_params();
+    params.extradata = laced.clone();
+    let mut via_extradata = ctx.codecs.first_decoder(&params).expect("decoder builds");
+    let pcm_extradata = drain_decode(&mut via_extradata, &audio);
+
+    // In-band control: headers as packets, then the same audio feed.
+    let mut in_band = make_decoder(&encoder_params()).expect("decoder builds");
+    let mut all = headers.clone();
+    all.extend(audio.iter().cloned());
+    let pcm_in_band = drain_decode(&mut in_band, &all);
+
+    assert!(!pcm_extradata.is_empty());
+    assert_eq!(
+        pcm_extradata, pcm_in_band,
+        "extradata-configured and in-band decodes must be bit-identical"
+    );
+}
+
+#[test]
+fn extradata_lace_roundtrips_through_the_container_unlace() {
+    // lace_vorbis_headers (this crate's §A.2 mux side) and the
+    // container crate's xiph_unlace (the demux side the decoder
+    // factory uses) must be exact inverses on real header packets.
+    let (headers, _) = encoded_headers_and_audio();
+    let laced = oxideav_vorbis::oggfile::lace_vorbis_headers(
+        &headers[0].data,
+        &headers[1].data,
+        &headers[2].data,
+    );
+    let unlaced = oxideav_ogg::mux::xiph_unlace(&laced).expect("unlaces");
+    assert_eq!(unlaced.len(), 3);
+    for (i, h) in headers.iter().enumerate() {
+        assert_eq!(
+            unlaced[i], h.data,
+            "header {i} survives the lace round-trip"
+        );
+    }
+}
+
+#[test]
+fn malformed_extradata_is_refused_at_build_time() {
+    let (headers, _) = encoded_headers_and_audio();
+    let build = |extradata: Vec<u8>| {
+        let mut params = encoder_params();
+        params.extradata = extradata;
+        make_decoder(&params)
+    };
+
+    // Not a lace blob at all.
+    assert!(build(vec![0xFF, 0xFF, 0xFF]).is_err(), "garbage refused");
+    // Truncated lacing (a 255 continuation with nothing after it).
+    assert!(build(vec![0x02, 255]).is_err(), "truncated lacing refused");
+    // Two packets instead of three.
+    let mut two = vec![0x01, headers[0].data.len() as u8];
+    two.extend_from_slice(&headers[0].data);
+    two.extend_from_slice(&headers[1].data);
+    assert!(build(two).is_err(), "two-packet lace refused");
+    // Three packets in the wrong §4.2.1 order.
+    let wrong_order = oxideav_vorbis::oggfile::lace_vorbis_headers(
+        &headers[1].data,
+        &headers[0].data,
+        &headers[2].data,
+    );
+    assert!(build(wrong_order).is_err(), "out-of-order headers refused");
+    // Empty extradata still builds the in-band decoder.
+    assert!(build(Vec::new()).is_ok(), "empty extradata = in-band mode");
+}
