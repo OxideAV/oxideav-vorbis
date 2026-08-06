@@ -36,6 +36,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
   also joins the §A.2 remux suite (`tests/ogg_vorbis_remux.rs`) and
   the container → registry → PCM end-to-end suite.
 
+- **Floor-0 fixture structural conformance**
+  (`tests/floor0_fixture_conformance.rs`) — the trace-substitute
+  suite for `mode-floor0-lsp` (the one fixture that ships no
+  `trace.txt`; its notes give the stream as closed forms instead).
+  Pins field-for-field the §4.2.2 identification and §4.2.4 setup
+  headers (all five codebooks down to their multiplicand tables, the
+  floor-0 config, residue / mapping / mode tables), the RFC 3533
+  page table, and — per audio packet — the §4.3.1 header decisions,
+  the §6.2.2 amplitude / booknumber / LSP entry run, and the §8.6.2
+  classword + value-codeword symbol stream, read bit-by-bit against
+  the documented closed forms (64 packets × 71 entropy symbols). The
+  §6.2.3 curve check closes the loop: the crate's decode of the real
+  packet bits must equal, bit-for-bit, `render_curve` over the
+  coefficients predicted by the closed form (entry run →
+  `unpack_vector` → §6.2.2 `[last]` accumulation).
+
 - **End-to-end container → registry → PCM validation**
   (`tests/ogg_registry_end_to_end.rs`) — the application-shaped
   pipeline over public API only: `.ogg` bytes through the
