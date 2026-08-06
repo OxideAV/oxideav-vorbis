@@ -22,6 +22,20 @@ All notable changes to `oxideav-vorbis` are recorded here.
   extradata-configured decode is pinned bit-identical to the in-band
   decode of the same stream.
 
+- **Floor-0 real-stream fixture validation** — the newly staged
+  `mode-floor0-lsp` corpus fixture (the only floor type 0 stream —
+  hand-crafted from the spec per its notes, since reference encoders
+  never emit floor 0) decodes **sample-exact** (±1 s16) against its
+  cross-checked `expected.wav` through the public
+  `StreamingDecoder::push_packet` path
+  (`tests/fixture_pcm_decode.rs`), closing the long-standing
+  "floor-0 has no end-to-end fixture" gap: §6.2.2 amplitude /
+  booknumber / prefix-summed LSP vector reads (`sequence_p = 1`
+  books) and the §6.2.3 Bark-mapped curve synthesis at both block
+  sizes are now pinned against an external reference. The fixture
+  also joins the §A.2 remux suite (`tests/ogg_vorbis_remux.rs`) and
+  the container → registry → PCM end-to-end suite.
+
 - **End-to-end container → registry → PCM validation**
   (`tests/ogg_registry_end_to_end.rs`) — the application-shaped
   pipeline over public API only: `.ogg` bytes through the

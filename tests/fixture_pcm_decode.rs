@@ -294,6 +294,20 @@ fn mode_floor1_only_decodes_sample_exact() {
 }
 
 #[test]
+fn mode_floor0_lsp_decodes_sample_exact() {
+    // The only floor-0 (LSP) stream in the corpus — hand-crafted from
+    // the spec, per its notes.md, because reference encoders never
+    // emit floor type 0. Every packet reads §6.2.2 amplitude +
+    // booknumber + prefix-summed LSP vectors (`sequence_p = 1` value
+    // books) and synthesizes the §6.2.3 Bark-mapped curve at both
+    // block sizes, so this is the end-to-end PCM validation of the
+    // whole floor-0 decode path against an external reference (the
+    // fixture's expected.wav, cross-checked between two independent
+    // black-box decoders by its notes).
+    assert_fixture_sample_exact("mode-floor0-lsp", &identity(1));
+}
+
+#[test]
 fn stereo_cbr_128kbps_decodes_sample_exact() {
     assert_fixture_sample_exact("stereo-cbr-128kbps", &identity(2));
 }

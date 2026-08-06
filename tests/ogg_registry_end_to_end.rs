@@ -196,6 +196,7 @@ fn single_stream_fixtures() -> Vec<(&'static str, Vec<usize>)> {
         ("noise-stream", id1.clone()),
         ("silence-stream", id1.clone()),
         ("mode-floor1-only", id1.clone()),
+        ("mode-floor0-lsp", id1.clone()),
         ("transient-blocksize-switch", id1.clone()),
         ("with-vorbis-comment-tags", id1.clone()),
         ("with-attached-picture", id1),

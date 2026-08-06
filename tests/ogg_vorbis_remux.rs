@@ -53,6 +53,7 @@ fn fixtures_available() -> bool {
 /// legal but out of scope for a single-stream muxer test).
 const FIXTURES: &[&str] = &[
     "5.1-channel-48000-q5",
+    "mode-floor0-lsp",
     "mode-floor1-only",
     "mode-residue-types-0-1-2",
     "mono-22050-low-rate",
