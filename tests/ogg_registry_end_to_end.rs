@@ -290,3 +290,118 @@ fn registry_resolution_is_load_bearing_for_the_demuxer_fallbackless_path() {
         "register() is what makes the demuxed stream decodable"
     );
 }
+
+#[test]
+fn seek_then_reset_resumes_bit_identically() {
+    // The seek shape of the same wiring: `Demuxer::seek_to` +
+    // `Decoder::reset()` (the decoder's documented seek-safe entry).
+    // After a mid-stream seek the §4.3.8 overlap chain re-primes on
+    // the first packet, so the resumed decode must be a **bit-identical
+    // tail** of the continuous decode — same registry decoder, same
+    // arithmetic, alignment recovered from the tail length itself.
+    // The staged fixtures carry their whole audio on one or two Ogg
+    // pages (nothing between granule 0 and EOS for a bisection to land
+    // on), so the multi-page stream comes from the crate's own encoder
+    // — which paginates at the RFC 3533 soft 4 kB target. Self-contained:
+    // runs on standalone CI too.
+    const RATE: u32 = 44_100;
+    let pcm: Vec<f32> = (0..6 * RATE as usize)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            // Drifting two-tone bed so every frame carries signal.
+            0.40 * (2.0 * std::f32::consts::PI * (330.0 + 40.0 * (0.5 * t).sin()) * t).sin()
+                + 0.20 * (2.0 * std::f32::consts::PI * 1244.5 * t).sin()
+        })
+        .collect();
+    let mut config = oxideav_vorbis::oggfile::StreamEncoderConfig::new(RATE, 1);
+    // One training pass: the seek geometry (multiple audio pages), not
+    // the rate, is what this test needs from the encoder.
+    config.training_iterations = 1;
+    let ogg = oxideav_vorbis::oggfile::encode_pcm_to_ogg(std::slice::from_ref(&pcm), &config)
+        .expect("encode succeeds");
+
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+    let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(ogg));
+    // The indexed open: seeks bisect the prebuilt page index.
+    let mut dmx = oxideav_ogg::demux::open_indexed(input, &ctx.codecs).expect("demuxer opens");
+    let params = dmx.streams()[0].params.clone();
+    let ch = params.channels.expect("channel count") as usize;
+
+    let mut dec = ctx
+        .codecs
+        .first_decoder(&params)
+        .expect("registry decoder builds");
+
+    // Flat PCM, planes concatenated per frame — frame boundaries are
+    // per-packet, so a resumed decode is a flat suffix of this.
+    let drain = |dec: &mut Box<dyn oxideav_core::Decoder>,
+                 dmx: &mut Box<dyn oxideav_core::Demuxer>|
+     -> Vec<f32> {
+        let mut pcm = Vec::new();
+        loop {
+            let pkt = match dmx.next_packet() {
+                Ok(p) => p,
+                Err(Error::Eof) => break,
+                Err(e) => panic!("next_packet: {e}"),
+            };
+            dec.send_packet(&pkt).expect("packet accepted");
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Audio(a)) => {
+                        for plane in &a.data {
+                            pcm.extend(
+                                plane
+                                    .chunks_exact(4)
+                                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                            );
+                        }
+                    }
+                    Ok(other) => panic!("expected audio frame, got {other:?}"),
+                    Err(Error::NeedMore) => break,
+                    Err(e) => panic!("receive_frame: {e}"),
+                }
+            }
+        }
+        pcm
+    };
+
+    // Continuous decode of the whole stream.
+    let full = drain(&mut dec, &mut dmx);
+    assert!(!full.is_empty());
+    let full_samples = full.len() / ch;
+
+    // Seek to the three-quarter point (pts counts samples — the stream
+    // time base), reset the same decoder instance, decode to EOS.
+    let target = (full_samples * 3 / 4) as i64;
+    let landed = dmx.seek_to(0, target).expect("demuxer seeks");
+    assert!(
+        landed > 0 && landed <= target,
+        "landed {landed} vs target {target}: a mid-stream page must exist"
+    );
+    dec.reset().expect("decoder resets");
+    let tail = drain(&mut dec, &mut dmx);
+    assert!(!tail.is_empty() && tail.len() < full.len());
+
+    // Alignment: the demuxer positions the input at the *start* of the
+    // page whose (end-PCM) granule is the floor of the target, so the
+    // resumed output must begin at or before that landed granule —
+    // covering it — and never past the requested target.
+    let resume_samples = (full.len() - tail.len()) / ch;
+    let tail_samples = tail.len() / ch;
+    assert!(
+        resume_samples <= landed as usize && resume_samples <= target as usize,
+        "resume {resume_samples} vs landed {landed} target {target}"
+    );
+    // Coverage: the requested target position is inside the resumed
+    // output (a seek may only undershoot, never skip past the target).
+    assert!(
+        (target as usize) < resume_samples + tail_samples,
+        "target {target} inside resumed output ({resume_samples} + {tail_samples})"
+    );
+    assert_eq!(
+        tail,
+        full[full.len() - tail.len()..],
+        "post-seek decode must be a bit-identical tail of the continuous decode"
+    );
+}

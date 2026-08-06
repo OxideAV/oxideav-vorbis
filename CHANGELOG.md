@@ -67,6 +67,16 @@ All notable changes to `oxideav-vorbis` are recorded here.
   control pins that the registration is load-bearing: an empty
   registry leaves the demuxed stream identified but undecodable.
 
+- **Seek wiring validation** — `Demuxer::seek_to` +
+  `Decoder::reset()` through the same container → registry chain: a
+  multi-page stream (the crate's own paginated encode) is decoded
+  continuously, seeked to the three-quarter point, and re-decoded to
+  EOS after a `reset()`; the resumed decode is pinned as a
+  **bit-identical tail** of the continuous decode, beginning at or
+  before the landed page granule and never past the requested
+  target, with the target position covered by the resumed output —
+  the seek-safe `reset()` contract proven end to end.
+
 ### Changed
 
 - Crate `description` no longer calls this an orphan-rebuild
