@@ -49,17 +49,36 @@ audio bytes). `register()` installs the
 codec — decoder and encoder factories, the Matroska `A_VORBIS`
 tag, and the §4.2.1 `"\x01vorbis"` payload magic for
 container-agnostic resolution — into
-`oxideav_core::RuntimeContext`, and the dual-API
+`oxideav_core::RuntimeContext`, the dual-API
 endpoints `decoder::make_decoder` / `encoder::make_encoder` are
-directly callable without a registry.
+directly callable without a registry, and the decoder configures
+from either header carriage (in-band §4.2 packets or a container's
+Xiph-laced codec-private extradata), so **Ogg-carried Vorbis
+auto-resolves end to end** — `.ogg` → `oxideav-ogg` demux →
+registry payload-magic resolution → PCM, sample-exact on the whole
+staged corpus with mid-stream seek + `reset()` resuming
+bit-identically.
 
-The §4.3 decode chain is sample-exact end to end: twelve staged fixtures
+The §4.3 decode chain is sample-exact end to end: thirteen staged fixtures
 (`docs/audio/vorbis/fixtures/*` — mono / stereo / 5.1, q−1 through q10,
-CBR, 22.05–96 kHz, floor-1-only, full-residue noise, all three residue
-formats, and the short↔long transient block-size switch) decode through
+CBR, 22.05–96 kHz, floor-1-only, **floor-0 LSP**, full-residue noise, all
+three residue formats, and the short↔long transient block-size switch)
+decode through
 the public `StreamingDecoder::push_packet` path to PCM that matches each
 fixture's `expected.wav` reference dump within the documented ±1 s16
-lossy tolerance (`tests/fixture_pcm_decode.rs`). A separate
+lossy tolerance (`tests/fixture_pcm_decode.rs`). The `mode-floor0-lsp`
+fixture (hand-crafted from the spec per its notes — reference encoders
+never emit floor 0) is the corpus' one stream whose PCM depends on the
+§6.2.2/§6.2.3 LSP path, and it ships no `trace.txt`: its notes give the
+stream as closed forms instead, which
+`tests/floor0_fixture_conformance.rs` replays at trace granularity —
+field-for-field §4.2.2/§4.2.4 header validation (all five codebooks down
+to their multiplicand tables), the RFC 3533 page table, and per audio
+packet the §4.3.1 header decisions plus the §6.2.2 amplitude / booknumber
+/ LSP entry run and the §8.6.2 classword + value-codeword symbol stream
+read bit-by-bit (64 packets × 71 entropy symbols), with the crate's
+decoded §6.2.3 curve pinned bit-for-bit against `render_curve` over the
+closed-form-predicted coefficients. A separate
 `tests/chained_stream_decode.rs` drives the chained-Ogg fixture (two
 concatenated logical bitstreams, RFC 3533 §5): the first stream decodes
 sample-exact against `expected.wav`, and the second logical bitstream
@@ -132,7 +151,7 @@ Vorbis-specific scaling.
   reproduce; the suite drives every fixture's audio packets through the
   public §4.3.1 parser (`read_packet_header`) and asserts each parsed
   header matches the trace **line-for-line** — **505 audio-packet decisions
-  across all 16 staged fixtures**, the chained two-stream fixture included
+  across all 16 trace-bearing fixtures**, the chained two-stream fixture included
   (a serial-aware de-framer separates its logical streams so each is
   validated against its own `stream_idx` trace records, proving the §4.3.1
   decode is per-stream independent across the chaining boundary). It is a
@@ -160,7 +179,7 @@ Vorbis-specific scaling.
   type/submaps/coupling-steps and the magnitude/angle/per-submap
   floor/residue index arrays; and per-mode
   blockflag/windowtype/transformtype/mapping — **842 structural events
-  across all 16 staged fixtures**, the chained two-stream fixture validated
+  across all 16 trace-bearing fixtures**, the chained two-stream fixture validated
   per-logical-stream. Together with the per-packet suite this pins the
   **entire** structural decode of every staged stream against the reference
   trace, leaving only the lossy sample values to the ±1-s16 PCM test.
@@ -174,7 +193,7 @@ Vorbis-specific scaling.
   checked across **all** packets — including the ones the trace does not
   log), that every channel of a frame has identical length, and that the
   streaming path reports the same `mode_number` / `blockflag` /
-  `block_size` the trace logged. **654 PCM frames across all 16 staged
+  `block_size` the trace logged. **654 PCM frames across all 16 trace-bearing
   fixtures.** It is a geometry + dispatch oracle (no sample-value re-check),
   isolating a §4.3.8 lap-length / priming / mode-dispatch regression from a
   numeric IMDCT/floor/residue one.
@@ -632,10 +651,12 @@ the flat-floor case. `render_curve` itself is unit-tested bit-identical to
 both the private curve-computation and the decode-path curve.
 
 Three further integration suites cover decode paths that **no staged
-fixture exercises** — every `docs/audio/vorbis/fixtures/*` stream is floor
-type 1 with residue formats 1/2 only, so the floor-0 LSP path and the
-residue format-0 strided-scatter layout had no end-to-end coverage despite
-both being wired into the decode driver.
+fixture exercised at the time** — the encoder-produced corpus streams are
+floor type 1, and residue format 0 appeared only later (the
+`mode-residue-types-0-1-2` fixture; the hand-crafted `mode-floor0-lsp`
+fixture now covers floor 0 end to end, see above) — so the floor-0 LSP
+path and the residue format-0 strided-scatter layout also carry
+self-contained encode→decode coverage that runs without the corpus.
 `tests/floor0_curve_roundtrip.rs` drives the floor-0
 plan→write→decode→curve loop (`plan_floor0_coefficients` →
 `write_floor0_packet` → `Floor0Decoder::decode`) and asserts the §6.2.3
@@ -714,12 +735,14 @@ beginning fresh, header pages at granule 0, audio pages stamped
 with the end-PCM position of the last packet completed on the page
 (`-1` for spanned pages), EOS on the final page with the end-trim
 granule. `tests/ogg_framing.rs` pins the dependency against the
-corpus (every page of all 16 staged real-world streams parses with
+corpus (every page of all 17 staged streams parses with
 a verifying CRC and re-serializes **byte-for-byte**);
-`tests/ogg_vorbis_remux.rs` de-frames all 15 single-stream
-fixtures, recomputes every packet's granule from the §4.3.1
+`tests/ogg_vorbis_remux.rs` de-frames all 16 single-stream
+fixtures (the floor-0 stream included), recomputes every packet's
+granule from the §4.3.1
 blocksize walk, remuxes, and asserts the identical packet sequence
-plus every §A.2 page rule. Black-box, all 15 remuxes decode
+plus every §A.2 page rule. Black-box, the 15 encoder-produced
+remuxes decode
 through ffmpeg to **exactly their declared final-granule length**,
 with ffmpeg's decode of each original a bit-identical prefix (three
 byte-identical; on the rest ffmpeg under-reads the original's own
@@ -846,18 +869,38 @@ fails the gate and stays uncoupled; a 4-channel stream gates each pair
 independently.
 
 **Registration + dual API**: `register()` installs the codec
-(decoder + encoder factories, Matroska `A_VORBIS` tag) into
+(decoder + encoder factories, the Matroska `A_VORBIS` tag, and the
+§4.2.1 `"\x01vorbis"` payload magic for container-agnostic
+resolution — Ogg has no codec tag at all) into
 `oxideav_core::RuntimeContext`. `decoder::VorbisDecoder` is the
-packet-to-frame `oxideav_core::Decoder` (in-band order-checked §4.2
-headers, §4.3 audio through the streaming pipeline, planar-f32
-frames with sample-granularity PTS, seek-safe `reset()`);
+packet-to-frame `oxideav_core::Decoder`, configured on either header
+carriage shape: in-band order-checked §4.2 header packets, **or a
+Xiph-laced codec-private `extradata` blob** (the `oxideav-ogg`
+demuxer's republished headers, Matroska's `A_VORBIS` `CodecPrivate`
+— `VorbisDecoder::with_extradata`, unlaced by the container crate's
+exact inverse of `lace_vorbis_headers`, malformed blobs refused
+typed at build time, decode pinned bit-identical to the in-band
+path); §4.3 audio runs through the streaming pipeline to planar-f32
+frames with sample-granularity PTS and a seek-safe `reset()`.
 `encoder::VorbisStreamEncoder` is the frame-to-packet
 `oxideav_core::Encoder` (buffers F32/F32P frames, two-pass encode at
 `flush()`, header-flagged §4.2 packets then timestamped audio
 packets; `"quality"` / `"blocksize"` / `"short_blocksize"` /
 `"coupling"` options).
 `tests/registry_wiring.rs` round-trips PCM through boxed trait
-objects on both the registry and the direct dual-API path.
+objects on both the registry and the direct dual-API path, and
+`tests/ogg_registry_end_to_end.rs` is the application-shaped
+**container → registry → PCM** proof over public API only: `.ogg`
+bytes through the `oxideav-ogg` demuxer with the registry as codec
+resolver, the decoder built by the registered factory from the
+demuxer's own `StreamInfo`, the demuxed packet feed decoded to PCM —
+all 16 staged single-stream fixtures sample-exact (±1 s16) against
+their `expected.wav` references (5.1 through its §4.3.9 WAV
+permutation), the crate's own `encode_pcm_to_ogg` output
+round-tripped through the same chain, an empty-registry control
+proving the registration is load-bearing, and a
+`Demuxer::seek_to` + `Decoder::reset()` pass whose resumed decode is
+a bit-identical tail of the continuous decode.
 
 The **temporal masking extension** (`psy::TemporalMasking`) adds the
 cross-frame component the per-frame model lacked: post-masking (a
