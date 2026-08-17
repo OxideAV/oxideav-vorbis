@@ -23,6 +23,17 @@ All notable changes to `oxideav-vorbis` are recorded here.
   realtime to ≈400–1000× realtime with reference-decoder agreement
   unchanged (≤0.01 s16 LSB on every corpus stream).
 
+- **FFT-decomposed forward MDCT** (`mdct::mdct` / `mdct_vec`) — the
+  encoder's analysis transform gets the same `O(N log N)` treatment:
+  the forward summation folds its N samples into an M = N/2-term
+  DCT-IV input via the same extension identities (applied to the
+  summed index — the DCT-IV kernel is symmetric, so the fold is the
+  exact mirror of the inverse kernel's output rearrangement) and runs
+  the shared `dct4_via_dft` core. `mdct_naive` stays exported as the
+  reference oracle, with unit tests pinning the fast path against it
+  across `N = 64..=8192` and tiny degenerate sizes. The whole-stream
+  encoder's per-frame analysis now uses it.
+
 - **Codec-private extradata decoding** — `VorbisDecoder::with_extradata`
   parses the Xiph-laced three-header blob container layers carry for
   Vorbis (the `oxideav-ogg` demuxer's `CodecParameters::extradata`,

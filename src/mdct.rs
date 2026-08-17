@@ -286,8 +286,8 @@ impl std::error::Error for MdctError {}
 ///
 /// `O(N²)` flops — every output coefficient sums every input sample
 /// against one cosine. The direct form is the *reference*
-/// implementation; an FFT-decomposed fast path can land in a later
-/// round and validate against this kernel's output.
+/// implementation; [`mdct`] is the `O(N log N)` production kernel
+/// validated against this one's output.
 pub fn mdct_naive(block: &[f32], output: &mut [f32], scale: f32) -> Result<(), MdctError> {
     let n = block.len();
     // A valid Vorbis blocksize is a power of two in 64..=8192, so the
@@ -350,6 +350,78 @@ pub fn mdct_naive(block: &[f32], output: &mut [f32], scale: f32) -> Result<(), M
 pub fn mdct_naive_vec(block: &[f32], scale: f32) -> Result<Vec<f32>, MdctError> {
     let mut out = vec![0.0f32; block.len() / 2];
     mdct_naive(block, &mut out, scale)?;
+    Ok(out)
+}
+
+/// FFT-decomposed forward MDCT — the production encoder-side kernel.
+///
+/// Same contract, arguments, and mathematical output as
+/// [`mdct_naive`] (agreement within `f64` rounding), evaluated in
+/// `O(N log N)`. The forward summation shares the inverse kernel's
+/// cosine, `cos((π/M)(n + 1/2 + M/2)(k + 1/2))` with `M = N/2` — only
+/// the roles of the sample index `n` (now summed over) and the
+/// coefficient index `k` (now free) swap. The [`crate::imdct`] Step 1
+/// extension identities on the *first* index therefore **fold** the N
+/// input samples into an M-term sequence with identical sign/mirror
+/// bookkeeping (`f[n + Q] += x[n]` for the first quarter,
+/// `f[3Q − 1 − n] −= x[n]` for the middle half, `f[n − 3Q] −= x[n]`
+/// for the last quarter, `Q = M/2`), after which the coefficients are
+/// one length-M DCT-IV — the same `dct4_via_dft` core the inverse
+/// uses, since the DCT-IV kernel is symmetric in its two indices.
+///
+/// # Errors
+///
+/// Same as [`mdct_naive`].
+pub fn mdct(block: &[f32], output: &mut [f32], scale: f32) -> Result<(), MdctError> {
+    let n = block.len();
+    if n < 2 || !n.is_power_of_two() {
+        return Err(MdctError::BlockNotPowerOfTwo { block_len: n });
+    }
+    let half = n / 2;
+    if output.len() != half {
+        return Err(MdctError::OutputLenMismatch {
+            output_len: output.len(),
+            expected_len: half,
+        });
+    }
+    if half < 2 {
+        // Degenerate M = 1 (N = 2): the fold below indexes with
+        // Q = M/2 ≥ 1; defer to the direct summation.
+        return mdct_naive(block, output, scale);
+    }
+    let q = half / 2;
+
+    // Fold the N samples into M = N/2 DCT-IV inputs via the Step 1
+    // extension identities applied to the summed index.
+    let mut folded = vec![0.0f64; half];
+    for (i, &x) in block.iter().take(q).enumerate() {
+        folded[i + q] += x as f64;
+    }
+    for (i, &x) in block.iter().enumerate().take(3 * q).skip(q) {
+        folded[3 * q - 1 - i] -= x as f64;
+    }
+    for (i, &x) in block.iter().enumerate().take(4 * q).skip(3 * q) {
+        folded[i - 3 * q] -= x as f64;
+    }
+
+    let mut coeffs = vec![0.0f64; half];
+    crate::imdct::dct4_via_dft(&folded, &mut coeffs);
+    let scale_f = scale as f64;
+    for (out, &c) in output.iter_mut().zip(&coeffs) {
+        *out = (c * scale_f) as f32;
+    }
+    Ok(())
+}
+
+/// Convenience wrapper over [`mdct`] that allocates the output buffer,
+/// mirroring [`mdct_naive_vec`].
+///
+/// # Errors
+///
+/// Same as [`mdct`].
+pub fn mdct_vec(block: &[f32], scale: f32) -> Result<Vec<f32>, MdctError> {
+    let mut out = vec![0.0f32; block.len() / 2];
+    mdct(block, &mut out, scale)?;
     Ok(out)
 }
 
@@ -532,6 +604,94 @@ mod tests {
     // typical short block, and a typical long block — to keep CI
     // time bounded while still covering the geometry.
     const TEST_BLOCKSIZES_N: &[usize] = &[64, 256, 1024];
+
+    // ---- FFT-decomposed fast path ----
+
+    /// Deterministic pseudo-random block (xorshift; no external
+    /// crates) spread across sign and magnitude.
+    fn synth_block(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32
+            })
+            .collect()
+    }
+
+    /// The fast forward kernel reproduces the naive kernel across
+    /// every valid Vorbis geometry (§4.2.2: N = 64..=8192) on
+    /// non-trivial blocks, with the encoder's own `4/N` scale.
+    #[test]
+    fn fast_matches_naive_across_all_vorbis_geometries() {
+        for shift in 6..=13 {
+            let n = 1usize << shift;
+            let block = synth_block(n, 0xA5A5_5A5A_DEAD_BEE5 ^ n as u64);
+            let scale = 4.0 / n as f32;
+            let naive = mdct_naive_vec(&block, scale).unwrap();
+            let fast = mdct_vec(&block, scale).unwrap();
+            assert_eq!(naive.len(), fast.len());
+            let mag = naive.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+            for i in 0..naive.len() {
+                let diff = (naive[i] - fast[i]).abs();
+                assert!(
+                    diff <= mag * 1.0e-5,
+                    "N {} coeff {}: naive {} fast {} diff {}",
+                    n,
+                    i,
+                    naive[i],
+                    fast[i],
+                    diff,
+                );
+            }
+        }
+    }
+
+    /// Degenerate below-spec geometries still match the naive kernel
+    /// (N = 2 takes the explicit fallback).
+    #[test]
+    fn fast_matches_naive_on_tiny_geometries() {
+        for n in [2usize, 4, 8, 16, 32] {
+            let block = synth_block(n, 3 + n as u64);
+            let naive = mdct_naive_vec(&block, 1.0).unwrap();
+            let fast = mdct_vec(&block, 1.0).unwrap();
+            for i in 0..naive.len() {
+                assert!(
+                    (naive[i] - fast[i]).abs() <= 1.0e-5,
+                    "N {n} coeff {i}: naive {} fast {}",
+                    naive[i],
+                    fast[i],
+                );
+            }
+        }
+    }
+
+    /// The fast kernel shares the naive kernel's validation contract.
+    #[test]
+    fn fast_rejects_invalid_inputs() {
+        let mut out = [0.0f32; 0];
+        assert_eq!(
+            mdct(&[], &mut out, 1.0),
+            Err(MdctError::BlockNotPowerOfTwo { block_len: 0 }),
+        );
+        let block = vec![0.0f32; 100];
+        let mut out = [0.0f32; 50];
+        assert_eq!(
+            mdct(&block, &mut out, 1.0),
+            Err(MdctError::BlockNotPowerOfTwo { block_len: 100 }),
+        );
+        let block = vec![0.0f32; 64];
+        let mut out = [0.0f32; 30];
+        assert_eq!(
+            mdct(&block, &mut out, 1.0),
+            Err(MdctError::OutputLenMismatch {
+                output_len: 30,
+                expected_len: 32,
+            }),
+        );
+    }
 
     // ---- error paths ----
 

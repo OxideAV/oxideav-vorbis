@@ -365,6 +365,50 @@ fn dft_radix2_in_place(re: &mut [f64], im: &mut [f64]) {
     }
 }
 
+/// Length-`M` type-IV cosine transform via the Step 2 pre-twiddle /
+/// `Q = M/2`-point DFT / post-twiddle factorization:
+/// `output[m] = Σ_k input[k]·cos((π/M)(m + 1/2)(k + 1/2))`.
+///
+/// `input.len()` must be a positive power of two and equal
+/// `output.len()`. Shared by the inverse ([`imdct`]) and forward
+/// ([`crate::mdct::mdct`]) fast kernels — the DCT-IV kernel is
+/// symmetric in `(m, k)`, so the same routine serves both directions.
+pub(crate) fn dct4_via_dft(input: &[f64], output: &mut [f64]) {
+    let m = input.len();
+    debug_assert!(m.is_power_of_two() && output.len() == m);
+    let m_f = m as f64;
+    if m == 1 {
+        // S[0] = X[0]·cos(π/4) — the factorization needs Q ≥ 1.
+        output[0] = input[0] * core::f64::consts::FRAC_PI_4.cos();
+        return;
+    }
+    let q = m / 2;
+
+    // Step 2 pre-twiddle: z[j] = (X[2j] + i·X[M-1-2j])·e^{−iπ(4j+1)/(4M)}.
+    let mut re = vec![0.0f64; q];
+    let mut im = vec![0.0f64; q];
+    for j in 0..q {
+        let a = input[2 * j];
+        let b = input[m - 1 - 2 * j];
+        let ang = -core::f64::consts::PI * (4 * j + 1) as f64 / (4.0 * m_f);
+        let (s, c) = ang.sin_cos();
+        re[j] = a * c - b * s;
+        im[j] = a * s + b * c;
+    }
+
+    dft_radix2_in_place(&mut re, &mut im);
+
+    // Step 2 post-twiddle: S[2r] = Re W[r], S[M-1-2r] = −Im W[r].
+    for r in 0..q {
+        let ang = -core::f64::consts::PI * r as f64 / m_f;
+        let (s, c) = ang.sin_cos();
+        let wr = re[r] * c - im[r] * s;
+        let wi = re[r] * s + im[r] * c;
+        output[2 * r] = wr;
+        output[m - 1 - 2 * r] = -wi;
+    }
+}
+
 /// FFT-decomposed inverse MDCT — the production §4.3.7 kernel.
 ///
 /// Same contract, arguments, and mathematical output as
@@ -392,37 +436,17 @@ pub fn imdct(spectrum: &[f32], output: &mut [f32], scale: f32) -> Result<(), Imd
     }
     if m < 2 {
         // Degenerate M = 1 (N = 2, far below the §4.2.2 minimum): the
-        // pairing needs Q = M/2 ≥ 1; defer to the direct summation.
+        // Step 1 rearrangement below indexes with Q = M/2 ≥ 1; defer
+        // to the direct summation.
         return imdct_naive(spectrum, output, scale);
     }
     let q = m / 2;
-    let m_f = m as f64;
 
-    // Step 2 pre-twiddle: z[j] = (X[2j] + i·X[M-1-2j])·e^{−iπ(4j+1)/(4M)}.
-    let mut re = vec![0.0f64; q];
-    let mut im = vec![0.0f64; q];
-    for j in 0..q {
-        let a = spectrum[2 * j] as f64;
-        let b = spectrum[m - 1 - 2 * j] as f64;
-        let ang = -core::f64::consts::PI * (4 * j + 1) as f64 / (4.0 * m_f);
-        let (s, c) = ang.sin_cos();
-        re[j] = a * c - b * s;
-        im[j] = a * s + b * c;
-    }
-
-    dft_radix2_in_place(&mut re, &mut im);
-
-    // Step 2 post-twiddle into S[0..M), then the Step 1 sign/mirror
+    // DCT-IV of the spectrum (Step 2), then the Step 1 sign/mirror
     // rearrangement into the N-sample output. `s_buf` holds S.
+    let input: Vec<f64> = spectrum.iter().map(|&x| x as f64).collect();
     let mut s_buf = vec![0.0f64; m];
-    for r in 0..q {
-        let ang = -core::f64::consts::PI * r as f64 / m_f;
-        let (s, c) = ang.sin_cos();
-        let wr = re[r] * c - im[r] * s;
-        let wi = re[r] * s + im[r] * c;
-        s_buf[2 * r] = wr;
-        s_buf[m - 1 - 2 * r] = -wi;
-    }
+    dct4_via_dft(&input, &mut s_buf);
     let scale_f = scale as f64;
     for (i, out) in output.iter_mut().take(q).enumerate() {
         *out = (s_buf[i + q] * scale_f) as f32;

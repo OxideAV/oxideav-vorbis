@@ -57,7 +57,7 @@ use crate::floor1_envelope::{plan_floor1_envelope, Floor1EnvelopeError};
 use crate::floor1_layout::{design_floor1_header, Floor1LayoutError};
 use crate::framing::{FrameSplitter, FramingError};
 use crate::identification::{parse_identification_header, VorbisIdentificationHeader};
-use crate::mdct::{mdct_naive_vec, MdctError};
+use crate::mdct::{mdct_vec, MdctError};
 use crate::packet::AudioPacketHeader;
 use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
 use crate::psy::{
@@ -1382,7 +1382,7 @@ fn encode_pcm_to_packets_geometry(
                 // §4.3.1 analysis window, so the bare kernel follows.
                 splitter.advance_pending_stride(sizes[f]);
                 let block = splitter.take_frame(sizes[f], &windows[window_of[f]])?;
-                per_ch.push(mdct_naive_vec(&block, 4.0 / sizes[f] as f32)?);
+                per_ch.push(mdct_vec(&block, 4.0 / sizes[f] as f32)?);
             }
             spectra.push(per_ch);
         }

@@ -363,7 +363,7 @@ pub use imdct::{imdct, imdct_naive, imdct_naive_vec, imdct_vec, ImdctError};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use mdct::{
-    apply_window_and_mdct, apply_window_and_mdct_vec, mdct_naive, mdct_naive_vec,
+    apply_window_and_mdct, apply_window_and_mdct_vec, mdct, mdct_naive, mdct_naive_vec, mdct_vec,
     ApplyWindowAndMdctError, MdctError,
 };
 pub use oggfile::{
