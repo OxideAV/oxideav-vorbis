@@ -95,7 +95,26 @@ identical audio and decode bit-for-bit alike). The §4.3.7 IMDCT
 normalization scalar — the last
 deferred decode unknown — is pinned to **1.0**: the bare cosine-summation
 kernel plus the §4.3.6 window and §4.3.8 overlap-add need no extra
-Vorbis-specific scaling.
+Vorbis-specific scaling. The production §4.3.7 kernels are
+**FFT-decomposed** (`O(N log N)`): the cosine summation factored — by
+algebra on the formula itself — into a shifted DCT-IV, an `N/4`-point
+radix-2 complex DFT and pre/post twiddles, with the direct `O(N²)`
+summation kept exported as the by-inspection reference oracle and the
+fast paths pinned against it across every valid geometry
+(`N = 64..=8192`). Measured on the differential corpus this moves the
+streaming decoder from ~0.6–2× realtime to **≈400–1000× realtime**
+(6 s stereo: 2.98 s → 15 ms; 4096-block 5.1: 10.2 s → 59 ms) with
+reference-decoder agreement unchanged. A **black-box differential
+campaign** (r447) further validated decode far outside the staged
+corpus: channel counts 1..=8 (the first real-stream exercise of the
+§4.3.9 3/4/6/7/8 layouts), q −1..10, rates 8 k..192 kHz, managed
+bitrate, a 60 s switching stream, and a second encoder dialect
+(`blocksize_0 == blocksize_1`, two modes, pass-2-only residue books) —
+zero decode defects, ≤0.01 s16 LSB agreement on every stream, and the
+equal-blocksize long-mode geometry now pinned natively in CI
+(`tests/equal_blocksize_long_mode_decode.rs`: long-mode packets decode
+bit-identically to short-mode packets of the same spectra across all
+four §4.3.1 window-flag combinations).
 
 ### Decode
 
@@ -110,8 +129,10 @@ Vorbis-specific scaling.
 - **Per-packet audio decode** — the §4.3 pipeline end to end: floor 0
   / floor 1 curve computation, residue formats 0 / 1 / 2, §4.3.3
   nonzero propagation, §4.3.5 inverse coupling, §4.3.6 dot product
-  (`audio::decode_audio_packet_pre_imdct`), the §4.3.7 inverse-MDCT
-  cosine-summation kernel (`imdct`), the §4.3.1 / §1.3.2 Vorbis window
+  (`audio::decode_audio_packet_pre_imdct`), the §4.3.7 inverse MDCT
+  (`imdct::imdct`, the `O(N log N)` shifted-DCT-IV / radix-2-DFT
+  factorization; `imdct_naive` is the `O(N²)` cosine-summation
+  reference oracle it is pinned against), the §4.3.1 / §1.3.2 Vorbis window
   (`synthesis::window_premultiply`), and the §4.3.8 overlap-add
   (`overlap::OverlapAdd`).
 - **§4.3.9 output channel order** — `channel_order::speaker_layout` /
