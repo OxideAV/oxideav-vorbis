@@ -58,6 +58,20 @@ All notable changes to `oxideav-vorbis` are recorded here.
   sizes — with the wire streams differing (the flags are really
   carried) and the §4.3.8 lap pinned at N/2.
 
+- **Fuzz harness** (`fuzz/`, fleet-standard cargo-fuzz layout) — three
+  targets: `decode` (panic-freedom of `decode_ogg_to_pcm`,
+  `ogg_packets`, the packet classifier and all three §4.2 header
+  parsers on arbitrary bytes, setup parse swept across hostile channel
+  counts), `stream_packets` (arbitrary packet bodies through the
+  public `StreamingDecoder::push_packet` path behind a fixed valid
+  two-mode setup, so the budget lands in the §4.3.1 prelude /
+  floor / §8.6.2 entropy / IMDCT / overlap-add instead of dying at
+  the header gates), and `roundtrip` (fuzzer-chosen PCM, channel
+  count and quality through `encode_pcm_to_ogg` →
+  `decode_ogg_to_pcm`, pinning end-trim-exact length and finite
+  samples). Shake-out runs: 16.9M / 628k / 7.8k iterations, zero
+  findings.
+
 - **Codec-private extradata decoding** — `VorbisDecoder::with_extradata`
   parses the Xiph-laced three-header blob container layers carry for
   Vorbis (the `oxideav-ogg` demuxer's `CodecParameters::extradata`,

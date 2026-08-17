@@ -1,0 +1,63 @@
+[package]
+name = "oxideav-vorbis-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-vorbis]
+path = ".."
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1: panic-freedom of the whole `.ogg` → PCM pipeline plus the
+# direct §4.2 header parsers on arbitrary bytes. Every public decode
+# surface MUST return a `Result` for malformed input — never panic,
+# never abort, never allocate unboundedly from attacker-controlled
+# length fields.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+# Target 2: §4.3 audio-packet stream robustness behind a *valid* setup.
+# Arbitrary fuzz bytes are split into packet bodies and pushed through
+# the public `StreamingDecoder::push_packet` path against a fixed
+# two-mode setup, so the fuzzer spends its budget past the header
+# gates — in the §4.3.1 prelude, floor/residue entropy decode, IMDCT
+# and overlap-add — where random whole-stream input rarely reaches.
+[[bin]]
+name = "stream_packets"
+path = "fuzz_targets/stream_packets.rs"
+test = false
+doc = false
+
+# Target 3: own-codec encode → decode round-trip. Fuzzer-chosen PCM
+# (length, channel count, quality knob) through `encode_pcm_to_ogg` →
+# `decode_ogg_to_pcm`, asserting the §A.2 end-trim recovers exactly
+# the input sample count per channel and every decoded sample is
+# finite. Lossy — no amplitude assertion — but the whole psy / floor /
+# residue / training / mux / demux / decode chain must hold shape for
+# arbitrary audio content.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
