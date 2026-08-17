@@ -34,6 +34,30 @@ All notable changes to `oxideav-vorbis` are recorded here.
   across `N = 64..=8192` and tiny degenerate sizes. The whole-stream
   encoder's per-frame analysis now uses it.
 
+- **Black-box differential decode campaign + equal-blocksize
+  coverage** — the decoder was differentially validated against a
+  black-box reference decoder over a generated corpus far outside the
+  staged fixtures: every §4.3.9 channel count 1..=8 (the 3/4/6/7/8
+  layouts had never been checked against a real stream), quality
+  −1..10, sample rates 8 kHz..192 kHz, managed-bitrate mode, a 60 s
+  block-switching stream, and a second, structurally different
+  encoder dialect whose streams set `blocksize_0 == blocksize_1` with
+  two modes and carry pass-2-only residue books. Result: **zero
+  decode defects** — agreement ≤0.01 s16 LSB on every stream (the two
+  observed deltas were reference-side: full-scale clipping in the
+  integer-output reference dump of an overdriven stream, and one
+  reference decoder's own tail handling on a 4096-block 5.1 stream,
+  where a second black-box decoder confirms this crate to 0.5 LSB).
+  The one geometry that campaign exposed as uncovered in CI is now
+  pinned natively: `tests/equal_blocksize_long_mode_decode.rs` builds
+  a two-mode `n0 == n1` stream and proves through the public
+  streaming path that long-mode packets (which still read the §4.3.1
+  window flags) decode **bit-identically** to the same spectra sent
+  through the short mode across all four window-flag combinations —
+  the §1.3.2 hybrid slope coincides with the full slope at equal
+  sizes — with the wire streams differing (the flags are really
+  carried) and the §4.3.8 lap pinned at N/2.
+
 - **Codec-private extradata decoding** — `VorbisDecoder::with_extradata`
   parses the Xiph-laced three-header blob container layers carry for
   Vorbis (the `oxideav-ogg` demuxer's `CodecParameters::extradata`,
