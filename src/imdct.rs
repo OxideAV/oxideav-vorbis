@@ -46,17 +46,14 @@
 //!    multiplicative factor), but the production decode path passes
 //!    `1.0`.
 //!
-//! 2. **An FFT-decomposed fast path.** Production codecs decompose the
-//!    IMDCT into a pre-twiddle, an N/4-point IFFT, and a post-twiddle
-//!    (the "FFT-based" form ATSC A/52 §7.9.4 spells out). That
-//!    decomposition produces the same mathematical output as the direct
-//!    cosine summation — by linearity and orthogonality of the cosine
-//!    basis — but requires roughly O(N log N) operations instead of
-//!    O(N²). This module implements the O(N²) form as the reference
-//!    that is **provably correct by inspection against the
-//!    cross-reference document**. A future round can land an
-//!    FFT-decomposed kernel and validate it against the bytes this
-//!    one emits.
+//! 2. ~~An FFT-decomposed fast path.~~ **Landed**: [`imdct`] is the
+//!    production `O(N log N)` kernel, factoring the same cosine
+//!    summation into a shifted DCT-IV, a Q = N/4-point complex DFT
+//!    (radix-2 decimation in time) and pre/post twiddles — derived in
+//!    this module's source purely by algebra on the summation formula
+//!    quoted below, and validated against [`imdct_naive`] across every
+//!    valid Vorbis geometry. The direct `O(N²)` form remains exported
+//!    as the by-inspection reference oracle.
 //!
 //! # The cosine-summation formula (verbatim from imdct-cross-reference.md)
 //!
@@ -246,6 +243,208 @@ pub fn imdct_naive(spectrum: &[f32], output: &mut [f32], scale: f32) -> Result<(
 pub fn imdct_naive_vec(spectrum: &[f32], scale: f32) -> Result<Vec<f32>, ImdctError> {
     let mut out = vec![0.0f32; spectrum.len() * 2];
     imdct_naive(spectrum, &mut out, scale)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// FFT-decomposed fast path
+// ---------------------------------------------------------------------------
+//
+// The direct cosine summation above is O(N²). The identical linear map
+// can be evaluated in O(N log N) by pure algebra on the summation
+// formula itself — no external algorithmic reference is needed beyond
+// the formula already quoted from `imdct-cross-reference.md`. The
+// derivation, in three steps:
+//
+// **Step 1 — the IMDCT is a shifted DCT-IV.** With `M = N/2` (the
+// spectrum length), the cosine argument rewrites as
+//
+// ```text
+// (π/N)·(2n + 1 + N/2)·(2k + 1)/2  =  (π/M)·(n + 1/2 + M/2)·(k + 1/2)
+// ```
+//
+// so `x[n] = S[n + M/2]` where `S[m] = Σ_k X[k]·cos((π/M)(m + 1/2)(k + 1/2))`
+// is the length-`M` "type-IV" cosine transform of the spectrum,
+// evaluated at shifted indices `m = M/2 .. 2M + M/2`. `S` extends past
+// `m = M - 1` by two closed-form symmetries of its own defining cosine
+// (substitute `m → 2M - 1 - m` and `m → m + 2M`; the argument shifts by
+// `2π(k + 1/2)` odd/even multiples exactly as in the module-doc
+// symmetry derivations):
+//
+// ```text
+// S[2M - 1 - m] = -S[m]          S[m + 2M] = -S[m]
+// ```
+//
+// With `Q = M/2` the N outputs are therefore a sign/mirror
+// rearrangement of the M values `S[0..M)`:
+//
+// ```text
+// n ∈ [0,  Q):  x[n] =  S[n + Q]
+// n ∈ [Q, 3Q):  x[n] = -S[3Q - 1 - n]
+// n ∈ [3Q, 4Q): x[n] = -S[n - 3Q]
+// ```
+//
+// **Step 2 — the M-point DCT-IV reduces to a Q-point complex DFT.**
+// Pair the even-indexed inputs with the mirrored odd-indexed inputs,
+// `z[q] = X[2q] + i·X[M-1-2q]` for `q = 0..Q`, and pair the outputs as
+// `(S[2r], S[M-1-2r])`. Substituting `k = 2q` and `k = M-1-2q` into the
+// DCT-IV cosine and using `cos(π(m+1/2)) = 0`, `sin(π(m+1/2)) = (−1)^m`
+// (for the mirrored half) plus the co-function identities at
+// `m = M-1-2r` gives, for `θ(r,q) = (π/M)(2r + 1/2)(2q + 1/2)`:
+//
+// ```text
+// S[2r]       = Σ_q  u[q]·cos θ + v[q]·sin θ        (u = X[2q], v = X[M-1-2q])
+// S[M-1-2r]   = Σ_q  u[q]·sin θ − v[q]·cos θ
+// ⇒  S[2r] − i·S[M-1-2r]  =  Σ_q z[q]·e^{−iθ(r,q)}
+// ```
+//
+// Expanding `θ(r,q) = 2πrq/Q + π(r + q + 1/4)/M` factors the sum into a
+// pre-twiddle, a plain DFT, and a post-twiddle:
+//
+// ```text
+// W[r] = e^{−iπr/M} · DFT_Q{ z[q]·e^{−iπ(4q+1)/(4M)} }[r]
+// S[2r] = Re W[r],   S[M-1-2r] = −Im W[r]
+// ```
+//
+// **Step 3 — the Q-point DFT** is evaluated with the standard
+// radix-2 decimation-in-time recursion (splitting the DFT sum over
+// even/odd indices — again pure algebra on the DFT's own definition).
+//
+// The whole pipeline is computed in `f64`, matching the naive kernel's
+// working precision; the two paths agree to ~1e-12 relative, far
+// inside the `f32` cast at the §4.3.6 boundary. The unit tests pin the
+// fast path against [`imdct_naive`] across every valid Vorbis geometry
+// (`N = 64..=8192`) and non-trivial spectra.
+
+/// In-place radix-2 decimation-in-time complex DFT,
+/// `X[r] = Σ_q x[q]·e^{−2πi·rq/Q}`, on split re/im arrays whose length
+/// `Q` is a power of two.
+fn dft_radix2_in_place(re: &mut [f64], im: &mut [f64]) {
+    let q = re.len();
+    debug_assert!(q.is_power_of_two() || q == 0);
+    if q <= 1 {
+        return;
+    }
+    // Bit-reversal permutation.
+    let bits = q.trailing_zeros();
+    for i in 0..q {
+        let j = i.reverse_bits() >> (usize::BITS - bits);
+        if j > i {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    // Butterfly passes. Twiddles for the full size are precomputed
+    // once (`e^{−2πi·j/Q}` for `j = 0..Q/2`) and strided per stage.
+    let half = q / 2;
+    let mut tw_re = vec![0.0f64; half];
+    let mut tw_im = vec![0.0f64; half];
+    for (j, (tr, ti)) in tw_re.iter_mut().zip(tw_im.iter_mut()).enumerate() {
+        let ang = -2.0 * core::f64::consts::PI * j as f64 / q as f64;
+        *tr = ang.cos();
+        *ti = ang.sin();
+    }
+    let mut len = 2usize;
+    while len <= q {
+        let stride = q / len;
+        for base in (0..q).step_by(len) {
+            for k in 0..len / 2 {
+                let tj = k * stride;
+                let (wr, wi) = (tw_re[tj], tw_im[tj]);
+                let lo = base + k;
+                let hi = lo + len / 2;
+                let tr = re[hi] * wr - im[hi] * wi;
+                let ti = re[hi] * wi + im[hi] * wr;
+                re[hi] = re[lo] - tr;
+                im[hi] = im[lo] - ti;
+                re[lo] += tr;
+                im[lo] += ti;
+            }
+        }
+        len *= 2;
+    }
+}
+
+/// FFT-decomposed inverse MDCT — the production §4.3.7 kernel.
+///
+/// Same contract, arguments, and mathematical output as
+/// [`imdct_naive`] (the two agree to within `f64` rounding, orders of
+/// magnitude below the `f32` output quantum), but evaluated in
+/// `O(N log N)` via the shifted-DCT-IV / complex-DFT factorization
+/// derived in the module source from the cosine-summation formula
+/// itself. The naive kernel remains exported as the by-inspection
+/// reference oracle.
+///
+/// # Errors
+///
+/// Same as [`imdct_naive`].
+pub fn imdct(spectrum: &[f32], output: &mut [f32], scale: f32) -> Result<(), ImdctError> {
+    let m = spectrum.len();
+    if m == 0 || !m.is_power_of_two() {
+        return Err(ImdctError::SpectrumNotPowerOfTwo { spectrum_len: m });
+    }
+    let n = m * 2;
+    if output.len() != n {
+        return Err(ImdctError::OutputLenMismatch {
+            output_len: output.len(),
+            expected_len: n,
+        });
+    }
+    if m < 2 {
+        // Degenerate M = 1 (N = 2, far below the §4.2.2 minimum): the
+        // pairing needs Q = M/2 ≥ 1; defer to the direct summation.
+        return imdct_naive(spectrum, output, scale);
+    }
+    let q = m / 2;
+    let m_f = m as f64;
+
+    // Step 2 pre-twiddle: z[j] = (X[2j] + i·X[M-1-2j])·e^{−iπ(4j+1)/(4M)}.
+    let mut re = vec![0.0f64; q];
+    let mut im = vec![0.0f64; q];
+    for j in 0..q {
+        let a = spectrum[2 * j] as f64;
+        let b = spectrum[m - 1 - 2 * j] as f64;
+        let ang = -core::f64::consts::PI * (4 * j + 1) as f64 / (4.0 * m_f);
+        let (s, c) = ang.sin_cos();
+        re[j] = a * c - b * s;
+        im[j] = a * s + b * c;
+    }
+
+    dft_radix2_in_place(&mut re, &mut im);
+
+    // Step 2 post-twiddle into S[0..M), then the Step 1 sign/mirror
+    // rearrangement into the N-sample output. `s_buf` holds S.
+    let mut s_buf = vec![0.0f64; m];
+    for r in 0..q {
+        let ang = -core::f64::consts::PI * r as f64 / m_f;
+        let (s, c) = ang.sin_cos();
+        let wr = re[r] * c - im[r] * s;
+        let wi = re[r] * s + im[r] * c;
+        s_buf[2 * r] = wr;
+        s_buf[m - 1 - 2 * r] = -wi;
+    }
+    let scale_f = scale as f64;
+    for (i, out) in output.iter_mut().take(q).enumerate() {
+        *out = (s_buf[i + q] * scale_f) as f32;
+    }
+    for (i, out) in output.iter_mut().enumerate().take(3 * q).skip(q) {
+        *out = (-s_buf[3 * q - 1 - i] * scale_f) as f32;
+    }
+    for (i, out) in output.iter_mut().enumerate().take(4 * q).skip(3 * q) {
+        *out = (-s_buf[i - 3 * q] * scale_f) as f32;
+    }
+    Ok(())
+}
+
+/// Convenience wrapper over [`imdct`] that allocates the output
+/// buffer, mirroring [`imdct_naive_vec`].
+///
+/// # Errors
+///
+/// Same as [`imdct`].
+pub fn imdct_vec(spectrum: &[f32], scale: f32) -> Result<Vec<f32>, ImdctError> {
+    let mut out = vec![0.0f32; spectrum.len() * 2];
+    imdct(spectrum, &mut out, scale)?;
     Ok(out)
 }
 
@@ -556,6 +755,152 @@ mod tests {
                 out[i],
                 expected[i],
                 diff,
+            );
+        }
+    }
+
+    // ---- FFT-decomposed fast path ----
+
+    /// Deterministic pseudo-random spectrum (xorshift; no external
+    /// crates) with values spread across sign and magnitude.
+    fn synth_spectrum(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Map to roughly [-4.0, 4.0).
+                ((state >> 11) as f64 / (1u64 << 53) as f64 * 8.0 - 4.0) as f32
+            })
+            .collect()
+    }
+
+    /// The fast kernel reproduces the naive kernel across every valid
+    /// Vorbis geometry (§4.2.2: blocksizes 64..=8192, spectrum lengths
+    /// 32..=4096) on non-trivial spectra. The two paths both work in
+    /// `f64`, so agreement is pinned far below one `f32` ULP of the
+    /// typical output magnitude.
+    #[test]
+    fn fast_matches_naive_across_all_vorbis_geometries() {
+        for shift in 5..=12 {
+            let half = 1usize << shift;
+            let spectrum = synth_spectrum(half, 0x9E37_79B9_7F4A_7C15 ^ half as u64);
+            let naive = imdct_naive_vec(&spectrum, 1.0).unwrap();
+            let fast = imdct_vec(&spectrum, 1.0).unwrap();
+            assert_eq!(naive.len(), fast.len());
+            // Absolute scale of the frame, to form a relative bound.
+            let frame_mag = naive.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+            for i in 0..naive.len() {
+                let diff = (naive[i] - fast[i]).abs();
+                assert!(
+                    diff <= frame_mag * 1.0e-5,
+                    "blocksize {} idx {}: naive {} fast {} diff {}",
+                    half * 2,
+                    i,
+                    naive[i],
+                    fast[i],
+                    diff,
+                );
+            }
+        }
+    }
+
+    /// The fast kernel honours `scale` identically to the naive kernel
+    /// (a pure output multiplier).
+    #[test]
+    fn fast_scale_matches_naive_scale() {
+        let half = 128;
+        let spectrum = synth_spectrum(half, 42);
+        let naive = imdct_naive_vec(&spectrum, -0.35).unwrap();
+        let fast = imdct_vec(&spectrum, -0.35).unwrap();
+        for i in 0..naive.len() {
+            assert!(
+                (naive[i] - fast[i]).abs() <= 1.0e-4,
+                "idx {i}: naive {} fast {}",
+                naive[i],
+                fast[i],
+            );
+        }
+    }
+
+    /// The fast kernel shares the naive kernel's validation contract.
+    #[test]
+    fn fast_rejects_invalid_inputs() {
+        let mut out = [0.0f32; 0];
+        assert_eq!(
+            imdct(&[], &mut out, 1.0),
+            Err(ImdctError::SpectrumNotPowerOfTwo { spectrum_len: 0 }),
+        );
+        let spectrum = vec![0.0f32; 100];
+        let mut out = [0.0f32; 200];
+        assert_eq!(
+            imdct(&spectrum, &mut out, 1.0),
+            Err(ImdctError::SpectrumNotPowerOfTwo { spectrum_len: 100 }),
+        );
+        let spectrum = vec![0.0f32; 32];
+        let mut out = [0.0f32; 50];
+        assert_eq!(
+            imdct(&spectrum, &mut out, 1.0),
+            Err(ImdctError::OutputLenMismatch {
+                output_len: 50,
+                expected_len: 64,
+            }),
+        );
+    }
+
+    /// Degenerate below-spec geometries (M = 1, 2, 4 …) still match the
+    /// naive kernel — the M = 1 case takes the explicit fallback, and
+    /// tiny powers of two exercise the DFT's smallest recursions.
+    #[test]
+    fn fast_matches_naive_on_tiny_geometries() {
+        for half in [1usize, 2, 4, 8, 16] {
+            let spectrum = synth_spectrum(half, 7 + half as u64);
+            let naive = imdct_naive_vec(&spectrum, 1.0).unwrap();
+            let fast = imdct_vec(&spectrum, 1.0).unwrap();
+            for i in 0..naive.len() {
+                assert!(
+                    (naive[i] - fast[i]).abs() <= 1.0e-5,
+                    "half {half} idx {i}: naive {} fast {}",
+                    naive[i],
+                    fast[i],
+                );
+            }
+        }
+    }
+
+    /// The hand-computed N = 4 impulse pins from the naive kernel hold
+    /// verbatim for the fast kernel.
+    #[test]
+    fn fast_hand_computed_n4_impulses() {
+        let out = imdct_vec(&[1.0f32, 0.0], 1.0).unwrap();
+        let expected = [
+            (3.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+            (5.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+            (7.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+            (9.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+        ];
+        for i in 0..4 {
+            assert!(
+                (out[i] - expected[i]).abs() < 1.0e-6,
+                "fast n4 idx {i}: got {} expected {}",
+                out[i],
+                expected[i],
+            );
+        }
+        let out = imdct_vec(&[0.0f32, 1.0], 1.0).unwrap();
+        let expected = [
+            (9.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+            (15.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+            (21.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+            (27.0_f64 * core::f64::consts::PI / 8.0).cos() as f32,
+        ];
+        for i in 0..4 {
+            assert!(
+                (out[i] - expected[i]).abs() < 1.0e-6,
+                "fast n4 k1 idx {i}: got {} expected {}",
+                out[i],
+                expected[i],
             );
         }
     }

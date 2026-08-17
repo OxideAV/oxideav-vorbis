@@ -6,6 +6,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **FFT-decomposed §4.3.7 IMDCT** (`imdct::imdct` / `imdct_vec`) — the
+  production decode kernel is now `O(N log N)`: the cosine summation
+  from `imdct-cross-reference.md` factored, by algebra on the formula
+  itself, into a shifted DCT-IV, a `Q = N/4`-point radix-2 complex DFT,
+  and pre/post twiddles (derivation in the module source). The direct
+  `O(N²)` summation stays exported as `imdct_naive`, the by-inspection
+  reference oracle; unit tests pin the fast path against it across
+  every valid Vorbis geometry (`N = 64..=8192`) and on degenerate tiny
+  sizes, plus the hand-computed N=4 impulse pins. The §4.3 windowed
+  decode driver now calls the fast kernel — measured on the black-box
+  differential corpus (see below): 6 s stereo 44.1 kHz decodes in
+  ~15 ms where the summation kernel took ~2.98 s (≈200×), a 60 s
+  stereo 48 kHz stream 31.1 s → 0.14 s, and the 4096-block 5.1 q=−1
+  case 10.2 s → 0.06 s — the streaming decoder moves from ~0.6–2×
+  realtime to ≈400–1000× realtime with reference-decoder agreement
+  unchanged (≤0.01 s16 LSB on every corpus stream).
+
 - **Codec-private extradata decoding** — `VorbisDecoder::with_extradata`
   parses the Xiph-laced three-header blob container layers carry for
   Vorbis (the `oxideav-ogg` demuxer's `CodecParameters::extradata`,

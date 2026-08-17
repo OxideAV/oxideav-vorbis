@@ -101,7 +101,7 @@
 
 use crate::floor0::{Floor0Curve, Floor0Decoder, Floor0Error};
 use crate::floor1::{Floor1Decoder, Floor1Error, FloorCurve};
-use crate::imdct::{imdct_naive, ImdctError};
+use crate::imdct::{imdct, ImdctError};
 use crate::packet::{
     dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader, PacketError,
 };
@@ -763,8 +763,7 @@ pub fn apply_imdct_and_window(
             let mut frames: Vec<Vec<f32>> = Vec::with_capacity(spectra.len());
             for spectrum in &spectra {
                 let mut time_frame = vec![0.0f32; n];
-                imdct_naive(spectrum, &mut time_frame, imdct_scale)
-                    .map_err(AudioPacketError::Imdct)?;
+                imdct(spectrum, &mut time_frame, imdct_scale).map_err(AudioPacketError::Imdct)?;
                 window_premultiply(&mut time_frame, &window)
                     .map_err(AudioPacketError::WindowPremultiply)?;
                 frames.push(time_frame);
