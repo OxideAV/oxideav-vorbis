@@ -6,6 +6,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **Per-channel block-size scheduling**
+  (`blocksize::plan_block_sequence_multi`) — the switching encoder's
+  §4.3.1 blockflag walk now runs the energy-envelope transient
+  detector **per channel** and OR-merges each packet's decision (the
+  blockflag is shared by every channel, so the packet goes short when
+  *any* channel's lookahead region is transient), each channel keeping
+  its own energy-rise context. The old channel-mixdown detector missed
+  a burst confined to one channel: a loud steady sibling dilutes the
+  mix's peak-to-mean concentration, and anti-correlated content
+  cancels in the mix outright — both failure modes are now pinned by
+  unit tests whose mixdown plans provably stay all-long while the
+  per-channel plan schedules short. N identical channels reproduce the
+  single-channel plan exactly (`plan_block_sequence` delegates to the
+  multi form); mono behavior is unchanged, and the full fixture
+  re-encode suite is unchanged.
+
 - **Measured per-channel adaptive-margin balance pass**
   (`EncoderTuning::adaptive_margin_headroom_db` +
   `encode_pcm_to_packets`) — closes the known stereo quiet-channel

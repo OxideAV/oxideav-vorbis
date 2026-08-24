@@ -303,7 +303,49 @@ pub fn plan_block_sequence(
     peak_to_mean_threshold: f64,
     energy_rise_threshold: f64,
 ) -> Result<BlockSequencePlan, BlocksizeError> {
-    if pcm.is_empty() {
+    plan_block_sequence_multi(
+        &[pcm],
+        short_n,
+        long_n,
+        subframes,
+        peak_to_mean_threshold,
+        energy_rise_threshold,
+    )
+}
+
+/// Multi-channel form of [`plan_block_sequence`]: one §4.3.8 granule
+/// walk (a Vorbis packet's `blockflag` is shared by every channel —
+/// the mode, and with it the window, is per *packet*), with each
+/// packet's decision taken **per channel** and OR-merged: the packet
+/// goes short when *any* channel's lookahead region is transient.
+///
+/// This is the schedule a channel *mixdown* cannot deliver: a burst
+/// confined to one channel is diluted by a loud steady sibling (the
+/// mix's peak-to-mean concentration collapses toward the steady
+/// channel's) or cancelled outright by anti-correlated content, so
+/// the mixdown detector misses it and the long block smears pre-echo
+/// across the burst's channel. Deciding per channel keeps each
+/// channel's own concentration ratio and its own energy-rise context
+/// (`prev_mean` is tracked per channel).
+///
+/// Channel rows may differ in length (decisions run over the longest
+/// row; a channel contributes nothing past its own end). A
+/// single-channel call is exactly [`plan_block_sequence`].
+///
+/// # Errors
+///
+/// As [`plan_block_sequence`]; additionally [`BlocksizeError::EmptyBlock`]
+/// when `channels` is empty or every row is empty.
+pub fn plan_block_sequence_multi(
+    channels: &[&[f32]],
+    short_n: usize,
+    long_n: usize,
+    subframes: usize,
+    peak_to_mean_threshold: f64,
+    energy_rise_threshold: f64,
+) -> Result<BlockSequencePlan, BlocksizeError> {
+    let len = channels.iter().map(|row| row.len()).max().unwrap_or(0);
+    if len == 0 {
         return Err(BlocksizeError::EmptyBlock);
     }
     let legal = |n: usize| n.is_power_of_two() && (64..=8192).contains(&n);
@@ -315,42 +357,54 @@ pub fn plan_block_sequence(
     }
 
     let lookahead = long_n;
-    // Mean sub-frame energy of the previous decision region — the
-    // context the energy-rise criterion compares against. `None` until
-    // the first non-empty region is analysed. (Packet 0 and packet 1
-    // decide at the same granule; the second call's context is then
-    // that same region's own mean, degenerating the rise criterion to
-    // the concentration criterion — harmless.)
-    let mut prev_mean: Option<f64> = None;
+    // Mean sub-frame energy of each channel's previous decision region
+    // — the context its energy-rise criterion compares against. `None`
+    // until that channel's first non-empty region is analysed.
+    // (Packet 0 and packet 1 decide at the same granule; the second
+    // call's context is then that same region's own mean, degenerating
+    // the rise criterion to the concentration criterion — harmless.)
+    let mut prev_mean: Vec<Option<f64>> = vec![None; channels.len()];
     let mut decide = |g: usize| -> Result<bool, BlocksizeError> {
         if short_n == long_n {
             // Degenerate single-blocksize stream: the flag is
             // meaningless; report the short/only block.
             return Ok(false);
         }
-        let end = (g + lookahead).min(pcm.len());
-        if g >= end {
-            // The frame covers only zero-padding past the input: no
-            // transient there — long block.
+        let mut transient = false;
+        let mut any_region = false;
+        for (row, pm) in channels.iter().zip(prev_mean.iter_mut()) {
+            let end = (g + lookahead).min(row.len());
+            if g >= end {
+                // This channel's frame covers only zero-padding past
+                // its input: no transient contribution from it.
+                continue;
+            }
+            any_region = true;
+            let region = &row[g..end];
+            let sf = subframes.min(region.len());
+            let analysis = detect_transient(region, sf)?;
+            let concentrated = analysis.peak_to_mean > peak_to_mean_threshold;
+            let rise = match *pm {
+                Some(prev) => {
+                    analysis.peak_energy > energy_rise_threshold * prev.max(f64::MIN_POSITIVE)
+                }
+                None => false,
+            };
+            *pm = Some(analysis.mean_energy);
+            transient = transient || concentrated || rise;
+        }
+        if !any_region {
+            // Every channel is past its end — pure zero-padding: long.
             return Ok(true);
         }
-        let region = &pcm[g..end];
-        let sf = subframes.min(region.len());
-        let analysis = detect_transient(region, sf)?;
-        let concentrated = analysis.peak_to_mean > peak_to_mean_threshold;
-        let rise = match prev_mean {
-            Some(pm) => analysis.peak_energy > energy_rise_threshold * pm.max(f64::MIN_POSITIVE),
-            None => false,
-        };
-        prev_mean = Some(analysis.mean_energy);
-        Ok(!(concentrated || rise))
+        Ok(!transient)
     };
 
     let size = |flag: bool| if flag { long_n } else { short_n };
     let mut blockflags = vec![decide(0)?];
     let mut granules = vec![0u64];
     let mut g = 0usize;
-    while g < pcm.len() {
+    while g < len {
         let flag = decide(g)?;
         let n_prev = size(*blockflags.last().expect("non-empty"));
         // §4.3.8: packet f finishes (n_{f-1} + n_f) / 4 samples.
@@ -458,6 +512,103 @@ mod tests {
                 "granule walk broken at packet {f}"
             );
         }
+    }
+
+    // ---- plan_block_sequence_multi ----
+
+    /// A burst confined to one quiet channel under a loud steady
+    /// sibling: the channel mixdown's peak-to-mean concentration is
+    /// dominated by the steady channel, so a mixdown plan stays all
+    /// long — the per-channel OR-merged plan must catch it.
+    #[test]
+    fn one_channel_burst_under_loud_sibling_schedules_short() {
+        let n = 6000usize;
+        // ch0: loud steady tone.
+        let ch0: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin() * 0.8).collect();
+        // ch1: near-silence with a sharp burst at sample 2000.
+        let mut ch1 = vec![0.0f32; n];
+        for (i, s) in ch1.iter_mut().enumerate().skip(2000).take(64) {
+            *s = if i % 2 == 0 { 0.05 } else { -0.05 };
+        }
+        // The mixdown detector misses the burst entirely.
+        let mix: Vec<f32> = ch0.iter().zip(&ch1).map(|(&a, &b)| (a + b) * 0.5).collect();
+        let mix_plan = plan_block_sequence(&mix, 256, 1024, 8, 4.0, 4.0).unwrap();
+        assert!(
+            mix_plan.blockflags.iter().all(|&f| f),
+            "premise: the mixdown must miss the one-channel burst"
+        );
+        // The per-channel plan catches it and stays walk-consistent.
+        let plan = plan_block_sequence_multi(&[&ch0, &ch1], 256, 1024, 8, 4.0, 4.0).unwrap();
+        assert_walk_consistent(&plan, 256, 1024);
+        assert!(
+            plan.blockflags.iter().any(|&f| !f),
+            "the per-channel schedule must catch the one-channel burst"
+        );
+    }
+
+    /// Anti-correlated burst content cancels in a mixdown (the mix is
+    /// silence at the burst); the per-channel plan sees each channel's
+    /// own burst.
+    #[test]
+    fn anti_correlated_burst_cancels_in_mix_but_schedules_short() {
+        let n = 6000usize;
+        let mut ch0 = vec![0.0f32; n];
+        for (i, s) in ch0.iter_mut().enumerate().skip(2000).take(64) {
+            *s = if i % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        // ch1 is the exact negation: the mixdown is identically zero.
+        let ch1: Vec<f32> = ch0.iter().map(|&v| -v).collect();
+        let mix: Vec<f32> = ch0.iter().zip(&ch1).map(|(&a, &b)| (a + b) * 0.5).collect();
+        assert!(mix.iter().all(|&v| v == 0.0), "premise: exact cancellation");
+        let mix_plan = plan_block_sequence(&mix, 256, 1024, 8, 4.0, 4.0).unwrap();
+        assert!(
+            mix_plan.blockflags.iter().all(|&f| f),
+            "premise: the silent mixdown plans all long"
+        );
+        let plan = plan_block_sequence_multi(&[&ch0, &ch1], 256, 1024, 8, 4.0, 4.0).unwrap();
+        assert_walk_consistent(&plan, 256, 1024);
+        assert!(
+            plan.blockflags.iter().any(|&f| !f),
+            "the per-channel schedule must catch the cancelled burst"
+        );
+    }
+
+    /// N identical channels decide exactly like the single channel:
+    /// the OR-merge over identical analyses changes nothing.
+    #[test]
+    fn identical_channels_match_the_single_channel_plan() {
+        let mut pcm = vec![0.0f32; 6000];
+        for (i, s) in pcm.iter_mut().enumerate().skip(2000).take(64) {
+            *s = if i % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        for (i, s) in pcm.iter_mut().enumerate().skip(3000) {
+            *s = (i as f32 * 0.05).sin() * 0.4;
+        }
+        let single = plan_block_sequence(&pcm, 256, 1024, 8, 4.0, 4.0).unwrap();
+        let multi = plan_block_sequence_multi(&[&pcm, &pcm, &pcm], 256, 1024, 8, 4.0, 4.0).unwrap();
+        assert_eq!(single, multi);
+    }
+
+    /// Rows of unequal length: the walk covers the longest row, and a
+    /// shorter row simply stops contributing past its end.
+    #[test]
+    fn unequal_rows_walk_the_longest() {
+        let long_row = vec![0.1f32; 5000];
+        let short_row = vec![0.1f32; 1000];
+        let plan =
+            plan_block_sequence_multi(&[&short_row, &long_row], 256, 1024, 8, 4.0, 4.0).unwrap();
+        assert_walk_consistent(&plan, 256, 1024);
+        assert!(*plan.granules.last().unwrap() as usize >= 5000);
+        // And an empty channel list (or all-empty rows) is rejected.
+        assert_eq!(
+            plan_block_sequence_multi(&[], 256, 1024, 8, 4.0, 4.0),
+            Err(BlocksizeError::EmptyBlock)
+        );
+        let empty: &[f32] = &[];
+        assert_eq!(
+            plan_block_sequence_multi(&[empty, empty], 256, 1024, 8, 4.0, 4.0),
+            Err(BlocksizeError::EmptyBlock)
+        );
     }
 
     #[test]

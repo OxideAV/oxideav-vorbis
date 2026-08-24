@@ -45,7 +45,7 @@
 //! `weights · error²  + λ · bits` per §8.6 partition).
 
 use crate::audio::AudioDecoderState;
-use crate::blocksize::{plan_block_sequence, BlocksizeError};
+use crate::blocksize::{plan_block_sequence_multi, BlocksizeError};
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::encoder::{
     write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
@@ -1386,23 +1386,20 @@ fn encode_pcm_to_packets_geometry(
 
     // ---- §4.3.1 block-size schedule ----
     // On a switching stream the per-packet blockflags come from the
-    // energy-envelope transient detector over a channel mixdown, and
-    // the granule positions from the §4.3.8 walk `(n_prev + n_cur)/4`
+    // energy-envelope transient detector run **per channel** and
+    // OR-merged (`plan_block_sequence_multi`): the packet's blockflag
+    // is shared by every channel, so it goes short when any channel's
+    // lookahead region is transient. (The old channel-mixdown detector
+    // missed a burst confined to one channel: a loud steady sibling
+    // dilutes the mix's peak-to-mean concentration, and
+    // anti-correlated content cancels in the mix outright.) The
+    // granule positions come from the §4.3.8 walk `(n_prev + n_cur)/4`
     // per packet. A single-blocksize stream is the uniform walk: the
     // priming packet plus one packet per n/2 finished samples.
     let (flags, granules) = if switching {
-        let mut mix = pcm[0].clone();
-        for row in &pcm[1..] {
-            for (m, &v) in mix.iter_mut().zip(row) {
-                *m += v;
-            }
-        }
-        let scale = 1.0 / ch as f32;
-        for m in &mut mix {
-            *m *= scale;
-        }
-        let plan = plan_block_sequence(
-            &mix,
+        let rows: Vec<&[f32]> = pcm.iter().map(|row| row.as_slice()).collect();
+        let plan = plan_block_sequence_multi(
+            &rows,
             n0,
             n1,
             TRANSIENT_SUBFRAMES,

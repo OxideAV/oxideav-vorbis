@@ -982,9 +982,11 @@ and mono stay single-pass and byte-identical
   need a second uncoupled mapping per block size).
 - **The transient detector is two global thresholds** (peak-to-mean
   concentration + energy rise over a 16-sub-frame lookahead); it is not
-  loudness-adaptive, and the block schedule is decided on a channel
-  mixdown, so a transient confined to one channel of an uncoupled pair
-  still switches both.
+  loudness-adaptive. (The schedule itself is per-channel since r451:
+  each packet's shared blockflag OR-merges the channels' own
+  detections, so a burst confined to one channel — diluted or
+  cancelled in a mixdown — still schedules short; the whole packet
+  switching is the format's own §4.3.1 per-packet mode.)
 - **The re-encoded audio rate still trails the reference corpus at
   the knee.** On audio-packet bytes the default-quality re-encode
   spends ~2.2× the reference stream's audio bytes (mono-q5: ~4.6 kB
