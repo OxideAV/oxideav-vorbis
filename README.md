@@ -163,7 +163,19 @@ four §4.3.1 window-flag combinations).
   truncated at every byte length, header-type packets (first bit set)
   routed into the audio driver, and empty / single-byte / pseudo-random
   packet bodies all return a typed `StreamingError` or decode cleanly —
-  never a panic.
+  never a panic. The §3.2.1 codebook parser additionally caps every
+  speculative `Vec` reservation at the reader's remaining bit budget, so
+  a hostile setup packet declaring the maximal `codebook_entries`
+  (24-bit, ~16.7 M) or a type-2 `lookup_values = entries × dimensions`
+  product (up to `u32::MAX` — a naive `Vec<u32>` reservation would reach
+  ~17 GB) cannot force a multi-gigabyte up-front allocation before the
+  reads that fail; the ordered length table grows run-by-run rather than
+  pre-filling from the raw entry count. Three unit tests pin that tiny
+  packets declaring those counts return `UnexpectedEndOfPacket` without
+  over-reserving, satisfying the `fuzz/` decode target's standing
+  no-unbounded-allocation contract (re-verified this round: the three
+  cargo-fuzz targets ran ~20 M / ~870 k / ~76 execs under ASAN at a
+  2 GB RSS cap with zero findings).
 - **Per-packet trace conformance** — `tests/audio_packet_trace_conformance.rs`
   validates the §4.3.1 *structural decisions* the PCM-level fixture test
   doesn't reach. Each fixture's `trace.txt` is the documented load-bearing
