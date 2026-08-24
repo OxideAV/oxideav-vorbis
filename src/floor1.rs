@@ -1041,6 +1041,59 @@ mod tests {
         assert_eq!(dec.floor1_values(), 4);
     }
 
+    /// The endpoint-only degenerate floor: `partitions = 0`, so the
+    /// stream carries no interior posts and the curve is the single
+    /// §7.2.4 line drawn between the two implicit endpoints (`x = 0` and
+    /// `x = 2^rangebits`). No conformant encoder emits it, but the
+    /// decode path must handle it without panicking.
+    fn header_zero_partitions() -> Floor1Header {
+        Floor1Header {
+            partitions: 0,
+            partition_class_list: vec![],
+            classes: vec![],
+            multiplier: 2,
+            rangebits: 4, // endpoint1 x = 16
+            x_list: vec![],
+        }
+    }
+
+    #[test]
+    fn new_accepts_endpoint_only_floor() {
+        // With no partitions there are no class/book references to
+        // validate, so an empty codebook slice is sufficient.
+        let dec = Floor1Decoder::new(&header_zero_partitions(), &[]).unwrap();
+        // Only the two implicit endpoints — floor1_values == 2.
+        assert_eq!(dec.floor1_values(), 2);
+    }
+
+    #[test]
+    fn endpoint_only_floor_decodes_to_a_line() {
+        let dec = Floor1Decoder::new(&header_zero_partitions(), &[]).unwrap();
+        // nonzero + two 7-bit endpoints, no codewords (there are no
+        // interior posts to read for a zero-partition floor).
+        let packet = pack_packet(true, 40, 20, &[]);
+        let mut r = BitReaderLsb::new(&packet);
+        let decoded = match dec.decode(&mut r, 16) {
+            FloorCurve::Curve(c) => c,
+            FloorCurve::Unused => panic!("expected a curve, got Unused"),
+        };
+        // A full-length curve, and the encoder-side primitive agrees.
+        assert_eq!(decoded.len(), 16);
+        let rendered = dec.render_curve(&[40, 20], 16);
+        assert_eq!(rendered, decoded);
+        // Endpoint 0 (amplitude 40) sits above endpoint 1 (amplitude 20),
+        // so the line — and the §10.1 dB-mapped curve — descends.
+        assert!(decoded[0] > decoded[15]);
+    }
+
+    #[test]
+    fn endpoint_only_floor_unused_when_nonzero_clear() {
+        let dec = Floor1Decoder::new(&header_zero_partitions(), &[]).unwrap();
+        let packet = pack_packet(false, 0, 0, &[]);
+        let mut r = BitReaderLsb::new(&packet);
+        assert_eq!(dec.decode(&mut r, 16), FloorCurve::Unused);
+    }
+
     // ---- curve computation (§7.2.4) ----
 
     /// Hand-traced full curve_computation against the Python reference:
