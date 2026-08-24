@@ -416,6 +416,24 @@ pub fn lookup1_values(entries: u32, dimensions: u16) -> u32 {
 /// `codebook_lookup_type` nibble for lookup type 0).
 ///
 /// On any deviation from §3.2.1, returns a structured [`ParseError`].
+/// Caps a speculative `Vec` pre-allocation to what the remaining
+/// bitstream could actually supply.
+///
+/// Every codebook table element the reader is about to decode costs at
+/// least one bit on the wire — the cheapest honest encoding is the
+/// unordered-sparse `used = 0` flag (one bit, no length), and the
+/// lookup multiplicands each spend `value_bits >= 1`. So a packet
+/// physically cannot encode more elements than it has remaining bits,
+/// and a `codebook_entries` (24-bit, up to ~16.7M) or `lookup_values`
+/// (up to `u32::MAX`, ~4.3 G — a 17 GB `Vec<u32>` reservation) field on
+/// a short or truncated packet is a hostile length claim. Reserving
+/// `min(requested, bits_remaining)` bounds the up-front allocation to
+/// the input size; a genuinely large, fully-present table still grows
+/// the `Vec` as its bits are actually read.
+fn budget_capacity(reader: &BitReaderLsb<'_>, requested: usize) -> usize {
+    requested.min(reader.bits_remaining() as usize)
+}
+
 pub fn parse_codebook(reader: &mut BitReaderLsb<'_>) -> Result<VorbisCodebook, ParseError> {
     // §3.2.1 step 1: 24-bit sync pattern 0x564342.
     let sync = read_u32(reader, 24)?;
@@ -436,7 +454,7 @@ pub fn parse_codebook(reader: &mut BitReaderLsb<'_>) -> Result<VorbisCodebook, P
     let codeword_lengths = if !ordered {
         // Unordered: 1-bit sparse flag, then per-entry length.
         let sparse = read_bit(reader)?;
-        let mut lengths = Vec::with_capacity(entries as usize);
+        let mut lengths = Vec::with_capacity(budget_capacity(reader, entries as usize));
         for _ in 0..entries {
             if sparse {
                 let used = read_bit(reader)?;
@@ -453,8 +471,13 @@ pub fn parse_codebook(reader: &mut BitReaderLsb<'_>) -> Result<VorbisCodebook, P
         }
         lengths
     } else {
-        // Ordered: ascending-length run encoding.
-        let mut lengths = vec![UNUSED_ENTRY; entries as usize];
+        // Ordered: ascending-length run encoding. The length table is
+        // grown run-by-run rather than pre-filled: `codebook_entries`
+        // alone (a 24-bit field) would otherwise materialise up to a
+        // ~16.7M-byte `Vec` before a single run bit is read, so a
+        // truncated ordered packet is bounded to what its run reads
+        // actually cover (`budget_capacity` caps the reservation).
+        let mut lengths: Vec<u8> = Vec::with_capacity(budget_capacity(reader, entries as usize));
         let mut current_entry: u32 = 0;
         let mut current_length: u32 = read_u32(reader, 5)? + 1;
         while current_entry < entries {
@@ -478,9 +501,7 @@ pub fn parse_codebook(reader: &mut BitReaderLsb<'_>) -> Result<VorbisCodebook, P
             // > 32. (A well-formed ordered stream must by construction
             // produce lengths in 1..=32.)
             let length_u8 = current_length.min(255) as u8;
-            for slot in &mut lengths[current_entry as usize..new_entry as usize] {
-                *slot = length_u8;
-            }
+            lengths.resize(new_entry as usize, length_u8);
             current_entry = new_entry;
             current_length += 1;
         }
@@ -515,7 +536,8 @@ pub fn parse_codebook(reader: &mut BitReaderLsb<'_>) -> Result<VorbisCodebook, P
                     .filter(|&v| v <= u32::MAX as u64)
                     .ok_or(ParseError::UnexpectedEndOfPacket)? as u32
             };
-            let mut multiplicands = Vec::with_capacity(lookup_values as usize);
+            let mut multiplicands =
+                Vec::with_capacity(budget_capacity(reader, lookup_values as usize));
             for _ in 0..lookup_values {
                 multiplicands.push(read_u32(reader, value_bits as u32)?);
             }
@@ -1090,6 +1112,81 @@ mod tests {
         w.write_bit(false); // sparse = 0
         w.write_u32(0, 5); // first entry length-1 = 0 (length 1)
                            // ...and now truncate: only one of two entries is present.
+        let bytes = w.finish();
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(
+            parse_codebook(&mut r),
+            Err(ParseError::UnexpectedEndOfPacket)
+        );
+    }
+
+    /// Hostile-codebook DoS surface: a tiny type-2 lookup header whose
+    /// `codebook_entries × codebook_dimensions` product (the §3.2.1
+    /// `lookup_values` count) is ~4.29 G — a naive
+    /// `Vec::<u32>::with_capacity(lookup_values)` would speculatively
+    /// reserve ~17 GB before reading a single multiplicand. The parser
+    /// must instead bound the reservation to the packet's remaining bit
+    /// budget and return a typed error (EOF on the first multiplicand),
+    /// never panic or reserve unboundedly.
+    #[test]
+    fn hostile_type2_lookup_values_does_not_over_reserve() {
+        let mut w = BitWriterLsb::with_capacity(64);
+        w.write_u32(VorbisCodebook::SYNC_PATTERN, 24);
+        w.write_u32(65535, 16); // dimensions
+        w.write_u32(65535, 24); // entries -> lookup_values = 65535^2
+        w.write_bit(true); // ordered = 1 (cheap length table: one run)
+        w.write_u32(0, 5); // starting_length - 1 -> length 1
+        let width = ilog(65535); // ilog(entries - current_entry)
+        w.write_u32(65535, width); // one run covering every entry
+        w.write_u32(2, 4); // lookup_type = 2
+        w.write_u32(0, 32); // minimum_value
+        w.write_u32(0, 32); // delta_value
+        w.write_u32(15, 4); // value_bits - 1 -> 16
+        w.write_bit(false); // sequence_p
+                            // No multiplicands present: 4_294_836_225 declared, zero on the wire.
+        let bytes = w.finish();
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(
+            parse_codebook(&mut r),
+            Err(ParseError::UnexpectedEndOfPacket)
+        );
+    }
+
+    /// Hostile-codebook DoS surface: an unordered book declaring the
+    /// full 24-bit `codebook_entries` maximum (~16.7 M) on a packet that
+    /// carries only a couple of length fields. The per-entry length
+    /// reservation must be bounded by the remaining bit budget, not by
+    /// the declared entry count, and the parse must EOF cleanly.
+    #[test]
+    fn hostile_unordered_entries_does_not_over_reserve() {
+        let mut w = BitWriterLsb::with_capacity(64);
+        w.write_u32(VorbisCodebook::SYNC_PATTERN, 24);
+        w.write_u32(1, 16); // dimensions
+        w.write_u32(0x00FF_FFFF, 24); // entries = 16_777_215
+        w.write_bit(false); // ordered = 0
+        w.write_bit(false); // sparse = 0 (every entry spends 5 bits)
+        w.write_u32(2, 5); // one length present; the rest are absent
+        let bytes = w.finish();
+        let mut r = BitReaderLsb::new(&bytes);
+        assert_eq!(
+            parse_codebook(&mut r),
+            Err(ParseError::UnexpectedEndOfPacket)
+        );
+    }
+
+    /// Companion sparse variant: sparse unordered entries cost one bit
+    /// each (the `used` flag), so the reservation is still bounded by
+    /// the remaining bits. A tiny packet declaring 16.7 M sparse entries
+    /// EOFs rather than reserving a 16 MB length table up front.
+    #[test]
+    fn hostile_sparse_entries_does_not_over_reserve() {
+        let mut w = BitWriterLsb::with_capacity(64);
+        w.write_u32(VorbisCodebook::SYNC_PATTERN, 24);
+        w.write_u32(1, 16); // dimensions
+        w.write_u32(0x00FF_FFFF, 24); // entries = 16_777_215
+        w.write_bit(false); // ordered = 0
+        w.write_bit(true); // sparse = 1
+        w.write_bit(false); // one 'used = 0' flag; the rest EOF
         let bytes = w.finish();
         let mut r = BitReaderLsb::new(&bytes);
         assert_eq!(

@@ -4,6 +4,30 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hostile-codebook allocation fence** (`codebook::parse_codebook`) —
+  the §3.2.1 codebook parser bounded every speculative `Vec`
+  reservation to the reader's remaining bit budget. The
+  attacker-controlled `codebook_entries` (24-bit, up to ~16.7 M) and
+  the type-2 `lookup_values = entries × dimensions` product (up to
+  `u32::MAX`, ~4.29 G — a naive `Vec::<u32>::with_capacity` would
+  reserve ~17 GB) previously drove the length-table and multiplicand
+  pre-allocations directly, so an 8 KB (or smaller) hostile packet
+  could force a multi-gigabyte up-front reservation before any read
+  failed. Reservations are now capped at `bits_remaining` (the cheapest
+  honest per-element encoding still spends ≥ 1 bit), and the ordered
+  length table is grown run-by-run rather than pre-filled from the raw
+  `codebook_entries` field; a genuinely large, fully-present table
+  still grows as its bits are read. Three regression tests
+  (`hostile_type2_lookup_values_does_not_over_reserve`,
+  `hostile_unordered_entries_does_not_over_reserve`,
+  `hostile_sparse_entries_does_not_over_reserve`) pin that tiny packets
+  declaring the maximal counts return a typed `UnexpectedEndOfPacket`
+  without over-reserving. This satisfies the `fuzz/` decode target's
+  standing "never allocate unboundedly from attacker-controlled length
+  fields" contract.
+
 ### Added
 
 - **FFT-decomposed §4.3.7 IMDCT** (`imdct::imdct` / `imdct_vec`) — the
