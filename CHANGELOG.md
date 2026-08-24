@@ -4,6 +4,30 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Measured per-channel adaptive-margin balance pass**
+  (`EncoderTuning::adaptive_margin_headroom_db` +
+  `encode_pcm_to_packets`) — closes the known stereo quiet-channel
+  top-end gap. Past the +6 dB global margin cap's knee (`q > 0.75`) a
+  multichannel encode own-decodes its first pass and, when a channel's
+  measured SNR trails the best channel by more than 3 dB, re-encodes
+  once granting a deficit-scaled share of up to +6 dB extra masking
+  margin to exactly the trailing channels; the retry is kept only when
+  the measured worst channel actually improves. The grant is measured,
+  not inferred: on the decorrelated `stereo-44100-q5-typical` fixture
+  the channels carry identical RMS (−21 dBFS each) and near-identical
+  over-masked-energy (0.7 % / 0.4 %) and energy-weighted tonality
+  (0.42 / 0.39) figures while coding 12 dB apart, so no cheap psy
+  statistic identifies the trailing channel — but a forced deep margin
+  on it lifts it by 18 dB. Measured at `q = 1` on that fixture:
+  min-channel SNR 40.2 → 55.2 dB and the inter-channel gap
+  12.1 → 3.0 dB, at 14.4 → 23.1 kB audio; `q ≤ 0.75` and mono encodes
+  stay single-pass and byte-identical (the headroom lever is 0 through
+  the knee). `tests/quiet_channel_margin.rs` pins both bands; the full
+  suite (fixture re-encodes, coupling, block switching, quality curve)
+  is unchanged.
+
 ### Fixed
 
 - **Hostile-codebook allocation fence** (`codebook::parse_codebook`) —

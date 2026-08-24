@@ -65,6 +65,24 @@ pub struct EncoderTuning {
     /// [`crate::psy::plan_psy_floor_envelope`] (constant `2`: the
     /// guard against inter-post floor dips is quality-independent).
     pub floor_smooth_radius: usize,
+    /// The **content-adaptive margin headroom** (dB): the extra
+    /// masking margin the whole-stream encoder may grant *per channel*
+    /// on top of [`Self::threshold_offset_db`] in its measured balance
+    /// pass (`encode_pcm_to_packets`): the first pass is own-decoded,
+    /// and a channel whose measured SNR trails the best channel by
+    /// more than 3 dB earns a deficit-scaled share of this headroom
+    /// for one retry — waveform coding exactly where the stream shows
+    /// it pays, without dragging every channel's rate along the way
+    /// the old uncapped global margin did. (The grant is measured, not
+    /// inferred: no cheap psy statistic identifies the trailing
+    /// channel — on the decorrelated stereo fixture the channels carry
+    /// identical RMS and near-identical over-masked-energy and
+    /// tonality figures while coding 12 dB apart.) `0` through
+    /// `q ≤ 0.75` — the encode below the cap knee stays single-pass
+    /// and byte-identical — rising linearly to `+6 dB` at `q = 1`
+    /// (the old uncapped law's top, now spent selectively). Monotone
+    /// non-decreasing in `q`.
+    pub adaptive_margin_headroom_db: f32,
     /// The **fine value-ladder divisor**: the integrated encoder's
     /// second-stage residue book quantises with step
     /// `max_abs / fine_step_divisor`, so this divisor sets the
@@ -138,6 +156,9 @@ impl EncoderTuning {
             // 10^-1.4 at q=0 → 10^-4 at q=1.
             lambda: 10f64.powf(-1.4 - 2.6 * qf),
             threshold_offset_db: (-12.0 + 24.0 * q).min(6.0),
+            // 0 through the +6 dB cap knee (q = 0.75), then linear to
+            // +6 dB of per-channel headroom at q = 1.
+            adaptive_margin_headroom_db: ((q - 0.75) * 24.0).clamp(0.0, 6.0),
             floor_post_budget: 8 + (24.0 * qf).round() as usize,
             floor_smooth_radius: 2,
             // 192 up to q = 0.7, then log-linear to 4 × 192 = 768 at
@@ -328,10 +349,22 @@ mod tests {
         assert_eq!(hi.threshold_offset_db, 6.0);
         assert_eq!(lo.floor_post_budget, 8);
         assert_eq!(hi.floor_post_budget, 32);
+        assert_eq!(lo.adaptive_margin_headroom_db, 0.0);
+        assert_eq!(hi.adaptive_margin_headroom_db, 6.0);
         assert_eq!(lo.floor_smooth_radius, 2);
         assert_eq!(lo.fine_step_divisor, 192.0);
         let mid = EncoderTuning::from_quality(0.7).unwrap();
         assert_eq!(mid.fine_step_divisor, 192.0);
+        // The adaptive headroom stays zero through the cap knee, so
+        // the whole-stream encode at and below the default quality is
+        // untouched by the per-channel lever.
+        assert_eq!(mid.adaptive_margin_headroom_db, 0.0);
+        assert_eq!(
+            EncoderTuning::from_quality(0.75)
+                .unwrap()
+                .adaptive_margin_headroom_db,
+            0.0
+        );
         assert!((hi.fine_step_divisor - 768.0).abs() < 1e-3);
     }
 
@@ -353,6 +386,10 @@ mod tests {
                 assert!(
                     t.fine_step_divisor >= p.fine_step_divisor,
                     "fine ladder resolution never falls"
+                );
+                assert!(
+                    t.adaptive_margin_headroom_db >= p.adaptive_margin_headroom_db,
+                    "adaptive margin headroom never falls"
                 );
             }
             prev = Some(t);

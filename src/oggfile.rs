@@ -1142,12 +1142,76 @@ pub fn encode_pcm_to_ogg(
 /// layer. Container-agnostic consumers (the [`oxideav_core::Encoder`]
 /// implementation, external muxers) use this form.
 ///
+/// At the top of the quality knob
+/// ([`EncoderTuning::adaptive_margin_headroom_db`] `> 0`, i.e.
+/// `q > 0.75`) a multichannel encode is **fidelity-balanced** by
+/// measurement: the encoder own-decodes its first pass, and when a
+/// channel's measured SNR trails the best channel by more than 3 dB it
+/// re-encodes once with a deeper per-channel masking margin for
+/// exactly the trailing channels (up to the headroom, scaled by the
+/// deficit) — waveform coding where it measurably pays. The retry is
+/// kept only when the worst channel actually improves; otherwise the
+/// first pass stands. Mono streams and the knob at or below `q = 0.75`
+/// are untouched (single pass, byte-identical to the ungated encoder).
+///
 /// # Errors
 ///
 /// As [`encode_pcm_to_ogg`].
 pub fn encode_pcm_to_packets(
     pcm: &[Vec<f32>],
     config: &StreamEncoderConfig,
+) -> Result<EncodedVorbisStream, OggFileError> {
+    let tuning = EncoderTuning::from_quality(config.quality)?;
+    let first = encode_pcm_to_packets_margined(pcm, config, &[])?;
+    let headroom = tuning.adaptive_margin_headroom_db;
+    if headroom <= 0.0 || pcm.len() < 2 {
+        return Ok(first);
+    }
+    // Measure where the first pass actually lands per channel.
+    let snrs = decoded_per_channel_snr(&first, pcm)?;
+    let best = snrs
+        .iter()
+        .copied()
+        .filter(|s| s.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !best.is_finite() {
+        return Ok(first);
+    }
+    // A channel earns extra margin in proportion to its measured
+    // deficit against the best channel: nothing within 3 dB, the full
+    // headroom at 12 dB behind.
+    let extras: Vec<f32> = snrs
+        .iter()
+        .map(|&s| {
+            let deficit = (best - s) as f32;
+            headroom * ((deficit - 3.0) / 9.0).clamp(0.0, 1.0)
+        })
+        .collect();
+    if extras.iter().all(|&e| e <= 0.01) {
+        return Ok(first);
+    }
+    let retry = encode_pcm_to_packets_margined(pcm, config, &extras)?;
+    let retry_snrs = decoded_per_channel_snr(&retry, pcm)?;
+    let min_of = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    // Keep the retry only when the measured worst channel genuinely
+    // improves — "deepens only where waveform coding pays" is checked
+    // against the stream itself, not assumed.
+    Ok(if min_of(&retry_snrs) > min_of(&snrs) + 0.5 {
+        retry
+    } else {
+        first
+    })
+}
+
+/// The single-margin-set encode under [`encode_pcm_to_packets`]:
+/// `extra_margins[c]` (empty = all zero) deepens channel `c`'s masking
+/// margin past the tuning's global `threshold_offset_db`. Runs the
+/// top-band geometry race when the knob sits past the lattice fine
+/// ladder's coverage cap.
+fn encode_pcm_to_packets_margined(
+    pcm: &[Vec<f32>],
+    config: &StreamEncoderConfig,
+    extra_margins: &[f32],
 ) -> Result<EncodedVorbisStream, OggFileError> {
     let tuning = EncoderTuning::from_quality(config.quality)?;
     let past_cap = tuning.fine_resolution_scale() > LATTICE_FINE_COVERAGE_CAP * 1.0001;
@@ -1173,8 +1237,8 @@ pub fn encode_pcm_to_packets(
             (seam_tuning.fine_resolution_scale() - LATTICE_FINE_COVERAGE_CAP).abs() < 1e-3,
             "LATTICE_SEAM_QUALITY must sit exactly at the coverage cap"
         );
-        let scalar = encode_pcm_to_packets_geometry(pcm, config, &tuning, false)?;
-        let joint = encode_pcm_to_packets_geometry(pcm, config, &seam_tuning, true)?;
+        let scalar = encode_pcm_to_packets_geometry(pcm, config, &tuning, false, extra_margins)?;
+        let joint = encode_pcm_to_packets_geometry(pcm, config, &seam_tuning, true, extra_margins)?;
         let scalar_snr = decoded_stream_snr(&scalar, pcm)?;
         let joint_snr = decoded_stream_snr(&joint, pcm)?;
         let scalar_bytes: usize = scalar.audio.iter().map(|(p, _)| p.len()).sum();
@@ -1183,13 +1247,13 @@ pub fn encode_pcm_to_packets(
             scalar_snr > joint_snr || (scalar_snr == joint_snr && scalar_bytes <= joint_bytes);
         return Ok(if keep_scalar { scalar } else { joint });
     }
-    encode_pcm_to_packets_geometry(pcm, config, &tuning, config.vq_dims > 1)
+    encode_pcm_to_packets_geometry(pcm, config, &tuning, config.vq_dims > 1, extra_margins)
 }
 
-/// Own-decode a packet stream and report the whole-stream SNR (dB)
-/// against the input PCM (`10·log10(Σ signal² / Σ error²)` across all
-/// channels) — the top-band geometry selector's ground truth.
-fn decoded_stream_snr(stream: &EncodedVorbisStream, pcm: &[Vec<f32>]) -> Result<f64, OggFileError> {
+/// Own-decode a packet stream back to per-channel PCM rows — the
+/// measurement half of the encoder's self-checks (the top-band
+/// geometry selector and the adaptive-margin balance pass).
+fn own_decode_stream(stream: &EncodedVorbisStream) -> Result<Vec<Vec<f32>>, OggFileError> {
     let id = parse_identification_header(&stream.identification)
         .map_err(|e| OggFileError::Header(e.to_string()))?;
     let setup = parse_setup_header(&stream.setup, id.audio_channels)
@@ -1215,6 +1279,33 @@ fn decoded_stream_snr(stream: &EncodedVorbisStream, pcm: &[Vec<f32>]) -> Result<
             }
         }
     }
+    Ok(decoded)
+}
+
+/// `10·log10(Σ signal² / Σ error²)` between one reference row and its
+/// decode (over the overlapping prefix). `+inf` for a bit-exact (or
+/// all-zero) row.
+fn row_snr_db(reference: &[f32], out: &[f32]) -> f64 {
+    let n = reference.len().min(out.len());
+    let mut sig = 0.0f64;
+    let mut err = 0.0f64;
+    for (&r, &d) in reference[..n].iter().zip(&out[..n]) {
+        sig += f64::from(r) * f64::from(r);
+        let e = f64::from(r) - f64::from(d);
+        err += e * e;
+    }
+    if err == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (sig / err).log10()
+    }
+}
+
+/// Own-decode a packet stream and report the whole-stream SNR (dB)
+/// against the input PCM (`10·log10(Σ signal² / Σ error²)` across all
+/// channels) — the top-band geometry selector's ground truth.
+fn decoded_stream_snr(stream: &EncodedVorbisStream, pcm: &[Vec<f32>]) -> Result<f64, OggFileError> {
+    let decoded = own_decode_stream(stream)?;
     let mut sig = 0.0f64;
     let mut err = 0.0f64;
     for (reference, out) in pcm.iter().zip(&decoded) {
@@ -1232,6 +1323,20 @@ fn decoded_stream_snr(stream: &EncodedVorbisStream, pcm: &[Vec<f32>]) -> Result<
     })
 }
 
+/// Per-channel variant of [`decoded_stream_snr`] — the adaptive-margin
+/// balance pass's measurement.
+fn decoded_per_channel_snr(
+    stream: &EncodedVorbisStream,
+    pcm: &[Vec<f32>],
+) -> Result<Vec<f64>, OggFileError> {
+    let decoded = own_decode_stream(stream)?;
+    Ok(pcm
+        .iter()
+        .zip(&decoded)
+        .map(|(reference, out)| row_snr_db(reference, out))
+        .collect())
+}
+
 /// The single-geometry encode under [`encode_pcm_to_packets`]:
 /// `joint_geometry` selects the corpus-designed 2-D lattice books
 /// (`true`) or the scalar ladders (`false`), and `tuning` carries the
@@ -1243,6 +1348,7 @@ fn encode_pcm_to_packets_geometry(
     config: &StreamEncoderConfig,
     tuning: &EncoderTuning,
     joint_geometry: bool,
+    extra_margins: &[f32],
 ) -> Result<EncodedVorbisStream, OggFileError> {
     // ---- validation ----
     if config.channels == 0 || pcm.len() != config.channels as usize {
@@ -1397,14 +1503,19 @@ fn encode_pcm_to_packets_geometry(
     // not define, so it uses the per-frame model — pre-echo control on
     // such a stream rests on the short blocks themselves, which is the
     // §1.3.2 mechanism for it.
-    let psy_config = PsyConfig {
-        threshold_offset_db: tuning.threshold_offset_db,
+    // A channel may carry an extra content-adaptive margin (the
+    // measured second-pass grant — see `encode_pcm_to_packets`); the
+    // common case is no extras and every channel sharing one config.
+    let psy_config_for = |c: usize| PsyConfig {
+        threshold_offset_db: tuning.threshold_offset_db
+            + extra_margins.get(c).copied().unwrap_or(0.0),
         ..PsyConfig::new(config.sample_rate)
     };
     let uniform_sizes = sizes.windows(2).all(|w| w[0] == w[1]);
     let mut maskings: Vec<Vec<MaskingAnalysis>> = vec![Vec::with_capacity(ch); frames];
     if uniform_sizes {
         for c in 0..ch {
+            let psy_config = psy_config_for(c);
             let mut temporal =
                 TemporalMasking::new(&TemporalMaskingConfig::new(sizes[0] / 2), &psy_config)?;
             let mut emitted = 0usize;
@@ -1420,8 +1531,8 @@ fn encode_pcm_to_packets_geometry(
         }
     } else {
         for (f, per_ch) in spectra.iter().enumerate() {
-            for x in per_ch {
-                maskings[f].push(compute_masking(x, &psy_config)?);
+            for (c, x) in per_ch.iter().enumerate() {
+                maskings[f].push(compute_masking(x, &psy_config_for(c))?);
             }
         }
     }
@@ -1445,6 +1556,7 @@ fn encode_pcm_to_packets_geometry(
         .collect();
     let frame_ps = |f: usize| partition_size_for((sizes[f] / 2) as u32) as usize;
     let frame_res_end = |f: usize| residue_ends[entry_of(f)];
+
     let mut envelopes = Vec::with_capacity(frames);
     let mut env_max: Vec<Vec<f32>> = (0..n_entries)
         .map(|e| vec![f32::MIN_POSITIVE; entry_half(e)])

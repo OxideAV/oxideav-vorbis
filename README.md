@@ -953,6 +953,23 @@ frame hop the temporal model does not define, so it uses the per-frame
 model (pre-echo control there rests on the short blocks themselves —
 the §1.3.2 mechanism).
 
+The **measured per-channel margin balance**
+(`EncoderTuning::adaptive_margin_headroom_db`, wired in
+`encode_pcm_to_packets`) closes the old stereo quiet-channel top end:
+past the +6 dB global margin cap's knee (`q > 0.75`) a multichannel
+encode own-decodes its first pass and, when a channel's measured SNR
+trails the best by more than 3 dB, re-encodes once granting a
+deficit-scaled share of up to +6 dB extra masking margin to exactly
+the trailing channels — keeping the retry only when the measured worst
+channel improves. The grant is measured rather than inferred: on the
+decorrelated stereo fixture the channels carry identical RMS and
+near-identical over-masked-energy and tonality figures while coding
+12 dB apart, so no cheap psy statistic identifies the trailing
+channel. Measured at `q = 1` there: min-channel 40.2 → 55.2 dB and the
+inter-channel gap 12.1 → 3.0 dB at 14.4 → 23.1 kB audio; `q ≤ 0.75`
+and mono stay single-pass and byte-identical
+(`tests/quiet_channel_margin.rs` pins both bands).
+
 ### Not yet supported / known gaps
 
 - **The psy tonality estimate is band-level spectral flatness** (no
@@ -987,14 +1004,6 @@ the §1.3.2 mechanism).
   lengths already price amplitude statistics inside one book; the
   per-band win must come from joint dimensionality, which is what
   the mid and deep band books do).
-- **The stereo quiet-channel top end trades against the +6 dB margin
-  cap.** The old uncapped margin (+12 dB at `q = 1`) pushed the psy
-  floor onto `|X|`, switching the encoder into waveform coding — on
-  the decorrelated stereo fixture that lifted the quiet channel's
-  `q = 1` SNR to ~56 dB at +37 % bytes; with the cap the min channel
-  reads ~31 dB (mean 43 dB, −30 % bytes vs the old encoder's top).
-  A per-channel (or content-adaptive) margin that deepens only where
-  waveform coding pays is the follow-up.
 
 ## Clean-room provenance
 
