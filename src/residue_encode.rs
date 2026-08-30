@@ -468,6 +468,59 @@ pub fn plan_partition_cascade_scored(
     residue_type: u16,
     partition_size: u32,
 ) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
+    plan_partition_cascade_impl(residual, stage_books, residue_type, partition_size, None)
+}
+
+/// [`plan_partition_cascade_scored`] under **per-element weights**
+/// (`weights.len() == partition_size`, each `≥ 0`): every VQ read is
+/// quantised with [`crate::vq::quantize_vector_weighted`] over the
+/// elements it covers, and the reported `error_sq` is the weighted
+/// squared error `Σ_k w_k · e_k²` of the residual the cascade
+/// leaves. With the weights the per-bin audibility factors
+/// (`(floor / threshold)²`), this is the masking-weighted selection
+/// the integrated encoder runs.
+///
+/// # Errors
+///
+/// As [`plan_partition_cascade_scored`], plus
+/// [`ResidueEncodeError::WeightLengthMismatch`] for a weight vector
+/// of the wrong length and [`ResidueEncodeError::BadWeight`] for a
+/// NaN / negative weight.
+pub fn plan_partition_cascade_scored_weighted(
+    residual: &[f32],
+    stage_books: &[Option<&VorbisCodebook>; 8],
+    residue_type: u16,
+    partition_size: u32,
+    weights: &[f64],
+) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
+    if weights.len() != partition_size as usize {
+        return Err(ResidueEncodeError::WeightLengthMismatch {
+            expected: partition_size as usize,
+            actual: weights.len(),
+        });
+    }
+    if let Some(p) = weights.iter().position(|v| !v.is_finite() || *v < 0.0) {
+        return Err(ResidueEncodeError::BadWeight {
+            partition: p,
+            value: weights[p],
+        });
+    }
+    plan_partition_cascade_impl(
+        residual,
+        stage_books,
+        residue_type,
+        partition_size,
+        Some(weights),
+    )
+}
+
+fn plan_partition_cascade_impl(
+    residual: &[f32],
+    stage_books: &[Option<&VorbisCodebook>; 8],
+    residue_type: u16,
+    partition_size: u32,
+    weights: Option<&[f64]>,
+) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
     if residue_type > 2 {
         return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
     }
@@ -518,9 +571,22 @@ pub fn plan_partition_cascade_scored(
                 target.push(v);
             }
 
-            // Quantise: pick the nearest codebook entry to the target.
-            let q = quantize_vector(book, &target)
-                .map_err(|source| ResidueEncodeError::Quantize { pass, read, source })?;
+            // Quantise: pick the nearest codebook entry to the target
+            // (under the elements' weights when supplied).
+            let q = match weights {
+                Some(w) => {
+                    let mut read_w = Vec::with_capacity(dims);
+                    for j in 0..dims {
+                        read_w.push(match gather_index(residue_type, read, j, step, dims, n) {
+                            Some(idx) => w[idx],
+                            None => 0.0,
+                        });
+                    }
+                    crate::vq::quantize_vector_weighted(book, &target, &read_w)
+                }
+                None => quantize_vector(book, &target),
+            }
+            .map_err(|source| ResidueEncodeError::Quantize { pass, read, source })?;
 
             // Subtract the chosen entry's reconstruction from the running
             // residual at the same positions, so the next stage refines
@@ -553,8 +619,8 @@ pub fn plan_partition_cascade_scored(
     // surplus tail elements are decoder-discarded, so they never appear in
     // `work` past `n` — `work` is length `n` throughout).
     let mut error_sq = 0.0f64;
-    for &w in &work {
-        error_sq += f64::from(w) * f64::from(w);
+    for (k, &w) in work.iter().enumerate() {
+        error_sq += f64::from(w) * f64::from(w) * weights.map_or(1.0, |ws| ws[k]);
     }
 
     Ok(ScoredPartitionCascade {
@@ -1054,6 +1120,53 @@ pub fn plan_vector_classifications_rd_weighted_biased(
     )
 }
 
+/// The **per-bin** masking-weighted rate-distortion classification
+/// chooser: like [`plan_vector_classifications_rd_weighted_biased`]
+/// but with one weight per *scalar* (`bin_weights.len() ==
+/// scalars.len()`) instead of one per partition. Each candidate
+/// cascade is planned with [`plan_partition_cascade_scored_weighted`]
+/// — every VQ read picks its entry under its own elements' weights —
+/// and the Lagrangian charges the resulting weighted error directly:
+/// `Σ_k w_k · e_k² + λ · (bits + bias[class])`. The returned
+/// [`PartitionClassChoice::error_sq`] is the *weighted* error.
+///
+/// # Errors
+///
+/// As [`plan_vector_classifications_rd_weighted_biased`], with the
+/// weight-length check against the scalar count.
+pub fn plan_vector_classifications_rd_bin_weighted(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    bin_weights: &[f64],
+    class_bit_bias: Option<&[f64]>,
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    if bin_weights.len() != scalars.len() {
+        return Err(ResidueEncodeError::WeightLengthMismatch {
+            expected: scalars.len(),
+            actual: bin_weights.len(),
+        });
+    }
+    if let Some(p) = bin_weights.iter().position(|v| !v.is_finite() || *v < 0.0) {
+        return Err(ResidueEncodeError::BadWeight {
+            partition: p,
+            value: bin_weights[p],
+        });
+    }
+    plan_vector_classifications_rd_core(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        None,
+        Some(bin_weights),
+        class_bit_bias,
+    )
+}
+
 /// Shared core of the unweighted and weighted rate-distortion
 /// classification choosers. `weights == None` charges every partition's
 /// distortion at factor `1.0` (the unweighted Lagrangian);
@@ -1065,6 +1178,29 @@ fn plan_vector_classifications_rd_impl(
     partition_size: u32,
     lambda: f64,
     weights: Option<&[f64]>,
+    class_bit_bias: Option<&[f64]>,
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    plan_vector_classifications_rd_core(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        weights,
+        None,
+        class_bit_bias,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_vector_classifications_rd_core(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    weights: Option<&[f64]>,
+    bin_weights: Option<&[f64]>,
     class_bit_bias: Option<&[f64]>,
 ) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
     if residue_type > 2 {
@@ -1126,12 +1262,21 @@ fn plan_vector_classifications_rd_impl(
         let mut best_cost = f64::INFINITY;
         let mut best_stages = usize::MAX;
         for (class, stage_books) in value_books.iter().enumerate() {
-            let scored = plan_partition_cascade_scored(
-                partition_scalars,
-                stage_books,
-                residue_type,
-                partition_size,
-            )?;
+            let scored = match bin_weights {
+                Some(bw) => plan_partition_cascade_scored_weighted(
+                    partition_scalars,
+                    stage_books,
+                    residue_type,
+                    partition_size,
+                    &bw[p * ps..(p + 1) * ps],
+                )?,
+                None => plan_partition_cascade_scored(
+                    partition_scalars,
+                    stage_books,
+                    residue_type,
+                    partition_size,
+                )?,
+            };
 
             // Lagrangian rate-distortion cost. `bit_cost` is exact bits;
             // `error_sq` is squared sample distortion (scaled by the

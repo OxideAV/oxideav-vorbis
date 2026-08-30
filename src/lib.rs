@@ -390,8 +390,8 @@ pub use packet_kind::{
 #[doc(hidden)]
 pub use psy::{
     ath_db, complex_spectrum, compute_masking, compute_masking_with_predictability,
-    plan_psy_floor_envelope, residue_partition_weights, unpredictability, Complex, MaskingAnalysis,
-    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
+    plan_psy_floor_envelope, residue_bin_weights, residue_partition_weights, unpredictability,
+    Complex, MaskingAnalysis, PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -402,15 +402,16 @@ pub use quality::{
 #[doc(hidden)]
 pub use residue::{ResidueDecoder, ResidueError};
 // internal — exposed for tests/fuzz; not part of the stable API
+pub use residue_encode::plan_partition_cascade_scored_weighted;
 #[doc(hidden)]
 pub use residue_encode::{
     plan_partition_cascade, plan_partition_cascade_scored, plan_vector_classifications,
-    plan_vector_classifications_rd, plan_vector_classifications_rd_weighted,
-    plan_vector_classifications_rd_weighted_biased, plan_vector_partition_entries,
-    plan_vector_residue, plan_vector_residue_rd, plan_vector_residue_rd_weighted,
-    plan_vector_residue_rd_weighted_biased, replay_partition_cascade, select_residue_config,
-    PartitionClassChoice, ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade,
-    ScoredVectorResidue, SelectedResidueConfig,
+    plan_vector_classifications_rd, plan_vector_classifications_rd_bin_weighted,
+    plan_vector_classifications_rd_weighted, plan_vector_classifications_rd_weighted_biased,
+    plan_vector_partition_entries, plan_vector_residue, plan_vector_residue_rd,
+    plan_vector_residue_rd_weighted, plan_vector_residue_rd_weighted_biased,
+    replay_partition_cascade, select_residue_config, PartitionClassChoice, ResidueConfigCandidate,
+    ResidueEncodeError, ScoredPartitionCascade, ScoredVectorResidue, SelectedResidueConfig,
 };
 // `VorbisSetupHeader` is named in the public `decode_packet` signature;
 // the rest of the `setup` re-exports are internal parsed-header types.
@@ -436,8 +437,8 @@ pub use synthesis::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use vq::{
-    quantize_vector, unpack_vector, QuantizeError as VqQuantizeError, QuantizedEntry,
-    UnpackError as VqUnpackError,
+    quantize_vector, quantize_vector_weighted, unpack_vector, QuantizeError as VqQuantizeError,
+    QuantizedEntry, UnpackError as VqUnpackError,
 };
 
 /// Crate-local error type for the in-progress clean-room rebuild.

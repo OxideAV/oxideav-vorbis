@@ -843,6 +843,56 @@ pub fn residue_partition_weights(
     Ok(weights)
 }
 
+/// The per-**bin** form of [`residue_partition_weights`]: one weight
+/// per bin of the `[begin, end)` residue window,
+/// `min((floor[k] / threshold[k])², 10⁴)` (a zero floor bin weighs
+/// zero). These drive the masking-weighted VQ selection
+/// ([`crate::residue_encode::plan_vector_classifications_rd_bin_weighted`]);
+/// their per-partition means are exactly
+/// [`residue_partition_weights`].
+///
+/// # Errors
+///
+/// [`PsyError::LengthMismatch`], [`PsyError::BadResidueWindow`]
+/// (an empty or out-of-range window), or [`PsyError::BadFloorValue`].
+pub fn residue_bin_weights(
+    floor: &[f32],
+    masking: &MaskingAnalysis,
+    begin: usize,
+    end: usize,
+) -> Result<Vec<f64>, PsyError> {
+    if floor.len() != masking.threshold.len() {
+        return Err(PsyError::LengthMismatch {
+            floor: floor.len(),
+            threshold: masking.threshold.len(),
+        });
+    }
+    if begin >= end || end > floor.len() {
+        return Err(PsyError::BadResidueWindow {
+            begin,
+            end,
+            len: floor.len(),
+        });
+    }
+    if let Some(off) = floor[begin..end]
+        .iter()
+        .position(|v| !v.is_finite() || *v < 0.0)
+    {
+        return Err(PsyError::BadFloorValue {
+            bin: begin + off,
+            value: floor[begin + off],
+        });
+    }
+    Ok(floor[begin..end]
+        .iter()
+        .zip(&masking.threshold[begin..end])
+        .map(|(&fl, &th)| {
+            let r = f64::from(fl) / f64::from(th);
+            (r * r).min(RATIO_SQ_CAP)
+        })
+        .collect())
+}
+
 /// The per-bin `(floor/threshold)²` ceiling
 /// [`residue_partition_weights`] applies: a 40 dB noise-to-mask excess.
 /// Beyond it a violation is perceptually saturated, and a single
@@ -1804,6 +1854,28 @@ mod tests {
             Err(PsyError::LengthMismatch {
                 floor: n / 2,
                 threshold: 10
+            })
+        );
+    }
+
+    #[test]
+    fn bin_weights_average_to_the_partition_weights() {
+        let threshold: Vec<f32> = (0..64).map(|k| 0.01 + 0.001 * k as f32).collect();
+        let m = masking_of(threshold);
+        let floor: Vec<f32> = (0..64).map(|k| 0.02 + 0.0005 * (k % 7) as f32).collect();
+        let bins = residue_bin_weights(&floor, &m, 0, 64).unwrap();
+        let parts = residue_partition_weights(&floor, &m, 0, 64, 16).unwrap();
+        assert_eq!(bins.len(), 64);
+        for (p, &pw) in parts.iter().enumerate() {
+            let mean = bins[p * 16..(p + 1) * 16].iter().sum::<f64>() / 16.0;
+            assert!((mean - pw).abs() < 1e-12, "partition {p}: {mean} vs {pw}");
+        }
+        assert_eq!(
+            residue_bin_weights(&floor, &m, 8, 8),
+            Err(PsyError::BadResidueWindow {
+                begin: 8,
+                end: 8,
+                len: 64
             })
         );
     }

@@ -487,6 +487,47 @@ pub fn quantize_vector(
     codebook: &VorbisCodebook,
     target: &[f32],
 ) -> Result<QuantizedEntry, QuantizeError> {
+    quantize_vector_impl(codebook, target, None)
+}
+
+/// [`quantize_vector`] under a **per-element weighted** squared
+/// distance: the entry minimising `Σ_j w_j · (t_j − v_j)²`, with
+/// `weights[j] ≥ 0` (a zero weight makes element `j` free). The
+/// returned `distance_sq` is the *weighted* distance. This is the
+/// masking-weighted selection the residue chooser runs: with each
+/// element's weight the perceptual audibility of error at that bin
+/// (`(floor / threshold)²`), the nearest entry is chosen for the
+/// error the listener would hear rather than the Euclidean one. On a
+/// dense full-grid lattice the per-dimension nearest level is
+/// unchanged by a positive weight (the distance separates per
+/// dimension), so the weighting acts through the sparse and general
+/// paths — the occupancy-trained books, where a pruned neighbourhood
+/// makes the joint choice a genuine trade between elements.
+///
+/// # Errors
+///
+/// As [`quantize_vector`], plus [`QuantizeError::TargetDimensionMismatch`]
+/// when `weights.len() != target.len()`.
+pub fn quantize_vector_weighted(
+    codebook: &VorbisCodebook,
+    target: &[f32],
+    weights: &[f64],
+) -> Result<QuantizedEntry, QuantizeError> {
+    if weights.len() != target.len() {
+        return Err(QuantizeError::TargetDimensionMismatch {
+            got: weights.len(),
+            expected: target.len(),
+        });
+    }
+    quantize_vector_impl(codebook, target, Some(weights))
+}
+
+fn quantize_vector_impl(
+    codebook: &VorbisCodebook,
+    target: &[f32],
+    weights: Option<&[f64]>,
+) -> Result<QuantizedEntry, QuantizeError> {
+    let weight = |j: usize| weights.map_or(1.0, |w| w[j]);
     if matches!(codebook.lookup, VqLookup::None) {
         return Err(QuantizeError::NoVectorForType0);
     }
@@ -543,14 +584,15 @@ pub fn quantize_vector(
             let mut stride: u32 = 1;
             let mut vector = Vec::with_capacity(dims);
             let mut distance_sq = 0.0f64;
-            for &t in target {
+            for (j, &t) in target.iter().enumerate() {
+                let wj = weight(j);
                 let mut best_m = 0usize;
                 let mut best_v = 0.0f32;
                 let mut best_d = f64::INFINITY;
                 for (m, &mult) in multiplicands.iter().enumerate() {
                     let v = (mult as f32) * *delta_value + *minimum_value + last;
                     let d = f64::from(t) - f64::from(v);
-                    let d = d * d;
+                    let d = d * d * wj;
                     // Strict `<` keeps the lowest level on an exact tie.
                     if d < best_d {
                         best_m = m;
@@ -598,14 +640,15 @@ pub fn quantize_vector(
                                // target component (ties to the lower level, which is the
                                // lower §3.2.1 digit and thus the lower entry index).
             let mut cands: Vec<Vec<(f64, u32, f32)>> = Vec::with_capacity(dims);
-            for &t in target {
+            for (j, &t) in target.iter().enumerate() {
+                let wj = weight(j);
                 let mut row: Vec<(f64, u32, f32)> = multiplicands
                     .iter()
                     .enumerate()
                     .map(|(m, &mult)| {
                         let v = (mult as f32) * *delta_value + *minimum_value + last;
                         let d = f64::from(t) - f64::from(v);
-                        (d * d, m as u32, v)
+                        (d * d * wj, m as u32, v)
                     })
                     .collect();
                 row.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -726,9 +769,9 @@ pub fn quantize_vector(
         // them, so a wide accumulator keeps the tie-break stable against
         // f32 rounding of near-equal candidates.
         let mut distance_sq = 0.0f64;
-        for (t, v) in target.iter().zip(vector.iter()) {
+        for (j, (t, v)) in target.iter().zip(vector.iter()).enumerate() {
             let d = f64::from(*t) - f64::from(*v);
-            distance_sq += d * d;
+            distance_sq += d * d * weight(j);
         }
 
         let replace = match &best {
@@ -1700,5 +1743,80 @@ mod tests {
             assert_eq!(q.entry, brute.entry, "target {t:?}");
             assert_eq!(q.distance_sq, brute.distance_sq, "target {t:?}");
         }
+    }
+
+    /// A 2-D, 3-level lookup-type-1 lattice over {−1, 0, 1}.
+    fn lattice_3x3_lookup() -> VqLookup {
+        VqLookup::Lattice {
+            minimum_value: -1.0,
+            delta_value: 1.0,
+            value_bits: 2,
+            sequence_p: false,
+            multiplicands: vec![0, 1, 2],
+        }
+    }
+
+    #[test]
+    fn weighted_quantiser_trades_elements_on_a_sparse_book() {
+        // A 2-D 3-level lattice {-1, 0, 1}² with the cells (0, 0),
+        // (1, 0) and (0, 1) pruned: the target (0.45, 0.45) is
+        // equidistant from (1, 1) and the axes' remaining cells; the
+        // weights decide which element's error matters.
+        let mut book = make_codebook_with_lengths(2, vec![1; 9], lattice_3x3_lookup());
+        // entry = m0 + 3·m1; level 1 is value 0.
+        for e in [4u32, 5, 7] {
+            book.codeword_lengths[e as usize] = UNUSED_ENTRY;
+        }
+        let target = [0.45f32, 0.45];
+        let plain = quantize_vector(&book, &target).unwrap();
+        // Unweighted: (1, 1) at distance 2·0.55² = 0.605 beats
+        // (−1, 1) / (1, −1) at 0.55² + 1.45²; ties are impossible here.
+        assert_eq!(plain.vector, vec![1.0, 1.0]);
+        // Heavily weighting element 0 makes its 0.55 error expensive:
+        // the entry (0, −1) — element 0 at level 0 (error 0.45), element
+        // 1 at −1 (error 1.45) — now beats (1, 1): 100·0.45² + 1.45²
+        // = 22.35 against 100·0.55² + 0.55² = 30.55. The joint choice
+        // traded the free element's error for the expensive one's.
+        let w = quantize_vector_weighted(&book, &target, &[100.0, 1.0]).unwrap();
+        assert_eq!(w.vector, vec![0.0, -1.0], "got {w:?}");
+        assert!((w.distance_sq - (100.0 * 0.45f64 * 0.45 + 1.45 * 1.45)).abs() < 1e-4);
+        // A zero weight frees an element: with element 1 free, the
+        // cheapest used entry for element 0 alone is level 0 (error
+        // 0.45) — and the distance counts only element 0.
+        let free = quantize_vector_weighted(&book, &target, &[1.0, 0.0]).unwrap();
+        assert_eq!(free.vector[0], 0.0);
+        assert!((free.distance_sq - 0.45f64 * 0.45).abs() < 1e-4);
+        assert_eq!(
+            quantize_vector_weighted(&book, &target, &[1.0]),
+            Err(QuantizeError::TargetDimensionMismatch {
+                got: 1,
+                expected: 2
+            })
+        );
+    }
+
+    #[test]
+    fn weighted_quantiser_matches_the_general_scan_on_a_dense_book() {
+        let book = make_codebook_with_lengths(2, vec![2; 9], lattice_3x3_lookup());
+        let target = [0.3f32, -0.8];
+        let weights = [2.5f64, 0.5];
+        let fast = quantize_vector_weighted(&book, &target, &weights).unwrap();
+        // Brute force over every entry.
+        let mut best: Option<(f64, u32)> = None;
+        for e in 0..9u32 {
+            let v = unpack_vector(&book, e).unwrap();
+            let d: f64 = target
+                .iter()
+                .zip(&v)
+                .zip(&weights)
+                .map(|((&t, &x), &w)| (f64::from(t) - f64::from(x)).powi(2) * w)
+                .sum();
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, e));
+            }
+        }
+        let (bd, be) = best.unwrap();
+        assert_eq!(fast.entry, be);
+        assert!((fast.distance_sq - bd).abs() < 1e-9);
     }
 }

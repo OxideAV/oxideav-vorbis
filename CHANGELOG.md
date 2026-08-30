@@ -6,6 +6,21 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **Masking-weighted VQ selection** (`vq::quantize_vector_weighted`,
+  `residue_encode::plan_partition_cascade_scored_weighted`,
+  `plan_vector_classifications_rd_bin_weighted`,
+  `psy::residue_bin_weights`): the residue chooser now carries one
+  audibility weight per *bin* (`(floor / threshold)²`, capped) rather
+  than one per partition, every VQ read picks its entry under its
+  own elements' weights (`Σ w_j · (t_j − v_j)²`; on the
+  occupancy-trained sparse books the joint choice genuinely trades
+  the free elements' error for the audible ones'), and the
+  Lagrangian charges the weighted error directly. The per-partition
+  weights (the bin weights' means) still drive the closed-loop
+  trainer. Measured: the decorrelated stereo fixture 28.2 → 33.9 dB
+  at `q = 0.3` (+2 % bytes), stereo-cbr 28.1 → 34.4 dB at `q = 0.3`
+  and 42.0 → 45.3 dB at `q = 0.5`; pure tones −13 % bytes and the
+  mid + side pair −5 % bytes at unchanged SNR; nothing measured worse.
 - **Phase-predictability tonality** (`psy::complex_spectrum`,
   `psy::unpredictability`, `compute_masking_with_predictability`,
   `TemporalMasking::push_frame_with_predictability`): each band's

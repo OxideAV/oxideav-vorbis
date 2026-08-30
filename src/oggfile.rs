@@ -62,11 +62,11 @@ use crate::packet::AudioPacketHeader;
 use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
 use crate::psy::{
     complex_spectrum, compute_masking_with_predictability, plan_psy_floor_envelope,
-    residue_partition_weights, unpredictability, Complex, MaskingAnalysis, PsyConfig, PsyError,
-    TemporalMasking, TemporalMaskingConfig,
+    residue_bin_weights, residue_partition_weights, unpredictability, Complex, MaskingAnalysis,
+    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 use crate::quality::{EncoderTuning, QualityError};
-use crate::residue_encode::{plan_vector_classifications_rd_weighted, ResidueEncodeError};
+use crate::residue_encode::{plan_vector_classifications_rd_bin_weighted, ResidueEncodeError};
 use crate::setup::{
     parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader,
     MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
@@ -1713,12 +1713,17 @@ fn encode_pcm_to_packets_geometry(
     let mut floor_ys: Vec<Vec<Vec<u32>>> = Vec::with_capacity(frames);
     let mut targets: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames);
     let mut weights: Vec<Vec<Vec<f64>>> = Vec::with_capacity(frames);
+    // Per-bin audibility weights for the masking-weighted VQ
+    // selection (the per-partition rows above are their means: the
+    // trainer and the band-adoption tallies work per partition).
+    let mut bin_weights: Vec<Vec<Vec<f64>>> = Vec::with_capacity(frames);
     for f in 0..frames {
         let e = entry_of(f);
         let half = sizes[f] / 2;
         let mut y_row = Vec::with_capacity(ch);
         let mut t_row = Vec::with_capacity(ch);
         let mut w_row = Vec::with_capacity(ch);
+        let mut bw_row = Vec::with_capacity(ch);
         for c in 0..ch {
             let (floor1_y, rendered) = fit_covering_floor(
                 &envelopes[f][c],
@@ -1742,13 +1747,16 @@ fn encode_pcm_to_packets_geometry(
                 frame_res_end(f),
                 partition_size_for(half as u32),
             )?;
+            let bw = residue_bin_weights(&rendered, &maskings[f][c], 0, frame_res_end(f))?;
             y_row.push(floor1_y);
             t_row.push(target);
             w_row.push(w);
+            bw_row.push(bw);
         }
         floor_ys.push(y_row);
         targets.push(t_row);
         weights.push(w_row);
+        bin_weights.push(bw_row);
     }
 
     // ---- §4.3.5 channel coupling (gated per adjacent pair) ----
@@ -1788,20 +1796,29 @@ fn encode_pcm_to_packets_geometry(
         Vec::new()
     };
     if !coupling_steps.is_empty() {
-        for (t_row, w_row) in targets.iter_mut().zip(weights.iter_mut()) {
+        for ((t_row, w_row), bw_row) in targets
+            .iter_mut()
+            .zip(weights.iter_mut())
+            .zip(bin_weights.iter_mut())
+        {
             forward_couple_all(t_row, &coupling_steps)
                 .expect("coupling steps are constructed in range with distinct channels");
-            // Merge each coupled pair's per-partition NMR weights to
-            // the element-wise max: quantisation error in either
-            // coupled vector spreads into both output channels through
-            // the inverse coupling, so the more sensitive channel's
-            // audibility bound must govern both.
+            // Merge each coupled pair's NMR weights (per partition and
+            // per bin) to the element-wise max: quantisation error in
+            // either coupled vector spreads into both output channels
+            // through the inverse coupling, so the more sensitive
+            // channel's audibility bound must govern both.
             for step in &coupling_steps {
                 let (mag, ang) = (step.magnitude_channel as usize, step.angle_channel as usize);
                 for p in 0..w_row[mag].len() {
                     let w = w_row[mag][p].max(w_row[ang][p]);
                     w_row[mag][p] = w;
                     w_row[ang][p] = w;
+                }
+                for k in 0..bw_row[mag].len() {
+                    let w = bw_row[mag][k].max(bw_row[ang][k]);
+                    bw_row[mag][k] = w;
+                    bw_row[ang][k] = w;
                 }
             }
         }
@@ -2371,31 +2388,23 @@ fn encode_pcm_to_packets_geometry(
                 let end = frame_res_end(f);
                 let mut plans = Vec::with_capacity(ch);
                 for c in 0..ch {
-                    let choices = match bias {
-                        Some(bias) => {
-                            crate::residue_encode::plan_vector_classifications_rd_weighted_biased(
-                                &targets[f][c][..end],
-                                &value_rows,
-                                1,
-                                frame_ps(f) as u32,
-                                tuning.lambda,
-                                &weights[f][c],
-                                bias,
-                            )?
-                        }
-                        None => plan_vector_classifications_rd_weighted(
-                            &targets[f][c][..end],
-                            &value_rows,
-                            1,
-                            frame_ps(f) as u32,
-                            tuning.lambda,
-                            &weights[f][c],
-                        )?,
-                    };
+                    // The per-bin masking-weighted chooser: every VQ
+                    // read is selected under its own elements'
+                    // audibility weights and the Lagrangian charges the
+                    // weighted error directly.
+                    let choices = plan_vector_classifications_rd_bin_weighted(
+                        &targets[f][c][..end],
+                        &value_rows,
+                        1,
+                        frame_ps(f) as u32,
+                        tuning.lambda,
+                        &bin_weights[f][c],
+                        bias,
+                    )?;
                     let mut classifications = Vec::with_capacity(choices.len());
                     let mut partition_entries = Vec::with_capacity(choices.len());
-                    for (p, choice) in choices.into_iter().enumerate() {
-                        weighted_error += weights[f][c][p] * choice.error_sq;
+                    for choice in choices {
+                        weighted_error += choice.error_sq;
                         classifications.push(choice.classification);
                         partition_entries.push(choice.entries);
                     }
