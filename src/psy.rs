@@ -208,16 +208,49 @@ impl std::error::Error for PsyError {}
 ///
 /// The curve is high at very low frequencies, dips to its minimum in
 /// the 3–4 kHz region (where hearing is most sensitive), and rises
-/// steeply above ~10 kHz. The evaluation clamps `f` to at least 20 Hz
-/// (the nominal lower edge of hearing; below it the power term
-/// diverges) and the result into `[-30, 120]` dB so extreme bins stay
-/// finite and orderable.
+/// steeply above ~10 kHz. The evaluation clamps `f` to at least
+/// [`ATH_LOW_EDGE_HZ`] and the result into `[-30, ATH_CAP_DB]` dB so
+/// extreme bins stay finite and orderable. Both clamps are
+/// calibrations, not conveniences:
+///
+/// * the lowest transform bins are not sub-audio tones — bin 0 of a
+///   2048-point transform is centred at 11 Hz but carries the block's
+///   DC and the leakage of everything below ~40 Hz. Evaluating the
+///   curve at its 20 Hz edge (83 dB) called every bass component
+///   under −16 dBFS in those bins inaudible and the residue dropped
+///   them, measured as a 10–20 dB deficit in the 0–250 Hz band on
+///   every bass-carrying signal; the 50 Hz evaluation point (40 dB)
+///   keeps the model's rise toward the low edge without throwing the
+///   bass away;
+/// * the analytic `f⁴` term overshoots the measured threshold past
+///   ~15 kHz (it reads 105 dB at 18 kHz and 160 dB at 20 kHz, where
+///   hearing data for young listeners sits around 70–80 dB), and an
+///   uncapped curve declared the whole 15–20 kHz octave inaudible at
+///   any level program material can carry — measured on the
+///   white-noise battery as the entire band above 12 kHz coded as
+///   silence.
 #[must_use]
 pub fn ath_db(f_hz: f32) -> f32 {
-    let f = (f_hz.max(20.0)) / 1000.0; // kHz, clamped away from 0
+    let f = (f_hz.max(ATH_LOW_EDGE_HZ)) / 1000.0; // kHz, clamped away from 0
     let v = 3.64 * f.powf(-0.8) - 6.5 * (-0.6 * (f - 3.3) * (f - 3.3)).exp() + 1.0e-3 * f.powi(4);
-    v.clamp(-30.0, 120.0)
+    v.clamp(-30.0, ATH_CAP_DB)
 }
+
+/// The ceiling on [`ath_db`] (dB SPL): the analytic curve's `f⁴` rise
+/// is held at the level hearing data puts the 18–20 kHz threshold at.
+pub const ATH_CAP_DB: f32 = 70.0;
+
+/// The lowest frequency [`ath_db`] evaluates its curve at (Hz); bins
+/// centred below it take this value (see the function docs).
+pub const ATH_LOW_EDGE_HZ: f32 = 50.0;
+
+/// The widest analysis band, in bins. The §6.2.3 Bark bands are
+/// sub-divided so no band spans more bins than this: the top Bark
+/// bands cover kilohertz each (Bark 24 is 15.5–20 kHz), and one
+/// tonality / energy figure over hundreds of bins would smear a
+/// narrow-band masker across the whole octave and evaluate the
+/// threshold in quiet a full octave from the bin it floors.
+pub const MAX_BAND_BINS: usize = 32;
 
 /// Masking spread slopes across the Bark axis, dB per Bark: the decay
 /// of a masker's influence toward **lower** frequencies (steep) and
@@ -231,9 +264,167 @@ fn tonal_offset_db(z: f32) -> f32 {
     14.5 + z
 }
 
-/// The noise-masker offset: a noise band masks a tone 5.5 dB below its
-/// own level.
-const NOISE_OFFSET_DB: f32 = 5.5;
+/// The noise-masker offset: a fully noise-like band's masking
+/// threshold sits this many dB below the band's own energy level.
+///
+/// The textbook noise-masking-tone figure is ~5.5 dB, but that is the
+/// threshold for detecting a *tone* under a noise masker. What the
+/// encoder shelters under this offset is its own reconstruction
+/// error — noise-on-noise, where detection is a partial-loudness /
+/// level-JND judgement and listeners resolve far smaller additions.
+/// At 5.5 dB the model let noisy channels code at single-digit SNR
+/// while their tonal siblings saturated (measured 24.9 dB vs 47.8 dB
+/// on the decorrelated stereo corpus at mid quality — the r451
+/// "quiet channel" gap was largely *this*); 18 dB closes that to
+/// 33.6 dB vs 48.1 dB for +4 % audio bytes and leaves every tonal
+/// corpus unchanged. Chosen by measurement over {5.5, 12, 18} against
+/// an equal-rate black-box reference across the staged fixtures and
+/// the synthetic battery.
+const NOISE_OFFSET_DB: f32 = 18.0;
+
+/// A tiny energy floor keeps the geometric mean defined for zero
+/// bins; it is far below any audible level at every calibration.
+const ENERGY_FLOOR: f64 = 1.0e-30;
+
+/// The analysis-band layout of one spectrum: the §6.2.3 Bark bands
+/// (bin `k`'s centre frequency is `(k + ½) · rate / n`), each
+/// sub-divided into contiguous runs of at most [`MAX_BAND_BINS`] bins.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BandLayout {
+    /// Per-bin analysis-band index.
+    pub bin_band: Vec<usize>,
+    /// Per-band `(first, last)` bin (inclusive).
+    pub band_bins: Vec<(usize, usize)>,
+    /// Per-band centre on the Bark axis.
+    pub band_center: Vec<f32>,
+    /// Per-bin centre frequency in Hz.
+    pub bin_freq: Vec<f32>,
+}
+
+impl BandLayout {
+    pub(crate) fn new(n_half: usize, sample_rate: u32) -> Self {
+        let rate = sample_rate as f32;
+        let bin_freq: Vec<f32> = (0..n_half)
+            .map(|k| (k as f32 + 0.5) * rate / (2.0 * n_half as f32))
+            .collect();
+        // Bark buckets first (a bucket is a contiguous bin run since
+        // the Bark map is monotone), then each bucket is split into
+        // ceil(len / MAX_BAND_BINS) near-equal runs.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut k = 0;
+        while k < n_half {
+            let z = bark(bin_freq[k]).max(0.0) as usize;
+            let mut end = k;
+            while end + 1 < n_half && bark(bin_freq[end + 1]).max(0.0) as usize == z {
+                end += 1;
+            }
+            let len = end - k + 1;
+            let parts = len.div_ceil(MAX_BAND_BINS);
+            let mut start = k;
+            for p in 0..parts {
+                let stop = k + (len * (p + 1)) / parts; // exclusive
+                runs.push((start, stop - 1));
+                start = stop;
+            }
+            k = end + 1;
+        }
+        let mut bin_band = vec![0usize; n_half];
+        let mut band_center = Vec::with_capacity(runs.len());
+        for (b, &(first, last)) in runs.iter().enumerate() {
+            for slot in &mut bin_band[first..=last] {
+                *slot = b;
+            }
+            band_center.push((bark(bin_freq[first]) + bark(bin_freq[last])) * 0.5);
+        }
+        BandLayout {
+            bin_band,
+            band_bins: runs,
+            band_center,
+            bin_freq,
+        }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.band_bins.len()
+    }
+
+    /// The bin count of band `b`.
+    pub(crate) fn width(&self, b: usize) -> usize {
+        let (first, last) = self.band_bins[b];
+        last - first + 1
+    }
+}
+
+/// Steps 3–4 of the model over an already-banded spectrum: reduce
+/// each band to one masker (its energy level less the tonality-
+/// interpolated offset), spread every masker to each bin's own Bark
+/// coordinate, max-combine, floor by the threshold in quiet, and
+/// convert the resulting **band-level** allowed-noise energy into a
+/// per-bin amplitude.
+///
+/// The band-vs-bin scale is the model's essential calibration: a
+/// masker's level is its band's *summed* energy, so the masked
+/// threshold it yields is likewise the total noise energy the masked
+/// band may carry — spread evenly over that band's bins. (Comparing
+/// the summed-energy threshold against single-bin levels declared
+/// every noise band masked by itself: a 100-bin band's own energy sits
+/// 20 dB above each of its bins.) The threshold in quiet is a
+/// tone-level figure, so the same band-to-bin split applies to it.
+fn threshold_from_bands(
+    layout: &BandLayout,
+    energy: &[f64],
+    band_tonality: &[f32],
+    config: &PsyConfig,
+) -> Vec<f32> {
+    let bands = layout.count();
+    // Band levels in dB (amplitude-calibrated: full-scale line =
+    // full_scale_db), reduced to one masker each: (centre bark, dB).
+    let mut maskers: Vec<(f32, f32)> = Vec::with_capacity(bands);
+    for b in 0..bands {
+        if energy[b] <= ENERGY_FLOOR * layout.width(b) as f64 {
+            continue;
+        }
+        let level_db = config.full_scale_db + 10.0 * energy[b].log10() as f32;
+        let alpha = band_tonality[b];
+        let offset =
+            alpha * tonal_offset_db(layout.band_center[b]) + (1.0 - alpha) * NOISE_OFFSET_DB;
+        maskers.push((layout.band_center[b], level_db - offset));
+    }
+
+    // Per-bin threshold: spread each masker to the bin's own
+    // (continuous) Bark coordinate, max-combine, floor by the
+    // threshold in quiet. Evaluating the spread at the bin — not at
+    // its band's centre — keeps the masking skirts continuous across
+    // band edges, so a bin just outside a loud masker's band still
+    // sees the skirt rather than a box-edge cliff.
+    let n_half = layout.bin_band.len();
+    let mut threshold = Vec::with_capacity(n_half);
+    for k in 0..n_half {
+        let zk = bark(layout.bin_freq[k]).max(0.0);
+        let mut masked = f32::NEG_INFINITY;
+        for &(zc, masker) in &maskers {
+            let dz = zk - zc;
+            let spread = if dz >= 0.0 {
+                -SPREAD_UP_DB_PER_BARK * dz
+            } else {
+                SPREAD_DOWN_DB_PER_BARK * dz
+            };
+            let contrib = masker + spread;
+            if contrib > masked {
+                masked = contrib;
+            }
+        }
+        let quiet = ath_db(layout.bin_freq[k]);
+        let band_db = masked.max(quiet) - config.threshold_offset_db;
+        // Band-level dB SPL → the bin's share of the allowed noise
+        // energy → linear amplitude under the full-scale calibration.
+        let share = layout.width(layout.bin_band[k]) as f32;
+        let amp = 10.0f32.powf((band_db - config.full_scale_db) / 20.0) / share.sqrt();
+        // Keep the threshold strictly positive and finite.
+        threshold.push(amp.max(f32::MIN_POSITIVE));
+    }
+    threshold
+}
 
 /// Compute the per-bin masking threshold for one analysis frame.
 ///
@@ -266,43 +457,29 @@ pub fn compute_masking(spectrum: &[f32], config: &PsyConfig) -> Result<MaskingAn
     }
 
     let n_half = spectrum.len();
-    let rate = config.sample_rate as f32;
-    // Bin k's centre frequency: the MDCT of a length-n block yields
-    // n/2 bins spanning [0, rate/2); bin k sits at (k + ½) · rate / n.
-    let bin_freq = |k: usize| (k as f32 + 0.5) * rate / (2.0 * n_half as f32);
-
-    // ---- 1. Critical-band grouping (1-Bark bands). ----
-    let mut bin_band = Vec::with_capacity(n_half);
-    for k in 0..n_half {
-        let z = bark(bin_freq(k)).max(0.0);
-        bin_band.push(z as usize);
-    }
-    let bands = bin_band.last().copied().unwrap_or(0) + 1;
+    let layout = BandLayout::new(n_half, config.sample_rate);
+    let bands = layout.count();
 
     // Band energy + flatness accumulators over bin energies.
     let mut energy = vec![0.0f64; bands];
     let mut log_sum = vec![0.0f64; bands];
-    let mut count = vec![0usize; bands];
-    // A tiny energy floor keeps the geometric mean defined for zero
-    // bins; it is far below any audible level at every calibration.
-    const ENERGY_FLOOR: f64 = 1.0e-30;
     for (k, &x) in spectrum.iter().enumerate() {
         let e = (f64::from(x) * f64::from(x)).max(ENERGY_FLOOR);
-        let b = bin_band[k];
+        let b = layout.bin_band[k];
         energy[b] += e;
         log_sum[b] += e.ln();
-        count[b] += 1;
     }
 
     // ---- 2. Per-band tonality from spectral flatness. ----
     let mut band_tonality = Vec::with_capacity(bands);
     for b in 0..bands {
-        if count[b] == 0 || energy[b] <= ENERGY_FLOOR * count[b] as f64 {
+        let count = layout.width(b);
+        if energy[b] <= ENERGY_FLOOR * count as f64 {
             band_tonality.push(0.0);
             continue;
         }
-        let arith = energy[b] / count[b] as f64;
-        let geo = (log_sum[b] / count[b] as f64).exp();
+        let arith = energy[b] / count as f64;
+        let geo = (log_sum[b] / count as f64).exp();
         // Flatness ∈ (0, 1]; in dB it is ≤ 0. −60 dB of flatness (or
         // below) is treated as fully tonal.
         let sfm_db = 10.0 * (geo / arith).log10();
@@ -310,71 +487,8 @@ pub fn compute_masking(spectrum: &[f32], config: &PsyConfig) -> Result<MaskingAn
         band_tonality.push(alpha as f32);
     }
 
-    // Band centre Bark values + band levels in dB (amplitude-calibrated:
-    // full-scale line = full_scale_db).
-    let mut band_center = vec![0.0f32; bands];
-    let mut band_bins = vec![(usize::MAX, 0usize); bands]; // (first, last)
-    for (k, &b) in bin_band.iter().enumerate() {
-        let (first, _) = band_bins[b];
-        if first == usize::MAX {
-            band_bins[b].0 = k;
-        }
-        band_bins[b].1 = k;
-    }
-    for b in 0..bands {
-        let (first, last) = band_bins[b];
-        band_center[b] = if first == usize::MAX {
-            b as f32 + 0.5
-        } else {
-            (bark(bin_freq(first)) + bark(bin_freq(last))) * 0.5
-        };
-    }
-    let band_level_db: Vec<f32> = energy
-        .iter()
-        .map(|&e| config.full_scale_db + 10.0 * (e.max(ENERGY_FLOOR)).log10() as f32)
-        .collect();
-
-    // ---- 3. Reduce each populated band to one masker. ----
-    let mut maskers: Vec<(f32, f32)> = Vec::with_capacity(bands); // (centre bark, masker dB)
-    for b in 0..bands {
-        if count[b] == 0 {
-            continue;
-        }
-        let alpha = band_tonality[b];
-        let offset = alpha * tonal_offset_db(band_center[b]) + (1.0 - alpha) * NOISE_OFFSET_DB;
-        maskers.push((band_center[b], band_level_db[b] - offset));
-    }
-
-    // ---- 4. Per-bin threshold: spread each masker to the bin's own
-    // (continuous) Bark coordinate, max-combine, floor by the
-    // threshold in quiet. Evaluating the spread at the bin — not at
-    // its band's centre — keeps the masking skirts continuous across
-    // band edges, so a bin just outside a loud masker's band still
-    // sees the skirt rather than a box-edge cliff.
-    let mut threshold = Vec::with_capacity(n_half);
-    for k in 0..n_half {
-        let zk = bark(bin_freq(k)).max(0.0);
-        let mut masked = f32::NEG_INFINITY;
-        for &(zc, masker) in &maskers {
-            let dz = zk - zc;
-            let spread = if dz >= 0.0 {
-                -SPREAD_UP_DB_PER_BARK * dz
-            } else {
-                SPREAD_DOWN_DB_PER_BARK * dz
-            };
-            let contrib = masker + spread;
-            if contrib > masked {
-                masked = contrib;
-            }
-        }
-        let quiet = ath_db(bin_freq(k));
-        let t_db = masked.max(quiet) - config.threshold_offset_db;
-        // dB SPL → linear amplitude under the full-scale calibration.
-        let amp = 10.0f32.powf((t_db - config.full_scale_db) / 20.0);
-        // Keep the threshold strictly positive and finite.
-        threshold.push(amp.max(f32::MIN_POSITIVE));
-    }
-
+    let threshold = threshold_from_bands(&layout, &energy, &band_tonality, config);
+    let bin_band = layout.bin_band;
     Ok(MaskingAnalysis {
         threshold,
         band_tonality,
@@ -830,7 +944,7 @@ mod tests {
         while f < 30_000.0 {
             let v = ath_db(f);
             assert!(v.is_finite());
-            assert!((-30.0..=120.0).contains(&v), "ath({f}) = {v}");
+            assert!((-30.0..=ATH_CAP_DB).contains(&v), "ath({f}) = {v}");
             f *= 1.3;
         }
     }
@@ -839,15 +953,18 @@ mod tests {
 
     #[test]
     fn silence_reduces_to_threshold_in_quiet() {
-        // A silent frame's threshold must be exactly the per-bin ATH
-        // (no masker anywhere) — strictly positive everywhere.
+        // A silent frame's threshold must be exactly the ATH (no
+        // masker anywhere) — a band-level figure, so each bin carries
+        // its band's share of the quiet-threshold energy — strictly
+        // positive everywhere.
         let n = 256;
         let s = vec![0.0f32; n];
         let m = compute_masking(&s, &cfg()).unwrap();
         assert_eq!(m.threshold.len(), n);
         for (k, &t) in m.threshold.iter().enumerate() {
             assert!(t > 0.0, "bin {k}");
-            let quiet = 10.0f32.powf((ath_db(freq(k, n)) - 96.0) / 20.0);
+            let width = m.bin_band.iter().filter(|&&b| b == m.bin_band[k]).count() as f32;
+            let quiet = 10.0f32.powf((ath_db(freq(k, n)) - 96.0) / 20.0) / width.sqrt();
             // The silent band levels sit ~200+ dB below the ATH, so
             // the max() must have picked the quiet curve exactly.
             assert!(

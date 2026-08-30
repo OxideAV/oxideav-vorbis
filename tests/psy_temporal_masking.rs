@@ -332,9 +332,15 @@ fn temporal_masking_cuts_rate_at_equal_transparency_on_a_transient_corpus() {
     );
     // The saving comes from post-masked detail, not a collapse: even
     // judged by the (stricter) per-frame model, the temporal encode's
-    // noise stays within a bounded factor of the threshold.
+    // noise stays within a bounded factor of the threshold. (The
+    // bound is a mean *squared* ratio; under the r453 band-share
+    // thresholds — each bin carries its band's share of the allowed
+    // noise energy, so the per-frame threshold on this corpus sits
+    // lower than the old per-bin figure — the measured value is ≈ 59,
+    // i.e. the post-masked frames' noise sits ~18 dB over the fresh
+    // threshold they no longer need to meet.)
     assert!(
-        nmr_temporal_vs_nominal < 30.0,
+        nmr_temporal_vs_nominal < 100.0,
         "temporal encode must stay bounded under the nominal model: {nmr_temporal_vs_nominal}"
     );
 }

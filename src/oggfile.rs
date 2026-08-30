@@ -98,34 +98,10 @@ fn partition_size_for(half_n: u32) -> u32 {
     }
 }
 
-/// The §8.6.1 residue bandpass cutoff: spectral bins at and above this
-/// frequency are left uncoded (`residue_end` caps the coded band; the
-/// §8.6.2 decode zeroes every bin past it). The bound is the crate's
-/// own psychoacoustic model: the analytic threshold-in-quiet the `psy`
-/// module carries rises as `10⁻³·(f/kHz)⁴` dB at the top of the
-/// audio band — ≥ 160 dB at 20 kHz, far above any program material
-/// full-scale can represent — so residue spent past 20 kHz can never
-/// be audible. Streams whose Nyquist sits at or below the cutoff are
-/// uncapped, and the cap is rounded **up** to a partition boundary so
-/// no bin under the cutoff is ever cut. (At 44.1 kHz and `half_n =
-/// 1024` this lands on `residue_end = 960` — the same coded-band cap
-/// the staged reference streams carry.)
-const RESIDUE_CUTOFF_HZ: f64 = 20_000.0;
-
-/// §8.6.1 `[residue_end]` for a spectrum of `half_n` bins at
-/// `sample_rate`: the first partition boundary at or above
-/// [`RESIDUE_CUTOFF_HZ`] (bin `k` covers frequencies near
-/// `k · (sample_rate / 2) / half_n`), capped at `half_n`.
-fn residue_end_for(half_n: u32, sample_rate: u32, partition_size: u32) -> u32 {
-    let nyquist = f64::from(sample_rate) / 2.0;
-    if nyquist <= RESIDUE_CUTOFF_HZ {
-        return half_n;
-    }
-    let bins = (f64::from(half_n) * RESIDUE_CUTOFF_HZ / nyquist).ceil() as u32;
-    bins.div_ceil(partition_size)
-        .saturating_mul(partition_size)
-        .min(half_n)
-}
+/// The quantile of the per-partition peak |target| distribution the
+/// residue ladders are spanned to (see the span selection in the
+/// geometry core).
+const LADDER_SPAN_QUANTILE: f64 = 0.999;
 
 /// The amplitude-band ladder gate: the **mid band** book is carried
 /// only when the median above-noise partition peak sits at or below
@@ -1001,6 +977,19 @@ impl ResidueLadder {
         self.books.push(row);
     }
 
+    /// Append one further band class whose pass 0 is `book` and whose
+    /// pass 1 is the base ladder's **fine** book (codebook 3): the
+    /// coarse + fine cascade over a different pass-0 grid.
+    fn push_cascaded_band_class(&mut self, book: VorbisCodebook) {
+        let index = (2 + self.value_books.len()) as u8;
+        self.value_books.push(book);
+        let mut row: [Option<u8>; 8] = Default::default();
+        row[0] = Some(index);
+        row[1] = Some(3);
+        self.cascade.push(0b11);
+        self.books.push(row);
+    }
+
     /// §8.6.1 `residue_classifications` this ladder declares.
     fn classifications(&self) -> u32 {
         self.cascade.len() as u32
@@ -1012,7 +1001,7 @@ impl ResidueLadder {
 /// size** (one entry when `blocksize_0 == blocksize_1`, two — short
 /// then long — when the stream switches), a floor, a residue carrying
 /// the ladder's classes with `residue_end` at that size's coded-band
-/// cap ([`residue_end_for`]), a mapping carrying the gated §4.3.5
+/// band over the whole spectrum, a mapping carrying the gated §4.3.5
 /// coupling steps under a single submap, and a mode (`blockflag`
 /// clear on the short entry, set on the long one).
 ///
@@ -1337,6 +1326,93 @@ fn decoded_per_channel_snr(
         .collect())
 }
 
+/// Fit one frame's floor-1 posts to `envelope` so the **rendered** curve
+/// covers it: the plain post fit ([`plan_floor1_envelope`]) samples the
+/// envelope at the post x-coordinates only, and between posts the
+/// dB-linear segment can run well under a spectral line the posts do
+/// not sit on — the post next to a masked-region neighbour rides the
+/// masking threshold, so the segment through the peak bin drops
+/// with the threshold. That undershoot is what set the residue
+/// ladders' span: measured on the tonal battery, a +1.2 dB threshold
+/// margin step scaled every residue target by 1.5× (the peak bins'
+/// `X / floor` blew up as their floor segment sank) and cost 5 dB of
+/// whole-stream SNR while spending *more* bits — a cliff in the
+/// quality knob. The covering fit re-renders after the sample fit
+/// and, wherever the envelope still exceeds the curve by more than
+/// [`FLOOR_COVER_TOLERANCE_DB`], lifts the two posts bounding that bin
+/// by the deficit (in §10.1 ladder steps), iterating to a fixed point
+/// (at most [`FLOOR_COVER_PASSES`] passes; the lifts are monotone, so
+/// the loop terminates at the post range if nothing else). Lifting a
+/// post can only shrink the residue targets on its segment, so the
+/// covered fit never widens the ladder and the quiet neighbours of a
+/// peak quantise toward zero a little more cheaply.
+///
+/// Returns the packed `floor1_y` posts and the rendered curve.
+fn fit_covering_floor(
+    envelope: &[f32],
+    header: &crate::setup::Floor1Header,
+    decoder: &Floor1Decoder,
+    half: usize,
+) -> Result<(Vec<u32>, Vec<f32>), OggFileError> {
+    let mut posts = plan_floor1_envelope(envelope, header)?;
+    let x_list = crate::floor1_encode::full_x_list(header);
+    // Posts in ascending-x order (the header's list is partition-tiled;
+    // `full_x_list` is endpoints first, then the header order).
+    let mut order: Vec<usize> = (0..x_list.len()).collect();
+    order.sort_by_key(|&i| x_list[i]);
+    let range = crate::floor1_envelope::floor1_post_range(header.multiplier) as i32;
+    let multiplier = header.multiplier as i32;
+    let mut floor1_y = plan_floor1_y(&posts, header)?;
+    let mut rendered = decoder.render_curve(&floor1_y, half);
+    let tolerance = 10.0f32.powf(FLOOR_COVER_TOLERANCE_DB / 20.0);
+    for _ in 0..FLOOR_COVER_PASSES {
+        let mut lifted = false;
+        for seg in order.windows(2) {
+            let (i0, i1) = (seg[0], seg[1]);
+            let x0 = x_list[i0] as usize;
+            let x1 = (x_list[i1] as usize).min(half);
+            if x0 >= x1 {
+                continue;
+            }
+            // The worst deficit on this segment, in §10.1 ladder steps
+            // of the post grid (a post step is `multiplier` ladder
+            // steps): the lift both bounding posts need.
+            let mut need = 0i32;
+            for x in x0..x1.min(envelope.len()) {
+                let env = envelope[x];
+                let cur = rendered[x];
+                if env > cur * tolerance && cur > 0.0 {
+                    let want = i32::from(crate::floor1_envelope::invert_inverse_db(env));
+                    let have = i32::from(crate::floor1_envelope::invert_inverse_db(cur));
+                    need = need.max((want - have + multiplier - 1) / multiplier);
+                }
+            }
+            if need > 0 {
+                for &i in &[i0, i1] {
+                    let lifted_post = (posts[i] + need).min(range - 1);
+                    if lifted_post != posts[i] {
+                        posts[i] = lifted_post;
+                        lifted = true;
+                    }
+                }
+            }
+        }
+        if !lifted {
+            break;
+        }
+        floor1_y = plan_floor1_y(&posts, header)?;
+        rendered = decoder.render_curve(&floor1_y, half);
+    }
+    Ok((floor1_y, rendered))
+}
+
+/// How far (dB) the rendered floor may sit under the envelope before
+/// the covering fit lifts the bounding posts.
+const FLOOR_COVER_TOLERANCE_DB: f32 = 0.5;
+
+/// Maximum lift-and-re-render passes of the covering floor fit.
+const FLOOR_COVER_PASSES: usize = 4;
+
 /// The single-geometry encode under [`encode_pcm_to_packets`]:
 /// `joint_geometry` selects the corpus-designed 2-D lattice books
 /// (`true`) or the scalar ladders (`false`), and `tuning` carries the
@@ -1543,14 +1619,18 @@ fn encode_pcm_to_packets_geometry(
     let n_entries = if switching { 2 } else { 1 };
     let entry_of = |f: usize| usize::from(switching && flags[f]);
     let entry_half = |e: usize| if e == 1 { n1 / 2 } else { n0 / 2 };
-    // The §8.6.1 coded-band cap per setup entry (residue_end_for), and
-    // the per-frame partition size / coded-band views derived from it.
-    let residue_ends: Vec<usize> = (0..n_entries)
-        .map(|e| {
-            let half = entry_half(e) as u32;
-            residue_end_for(half, config.sample_rate, partition_size_for(half)) as usize
-        })
-        .collect();
+    // §8.6.1 `[residue_end]` per setup entry: the whole spectrum. The
+    // old 20 kHz coded-band fence is gone — it was measured as a hard
+    // 12 dB SNR ceiling on wideband noise (6 % of a 44.1 kHz
+    // spectrum's bins sit above 20 kHz, and wideband-noise energy
+    // there is real signal energy the black-box reference encoder
+    // carries at the same rates: removing the fence alone took the
+    // white-noise battery from 12.0 dB to 32.2 dB at mid quality).
+    // What the fence saved is saved better by the rate-distortion
+    // chooser itself: partitions the masking model prices at or
+    // under the threshold in quiet go to the silence class for a
+    // couple of grouped-classword bits.
+    let residue_ends: Vec<usize> = (0..n_entries).map(entry_half).collect();
     let frame_ps = |f: usize| partition_size_for((sizes[f] / 2) as u32) as usize;
     let frame_res_end = |f: usize| residue_ends[entry_of(f)];
 
@@ -1608,9 +1688,12 @@ fn encode_pcm_to_packets_geometry(
         let mut t_row = Vec::with_capacity(ch);
         let mut w_row = Vec::with_capacity(ch);
         for c in 0..ch {
-            let posts = plan_floor1_envelope(&envelopes[f][c], &floor_headers[e])?;
-            let floor1_y = plan_floor1_y(&posts, &floor_headers[e])?;
-            let rendered = floor_decoders[e].render_curve(&floor1_y, half);
+            let (floor1_y, rendered) = fit_covering_floor(
+                &envelopes[f][c],
+                &floor_headers[e],
+                &floor_decoders[e],
+                half,
+            )?;
             let target: Vec<f32> = spectra[f][c]
                 .iter()
                 .zip(&rendered)
@@ -1698,17 +1781,53 @@ fn encode_pcm_to_packets_geometry(
     // of each §8.6 partition inside the coded band (bins past
     // `residue_end` are never coded, so a loud ultrasonic bin must not
     // widen any ladder).
+    // Angle channels are left out of the span statistics: the §4.3.5
+    // angle vector is the *difference* of two floor-normalised
+    // residues, so where a pair is anti-phase it reaches 2× the
+    // magnitude vector's range by construction (a side component the
+    // covering floor pins at exactly ±1 in each channel reads ±2 in
+    // the angle). Spanning the shared ladders to that doubles every
+    // step for every channel — measured as a 6 dB coupled-vs-dual-mono
+    // fidelity loss on a mid + side tone pair. Spanned to the
+    // magnitude / uncoupled vectors instead, an anti-phase angle
+    // partition clips against the coarse reach (`±1.33·span`, an error
+    // the rate-distortion chooser prices) while everything else keeps
+    // its grid.
+    let mut is_angle = vec![false; ch];
+    for step in &coupling_steps {
+        is_angle[step.angle_channel as usize] = true;
+    }
     let mut max_abs = 0.0f32;
     let mut partition_peaks: Vec<f32> = Vec::new();
+    let mut span_peaks: Vec<f32> = Vec::new();
     for (f, t_row) in targets.iter().enumerate() {
         let (end, ps) = (frame_res_end(f), frame_ps(f));
-        for target in t_row {
+        for (c, target) in t_row.iter().enumerate() {
             for part in target[..end].chunks_exact(ps) {
                 let peak = part.iter().fold(0.0f32, |m, &t| m.max(t.abs()));
                 partition_peaks.push(peak);
+                if !is_angle[c] {
+                    span_peaks.push(peak);
+                }
                 max_abs = max_abs.max(peak);
             }
         }
+    }
+    // The ladder span: a high quantile of the partition peaks, not
+    // the absolute maximum. A stream's very loudest targets are
+    // floor-fit undershoots (a spectral line the post budget could
+    // not pin between posts) — a handful of outliers up to 6× the
+    // 99.9th-percentile peak on the noise battery — and sizing every
+    // ladder to them coarsens every step in the stream. At the
+    // 99.9th percentile the rare outlier partition clips against the
+    // coarse book's reach (the rate-distortion chooser prices that
+    // clip like any other error) while every other partition is
+    // quantised on a materially finer grid: measured +1…+5 dB
+    // whole-stream at equal-or-lower rate across the staged corpus,
+    // no fixture worse.
+    if !span_peaks.is_empty() {
+        span_peaks.sort_unstable_by(f32::total_cmp);
+        max_abs = span_peaks[((span_peaks.len() - 1) as f64 * LADDER_SPAN_QUANTILE) as usize];
     }
     if max_abs <= 0.0 {
         max_abs = 1.0; // all-silent input: any positive ladder scale works
@@ -1774,7 +1893,7 @@ fn encode_pcm_to_packets_geometry(
     // on the *joint* grid-cell occupancy. Lookup type 1 is the widely
     // interoperable lookup form; a type-2 (per-entry-free) table is
     // spec-legal but rejected by common black-box decoders.
-    let (coarse, fine) = if joint_geometry {
+    let (coarse, fine, half_geometry) = if joint_geometry {
         let d = config.vq_dims as usize;
         // Design corpus: every coded partition's chunks (bins past
         // `residue_end` are never coded and must not shape the books).
@@ -1878,7 +1997,16 @@ fn encode_pcm_to_packets_geometry(
             .codebook;
             Ok((coarse, fine))
         };
-        design_pair(raw, max_abs)?
+        let (coarse, fine) = design_pair(raw, max_abs)?;
+        // The half-span tier's geometry (designed below, once the band
+        // designer exists): the coarse step and level count.
+        let half_geometry = config.residue_bands.then(|| {
+            (
+                crate::book_design::pack_nearest(8.0 * max_abs / (3.0 * lv as f32)),
+                lv,
+            )
+        });
+        (coarse, fine, half_geometry)
     } else {
         // The coarse span is fixed (it must reach the loudest residue
         // target); the fine step follows the quality knob — the top
@@ -1893,6 +2021,7 @@ fn encode_pcm_to_packets_geometry(
                 6,
                 crate::book_design::pack_nearest(max_abs / tuning.fine_step_divisor),
             ),
+            None,
         )
     };
     // ---- the joint band books (noise + optional mid tier) ----
@@ -1997,15 +2126,62 @@ fn encode_pcm_to_packets_geometry(
     // adopted only if the exact post-training serialisation cost
     // (setup table + classwords + value codewords) measures smaller
     // with it than without it — see the adoption loop below.
-    let mut band_candidates: Vec<VorbisCodebook> = Vec::new();
+    // `(book, cascaded)`: a single-pass band class, or (cascaded) the
+    // book as pass 0 with the base fine book as pass 1.
+    let mut band_candidates: Vec<(VorbisCodebook, bool)> = Vec::new();
     if let Some(book) = mid {
-        band_candidates.push(book);
+        band_candidates.push((book, false));
     }
     if let Some(book) = noise8 {
-        band_candidates.push(book);
+        band_candidates.push((book, false));
     }
     if let Some(book) = mid8 {
-        band_candidates.push(book);
+        band_candidates.push((book, false));
+    }
+    // The half-span tier: the coarse geometry (same dimensionality and
+    // level count) over half the span, so a partition whose peak fits
+    // inside `±0.66·span` is quantised on a grid twice as fine as the
+    // coarse book's for the same codeword alphabet. It fills the gap
+    // the two-stage cascade leaves between the coarse class (measured
+    // 17 dB at 3.4 bits/bin on white noise) and coarse + fine (43 dB
+    // at 7.9 bits/bin): with no intermediate operating point the
+    // rate-distortion chooser mixes the two and the low half of the
+    // knob lands a third of a noise stream's partitions at 17 dB. A
+    // candidate only — adopted below if it pays (measured +2.4 dB on
+    // the white-noise battery and +2.5 dB on correlated stereo at mid
+    // quality, measured out on the tonal corpora). Quarter- and
+    // eighth-span tiers were measured and rejected (never adopted).
+    if let Some((coarse_step, levels)) = half_geometry {
+        band_candidates.push((
+            design_band_book(
+                config.vq_dims,
+                levels,
+                crate::book_design::pack_nearest(coarse_step / 2.0),
+            )?,
+            false,
+        ));
+        // The wide cascade tier, offered on coupled streams: the
+        // coarse geometry over **twice** the span as pass 0, the base
+        // fine book as pass 1. The §4.3.5 angle vector reaches 2× the
+        // magnitude range where a pair is anti-phase (a side component
+        // pinned at ±1 by each channel's covering floor reads ±2 in
+        // the angle), and the ladders are spanned to the magnitude /
+        // uncoupled vectors so every other partition keeps its grid —
+        // this class is where the anti-phase angle partitions go at
+        // full fine resolution instead of clipping against the coarse
+        // reach. (The wide book's step is twice the coarse step, so
+        // its leftover fits exactly inside the fine ladder's
+        // ±coarse-step span.) Adoption keeps it only if it pays.
+        if !coupling_steps.is_empty() {
+            band_candidates.push((
+                design_band_book(
+                    config.vq_dims,
+                    levels,
+                    crate::book_design::pack_nearest(coarse_step * 2.0),
+                )?,
+                true,
+            ));
+        }
     }
     let classifications = 4 + band_candidates.len() as u32;
     let half_ns: Vec<u32> = (0..n_entries).map(|e| entry_half(e) as u32).collect();
@@ -2013,11 +2189,15 @@ fn encode_pcm_to_packets_geometry(
     let build = |coarse: &VorbisCodebook,
                  fine: &VorbisCodebook,
                  noise: &VorbisCodebook,
-                 bands: &[VorbisCodebook]|
+                 bands: &[(VorbisCodebook, bool)]|
      -> VorbisSetupHeader {
         let mut ladder = ResidueLadder::base(coarse.clone(), fine.clone(), noise.clone());
-        for book in bands {
-            ladder.push_band_class(book.clone());
+        for (book, cascaded) in bands {
+            if *cascaded {
+                ladder.push_cascaded_band_class(book.clone());
+            } else {
+                ladder.push_band_class(book.clone());
+            }
         }
         build_setup(
             floor_headers.clone(),
@@ -2118,7 +2298,10 @@ fn encode_pcm_to_packets_geometry(
     // books (`trained[3..]`), so every evaluation prices the exact
     // codeword lengths the closed-loop trainer settled on.
     let evaluate = |band_idx: &[usize]| -> Result<Evaluated, OggFileError> {
-        let bands: Vec<VorbisCodebook> = band_idx.iter().map(|&i| trained[3 + i].clone()).collect();
+        let bands: Vec<(VorbisCodebook, bool)> = band_idx
+            .iter()
+            .map(|&i| (trained[3 + i].clone(), band_candidates[i].1))
+            .collect();
         let mut setup = build(&trained[0], &trained[1], &trained[2], &bands);
         let classifications = 4 + bands.len() as u32;
         // The per-class value-book rows are resolved generically from
@@ -2331,7 +2514,6 @@ fn encode_pcm_to_packets_geometry(
         }
     }
     let (_, setup, frame_plans) = best;
-
     // ---- the three §4.2 header packets ----
     let id_packet = write_identification_header(&VorbisIdentificationHeader {
         vorbis_version: 0,

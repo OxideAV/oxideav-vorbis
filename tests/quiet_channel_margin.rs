@@ -107,17 +107,18 @@ fn adaptive_margin_balances_the_trailing_channel_at_the_top() {
     ));
 
     // Below the cap knee the balance pass is dormant: the default-band
-    // encode carries no adaptive headroom, so rate and fidelity match
-    // the pre-lever encoder (r451 measurement: 10353 audio B,
-    // [47.8, 29.8] dB).
+    // encode carries no adaptive headroom. Since the r453 psy
+    // recalibration (the noise-masker offset) the mid-knob encode is
+    // already balanced on its own — measured 24571 audio B,
+    // [46.6, 49.2] dB (r451: 10353 B, [47.8, 29.8] dB).
     let (mid_audio, mid_snrs) = measure(&pcm, rate, 0.7);
     eprintln!("q=0.7: audio {mid_audio} B, per-ch SNR {mid_snrs:.2?} dB");
     assert!(
-        mid_audio <= 11_000,
-        "q=0.7 audio bytes {mid_audio} above the 11 kB regression bound"
+        mid_audio <= 27_000,
+        "q=0.7 audio bytes {mid_audio} above the 27 kB regression bound"
     );
     assert!(
-        mid_snrs[0] >= 45.0 && mid_snrs[1] >= 28.0,
+        mid_snrs[0] >= 44.0 && mid_snrs[1] >= 44.0,
         "q=0.7 per-channel SNR regressed: {mid_snrs:.2?}"
     );
 
@@ -138,16 +139,20 @@ fn adaptive_margin_balances_the_trailing_channel_at_the_top() {
         "q=1 channel imbalance {:.2} dB above 6 dB: {top_snrs:.2?}",
         top_max - top_min
     );
+    // r453 measurement: 42570 audio B, [60.4, 59.8] dB.
     assert!(
-        top_audio <= 26_000,
-        "q=1 audio bytes {top_audio} above the 26 kB regression bound"
+        top_audio <= 45_000,
+        "q=1 audio bytes {top_audio} above the 45 kB regression bound"
     );
 
-    // The top of the knob buys decisive min-channel headroom over the
-    // mid-knob (measured 25.4 dB).
+    // The top of the knob never regresses the min channel against the
+    // mid-knob (r451 measured a 25.4 dB lift when the mid-knob still
+    // carried the 12 dB imbalance; since r453 the mid-knob is
+    // balanced on its own, so the pin is non-regression plus the
+    // absolute floors above).
     let mid_min = mid_snrs.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
-        top_min >= mid_min + 15.0,
-        "q=1 min-channel SNR {top_min:.2} dB must clear q=0.7's {mid_min:.2} dB by >= 15 dB"
+        top_min >= mid_min,
+        "q=1 min-channel SNR {top_min:.2} dB must not fall under q=0.7's {mid_min:.2} dB"
     );
 }

@@ -161,6 +161,18 @@ pub fn invert_inverse_db(target: f32) -> u8 {
     }
 }
 
+/// The post value range for a `floor1_multiplier` (§7.2.4: `256 /
+/// multiplier` rounded as the `RANGE_TABLE`): `256`, `128`, `86`, `64`.
+/// Multipliers outside `1..=4` report `0`.
+#[must_use]
+pub fn floor1_post_range(multiplier: u8) -> u32 {
+    if (1..=4).contains(&multiplier) {
+        RANGE_TABLE[(multiplier - 1) as usize]
+    } else {
+        0
+    }
+}
+
 /// Fit a floor-1 reconstructed-post vector `[floor1_final_Y]` to a desired
 /// linear-domain floor `envelope`.
 ///

@@ -92,10 +92,16 @@ fn correlated_stereo_couples_and_beats_dual_mono_rate_at_equal_quality() {
     let samples = 22_050;
     let pcm = correlated_stereo(samples);
 
-    let coupled_cfg = StreamEncoderConfig::new(RATE, 2);
+    // Measured at the middle of the knob (q = 0.5): the equal-quality
+    // comparison is made where both encodes sit on the same part of
+    // the rate/fidelity frontier (r453 measurement on this shape:
+    // coupled 43.7 dB at 138 kbps vs dual-mono 43.9 dB at 178 kbps).
+    let mut coupled_cfg = StreamEncoderConfig::new(RATE, 2);
     assert!(coupled_cfg.coupling, "coupling is on by default");
+    coupled_cfg.quality = 0.5;
     let mut uncoupled_cfg = StreamEncoderConfig::new(RATE, 2);
     uncoupled_cfg.coupling = false;
+    uncoupled_cfg.quality = 0.5;
 
     let coupled = encode_pcm_to_ogg(&pcm, &coupled_cfg).expect("coupled encodes");
     let uncoupled = encode_pcm_to_ogg(&pcm, &uncoupled_cfg).expect("uncoupled encodes");

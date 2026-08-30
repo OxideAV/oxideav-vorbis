@@ -164,12 +164,18 @@ fn transient_fixture_reencode_switches_and_roundtrips() {
     assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("transient fixture re-encode SNR: {snr:.2} dB");
-    // Two-sided r416 gates (measured 7797 audio B / 19.5 dB): neither
-    // rate nor fidelity may regress at the default quality point.
-    assert!(snr >= 12.0, "SNR {snr:.2} dB below 12 dB");
+    // Two-sided r453 gates (measured 15394 audio B / 44.3 dB at the
+    // default quality point, up from the r416 7797 B / 19.5 dB: the
+    // psy recalibration — band-level masking, the dropped 20 kHz
+    // fence that capped this white-noise burst at a hard ceiling,
+    // the covering floor fit — roughly doubles the default-point rate
+    // and lifts fidelity by 25 dB; at equal rate against the black-box
+    // reference the fixture measures +6 dB): neither rate nor fidelity
+    // may regress.
+    assert!(snr >= 42.0, "SNR {snr:.2} dB below 42 dB");
     assert!(
-        re.audio_bytes <= 8_800,
-        "default-quality audio bytes {} above the 8.8 kB regression bound",
+        re.audio_bytes <= 17_000,
+        "default-quality audio bytes {} above the 17 kB regression bound",
         re.audio_bytes
     );
 }
@@ -197,14 +203,16 @@ fn steady_music_fixture_reencode_stays_long_at_high_fidelity() {
     assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("steady fixture re-encode SNR: {snr:.2} dB");
-    // Two-sided r416 gates for the default quality point (measured
-    // 4741 audio B / 47.9 dB under the default joint geometry — the
-    // r410 scalar encoder spent 6072 B for 41.6 dB here): neither
-    // rate nor fidelity may regress.
-    assert!(snr >= 46.0, "SNR {snr:.2} dB below 46 dB");
+    // Two-sided r453 gates for the default quality point (measured
+    // 11858 audio B / 49.3 dB; the r416 encoder spent 4741 B for
+    // 47.9 dB here — the recalibrated default point sits higher on
+    // the knob's rate axis, and at equal rate the fixture measures
+    // +9 dB over the black-box reference): neither rate nor fidelity
+    // may regress.
+    assert!(snr >= 47.0, "SNR {snr:.2} dB below 47 dB");
     assert!(
-        re.audio_bytes <= 5_400,
-        "default-quality audio bytes {} above the 5.4 kB regression bound",
+        re.audio_bytes <= 13_000,
+        "default-quality audio bytes {} above the 13 kB regression bound",
         re.audio_bytes
     );
 }
@@ -231,12 +239,12 @@ fn steady_music_fixture_top_of_knob_delivers_real_headroom() {
     assert_eq!(decoded.pcm[0].len(), pcm[0].len(), "end-trim exact");
     let snr = snr_db(&pcm[0], &decoded.pcm[0]);
     eprintln!("steady fixture q=1: {} B, SNR {snr:.2} dB", ogg.len());
-    assert!(snr >= 52.0, "q=1 SNR {snr:.2} dB below 52 dB");
-    // Tightened r416 bound (measured 10973 B whole-stream: the
-    // top-band geometry race keeps the scalar candidate here).
+    assert!(snr >= 58.0, "q=1 SNR {snr:.2} dB below 58 dB");
+    // r453 bound (measured 17451 B whole-stream for 60.5 dB; r416:
+    // 10973 B for 56.6 dB).
     assert!(
-        ogg.len() <= 12_000,
-        "q=1 spends {} B, above the 12 kB regression bound",
+        ogg.len() <= 19_000,
+        "q=1 spends {} B, above the 19 kB regression bound",
         ogg.len()
     );
 }
@@ -265,15 +273,16 @@ fn decorrelated_stereo_fixture_reencode_stays_uncoupled() {
         assert_eq!(decoded.pcm[c].len(), input.len(), "end-trim exact");
         let snr = snr_db(input, &decoded.pcm[c]);
         eprintln!("stereo fixture re-encode ch{c}: SNR {snr:.2} dB");
-        // r420 floor: the amplitude-band mid class lifts the quiet
-        // channel 26.3 → 29.6 dB at the default quality.
-        assert!(snr >= 28.0, "ch{c} SNR {snr:.2} dB below 28 dB");
+        // r453 floor: the noise-masker offset recalibration closes the
+        // quiet-channel gap at the default quality — measured
+        // [46.6, 49.2] dB (r420: [47.8, 29.6] dB).
+        assert!(snr >= 44.0, "ch{c} SNR {snr:.2} dB below 44 dB");
     }
-    // Two-sided r416 rate gate (measured 9654 audio B at the default
-    // quality; the r410 scalar encoder spent 12100 B here).
+    // Two-sided r453 rate gate (measured 24571 audio B at the default
+    // quality; r416: 9654 B with the quiet channel at 29.6 dB).
     assert!(
-        re.audio_bytes <= 10_800,
-        "default-quality audio bytes {} above the 10.8 kB regression bound",
+        re.audio_bytes <= 27_000,
+        "default-quality audio bytes {} above the 27 kB regression bound",
         re.audio_bytes
     );
 }

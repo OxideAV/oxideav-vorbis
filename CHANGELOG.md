@@ -4,6 +4,60 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Psychoacoustic model recalibrated to band-level masking** (`psy`):
+  a masker's level is its analysis band's *summed* energy, so the
+  threshold it yields is now spread over the masked band's bins
+  (each bin carries its band's share of the allowed noise energy);
+  the §6.2.3 Bark bands are sub-divided to at most 32 bins
+  (`MAX_BAND_BINS`); the threshold in quiet is capped at 70 dB SPL
+  (`ATH_CAP_DB`) and evaluated no lower than 50 Hz
+  (`ATH_LOW_EDGE_HZ`); the noise-masker offset is 18 dB
+  (`NOISE_OFFSET_DB`, measured over {5.5, 12, 18} against an
+  equal-rate black-box reference). The old per-bin comparison
+  declared every noise band masked by itself (a 100-bin band's own
+  energy sits 20 dB over each bin), the uncapped `f⁴` ATH term wrote
+  off everything above 15 kHz, and the 20 Hz ATH edge dropped the
+  bass leaking into the lowest transform bins.
+- **The 20 kHz coded-band fence is gone** — `residue_end` covers the
+  whole spectrum on every entry. It was a hard 12 dB SNR ceiling on
+  wideband noise (6 % of a 44.1 kHz spectrum's bins sit above
+  20 kHz); the rate-distortion chooser sends inaudible partitions to
+  the silence class instead.
+- **Covering floor-1 fit** (`encode_pcm_to_ogg` pipeline): after the
+  sampled post fit the rendered floor is re-checked against the
+  envelope and the posts bounding any bin it runs under are lifted,
+  so a spectral line between posts never blows up its residue target.
+  This removed a quality-knob cliff (a +1.2 dB margin step scaled
+  every residue target 1.5× and cost 5 dB) and pins every target
+  inside `±1.03`.
+- **Residue ladders span the 99.9th-percentile partition peak**
+  (`LADDER_SPAN_QUANTILE`) of the magnitude / uncoupled vectors, not
+  the absolute maximum (fit outliers up to 6× the p99.9 peak coarsened
+  every step), and §4.3.5 angle vectors — which reach 2× the magnitude
+  range where a pair is anti-phase — are excluded from the span.
+- **Two new band-class candidates** under the Lagrangian adoption:
+  the *half-span* coarse-geometry tier (fills the 26 dB gap between
+  the coarse class and the coarse + fine cascade that left a third of
+  a noise stream's partitions at 17 dB in the low half of the knob)
+  and, on coupled streams, the *wide cascade* tier (coarse geometry
+  over twice the span as pass 0, the base fine book as pass 1) that
+  carries anti-phase angle partitions at full fine resolution
+  instead of clipping them.
+
+  Measured on the staged fixtures and a synthetic battery against an
+  equal-rate black-box reference encode (own-decode SNR, both decoders
+  agree on every stream): mono-44100 +9…+12 dB, mono-22050 +0.4…+2,
+  transient fixture 19.5 → 44.3 dB at the default point (equal rate
+  +6 dB), noise fixture +7…+9, white noise 12.0 → 42 dB at the top of
+  the mid knob, the decorrelated stereo fixture's quiet channel
+  29.6 → 49.2 dB at the default point. Rates at a given knob setting
+  roughly double at the default point; the `fixture_reencode` /
+  `quiet_channel_margin` / `banded_residue_books` gates are re-pinned
+  to the r453 measurements, and the coupled-stream equal-quality
+  comparison is taken at `q = 0.5`.
+
 ### Added
 
 - **Per-channel block-size scheduling**
