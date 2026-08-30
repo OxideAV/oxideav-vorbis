@@ -19,15 +19,23 @@
 //! 1. **Critical-band analysis.** Bins are grouped into 1-Bark bands
 //!    via the §6.2.3 Bark map (bin `k`'s centre frequency is
 //!    `(k + ½) · rate / n`); each band's energy is summed.
-//! 2. **Tonality estimate.** Each band's spectral flatness (geometric
-//!    over arithmetic mean of the bin energies) separates tone-like
-//!    bands (flatness → 0, energy concentrated in few bins) from
-//!    noise-like bands (flatness → 1). The tonality coefficient
-//!    `α ∈ [0, 1]` interpolates between the two classic masking
-//!    offsets: a tonal masker masks *less* relative to its own level
-//!    (offset `14.5 + z` dB at critical band `z`) than a noise masker
-//!    (offset `5.5` dB) — the tone-masking-noise / noise-masking-tone
-//!    asymmetry used throughout the perceptual-coding literature.
+//! 2. **Tonality estimate.** Two measures, combined by maximum. Each
+//!    band's spectral flatness (geometric over arithmetic mean of the
+//!    bin energies) separates tone-like bands (flatness → 0, energy
+//!    concentrated in few bins) from noise-like bands (flatness → 1)
+//!    — a single-frame figure. Where the caller supplies the
+//!    **phase-predictability** figure ([`unpredictability`]: each
+//!    bin's complex value against the linear extrapolation of the
+//!    two preceding frames' magnitude and phase), a band whose
+//!    energy-weighted unpredictability is low is tonal *across
+//!    time* — a stationary sinusoid — even when the band holds
+//!    several lines and reads flat to the single-frame measure. The
+//!    tonality coefficient `α ∈ [0, 1]` interpolates between the two
+//!    classic masking offsets: a tonal masker masks *less* relative
+//!    to its own level (offset `14.5 + z` dB at critical band `z`)
+//!    than a noise masker (offset 18 dB, `NOISE_OFFSET_DB`) — the
+//!    tone-masking-noise / noise-masking-tone asymmetry used
+//!    throughout the perceptual-coding literature.
 //! 3. **Spreading.** A masker's influence decays across the Bark axis
 //!    asymmetrically: steeply toward lower frequencies
 //!    (−27 dB/Bark) and shallowly toward higher ones (−10 dB/Bark) —
@@ -426,6 +434,137 @@ fn threshold_from_bands(
     threshold
 }
 
+/// One complex spectral line `(re, im)`.
+pub type Complex = (f32, f32);
+
+/// The complex spectrum of one windowed analysis block: an in-place
+/// radix-2 DFT of `block` (length a power of two ≥ 2), returning the
+/// `n/2` positive-frequency lines `k · rate / n`, `k ∈ [0, n/2)`.
+/// This is the phase-carrying companion of the §4.3.7 MDCT (whose
+/// real lines sit at `(k + ½) · rate / n`); the encoder feeds it the
+/// same §4.3.1-windowed block it transforms, and the masking model
+/// pairs DFT line `k` with MDCT bin `k` for its band-level figures.
+///
+/// # Errors
+///
+/// [`PsyError::EmptySpectrum`] for a block shorter than two samples
+/// or not a power of two in length; [`PsyError::NonFiniteSpectrum`]
+/// for a NaN / ±∞ sample.
+pub fn complex_spectrum(block: &[f32]) -> Result<Vec<Complex>, PsyError> {
+    let n = block.len();
+    if n < 2 || !n.is_power_of_two() {
+        return Err(PsyError::EmptySpectrum);
+    }
+    if let Some(bin) = block.iter().position(|v| !v.is_finite()) {
+        return Err(PsyError::NonFiniteSpectrum {
+            bin,
+            value: block[bin],
+        });
+    }
+    // Bit-reversal permutation, then the iterative butterflies.
+    let mut re: Vec<f64> = vec![0.0; n];
+    let mut im: Vec<f64> = vec![0.0; n];
+    let bits = n.trailing_zeros();
+    for (i, &x) in block.iter().enumerate() {
+        let j = i.reverse_bits() >> (usize::BITS - bits);
+        re[j] = f64::from(x);
+    }
+    let mut len = 2;
+    while len <= n {
+        let half = len / 2;
+        let theta = -2.0 * core::f64::consts::PI / len as f64;
+        let (wr, wi) = (theta.cos(), theta.sin());
+        for start in (0..n).step_by(len) {
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            for k in 0..half {
+                let (a, b) = (start + k, start + k + half);
+                let tr = re[b] * cr - im[b] * ci;
+                let ti = re[b] * ci + im[b] * cr;
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+                let ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+            }
+        }
+        len *= 2;
+    }
+    Ok((0..n / 2).map(|k| (re[k] as f32, im[k] as f32)).collect())
+}
+
+/// Per-bin **unpredictability** of `current` against the linear
+/// extrapolation of the two preceding frames: magnitude `r̂ = 2·r₁ −
+/// r₂` and phase `φ̂ = 2·φ₁ − φ₂`, then
+///
+/// ```text
+/// c[k] = |X[k] − X̂[k]| / (|X[k]| + |X̂[k]|)   ∈ [0, 1]
+/// ```
+///
+/// A stationary sinusoid advances its phase by a constant per frame
+/// at a constant magnitude, so the extrapolation lands on it and
+/// `c → 0`; a noise line's next phase is unrelated to the last two,
+/// so `c` sits near `0.5–0.7`. This is the classic
+/// "unpredictability measure" of tonality: unlike single-frame
+/// spectral flatness it recognises a stationary tone inside a
+/// crowded band, and reads a rapidly modulated line as the noise it
+/// masks like. Bins where both `|X|` and `|X̂|` vanish read `0`
+/// (nothing to mis-predict). The three spectra must share one
+/// length (one block size); the encoder falls back to the flatness
+/// figure across a block-size switch.
+///
+/// # Errors
+///
+/// [`PsyError::EmptySpectrum`] for empty input,
+/// [`PsyError::LengthMismatch`] when the frames differ in length.
+pub fn unpredictability(
+    current: &[Complex],
+    prev1: &[Complex],
+    prev2: &[Complex],
+) -> Result<Vec<f32>, PsyError> {
+    if current.is_empty() {
+        return Err(PsyError::EmptySpectrum);
+    }
+    if prev1.len() != current.len() || prev2.len() != current.len() {
+        return Err(PsyError::LengthMismatch {
+            floor: current.len(),
+            threshold: prev1.len().min(prev2.len()),
+        });
+    }
+    let polar = |(re, im): Complex| -> (f64, f64) {
+        let (re, im) = (f64::from(re), f64::from(im));
+        ((re * re + im * im).sqrt(), im.atan2(re))
+    };
+    Ok(current
+        .iter()
+        .zip(prev1)
+        .zip(prev2)
+        .map(|((&x, &p1), &p2)| {
+            let (r, phi) = polar(x);
+            let (r1, phi1) = polar(p1);
+            let (r2, phi2) = polar(p2);
+            let r_hat = (2.0 * r1 - r2).max(0.0);
+            let phi_hat = 2.0 * phi1 - phi2;
+            let (ex, ey) = (
+                r * phi.cos() - r_hat * phi_hat.cos(),
+                r * phi.sin() - r_hat * phi_hat.sin(),
+            );
+            let denom = r + r_hat;
+            if denom <= 0.0 {
+                0.0
+            } else {
+                ((ex * ex + ey * ey).sqrt() / denom).clamp(0.0, 1.0) as f32
+            }
+        })
+        .collect())
+}
+
+/// The unpredictability at or above which a band reads fully
+/// noise-like on the phase-predictability measure (`α_pred = 0`); a
+/// perfectly predicted band (`c = 0`) reads fully tonal.
+const UNPREDICTABILITY_NOISE: f32 = 0.5;
+
 /// Compute the per-bin masking threshold for one analysis frame.
 ///
 /// `spectrum` holds the frame's MDCT coefficients (length `n/2`); the
@@ -440,6 +579,34 @@ fn threshold_from_bands(
 /// [`PsyError::ZeroSampleRate`] / [`PsyError::NonFiniteConfig`] for a
 /// bad configuration.
 pub fn compute_masking(spectrum: &[f32], config: &PsyConfig) -> Result<MaskingAnalysis, PsyError> {
+    compute_masking_with_predictability(spectrum, None, config)
+}
+
+/// [`compute_masking`] with an optional per-bin **unpredictability**
+/// figure ([`unpredictability`], one value per spectrum bin): each
+/// band's tonality is then the maximum of the spectral-flatness
+/// estimate and the phase-predictability estimate (`1 −
+/// c_w / 0.5`, clamped, where `c_w` is the band's energy-weighted
+/// mean unpredictability). `None` reduces to the flatness-only model.
+///
+/// # Errors
+///
+/// As [`compute_masking`]; additionally [`PsyError::LengthMismatch`]
+/// when the unpredictability vector's length differs from the
+/// spectrum's.
+pub fn compute_masking_with_predictability(
+    spectrum: &[f32],
+    unpredictability: Option<&[f32]>,
+    config: &PsyConfig,
+) -> Result<MaskingAnalysis, PsyError> {
+    if let Some(c) = unpredictability {
+        if c.len() != spectrum.len() {
+            return Err(PsyError::LengthMismatch {
+                floor: spectrum.len(),
+                threshold: c.len(),
+            });
+        }
+    }
     if spectrum.is_empty() {
         return Err(PsyError::EmptySpectrum);
     }
@@ -460,17 +627,23 @@ pub fn compute_masking(spectrum: &[f32], config: &PsyConfig) -> Result<MaskingAn
     let layout = BandLayout::new(n_half, config.sample_rate);
     let bands = layout.count();
 
-    // Band energy + flatness accumulators over bin energies.
+    // Band energy + flatness accumulators over bin energies, plus the
+    // energy-weighted unpredictability when supplied.
     let mut energy = vec![0.0f64; bands];
     let mut log_sum = vec![0.0f64; bands];
+    let mut unpred_sum = vec![0.0f64; bands];
     for (k, &x) in spectrum.iter().enumerate() {
         let e = (f64::from(x) * f64::from(x)).max(ENERGY_FLOOR);
         let b = layout.bin_band[k];
         energy[b] += e;
         log_sum[b] += e.ln();
+        if let Some(c) = unpredictability {
+            unpred_sum[b] += e * f64::from(c[k].clamp(0.0, 1.0));
+        }
     }
 
-    // ---- 2. Per-band tonality from spectral flatness. ----
+    // ---- 2. Per-band tonality: spectral flatness, lifted by the
+    // phase-predictability figure where supplied. ----
     let mut band_tonality = Vec::with_capacity(bands);
     for b in 0..bands {
         let count = layout.width(b);
@@ -483,8 +656,13 @@ pub fn compute_masking(spectrum: &[f32], config: &PsyConfig) -> Result<MaskingAn
         // Flatness ∈ (0, 1]; in dB it is ≤ 0. −60 dB of flatness (or
         // below) is treated as fully tonal.
         let sfm_db = 10.0 * (geo / arith).log10();
-        let alpha = (sfm_db / -60.0).clamp(0.0, 1.0);
-        band_tonality.push(alpha as f32);
+        let mut alpha = (sfm_db / -60.0).clamp(0.0, 1.0) as f32;
+        if unpredictability.is_some() {
+            let c_w = (unpred_sum[b] / energy[b]) as f32;
+            let alpha_pred = (1.0 - c_w / UNPREDICTABILITY_NOISE).clamp(0.0, 1.0);
+            alpha = alpha.max(alpha_pred);
+        }
+        band_tonality.push(alpha);
     }
 
     let threshold = threshold_from_bands(&layout, &energy, &band_tonality, config);
@@ -813,7 +991,23 @@ impl TemporalMasking {
         spectrum: &[f32],
         psy: &PsyConfig,
     ) -> Result<Option<MaskingAnalysis>, PsyError> {
-        let fresh = compute_masking(spectrum, psy)?;
+        self.push_frame_with_predictability(spectrum, None, psy)
+    }
+
+    /// [`push_frame`](Self::push_frame) with the frame's optional
+    /// per-bin unpredictability figure (see
+    /// [`compute_masking_with_predictability`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`push_frame`](Self::push_frame).
+    pub fn push_frame_with_predictability(
+        &mut self,
+        spectrum: &[f32],
+        unpredictability: Option<&[f32]>,
+        psy: &PsyConfig,
+    ) -> Result<Option<MaskingAnalysis>, PsyError> {
+        let fresh = compute_masking_with_predictability(spectrum, unpredictability, psy)?;
         if let Some(pending) = &self.pending {
             if pending.threshold.len() != fresh.threshold.len() {
                 return Err(PsyError::LengthMismatch {
@@ -1475,5 +1669,142 @@ mod tests {
             Err(PsyError::BadFloorValue { bin, .. }) => assert_eq!(bin, 3),
             other => panic!("expected BadFloorValue, got {other:?}"),
         }
+    }
+
+    // ---------- phase predictability ----------
+
+    /// A windowed block of a stationary sinusoid at `f_hz`, `n`
+    /// samples starting at sample `start` (a sine window, as the
+    /// encoder's analysis would apply).
+    fn sine_block(f_hz: f32, n: usize, start: usize, phase: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = (start + i) as f32 / RATE as f32;
+                let w = (core::f32::consts::PI * (i as f32 + 0.5) / n as f32).sin();
+                w * (2.0 * core::f32::consts::PI * f_hz * t + phase).sin()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn complex_spectrum_matches_a_naive_dft_and_rejects_bad_shapes() {
+        let n = 64;
+        let block: Vec<f32> = (0..n)
+            .map(|i| ((i * 7919) % 97) as f32 / 97.0 - 0.5)
+            .collect();
+        let fast = complex_spectrum(&block).unwrap();
+        assert_eq!(fast.len(), n / 2);
+        for (k, &(re, im)) in fast.iter().enumerate() {
+            let (mut nr, mut ni) = (0.0f64, 0.0f64);
+            for (i, &x) in block.iter().enumerate() {
+                let a = -2.0 * core::f64::consts::PI * (k * i) as f64 / n as f64;
+                nr += f64::from(x) * a.cos();
+                ni += f64::from(x) * a.sin();
+            }
+            assert!((f64::from(re) - nr).abs() < 1e-4, "bin {k} re {re} vs {nr}");
+            assert!((f64::from(im) - ni).abs() < 1e-4, "bin {k} im {im} vs {ni}");
+        }
+        assert_eq!(complex_spectrum(&[]), Err(PsyError::EmptySpectrum));
+        assert_eq!(complex_spectrum(&[0.0; 48]), Err(PsyError::EmptySpectrum));
+        assert!(matches!(
+            complex_spectrum(&[0.0, f32::NAN, 0.0, 0.0]),
+            Err(PsyError::NonFiniteSpectrum { bin: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn stationary_tone_is_predictable_and_noise_is_not() {
+        let n = 512;
+        let hop = n / 2;
+        let f = 3_000.0;
+        let frames: Vec<Vec<Complex>> = (0..3)
+            .map(|i| complex_spectrum(&sine_block(f, n, i * hop, 0.3)).unwrap())
+            .collect();
+        let c = unpredictability(&frames[2], &frames[1], &frames[0]).unwrap();
+        let k = bin_at(f, n / 2);
+        // The DFT line nearest the tone (and its neighbours, which
+        // carry the window's main lobe) is predicted almost exactly.
+        for (j, &cj) in c.iter().enumerate().take(k + 2).skip(k.saturating_sub(1)) {
+            assert!(cj < 0.05, "tone line {j}: c = {cj}");
+        }
+
+        let mut seed = 0x9e37_79b9u32;
+        let mut noise_frame = || -> Vec<Complex> {
+            let block: Vec<f32> = (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed as f32 / u32::MAX as f32) - 0.5
+                })
+                .collect();
+            complex_spectrum(&block).unwrap()
+        };
+        let (n0, n1, n2) = (noise_frame(), noise_frame(), noise_frame());
+        let cn = unpredictability(&n2, &n1, &n0).unwrap();
+        let mean = cn.iter().map(|&v| f64::from(v)).sum::<f64>() / cn.len() as f64;
+        assert!(mean > 0.4, "noise mean unpredictability {mean}");
+        assert!(cn.iter().all(|&v| (0.0..=1.0).contains(&v)));
+
+        assert_eq!(
+            unpredictability(&frames[2], &frames[1][..3], &frames[0]),
+            Err(PsyError::LengthMismatch {
+                floor: n / 2,
+                threshold: 3
+            })
+        );
+        assert_eq!(
+            unpredictability(&[], &[], &[]),
+            Err(PsyError::EmptySpectrum)
+        );
+    }
+
+    #[test]
+    fn predictability_lifts_a_crowded_tonal_band_to_tonal() {
+        // Three stationary lines inside one analysis band read
+        // noise-like to spectral flatness alone (the band is nearly
+        // flat across its populated bins) but tonal to the
+        // predictability measure.
+        let n = 2048;
+        let hop = n / 2;
+        let lines = [4_000.0f32, 4_060.0, 4_120.0];
+        let block = |start: usize| -> Vec<f32> {
+            let mut acc = vec![0.0f32; n];
+            for &f in &lines {
+                for (a, v) in acc.iter_mut().zip(sine_block(f, n, start, 0.0)) {
+                    *a += v / 3.0;
+                }
+            }
+            acc
+        };
+        let spectra: Vec<Vec<Complex>> = (0..3)
+            .map(|i| complex_spectrum(&block(i * hop)).unwrap())
+            .collect();
+        // A magnitude spectrum standing in for the MDCT bins.
+        let mags: Vec<f32> = spectra[2]
+            .iter()
+            .map(|&(re, im)| (re * re + im * im).sqrt() / n as f32)
+            .collect();
+        let c = unpredictability(&spectra[2], &spectra[1], &spectra[0]).unwrap();
+        let plain = compute_masking(&mags, &cfg()).unwrap();
+        let tonal = compute_masking_with_predictability(&mags, Some(&c), &cfg()).unwrap();
+        let band = plain.bin_band[bin_at(4_060.0, n / 2)];
+        assert!(
+            tonal.band_tonality[band] > plain.band_tonality[band] + 0.3,
+            "predictability must lift the crowded band: {} vs {}",
+            tonal.band_tonality[band],
+            plain.band_tonality[band]
+        );
+        // A tonal masker masks less: the threshold at the lines drops.
+        let k = bin_at(4_060.0, n / 2);
+        assert!(tonal.threshold[k] < plain.threshold[k]);
+        // Length guard.
+        assert_eq!(
+            compute_masking_with_predictability(&mags, Some(&c[..10]), &cfg()),
+            Err(PsyError::LengthMismatch {
+                floor: n / 2,
+                threshold: 10
+            })
+        );
     }
 }

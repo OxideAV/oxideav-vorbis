@@ -389,7 +389,8 @@ pub use packet_kind::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use psy::{
-    ath_db, compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
+    ath_db, complex_spectrum, compute_masking, compute_masking_with_predictability,
+    plan_psy_floor_envelope, residue_partition_weights, unpredictability, Complex, MaskingAnalysis,
     PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 // internal — exposed for tests/fuzz; not part of the stable API

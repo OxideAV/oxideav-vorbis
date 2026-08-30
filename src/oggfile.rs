@@ -61,8 +61,9 @@ use crate::mdct::{mdct_vec, MdctError};
 use crate::packet::AudioPacketHeader;
 use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
 use crate::psy::{
-    compute_masking, plan_psy_floor_envelope, residue_partition_weights, MaskingAnalysis,
-    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
+    complex_spectrum, compute_masking_with_predictability, plan_psy_floor_envelope,
+    residue_partition_weights, unpredictability, Complex, MaskingAnalysis, PsyConfig, PsyError,
+    TemporalMasking, TemporalMaskingConfig,
 };
 use crate::quality::{EncoderTuning, QualityError};
 use crate::residue_encode::{plan_vector_classifications_rd_weighted, ResidueEncodeError};
@@ -1539,6 +1540,14 @@ fn encode_pcm_to_packets_geometry(
     // preserve across long↔short transitions). The per-frame scale
     // keeps this per-frame-linear property on a switched stream.
     let mut spectra: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames); // [frame][channel][bin]
+                                                                      // Per-frame, per-channel phase-predictability figure for the
+                                                                      // masking model's tonality estimate (`psy::unpredictability`):
+                                                                      // the windowed block's complex spectrum against the linear
+                                                                      // extrapolation of the two preceding frames' — defined only where
+                                                                      // the last three frames share one block size (across a §4.3.1
+                                                                      // switch the model falls back to spectral flatness). Only a
+                                                                      // two-deep complex history per channel is kept.
+    let mut unpred: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(frames);
     {
         // Zero-pad the tail so every frame's analysis span is covered:
         // frame f is centred on granules[f] and spans ±sizes[f]/2.
@@ -1553,17 +1562,32 @@ fn encode_pcm_to_packets_geometry(
             splitter.push_pcm(&pcm[c]);
             splitter.push_pcm(&vec![0.0f32; pad]);
         }
+        // (prev1, prev2) complex spectra per channel.
+        type History = (Option<Vec<Complex>>, Option<Vec<Complex>>);
+        let mut history: Vec<History> = vec![(None, None); ch];
         for f in 0..frames {
             let mut per_ch = Vec::with_capacity(ch);
-            for splitter in splitters.iter_mut() {
+            let mut u_row = Vec::with_capacity(ch);
+            for (splitter, hist) in splitters.iter_mut().zip(history.iter_mut()) {
                 // Apply the pending §4.3.8 stride between differing
                 // block sizes, then slice; take_frame applies the
                 // §4.3.1 analysis window, so the bare kernel follows.
                 splitter.advance_pending_stride(sizes[f]);
                 let block = splitter.take_frame(sizes[f], &windows[window_of[f]])?;
                 per_ch.push(mdct_vec(&block, 4.0 / sizes[f] as f32)?);
+                let cplx = complex_spectrum(&block)?;
+                let u = match (&hist.0, &hist.1) {
+                    (Some(p1), Some(p2)) if p1.len() == cplx.len() && p2.len() == cplx.len() => {
+                        Some(unpredictability(&cplx, p1, p2)?)
+                    }
+                    _ => None,
+                };
+                u_row.push(u);
+                hist.1 = hist.0.take();
+                hist.0 = Some(cplx);
             }
             spectra.push(per_ch);
+            unpred.push(u_row);
         }
     }
 
@@ -1592,8 +1616,12 @@ fn encode_pcm_to_packets_geometry(
             let mut temporal =
                 TemporalMasking::new(&TemporalMaskingConfig::new(sizes[0] / 2), &psy_config)?;
             let mut emitted = 0usize;
-            for per_ch in &spectra {
-                if let Some(analysis) = temporal.push_frame(&per_ch[c], &psy_config)? {
+            for (per_ch, u_row) in spectra.iter().zip(&unpred) {
+                if let Some(analysis) = temporal.push_frame_with_predictability(
+                    &per_ch[c],
+                    u_row[c].as_deref(),
+                    &psy_config,
+                )? {
                     maskings[emitted].push(analysis);
                     emitted += 1;
                 }
@@ -1605,7 +1633,11 @@ fn encode_pcm_to_packets_geometry(
     } else {
         for (f, per_ch) in spectra.iter().enumerate() {
             for (c, x) in per_ch.iter().enumerate() {
-                maskings[f].push(compute_masking(x, &psy_config_for(c))?);
+                maskings[f].push(compute_masking_with_predictability(
+                    x,
+                    unpred[f][c].as_deref(),
+                    &psy_config_for(c),
+                )?);
             }
         }
     }

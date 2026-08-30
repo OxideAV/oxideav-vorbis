@@ -6,6 +6,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **Phase-predictability tonality** (`psy::complex_spectrum`,
+  `psy::unpredictability`, `compute_masking_with_predictability`,
+  `TemporalMasking::push_frame_with_predictability`): each band's
+  tonality is now the maximum of the single-frame spectral-flatness
+  figure and a cross-frame phase-predictability figure — the
+  windowed block's complex spectrum against the linear extrapolation
+  of the two preceding frames' magnitude and phase (`c = |X − X̂| /
+  (|X| + |X̂|)`, energy-weighted per band, fully tonal at `c = 0`,
+  fully noise-like from `c = 0.5`). A stationary line inside a crowded
+  band, invisible to flatness, now reads tonal and masks less. The
+  integrated encoder feeds it from the same §4.3.1-windowed block it
+  transforms (a two-deep complex history per channel; across a block
+  size switch the flatness figure stands alone). Measured: the
+  decorrelated stereo fixture 36.1 → 46.7 dB at `q = 0.5` for +3 %
+  audio bytes (stereo-cbr 36.9 → 42.0 dB); pure-tone synthetics pay
+  +9 % rate at unchanged SNR; every other corpus is unchanged.
 - **Psychoacoustic model recalibrated to band-level masking** (`psy`):
   a masker's level is its analysis band's *summed* energy, so the
   threshold it yields is now spread over the masked band's bins
