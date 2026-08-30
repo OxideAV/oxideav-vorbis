@@ -16,36 +16,43 @@ encoder** (`encode_pcm_to_ogg`): the §A.2 Ogg/Vorbis encapsulation
 rules over the [`oxideav-ogg`](https://github.com/OxideAV/oxideav-ogg)
 container crate's RFC 3533 page transport, and the whole
 psychoacoustic / floor / residue encode stack — **§4.3.1 short/long
-block switching** (transient-scheduled short blocks, per-size setup
-entries, hybrid window edges) and gated **§4.3.5 square-polar channel
-coupling** (a correlated stereo pair encodes −33 % vs dual-mono at
-equal SNR) included — behind one quality scalar, with the wire-format
-entropy (residue classwords, floor-post codewords, value books)
-trained per stream, an **amplitude-banded residue class ladder**
-whose tiers are *measured candidates* — silence / joint 4-D noise
-book / a 4-D **mid band book** / two ternary **8-D deep tiers**
-(one codeword per eight §8.6.4 bins) / coarse / coarse + fine —
-kept only when a greedy post-training adoption loop measures the
-whole Lagrangian (weighted distortion + λ × setup-table +
+block switching** (a loudness-adaptive perceptual attack detector:
+high-passed sub-frame energy against a post-masking-decayed
+envelope with an absolute audibility floor) and **per-packet,
+masking-driven §4.3.5 square-polar coupling** (one mapping + mode
+per distinct `(block size, coupling-step set)` the packets elect;
+a coupled pair codes under one shared floor; the angle vector
+carries an interaural-phase point-stereo discount above 1.5 kHz at
+the low knob) — behind one quality scalar or an **ABR bit target**
+(`StreamEncoderConfig::target_bitrate`), on a **band-level masking
+model** (masker level = analysis-band energy spread over the masked
+band's bins; ATH capped and band-shared; tonality = max of spectral
+flatness and cross-frame **phase predictability**) whose per-bin
+audibility weights drive a **masking-weighted VQ selection** (every
+§8.6.2 read picks its entry under its own elements' weights), a
+**covering floor-1 fit** (posts lifted until the rendered curve
+covers the envelope, so no spectral line between posts blows up its
+residue target), residue ladders spanned to the 99.9th-percentile
+partition peak of the magnitude/uncoupled vectors, the coded band
+over the **whole spectrum** (the old 20 kHz fence was a measured
+12 dB ceiling on wideband noise), and an **amplitude-banded residue
+class ladder** whose tiers are *measured candidates* — silence /
+joint 4-D noise book / a 4-D **mid band book** / two ternary
+**8-D deep tiers** / a **half-span coarse tier** / a **wide
+cascade tier** for anti-phase angle partitions / coarse / coarse +
+fine — kept only when a greedy post-training adoption loop measures
+the whole Lagrangian (weighted distortion + λ × setup-table +
 classword + value bits) strictly smaller, with every value book's
 codeword lengths retrained sparse from the final plans' exact
-emission tallies (a band book must buy its own setup table; short
-streams ship the lean base ladder, long streams adopt the tiers),
-the §8.6.1 **coded-band cap** (`residue_end` stops at the 20 kHz
-ATH bound — 960 of 1024 long-block bins at 44.1 kHz, the reference
-streams' own cap), and the cascade value books **corpus-designed as
-2-D joint lattices by default** (the scalar ladders take over past
-the lattice fine ladder's coverage cap via a top-of-knob candidate
-race) — black-box verified: 21 swept encoder outputs (mono/stereo,
-real-audio re-encodes with block switching, `q ∈ {0.4, 0.7, 1.0}`,
-4–32 s, including a stream whose adopted deep tier carries 218 of
-6561 codeword cells) decode through the black-box reference
-decoder to the exact declared frame counts, agreeing with the
-crate's own decoder at 100–110 dB on a 16-bit compare (vs the r420
-always-carry ladder the staged 4-s corpus re-encodes −21/−14/−3 %
-total bytes on mono-44100 at q = 0.4/0.7/1 at equal measured SNR;
-the ×8-tiled stereo corpus adopts the deep 8-D tier at −5.1 %
-audio bytes). `register()` installs the
+emission tallies. Black-box verified: every swept encoder output
+(the staged fixture re-encodes and a synthetic battery at
+`q ∈ {0.3, 0.5, 0.7}`) decodes identically through the black-box
+reference decoder and the crate's own; measured at equal rate
+against the black-box reference encoder the r453 encoder leads on
+the mono fixtures (+9…+12 dB), tones, wideband noise at the upper
+knob, transients (+2…+6 dB, with better pre-echo figures), and
+trails on dense-correlated stereo and white noise at the low knob
+(see the gaps list). `register()` installs the
 codec — decoder and encoder factories, the Matroska `A_VORBIS`
 tag, and the §4.2.1 `"\x01vorbis"` payload magic for
 container-agnostic resolution — into
@@ -317,7 +324,10 @@ zero) and high for an anti-correlated one (ratio 4 — coupling buys nothing).
 `prune_coupling_steps` drives that gate over a candidate coupling-step list
 in `forward_couple_all` order, returning the subset worth applying; the
 kept set round-trips cleanly through `forward_couple_all` →
-`inverse_couple_all`.
+`inverse_couple_all`. (The integrated encoder's own coupling decision
+is per packet and masking-driven since r453 — a bits-like
+`Σ log2(1 + w·t²)` election over shared-pair-floor targets — with
+these energy primitives remaining the reusable building blocks.)
 
 The **long/short block-size decision** (`blocksize` module:
 `detect_transient`, `choose_blocksize`, `plan_block_sequence`) is the
@@ -338,7 +348,19 @@ within-window peak-to-mean **concentration** (a sharp attack), and an
 loudness step — a noise burst over a tone bed — that is flat within the
 window and invisible to concentration; the staged
 `transient-blocksize-switch` fixture is exactly this shape, measuring
-concentration ≤ 2.7 in every window).
+concentration ≤ 2.7 in every window). The integrated encoder's
+schedule is `plan_block_sequence_perceptual` since r453: the
+**loudness-adaptive** detector — high-passed sub-frame energy against
+a post-masking-decaying envelope (0.4 dB/ms) with an absolute
+audibility floor — whose schedule is invariant to input scaling, does
+not read a steady signal's switch-on as an attack, forgives a modest
+hit right after a loud passage, and fires on the same hit out of
+quiet; the explicit-threshold planners above remain for callers that
+want the levers. Measured on the click battery the r453 encoder's
+pre-echo figures (error energy in the 5 ms before each onset) beat
+the black-box reference's at every swept rate (21.4/29.1/36.7 dB vs
+17.3/26.1/27.9 dB at q = 0.3/0.5/0.7) at a 1.5–3 dB whole-stream
+SNR cost on that battery.
 
 The **floor-0 VQ-encode glue** (`floor0_encode` module:
 `plan_floor0_coefficients` + `floor0_vector_count`) is the analogous glue
@@ -972,40 +994,37 @@ and mono stay single-pass and byte-identical
 
 ### Not yet supported / known gaps
 
-- **The psy tonality estimate is band-level spectral flatness** (no
-  phase-predictability tracking), the perceptual weighting enters the
-  residue chooser per *partition* (the VQ entry selection inside
-  `vq::quantize_vector` is unweighted Euclidean per read), and the
-  coupling gate is energy-driven, not masking-driven (and whole-stream:
-  one coupling decision per pair, since the §4.2.4 mapping fixes the
-  steps for every packet using it — per-packet coupling choice would
-  need a second uncoupled mapping per block size).
-- **The transient detector is two global thresholds** (peak-to-mean
-  concentration + energy rise over a 16-sub-frame lookahead); it is not
-  loudness-adaptive. (The schedule itself is per-channel since r451:
-  each packet's shared blockflag OR-merges the channels' own
-  detections, so a burst confined to one channel — diluted or
-  cancelled in a mixdown — still schedules short; the whole packet
-  switching is the format's own §4.3.1 per-packet mode.)
-- **The re-encoded audio rate still trails the reference corpus at
-  the knee.** On audio-packet bytes the default-quality re-encode
-  spends ~2.2× the reference stream's audio bytes (mono-q5: ~4.6 kB
-  vs 2.1 kB — down from 6.1 kB scalar) at a measured 47.9 dB, with
-  audio-parity near `q ≈ 0.55` at ~35 dB. The amplitude-band tiers
-  (4-D mid + the r430 8-D deep pair), the measured band adoption,
-  the final-emission value-book retrain, and the coded-band cap all
-  landed; the remaining structural gap versus the reference's class
-  set (10 classes, per-band books up to 8-D with per-band *coarse*
-  dimensionality) is per-band cascade dimensionality and
-  cross-frame entropy. Measured and rejected across r416–r430: a
-  third-stage ultra lattice (+36 % audio bytes for +0.1 dB), an
-  in-ladder scalar/joint hybrid class (routing collapse under the
-  unweighted trainer; still byte-dominated under the weighted one),
-  and a same-dimensionality narrower-span per-band coarse + fine
-  pair (+4…+13 % audio bytes at identical SNR — occupancy-trained
-  lengths already price amplitude statistics inside one book; the
-  per-band win must come from joint dimensionality, which is what
-  the mid and deep band books do).
+All figures are r453 equal-rate comparisons against the black-box
+reference encoder (own-decode SNR; both decoders agree on every
+stream).
+
+- **White noise / dense noisy content at the low knob trails the
+  reference** (white-noise battery: 22.1 dB vs 28.8 dB at ~296 kbps;
+  the correlated-with-delay stereo battery: 22.0 vs 37.3 dB at
+  ~466 kbps at `q = 0.3`, closing to −2 dB at `q = 0.5` and parity
+  above). The structural cause is measured: the class ladder offers
+  a ~17 dB coarse point and a ~43 dB coarse + fine point with a
+  26 dB gap between them, so the low knob mixes the two instead of
+  holding an intermediate operating point. The r453 half-span tier
+  narrows this (+2.4 dB); quarter- and eighth-span tiers were
+  measured and rejected (never adopted); the remaining fix is a
+  finer cascade rung or per-band coarse dimensionality.
+- **The knob's floor is high**: `q = 0` spends ~130 kbps on a
+  tones+hiss corpus where the reference reaches ~20 kbps modes; the
+  ABR entry degrades to the `q = 0` stream for smaller budgets. A
+  genuine low-bitrate mode needs a deeper masking margin than the
+  −12 dB the `q = 0` tuning applies plus coarser base ladders.
+- **The angle-vector point-stereo discount is SNR-invisible**: the
+  interaural-phase discount above 1.5 kHz trades waveform SNR (what
+  the harness measures) for bits, so its benefit is asserted from
+  psychoacoustics, not from the measured curves; it fades out by
+  `q = 0.75` and stays modest for that reason.
+- **The temporal masking pipeline is bypassed on switched streams**
+  (a variable frame hop the model does not define); pre-echo control
+  there rests on the short blocks themselves.
+- **The stereo image election is per pair of adjacent channels
+  only** (front-pair conventions); no cross-pair or mid/side matrix
+  beyond §4.3.5 square-polar.
 
 ## Clean-room provenance
 

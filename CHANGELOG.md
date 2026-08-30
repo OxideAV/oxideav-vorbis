@@ -4,6 +4,13 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Documentation
+
+- README status, encode-stack and known-gaps sections rewritten to
+  the r453 encoder (band-level masking, predictability tonality,
+  weighted VQ, covering floor fit, per-packet coupling, perceptual
+  transient detector, ABR) with the r453 equal-rate measurements.
+
 ### Added
 
 - **ABR bit targeting** (`StreamEncoderConfig::target_bitrate`):
