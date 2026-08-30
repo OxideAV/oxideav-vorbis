@@ -184,7 +184,7 @@ pub struct LambdaSolution {
 }
 
 /// Errors from [`solve_lambda_for_bits`]. `E` is the caller's rate
-///-measurement error type, carried verbatim.
+/// -measurement error type, carried verbatim.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LambdaSolveError<E> {
     /// The search range was empty, non-finite, or negative

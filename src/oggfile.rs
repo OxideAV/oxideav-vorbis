@@ -308,8 +308,24 @@ pub struct StreamEncoderConfig {
     /// channel uncoupled.
     pub coupling: bool,
     /// Quality knob `q ∈ [0, 1]` — expanded through
-    /// [`EncoderTuning::from_quality`].
+    /// [`EncoderTuning::from_quality`]. Ignored when
+    /// [`Self::target_bitrate`] is set.
     pub quality: f32,
+    /// **ABR bit targeting**: when `Some(bits_per_second)`, the
+    /// encoder solves for the quality whose whole-stream audio-packet
+    /// rate fits the budget instead of using [`Self::quality`] — the
+    /// bit-targeting entry [`crate::quality::solve_lambda_for_bits`]
+    /// describes, run over real whole-stream encodes: the residue
+    /// Lagrangian `lambda` is bisected over its `q ∈ [0, 1]` law (each
+    /// probe is a full encode, every other lever following the same
+    /// `q`), and the returned stream is the highest-fidelity probe
+    /// measured within budget. When even `q = 0` overshoots, the
+    /// `q = 0` stream is returned (the cheapest the encoder offers).
+    /// The identification header's `bitrate_nominal` carries the
+    /// target. Whole-stream targeting is deliberate: the encoder is a
+    /// whole-stream design, so the "reservoir" is the file itself —
+    /// bits flow to the frames that need them under one `lambda`.
+    pub target_bitrate: Option<u32>,
     /// The **long** blocksize `blocksize_1` (a power of two in
     /// `64..=8192`, §4.2.2) — the analysis/synthesis size steady
     /// content uses.
@@ -387,6 +403,7 @@ impl StreamEncoderConfig {
             channels,
             coupling: true,
             quality: 0.7,
+            target_bitrate: None,
             blocksize: 2048,
             short_blocksize: 256,
             serial: 0x6F78_7662,
@@ -1175,6 +1192,9 @@ pub fn encode_pcm_to_packets(
     pcm: &[Vec<f32>],
     config: &StreamEncoderConfig,
 ) -> Result<EncodedVorbisStream, OggFileError> {
+    if let Some(bits_per_second) = config.target_bitrate {
+        return encode_pcm_to_packets_abr(pcm, config, bits_per_second);
+    }
     let tuning = EncoderTuning::from_quality(config.quality)?;
     let first = encode_pcm_to_packets_margined(pcm, config, &[])?;
     let headroom = tuning.adaptive_margin_headroom_db;
@@ -1215,6 +1235,82 @@ pub fn encode_pcm_to_packets(
     } else {
         first
     })
+}
+
+/// The ABR entry under [`encode_pcm_to_packets`] (see
+/// [`StreamEncoderConfig::target_bitrate`]): bisect the residue
+/// Lagrangian over its quality law with
+/// [`crate::quality::solve_lambda_for_bits`], measuring each probe as
+/// a full quality-mode encode's audio-packet bits, and return the
+/// highest-fidelity stream measured within the budget (the cheapest
+/// probe when even `q = 0` overshoots). The mapping `q(λ)` inverts
+/// the [`EncoderTuning::from_quality`] lambda law, so every other
+/// lever follows the probe's quality coherently.
+fn encode_pcm_to_packets_abr(
+    pcm: &[Vec<f32>],
+    config: &StreamEncoderConfig,
+    bits_per_second: u32,
+) -> Result<EncodedVorbisStream, OggFileError> {
+    if pcm.is_empty() || pcm[0].is_empty() || config.sample_rate == 0 {
+        // Let the quality-mode validation produce the precise error.
+        let mut probe = config.clone();
+        probe.target_bitrate = None;
+        return encode_pcm_to_packets(pcm, &probe);
+    }
+    let seconds = pcm[0].len() as f64 / f64::from(config.sample_rate);
+    let target_bits = (f64::from(bits_per_second) * seconds) as u64;
+    // The from_quality lambda law, invertible: λ = 10^(−1.4 − 2.6 q).
+    let q_of = |lambda: f64| ((-1.4 - lambda.log10()) / 2.6).clamp(0.0, 1.0) as f32;
+    let lambda_of = |q: f64| 10f64.powf(-1.4 - 2.6 * q);
+    // Every probe is kept so the returned stream is exactly the one
+    // the solver measured — no re-encode, no drift.
+    let mut probes: Vec<(u64, EncodedVorbisStream)> = Vec::new();
+    let mut encode_at = |lambda: f64| -> Result<u64, OggFileError> {
+        let mut probe = config.clone();
+        probe.target_bitrate = None;
+        probe.quality = q_of(lambda);
+        let stream = encode_pcm_to_packets(pcm, &probe)?;
+        let bits = 8 * stream
+            .audio
+            .iter()
+            .map(|(p, _)| p.len() as u64)
+            .sum::<u64>();
+        probes.push((bits, stream));
+        Ok(bits)
+    };
+    // λ(q=1) is the expensive end, λ(q=0) the cheap end; six halvings
+    // resolve the knob to ~1.5 % of its range.
+    let solution = crate::quality::solve_lambda_for_bits(
+        target_bits,
+        lambda_of(1.0),
+        lambda_of(0.0),
+        6,
+        &mut encode_at,
+    )
+    .map_err(|e| match e {
+        crate::quality::LambdaSolveError::Rate(inner) => inner,
+        // The bracket and iteration count are fixed above.
+        other => OggFileError::Header(other.to_string()),
+    })?;
+    let position = probes
+        .iter()
+        .position(|(bits, _)| *bits == solution.bits)
+        .expect("the solution's rate was measured on one of the probes");
+    let mut stream = probes.swap_remove(position).1;
+    // Stamp the target as the nominal bitrate (§4.2.2: purely
+    // informational fields).
+    let id = write_identification_header(&VorbisIdentificationHeader {
+        vorbis_version: 0,
+        audio_channels: config.channels,
+        audio_sample_rate: config.sample_rate,
+        bitrate_maximum: 0,
+        bitrate_nominal: bits_per_second as i32,
+        bitrate_minimum: 0,
+        blocksize_0: stream.short_blocksize as u16,
+        blocksize_1: stream.blocksize as u16,
+    })?;
+    stream.identification = id;
+    Ok(stream)
 }
 
 /// The single-margin-set encode under [`encode_pcm_to_packets`]:

@@ -4,6 +4,23 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **ABR bit targeting** (`StreamEncoderConfig::target_bitrate`):
+  `Some(bits_per_second)` makes the encoder solve for the quality
+  whose whole-stream audio-packet rate fits the budget —
+  `quality::solve_lambda_for_bits` run over real encodes, bisecting
+  the residue Lagrangian over its quality law with every other lever
+  following the probe's quality coherently. The returned stream is
+  the highest-fidelity probe measured within budget (the `q = 0`
+  stream when even that overshoots), and the identification header
+  carries the target as `bitrate_nominal`. Whole-stream targeting is
+  deliberate: the encoder is a whole-stream design, so the reservoir
+  is the file itself — bits flow to the frames that need them under
+  one `lambda`. Pinned by `tests/abr_bit_targeting.rs` (budget met
+  from below, monotone in the budget, unreachable budget degrades to
+  the cheapest knob end).
+
 ### Changed
 
 - **Loudness-adaptive perceptual attack detector**
