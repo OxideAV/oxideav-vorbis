@@ -276,27 +276,31 @@ fn steady_content_stays_all_long() {
 
 #[test]
 fn all_transient_content_stays_all_short_and_roundtrips() {
-    // Dense impulses: every lookahead region is transient, so the
-    // schedule is all-short — the degenerate opposite of the steady
-    // corpus. This also exercises the unused-size floor design (the
-    // long entry's representative envelope is resampled from the
-    // short one, since no long frame ever contributes).
+    // A train of *growing* impulses, spaced one lookahead apart: every
+    // impulse clears the r453 detector's post-masking-decayed envelope
+    // (20 ms of decay ≈ −8 dB, plus +2.3 dB of growth, against the
+    // +9 dB attack ratio), and every `long_n`-sample lookahead region
+    // contains one — so the schedule is all-short, the degenerate
+    // opposite of the steady corpus. (The old two-threshold detector
+    // was fed a 147 Hz dense train here; under the loudness-adaptive
+    // envelope such a train reads as the steady buzz it is, so the
+    // corpus is spaced to be genuinely transient.) This also
+    // exercises the unused-size floor design (the long entry's
+    // representative envelope is resampled from the short one, since
+    // no long frame ever contributes).
     let samples = 10_000;
     let mut pcm = vec![0.0f32; samples];
     let mut k = 150usize;
+    let mut amp = 0.05f32;
     while k < samples {
         for j in 0..24.min(samples - k) {
             let d = (-(j as f32) / 6.0).exp();
-            pcm[k + j] = 0.8 * d * if j % 2 == 0 { 1.0 } else { -1.0 };
+            pcm[k + j] = amp * d * if j % 2 == 0 { 1.0 } else { -1.0 };
         }
-        k += 300;
+        amp = (amp * 1.3).min(0.9);
+        k += 900;
     }
     let input = vec![pcm];
-    // The impulse spacing (300 samples) is dense relative to a 1024
-    // lookahead (an impulse in every fourth-or-so 64-sample sub-frame
-    // keeps the peak-to-mean concentration high); the default 2048
-    // window would dilute the same train into quasi-steady content,
-    // so the test pins its long size explicitly.
     let mut config = StreamEncoderConfig::new(RATE, 1);
     config.blocksize = 1024;
     let ogg = encode_pcm_to_ogg(&input, &config).expect("encodes");

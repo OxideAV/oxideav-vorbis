@@ -266,6 +266,7 @@ pub use audio::{
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub use blocksize::plan_block_sequence_perceptual;
 pub use blocksize::{
     choose_blocksize, detect_transient, plan_block_sequence, BlockSequencePlan, BlocksizeError,
     TransientAnalysis,

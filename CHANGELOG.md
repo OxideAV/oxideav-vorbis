@@ -6,6 +6,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **Loudness-adaptive perceptual attack detector**
+  (`blocksize::plan_block_sequence_perceptual`, now driving the
+  integrated encoder's §4.3.1 schedule): detection runs on the
+  high-passed signal (attacks are broadband; bass carries most raw
+  energy), each `long_n / 16`-sample sub-frame's energy is compared
+  against a post-masking-**decaying** envelope of the material before
+  it (0.4 dB/ms — a modest hit right after a loud passage is masked
+  and stays long, the same hit out of quiet fires), with an absolute
+  audibility floor (−72 dBFS RMS in the difference signal — a
+  sub-audible tick never schedules short blocks). Both criteria are
+  loudness-relative or absolute-perceptual, so scaling the input does
+  not change the schedule; the envelope warms up on the first
+  sub-frame (a steady signal's own switch-on is not an attack). The
+  two global thresholds (peak-to-mean concentration, energy rise)
+  remain available on `plan_block_sequence_multi` for callers that
+  want them. A dense 147 Hz impulse train now reads as the steady
+  buzz it is (the block-switching suite's all-transient corpus is
+  respaced to genuinely isolated, growing impulses).
 - **Per-packet, masking-driven channel coupling** — the §4.2.4
   mapping fixes the coupling steps for every packet using it, so the
   encoder now declares one mapping (and §4.2.4 mode) per distinct

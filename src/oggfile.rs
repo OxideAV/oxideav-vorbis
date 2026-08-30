@@ -15,10 +15,12 @@
 //!
 //! The stream carries the §4.2.2 blocksize pair `(blocksize_0,
 //! blocksize_1)`. When they differ, the encoder runs §4.3.1 **block
-//! switching**: a clean-room energy-envelope transient detector
-//! ([`crate::blocksize::plan_block_sequence`]) schedules the short
-//! block over attacks (confining quantisation noise to avoid
-//! pre-echo) and the long block elsewhere; each long packet's
+//! switching**: the clean-room loudness-adaptive attack detector
+//! ([`crate::blocksize::plan_block_sequence_perceptual`] — high-passed
+//! sub-frame energy against a post-masking-decayed envelope, with an
+//! absolute audibility floor) schedules the short block over attacks
+//! (confining quantisation noise to avoid pre-echo) and the long
+//! block elsewhere; each long packet's
 //! `previous_window_flag` / `next_window_flag` mirror its neighbours'
 //! blockflags so the §4.3.1 hybrid window edges lap every long↔short
 //! transition, and the setup header carries a floor / residue /
@@ -45,7 +47,7 @@
 //! `weights · error²  + λ · bits` per §8.6 partition).
 
 use crate::audio::AudioDecoderState;
-use crate::blocksize::{plan_block_sequence_multi, BlocksizeError};
+use crate::blocksize::{plan_block_sequence_perceptual, BlocksizeError};
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::encoder::{
     write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
@@ -285,31 +287,6 @@ fn angle_weight_scale(f_hz: f32, tuning: &EncoderTuning) -> f32 {
     }
 }
 
-/// Sub-frame count the §4.3.1 transient detector splits its lookahead
-/// region into ([`crate::blocksize::detect_transient`]): sixteen
-/// sub-frames over the `long_n` lookahead resolve an attack finely
-/// enough that a decaying hit over a tone bed still concentrates in
-/// one or two sub-frames instead of diluting into the bed energy.
-const TRANSIENT_SUBFRAMES: usize = 16;
-
-/// Peak-to-mean energy-concentration ratio above which the lookahead
-/// region is called a transient and the encoder schedules the short
-/// block. A flat region scores `≈ 1`; a tonal region whose lookahead
-/// covers only a fraction of a low-frequency cycle stays under `≈
-/// 2.5`; a genuine attack over a tone bed clears `4`–`8`. `3.0` sits
-/// between the two regimes.
-const TRANSIENT_PEAK_TO_MEAN: f64 = 3.0;
-
-/// Energy-rise factor of the §4.3.1 schedule's second transient
-/// criterion: the lookahead's peak sub-frame energy against the
-/// previous decision region's mean sub-frame energy. Catches a
-/// sustained loudness step (a noise burst over a tone bed) that is
-/// flat *within* the window — invisible to the concentration ratio —
-/// but whose onset a long block would smear pre-echo across. `4.0`
-/// (+6 dB in energy over one lookahead) is well above ordinary
-/// musical envelope motion.
-const TRANSIENT_ENERGY_RISE: f64 = 4.0;
-
 /// Configuration for [`encode_pcm_to_ogg`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamEncoderConfig {
@@ -340,10 +317,10 @@ pub struct StreamEncoderConfig {
     /// The **short** blocksize `blocksize_0` (a power of two in
     /// `64..=8192`, `<=` [`Self::blocksize`], §4.2.2). When strictly
     /// smaller than the long size, the encoder runs §4.3.1 block
-    /// switching: a clean-room energy-envelope transient detector
-    /// ([`crate::blocksize::plan_block_sequence`]) schedules short
-    /// blocks around attacks (confining quantisation noise to avoid
-    /// pre-echo) and long blocks elsewhere, with per-size floors and
+    /// switching: the clean-room loudness-adaptive attack detector
+    /// ([`crate::blocksize::plan_block_sequence_perceptual`]) schedules
+    /// short blocks around attacks (confining quantisation noise to
+    /// avoid pre-echo) and long blocks elsewhere, with per-size floors and
     /// residues and the §4.3.1 hybrid window edges at every
     /// long↔short transition. Setting it equal to
     /// [`Self::blocksize`] disables switching (a single-blocksize,
@@ -1522,14 +1499,7 @@ fn encode_pcm_to_packets_geometry(
     // priming packet plus one packet per n/2 finished samples.
     let (flags, granules) = if switching {
         let rows: Vec<&[f32]> = pcm.iter().map(|row| row.as_slice()).collect();
-        let plan = plan_block_sequence_multi(
-            &rows,
-            n0,
-            n1,
-            TRANSIENT_SUBFRAMES,
-            TRANSIENT_PEAK_TO_MEAN,
-            TRANSIENT_ENERGY_RISE,
-        )?;
+        let plan = plan_block_sequence_perceptual(&rows, n0, n1, config.sample_rate)?;
         (plan.blockflags, plan.granules)
     } else {
         let half = n1 / 2;

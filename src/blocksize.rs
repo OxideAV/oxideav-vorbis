@@ -418,6 +418,168 @@ pub fn plan_block_sequence_multi(
     })
 }
 
+/// Plan a whole stream's block-size sequence with the
+/// **loudness-adaptive perceptual attack detector** — the integrated
+/// encoder's §1.3.2 schedule since r453, replacing the two
+/// global-threshold criteria of [`plan_block_sequence_multi`] (which
+/// remains for callers that want explicit thresholds).
+///
+/// Detection runs per channel on the **high-passed** signal (the first
+/// difference `x[i] − x[i−1]`): an attack is broadband while bass
+/// carries most raw energy, so a drum hit over a loud bass line —
+/// invisible to a raw-energy ratio — stands out in the difference
+/// signal, and a low tone's own cycles stop reading as motion. The
+/// signal is split into sub-frames of `long_n / 16` samples, and each
+/// sub-frame's high-passed energy is compared against a **decaying
+/// envelope** of the sub-frames before it (the engineering shape of
+/// post-masking: the reference an onset must beat falls by
+/// [`ATTACK_ENVELOPE_DECAY_DB_PER_MS`] per millisecond, so a modest
+/// hit right after a loud passage is masked and does not fire, while
+/// the same hit out of quiet does). A sub-frame marks an attack when
+/// its energy exceeds [`ATTACK_RATIO`] × the decayed envelope **and**
+/// clears the absolute audibility floor
+/// ([`ATTACK_QUIET_FLOOR_AMPLITUDE`] RMS in the difference signal —
+/// sub-audible ticks never schedule short blocks). Both criteria are
+/// relative or absolute-perceptual: scaling the input does not change
+/// the schedule until it crosses the audibility floor.
+///
+/// The §4.3.8 granule walk then schedules the **short** block for
+/// every packet whose `long_n`-sample lookahead region contains an
+/// attack of any channel (the packet's blockflag is shared by all
+/// channels), exactly the lookahead semantics of
+/// [`plan_block_sequence_multi`].
+///
+/// # Errors
+///
+/// As [`plan_block_sequence_multi`]: [`BlocksizeError::EmptyBlock`],
+/// [`BlocksizeError::BadBlocksizePair`], or
+/// [`BlocksizeError::NonFiniteSample`].
+pub fn plan_block_sequence_perceptual(
+    channels: &[&[f32]],
+    short_n: usize,
+    long_n: usize,
+    sample_rate: u32,
+) -> Result<BlockSequencePlan, BlocksizeError> {
+    let len = channels.iter().map(|row| row.len()).max().unwrap_or(0);
+    if len == 0 || sample_rate == 0 {
+        return Err(BlocksizeError::EmptyBlock);
+    }
+    let legal = |n: usize| n.is_power_of_two() && (64..=8192).contains(&n);
+    if !legal(short_n) || !legal(long_n) || short_n > long_n {
+        return Err(BlocksizeError::BadBlocksizePair { short_n, long_n });
+    }
+    for row in channels {
+        if let Some(i) = row.iter().position(|s| !s.is_finite()) {
+            return Err(BlocksizeError::NonFiniteSample(i));
+        }
+    }
+    if short_n == long_n {
+        // Degenerate single-blocksize stream (mirrors the multi form).
+        let half = long_n / 2;
+        let frames = len.div_ceil(half) + 1;
+        return Ok(BlockSequencePlan {
+            blockflags: vec![false; frames],
+            granules: (0..frames as u64).map(|f| f * (half as u64)).collect(),
+        });
+    }
+
+    let sub = (long_n / 16).max(1);
+    let subframes = len.div_ceil(sub);
+    // Per-sub-frame decayed-envelope attack marks, OR-merged over the
+    // channels.
+    let mut attack = vec![false; subframes];
+    let decay_per_sub = {
+        let sub_ms = sub as f32 * 1000.0 / sample_rate as f32;
+        10.0f64.powf(f64::from(-ATTACK_ENVELOPE_DECAY_DB_PER_MS * sub_ms) / 10.0)
+    };
+    let quiet_floor_energy =
+        f64::from(ATTACK_QUIET_FLOOR_AMPLITUDE) * f64::from(ATTACK_QUIET_FLOOR_AMPLITUDE);
+    for row in channels {
+        // The envelope warms up on the first sub-frame: the reference
+        // an onset must beat is the content *before* it, and the
+        // stream head has none — a steady signal must not read its own
+        // switch-on as an attack (its pre-echo would land in the
+        // priming frame's discarded left half anyway).
+        let mut env = f64::INFINITY;
+        for (j, marked) in attack.iter_mut().enumerate() {
+            let lo = j * sub;
+            let hi = ((j + 1) * sub).min(row.len());
+            if lo >= hi {
+                break;
+            }
+            // Mean high-passed energy of the sub-frame (per sample, so
+            // the audibility floor is amplitude-calibrated).
+            let mut e = 0.0f64;
+            let mut prev = if lo == 0 { 0.0f32 } else { row[lo - 1] };
+            for &x in &row[lo..hi] {
+                let d = f64::from(x - prev);
+                e += d * d;
+                prev = x;
+            }
+            e /= (hi - lo) as f64;
+            if e > ATTACK_RATIO * env && e > quiet_floor_energy {
+                *marked = true;
+            }
+            env = if env.is_finite() {
+                e.max(env * decay_per_sub)
+            } else {
+                e
+            };
+        }
+    }
+    // Attack sub-frame j covers samples [j·sub, (j+1)·sub); a packet
+    // decided at granule g goes short when any attack overlaps its
+    // lookahead [g, g + long_n).
+    let attack_in = |g: usize| -> bool {
+        let first = g / sub;
+        let last = (g + long_n - 1) / sub;
+        attack[first..=last.min(subframes.saturating_sub(1))]
+            .iter()
+            .any(|&a| a)
+    };
+
+    let size = |flag: bool| if flag { long_n } else { short_n };
+    let decide = |g: usize| -> bool {
+        if g >= len {
+            return true; // pure zero-padding: long
+        }
+        !attack_in(g)
+    };
+    let mut blockflags = vec![decide(0)];
+    let mut granules = vec![0u64];
+    let mut g = 0usize;
+    while g < len {
+        let flag = decide(g);
+        let n_prev = size(*blockflags.last().expect("non-empty"));
+        // §4.3.8: packet f finishes (n_{f-1} + n_f) / 4 samples.
+        g += (n_prev + size(flag)) / 4;
+        blockflags.push(flag);
+        granules.push(g as u64);
+    }
+    Ok(BlockSequencePlan {
+        blockflags,
+        granules,
+    })
+}
+
+/// How fast the perceptual attack detector's reference envelope
+/// decays, in dB per millisecond — the post-masking shape: a modest
+/// onset within ~100 ms of a loud passage is masked and must not
+/// schedule short blocks.
+pub const ATTACK_ENVELOPE_DECAY_DB_PER_MS: f32 = 0.4;
+
+/// The energy ratio over the decayed envelope at which a sub-frame is
+/// called an attack (≈ +9 dB — well above musical envelope motion,
+/// comfortably below any genuine hit's onset step in the
+/// high-passed domain).
+pub const ATTACK_RATIO: f64 = 8.0;
+
+/// The absolute audibility floor of the attack detector: the RMS
+/// amplitude (in the high-passed, nominal ±1.0 domain) a sub-frame
+/// must exceed to mark an attack. ~ −72 dBFS: a tick under it cannot
+/// produce audible pre-echo through a long block either.
+pub const ATTACK_QUIET_FLOOR_AMPLITUDE: f32 = 2.5e-4;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +933,132 @@ mod tests {
             detect_transient(&[1.0, f32::NAN, 3.0], 1),
             Err(BlocksizeError::NonFiniteSample(1))
         );
+    }
+
+    // ---------- the perceptual detector ----------
+
+    const RATE: u32 = 44_100;
+
+    fn perceptual(rows: &[&[f32]]) -> BlockSequencePlan {
+        plan_block_sequence_perceptual(rows, 256, 2048, RATE).expect("plans")
+    }
+
+    fn shorts(plan: &BlockSequencePlan) -> usize {
+        plan.blockflags.iter().filter(|&&f| !f).count()
+    }
+
+    /// A bass tone with a click at `at` of amplitude `amp`.
+    fn bass_with_click(n: usize, at: usize, amp: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let bed = 0.5 * (2.0 * core::f32::consts::PI * 60.0 * t).sin();
+                if (at..at + 64).contains(&i) {
+                    bed + amp * if i % 2 == 0 { 1.0 } else { -1.0 }
+                } else {
+                    bed
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steady_tone_plans_all_long_and_click_over_bass_fires() {
+        let n = 30_000;
+        let steady = bass_with_click(n, n + 1, 0.0);
+        let plan = perceptual(&[&steady]);
+        assert_eq!(shorts(&plan), 0, "steady bass must stay long");
+
+        // A modest click over the loud bass: diluted in raw energy,
+        // plain in the high-passed domain.
+        let clicked = bass_with_click(n, 15_000, 0.05);
+        let plan = perceptual(&[&clicked]);
+        assert!(shorts(&plan) > 0, "the click must schedule short blocks");
+        // Scaling the whole signal down (still audible) must not
+        // change the schedule: the criteria are loudness-relative.
+        let scaled: Vec<f32> = clicked.iter().map(|&x| x * 0.1).collect();
+        assert_eq!(perceptual(&[&scaled]), plan, "schedule is scale-free");
+    }
+
+    #[test]
+    fn sub_audible_click_does_not_fire() {
+        let n = 30_000;
+        let mut quiet = vec![0.0f32; n];
+        for (i, v) in quiet.iter_mut().enumerate().skip(15_000).take(64) {
+            *v = if i % 2 == 0 { 1.0e-4 } else { -1.0e-4 };
+        }
+        let plan = perceptual(&[&quiet]);
+        assert_eq!(shorts(&plan), 0, "a sub-audible tick must stay long");
+    }
+
+    #[test]
+    fn post_masked_click_is_forgiven_but_isolated_click_fires() {
+        let n = 60_000;
+        // A loud broadband burst at 0.2 s, then the candidate click
+        // 30 ms after it — inside the post-masking decay.
+        let mut x = vec![0.0f32; n];
+        for (i, v) in x.iter_mut().enumerate().skip(8_820).take(2_000) {
+            *v = 0.7 * if (i / 3) % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let masked_at = 8_820 + 2_000 + (RATE as usize * 30) / 1000;
+        for (i, v) in x.iter_mut().enumerate().skip(masked_at).take(64) {
+            *v = 0.02 * if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let plan_masked = perceptual(&[&x]);
+
+        // The same small click alone, out of silence-plus-soft-bed.
+        let mut y = vec![0.0f32; n];
+        for (i, v) in y.iter_mut().enumerate() {
+            let t = i as f32 / RATE as f32;
+            *v = 0.005 * (2.0 * core::f32::consts::PI * 220.0 * t).sin();
+        }
+        for (i, v) in y.iter_mut().enumerate().skip(masked_at).take(64) {
+            *v = 0.02 * if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let plan_isolated = perceptual(&[&y]);
+
+        // The isolated click fires; the post-masked one adds no shorts
+        // beyond the loud burst's own.
+        assert!(
+            shorts(&plan_isolated) > 0,
+            "isolated click must schedule short blocks"
+        );
+        let burst_end_granule = 8_820 + 2_000 + 2_048;
+        let masked_tail_shorts = plan_masked
+            .blockflags
+            .iter()
+            .zip(&plan_masked.granules)
+            .filter(|&(&flag, &g)| !flag && g as usize > burst_end_granule)
+            .count();
+        assert_eq!(
+            masked_tail_shorts, 0,
+            "a click 30 ms after a loud burst is post-masked"
+        );
+    }
+
+    #[test]
+    fn perceptual_guards_fire() {
+        assert_eq!(
+            plan_block_sequence_perceptual(&[], 256, 2048, RATE),
+            Err(BlocksizeError::EmptyBlock)
+        );
+        assert_eq!(
+            plan_block_sequence_perceptual(&[&[0.0; 8][..]], 256, 2048, 0),
+            Err(BlocksizeError::EmptyBlock)
+        );
+        assert_eq!(
+            plan_block_sequence_perceptual(&[&[0.0; 8][..]], 2048, 256, RATE),
+            Err(BlocksizeError::BadBlocksizePair {
+                short_n: 2048,
+                long_n: 256
+            })
+        );
+        assert!(matches!(
+            plan_block_sequence_perceptual(&[&[f32::NAN; 8][..]], 256, 2048, RATE),
+            Err(BlocksizeError::NonFiniteSample(0))
+        ));
+        // Degenerate equal blocksizes: uniform walk.
+        let plan = plan_block_sequence_perceptual(&[&[0.1; 4096][..]], 2048, 2048, RATE).unwrap();
+        assert!(plan.blockflags.iter().all(|&f| !f));
     }
 }
