@@ -71,20 +71,27 @@ fn snr_db(reference: &[f32], decoded: &[f32]) -> f64 {
     10.0 * (sig / err).log10()
 }
 
-/// Parse the coupling steps out of a produced stream's setup header.
-/// Every mapping (one per block size) must carry the identical step
-/// list — the coupling decision is per stream, not per block size.
+/// The coupling steps a produced stream uses: the union over its
+/// mappings' step lists. Since r453 the coupling decision is per
+/// packet — the setup header declares one mapping (and mode) per
+/// distinct `(block size, step set)` the stream's packets select, so a
+/// stream that couples some packets and not others carries both a
+/// coupled and an uncoupled mapping per block size; a stream that
+/// never couples carries no coupled mapping at all.
 fn coupling_steps_of(ogg: &[u8], channels: u8) -> Vec<MappingCouplingStep> {
     let packets = ogg_packets(ogg).expect("stream de-frames");
     let setup = parse_setup_header(&packets[2], channels).expect("setup header parses");
     assert!(!setup.mappings.is_empty());
-    for mapping in &setup.mappings[1..] {
-        assert_eq!(
-            mapping.coupling, setup.mappings[0].coupling,
-            "all mappings must agree on the coupling steps"
-        );
+    let mut steps: Vec<MappingCouplingStep> = Vec::new();
+    for mapping in &setup.mappings {
+        for step in &mapping.coupling {
+            if !steps.contains(step) {
+                steps.push(*step);
+            }
+        }
     }
-    setup.mappings[0].coupling.clone()
+    steps.sort_by_key(|s| (s.magnitude_channel, s.angle_channel));
+    steps
 }
 
 #[test]

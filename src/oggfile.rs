@@ -72,7 +72,7 @@ use crate::setup::{
     MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
 };
 use crate::streaming::{StreamingDecoder, StreamingError, StreamingFrame};
-use crate::synthesis::{coupling_energy, forward_couple_all, WindowError};
+use crate::synthesis::{forward_couple_all, WindowError};
 use crate::VorbisCommentHeader;
 use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
 use oxideav_ogg::page::Page;
@@ -243,17 +243,47 @@ const NOISE_BOOK_LEVELS: u32 = 3;
 /// total instead of one codeword per partition.
 const CLASS_GROUP_DIMS: u16 = 4;
 
-/// The §4.3.5 coupling gate: a candidate channel pair is coupled when
-/// its whole-stream square-polar angle energy is at most this fraction
-/// of its magnitude energy ([`CouplingEnergy::angle_ratio`] semantics,
-/// accumulated over every frame's residue targets). A strongly
-/// correlated stereo pair sits far below this (the `L − R` angle
-/// residue quantises toward zero); an independent or anti-correlated
-/// pair sits near or above `1.0`, where coupling would only move
-/// energy around. `0.5` keeps the gate on the clearly-profitable side.
-///
-/// [`CouplingEnergy::angle_ratio`]: crate::synthesis::CouplingEnergy::angle_ratio
-const COUPLING_MAX_ANGLE_RATIO: f64 = 0.5;
+/// The frequency below which the §4.3.5 angle vector carries its full
+/// audibility weight: fine interaural phase is resolved up to roughly
+/// this frequency, so a difference-vector error below it is as audible
+/// as a magnitude error.
+const ANGLE_FULL_WEIGHT_HZ: f32 = 1_500.0;
+
+/// The frequency from which the angle vector's weight reaches its
+/// discount floor (log-frequency interpolation in between): above a
+/// few kHz the auditory system localises on envelopes, not carrier
+/// phase, so error in the difference vector — which perturbs the
+/// stereo image, not the sum — is far less audible than the same
+/// error in the magnitude vector.
+const ANGLE_DISCOUNT_HZ: f32 = 6_000.0;
+
+/// The angle vector's audibility weight at and above
+/// [`ANGLE_DISCOUNT_HZ`] at the bottom of the quality knob (`0.25` =
+/// 6 dB more difference-vector noise allowed). The discount fades to
+/// none (`1.0`) at the top of the knob, where waveform fidelity is
+/// what the knob promises.
+const ANGLE_DISCOUNT_FLOOR: f32 = 0.25;
+
+/// The angle vector's audibility weight scale at frequency `f_hz`
+/// under `tuning` (see [`ANGLE_FULL_WEIGHT_HZ`], [`ANGLE_DISCOUNT_HZ`],
+/// [`ANGLE_DISCOUNT_FLOOR`]): `1.0` below the full-weight edge, the
+/// knob's discount floor from the discount edge up, log-frequency
+/// linear between. The floor rises from [`ANGLE_DISCOUNT_FLOOR`] at
+/// `q = 0` to `1.0` at the +6 dB masking-margin cap (`q = 0.75`), so
+/// the top of the knob codes the stereo image at waveform fidelity.
+fn angle_weight_scale(f_hz: f32, tuning: &EncoderTuning) -> f32 {
+    let knob = ((tuning.threshold_offset_db + 12.0) / 18.0).clamp(0.0, 1.0);
+    let floor = ANGLE_DISCOUNT_FLOOR + (1.0 - ANGLE_DISCOUNT_FLOOR) * knob;
+    if f_hz <= ANGLE_FULL_WEIGHT_HZ {
+        1.0
+    } else if f_hz >= ANGLE_DISCOUNT_HZ {
+        floor
+    } else {
+        let t =
+            (f_hz / ANGLE_FULL_WEIGHT_HZ).ln() / (ANGLE_DISCOUNT_HZ / ANGLE_FULL_WEIGHT_HZ).ln();
+        1.0 + (floor - 1.0) * t
+    }
+}
 
 /// Sub-frame count the §4.3.1 transient detector splits its lookahead
 /// region into ([`crate::blocksize::detect_transient`]): sixteen
@@ -1009,12 +1039,23 @@ impl ResidueLadder {
 /// The classbook groups [`CLASS_GROUP_DIMS`] partitions per §8.6.2
 /// classword (radix-packed); its seed lengths are uniform and the
 /// encode path retrains them occupancy-optimal for the final plans.
+/// One §4.2.4 mode of the produced stream: the setup entry (block
+/// size) it maps to and the §4.3.5 coupling steps its mapping carries.
+/// A stream declares one mode per distinct `(entry, steps)` pair the
+/// per-packet coupling election uses, so a packet selects its
+/// coupling by selecting its mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModeSpec {
+    entry: usize,
+    coupling: Vec<MappingCouplingStep>,
+}
+
 fn build_setup(
     floor_headers: Vec<crate::setup::Floor1Header>,
     ladder: ResidueLadder,
     half_ns: &[u32],
     residue_ends: &[u32],
-    coupling: Vec<MappingCouplingStep>,
+    mode_specs: &[ModeSpec],
     switching: bool,
 ) -> VorbisSetupHeader {
     let floors = floor_headers
@@ -1039,27 +1080,33 @@ fn build_setup(
             books: ladder.books.clone(),
         })
         .collect();
-    let mappings = (0..half_ns.len())
-        .map(|e| MappingHeader {
+    // One mapping + mode per spec: the mapping carries the spec's
+    // coupling steps under a single submap over the entry's floor and
+    // residue; the mode selects the entry's block size.
+    let mappings = mode_specs
+        .iter()
+        .map(|spec| MappingHeader {
             mapping_type: 0,
             submaps: 1,
-            coupling: coupling.clone(),
+            coupling: spec.coupling.clone(),
             // §4.2.4: the mux table is only present when submaps > 1;
             // with one submap every channel implicitly maps to it.
             mux: Vec::new(),
             submap_configs: vec![MappingSubmap {
                 time_placeholder: 0,
-                floor: e as u8,
-                residue: e as u8,
+                floor: spec.entry as u8,
+                residue: spec.entry as u8,
             }],
         })
         .collect();
-    let modes = (0..half_ns.len())
-        .map(|e| ModeHeader {
-            blockflag: switching && e == 1,
+    let modes = mode_specs
+        .iter()
+        .enumerate()
+        .map(|(m, spec)| ModeHeader {
+            blockflag: switching && spec.entry == 1,
             windowtype: 0,
             transformtype: 0,
-            mapping: e as u8,
+            mapping: m as u8,
         })
         .collect();
     let mut codebooks = vec![
@@ -1502,7 +1549,9 @@ fn encode_pcm_to_packets_geometry(
     // take `true` on their outward side: the priming frame's left half
     // and the final frame's right half never reach the output (§4.3.8
     // priming / §A.2 end-trim), so the full-width slope is free.
-    let headers: Vec<AudioPacketHeader> = (0..frames)
+    // (`mode_number` is finalised once the per-packet coupling election
+    // below has fixed the stream's mode list.)
+    let mut headers: Vec<AudioPacketHeader> = (0..frames)
         .map(|f| AudioPacketHeader {
             mode_number: u32::from(switching && flags[f]),
             blockflag: flags[f],
@@ -1717,9 +1766,48 @@ fn encode_pcm_to_packets_geometry(
     // selection (the per-partition rows above are their means: the
     // trainer and the band-adoption tallies work per partition).
     let mut bin_weights: Vec<Vec<Vec<f64>>> = Vec::with_capacity(frames);
+    // ---- §4.3.5 channel coupling: per-packet, masking-driven ----
+    // The §4.2.4 mapping fixes the coupling steps for every packet
+    // using it, so a per-packet choice needs one mapping (and mode)
+    // per distinct step set the stream uses: the election here picks
+    // each frame's step set, and the setup header declares exactly
+    // the `(block size, step set)` pairs that occur — a stream that
+    // never couples carries no coupled mapping, one that always does
+    // carries no uncoupled one.
+    //
+    // A coupled pair codes under **one shared floor** (the two
+    // channels' envelopes' maximum, fitted once and carried by both):
+    // the §4.3.5 transform acts on the floor-normalised residues, so
+    // under two independently fitted floors an identical signal in
+    // both channels still leaves a difference vector — the floors'
+    // mismatch — and the pair reads decorrelated (measured: a mid +
+    // small-side tone pair elected coupling on 6 of 23 frames under
+    // its own floors). Under the shared floor the difference vector
+    // is the true side signal.
+    //
+    // Each candidate pair `(2p, 2p+1)` is elected per frame on the
+    // **audible energy to code**: the bin-weighted energy of the pair's
+    // own-floor residue targets left uncoupled, `Σ_k w_L·L² + w_R·R²`,
+    // against the shared-floor targets coupled, `Σ_k w·(M² + s_k·A²)`
+    // with `w = max(w_L, w_R)` (error in either coupled vector reaches
+    // both outputs) and `s_k` the angle audibility scale
+    // ([`angle_weight_scale`]: fine interaural phase is inaudible
+    // above ~1.5 kHz, so error in the difference vector weighs less up
+    // there — the point-stereo discount, faded out toward the top of
+    // the knob). A correlated pair couples (the angle quantises toward
+    // zero cheaply); an independent or anti-phase pair stays
+    // uncoupled (coupling would only move energy around).
+    let pairs: Vec<(usize, usize)> = if config.coupling && ch >= 2 {
+        (0..ch / 2).map(|p| (2 * p, 2 * p + 1)).collect()
+    } else {
+        Vec::new()
+    };
+    let mut frame_steps: Vec<Vec<MappingCouplingStep>> = Vec::with_capacity(frames);
     for f in 0..frames {
         let e = entry_of(f);
         let half = sizes[f] / 2;
+        let end = frame_res_end(f);
+        let ps = frame_ps(f);
         let mut y_row = Vec::with_capacity(ch);
         let mut t_row = Vec::with_capacity(ch);
         let mut w_row = Vec::with_capacity(ch);
@@ -1753,6 +1841,69 @@ fn encode_pcm_to_packets_geometry(
             w_row.push(w);
             bw_row.push(bw);
         }
+        let mut steps = Vec::new();
+        for &(mag, ang) in &pairs {
+            let shared_env: Vec<f32> = envelopes[f][mag]
+                .iter()
+                .zip(&envelopes[f][ang])
+                .map(|(&a, &b)| a.max(b))
+                .collect();
+            let (y_s, rendered_s) =
+                fit_covering_floor(&shared_env, &floor_headers[e], &floor_decoders[e], half)?;
+            let target_s = |c: usize| -> Vec<f32> {
+                spectra[f][c]
+                    .iter()
+                    .zip(&rendered_s)
+                    .map(|(&xv, &fv)| xv / fv)
+                    .collect()
+            };
+            let (t_mag, t_ang) = (target_s(mag), target_s(ang));
+            let bw_mag = residue_bin_weights(&rendered_s, &maskings[f][mag], 0, end)?;
+            let bw_ang = residue_bin_weights(&rendered_s, &maskings[f][ang], 0, end)?;
+            // Bits-like measure: `log2(1 + w·t²)` per bin — the rate a
+            // bin needs to bring its weighted error under the mask
+            // grows with the log of its audible energy, and a sum of
+            // logs counts every bin instead of letting the few most
+            // audible bins (weights reach 10⁴) decide alone. (Measured:
+            // under a plain weighted-energy sum a mid + small-side pair
+            // read *uncoupled* — the side tone's anti-phase bins cost
+            // 2.5× under coupling and outweighed the hundreds of
+            // identical mid bins that halve.)
+            let bits = |w: f64, t: f32| (1.0 + w * f64::from(t * t)).log2();
+            let mut uncoupled = 0.0f64;
+            let mut coupled = 0.0f64;
+            for k in 0..end {
+                let (l, r) = (t_row[mag][k], t_row[ang][k]);
+                uncoupled += bits(bw_row[mag][k], l) + bits(bw_row[ang][k], r);
+                let (m, a) = crate::synthesis::forward_couple_scalar(t_mag[k], t_ang[k]);
+                let scale = angle_weight_scale(
+                    (k as f32 + 0.5) * config.sample_rate as f32 / (2.0 * half as f32),
+                    tuning,
+                );
+                let w = bw_mag[k].max(bw_ang[k]);
+                coupled += bits(w, m) + bits(w * f64::from(scale), a);
+            }
+            if coupled <= uncoupled {
+                steps.push(MappingCouplingStep {
+                    magnitude_channel: mag as u8,
+                    angle_channel: ang as u8,
+                });
+                let means = |bw: &[f64]| -> Vec<f64> {
+                    bw.chunks(ps)
+                        .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
+                        .collect()
+                };
+                w_row[mag] = means(&bw_mag);
+                w_row[ang] = means(&bw_ang);
+                bw_row[mag] = bw_mag;
+                bw_row[ang] = bw_ang;
+                t_row[mag] = t_mag;
+                t_row[ang] = t_ang;
+                y_row[mag] = y_s.clone();
+                y_row[ang] = y_s;
+            }
+        }
+        frame_steps.push(steps);
         floor_ys.push(y_row);
         targets.push(t_row);
         weights.push(w_row);
@@ -1773,56 +1924,90 @@ fn encode_pcm_to_packets_geometry(
     // residue decode, before the §4.3.6 floor multiply. The coupling is
     // applied to the *residue targets* (`X / rendered_floor`), the
     // exact vectors the decoder inverse-couples.
-    let coupling_steps: Vec<MappingCouplingStep> = if config.coupling && ch >= 2 {
-        (0..ch / 2)
-            .filter_map(|pair| {
-                let (mag, ang) = (2 * pair, 2 * pair + 1);
-                let mut mag_energy = 0.0f64;
-                let mut ang_energy = 0.0f64;
-                for t_row in &targets {
-                    let e = coupling_energy(&t_row[mag], &t_row[ang]);
-                    mag_energy += e.magnitude_energy;
-                    ang_energy += e.angle_energy;
-                }
-                (ang_energy <= COUPLING_MAX_ANGLE_RATIO * mag_energy).then_some(
-                    MappingCouplingStep {
-                        magnitude_channel: mag as u8,
-                        angle_channel: ang as u8,
-                    },
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if !coupling_steps.is_empty() {
-        for ((t_row, w_row), bw_row) in targets
-            .iter_mut()
-            .zip(weights.iter_mut())
-            .zip(bin_weights.iter_mut())
-        {
-            forward_couple_all(t_row, &coupling_steps)
+    // Elected steps are forward-coupled here — the residue planner
+    // below quantises magnitude/angle vectors — and the decoder's
+    // §4.3.5 inverse coupling undoes the transform after residue
+    // decode, before the §4.3.6 floor multiply.
+    // Per frame, per channel: is the channel an angle vector?
+    let mut is_angle: Vec<Vec<bool>> = vec![vec![false; ch]; frames];
+    for (f, ((t_row, w_row), bw_row)) in targets
+        .iter_mut()
+        .zip(weights.iter_mut())
+        .zip(bin_weights.iter_mut())
+        .enumerate()
+    {
+        let half = sizes[f] / 2;
+        let steps = &frame_steps[f];
+        if !steps.is_empty() {
+            forward_couple_all(t_row, steps)
                 .expect("coupling steps are constructed in range with distinct channels");
             // Merge each coupled pair's NMR weights (per partition and
             // per bin) to the element-wise max: quantisation error in
             // either coupled vector spreads into both output channels
             // through the inverse coupling, so the more sensitive
-            // channel's audibility bound must govern both.
-            for step in &coupling_steps {
+            // channel's audibility bound governs both — the angle
+            // vector's additionally scaled by the interaural-phase
+            // audibility of its frequency.
+            for step in steps {
                 let (mag, ang) = (step.magnitude_channel as usize, step.angle_channel as usize);
-                for p in 0..w_row[mag].len() {
-                    let w = w_row[mag][p].max(w_row[ang][p]);
-                    w_row[mag][p] = w;
-                    w_row[ang][p] = w;
-                }
+                is_angle[f][ang] = true;
+                let ps = frame_ps(f);
                 for k in 0..bw_row[mag].len() {
                     let w = bw_row[mag][k].max(bw_row[ang][k]);
+                    let scale = angle_weight_scale(
+                        (k as f32 + 0.5) * config.sample_rate as f32 / (2.0 * half as f32),
+                        tuning,
+                    );
                     bw_row[mag][k] = w;
-                    bw_row[ang][k] = w;
+                    bw_row[ang][k] = w * f64::from(scale);
+                }
+                for p in 0..w_row[mag].len() {
+                    let lo = p * ps;
+                    let hi = (lo + ps).min(bw_row[mag].len());
+                    w_row[mag][p] = bw_row[mag][lo..hi].iter().sum::<f64>() / (hi - lo) as f64;
+                    w_row[ang][p] = bw_row[ang][lo..hi].iter().sum::<f64>() / (hi - lo) as f64;
                 }
             }
         }
     }
+    // The stream's mode list: one `(entry, steps)` per distinct pair
+    // used, entries first, the most-coupled variant of each entry
+    // first. Every entry keeps at least one mode (an unused block
+    // size still needs a legal mode).
+    let mut mode_specs: Vec<ModeSpec> = Vec::new();
+    for e in 0..n_entries {
+        let mut variants: Vec<Vec<MappingCouplingStep>> = Vec::new();
+        for (f, steps) in frame_steps.iter().enumerate() {
+            if entry_of(f) == e && !variants.contains(steps) {
+                variants.push(steps.clone());
+            }
+        }
+        if variants.is_empty() {
+            variants.push(Vec::new());
+        }
+        let key = |steps: &Vec<MappingCouplingStep>| -> Vec<(u8, u8)> {
+            steps
+                .iter()
+                .map(|s| (s.magnitude_channel, s.angle_channel))
+                .collect()
+        };
+        variants.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| key(a).cmp(&key(b))));
+        for coupling in variants {
+            mode_specs.push(ModeSpec { entry: e, coupling });
+        }
+    }
+    for (f, header) in headers.iter_mut().enumerate() {
+        let spec = ModeSpec {
+            entry: entry_of(f),
+            coupling: frame_steps[f].clone(),
+        };
+        header.mode_number = mode_specs
+            .iter()
+            .position(|s| *s == spec)
+            .expect("every frame's (entry, steps) pair is declared")
+            as u32;
+    }
+    let any_coupling = mode_specs.iter().any(|s| !s.coupling.is_empty());
 
     // ---- per-partition peak statistics over the coded band ----
     // Everything downstream — the ladder spans, the amplitude-band
@@ -1842,10 +2027,6 @@ fn encode_pcm_to_packets_geometry(
     // partition clips against the coarse reach (`±1.33·span`, an error
     // the rate-distortion chooser prices) while everything else keeps
     // its grid.
-    let mut is_angle = vec![false; ch];
-    for step in &coupling_steps {
-        is_angle[step.angle_channel as usize] = true;
-    }
     let mut max_abs = 0.0f32;
     let mut partition_peaks: Vec<f32> = Vec::new();
     let mut span_peaks: Vec<f32> = Vec::new();
@@ -1855,7 +2036,7 @@ fn encode_pcm_to_packets_geometry(
             for part in target[..end].chunks_exact(ps) {
                 let peak = part.iter().fold(0.0f32, |m, &t| m.max(t.abs()));
                 partition_peaks.push(peak);
-                if !is_angle[c] {
+                if !is_angle[f][c] {
                     span_peaks.push(peak);
                 }
                 max_abs = max_abs.max(peak);
@@ -2221,7 +2402,7 @@ fn encode_pcm_to_packets_geometry(
         // reach. (The wide book's step is twice the coarse step, so
         // its leftover fits exactly inside the fine ladder's
         // ±coarse-step span.) Adoption keeps it only if it pays.
-        if !coupling_steps.is_empty() {
+        if any_coupling {
             band_candidates.push((
                 design_band_book(
                     config.vq_dims,
@@ -2253,7 +2434,7 @@ fn encode_pcm_to_packets_geometry(
             ladder,
             &half_ns,
             &residue_ends_u32,
-            coupling_steps.clone(),
+            &mode_specs,
             switching,
         )
     };

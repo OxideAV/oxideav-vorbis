@@ -6,6 +6,32 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- **Per-packet, masking-driven channel coupling** — the §4.2.4
+  mapping fixes the coupling steps for every packet using it, so the
+  encoder now declares one mapping (and §4.2.4 mode) per distinct
+  `(block size, coupling-step set)` its packets actually select, and
+  each frame elects its own coupling: a stream that never couples
+  carries no coupled mapping, one that always does carries no
+  uncoupled one, and mixed content switches per packet — the
+  lossless-stereo bypass where mid/side loses. The election compares
+  the audible energy to code on a bits-like `Σ log2(1 + w·t²)`
+  measure (a plain weighted-energy sum let the few most audible bins
+  decide alone: a mid + small-side pair read uncoupled because the
+  side tone's anti-phase bins cost 2.5× under coupling while hundreds
+  of identical mid bins that halve went unheard). A coupled pair
+  codes under **one shared floor** (the two envelopes' maximum,
+  fitted once, carried by both channels), so the §4.3.5 difference
+  vector is the true side signal rather than the two independent
+  floor fits' mismatch. The angle vector's audibility weight carries
+  a frequency-dependent **point-stereo discount** (full weight below
+  1.5 kHz where fine interaural phase is resolved, down to ×0.25
+  from 6 kHz at the bottom of the knob, faded out entirely by
+  `q = 0.75`), and angle vectors are excluded from the residue-ladder
+  span (they reach 2× the magnitude range where a pair is
+  anti-phase); on coupled streams a *wide cascade* band tier (coarse
+  geometry over twice the span + the base fine book) carries
+  anti-phase angle partitions at full fine resolution. The old
+  whole-stream angle/magnitude energy gate is gone.
 - **Masking-weighted VQ selection** (`vq::quantize_vector_weighted`,
   `residue_encode::plan_partition_cascade_scored_weighted`,
   `plan_vector_classifications_rd_bin_weighted`,
