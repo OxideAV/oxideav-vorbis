@@ -18,12 +18,19 @@ container crate's RFC 3533 page transport, and the whole
 psychoacoustic / floor / residue encode stack — **§4.3.1 short/long
 block switching** (a loudness-adaptive perceptual attack detector:
 high-passed sub-frame energy against a post-masking-decayed
-envelope with an absolute audibility floor) and **per-packet,
-masking-driven §4.3.5 square-polar coupling** (one mapping + mode
-per distinct `(block size, coupling-step set)` the packets elect;
-a coupled pair codes under one shared floor; the angle vector
-carries an interaural-phase point-stereo discount above 1.5 kHz at
-the low knob) — behind one quality scalar or an **ABR bit target**
+envelope with an absolute audibility floor) and **masking-driven
+§4.3.5 square-polar coupling** (a bits-like election per frame and
+pair over shared-pair-floor targets, declared within a **two-mode
+budget** — one coupling-step set per block size on a switching
+stream, the whole-stream set against the uncoupled mapping on a
+single-blocksize stream — because a widely deployed black-box
+decoder's packet parser diagnoses any other mode count; the
+magnitude vector carries the larger-magnitude channel value so the
+`M = 0, A ≠ 0` corner the inverse rule splits on is never emitted,
+with a joint magnitude/angle re-plan clearing the quantisation
+leftovers; the angle vector carries an interaural-phase
+point-stereo discount above 1.5 kHz at the low knob) — behind one
+quality scalar or an **ABR bit target**
 (`StreamEncoderConfig::target_bitrate`), on a **band-level masking
 model** (masker level = analysis-band energy spread over the masked
 band's bins; ATH capped and band-shared; tonality = max of spectral
@@ -915,17 +922,30 @@ regression gates** (an audio-byte ceiling AND an SNR floor) at the
 pinned quality points.
 
 **§4.3.5 channel coupling** is likewise wired
-(`tests/ogg_coupled_stream.rs`): adjacent channel pairs are gated on
-the whole stream's square-polar energy split (angle ≤ half the
-magnitude energy, accumulated over every frame's residue targets),
-kept steps land in every mapping and are forward-coupled over the
-residue targets (`X / rendered_floor`, the exact vectors the decoder
-inverse-couples), and each coupled pair's per-partition NMR weights
-merge to the element-wise max. Measured: a correlated stereo corpus at
-`q = 0.7` encodes to **12.0 kB coupled vs 18.0 kB dual-mono (−33 %)**
-at equal per-channel SNR (32.8 dB / 32.7 dB); an anti-correlated pair
-fails the gate and stays uncoupled; a 4-channel stream gates each pair
-independently.
+(`tests/ogg_coupled_stream.rs`): each adjacent channel pair is
+elected per frame on the bits-like audible-energy measure over its
+shared-floor targets, the stream declares the elected step sets
+within the two-mode budget (above), kept steps are forward-coupled
+over the residue targets (`X / rendered_floor`, the exact vectors
+the decoder inverse-couples), and each coupled pair's per-partition
+NMR weights merge to the element-wise max. Measured: a correlated
+stereo corpus at `q = 0.5` encodes to **14.6 kB coupled vs 21.4 kB
+dual-mono (−32 %)** at equal per-channel SNR (42.4 dB / 42.5 dB); an
+anti-correlated pair stays uncoupled; a 4-channel stream elects each
+pair independently. The forward map's **larger-magnitude
+convention** (`|M| = max(|L|, |R|)`) matters for interoperability:
+the inverse rule splits on `M > 0`, and a black-box probe over a
+`(M, A)` grid of hand-built coupled packets showed one widely
+deployed decoder taking the `M > 0` branch at exactly `M = 0` (the
+crate's decoder and a second black-box decoder follow the
+specification's pseudo-code) — a sign flip of the reconstructed
+channel on every zero-magnitude / non-zero-angle bin. Under the
+larger-magnitude map `M = 0` implies `L = R = 0`; the rare
+quantisation leftovers (an angle partition coded finer than its
+magnitude partition) are re-planned jointly over every magnitude
+class with the angle zeroed on zero-magnitude bins, and every
+coupled stream in the battery now decodes bit-identically
+(`≤ 2·10⁻⁷`) through both black-box decoders and the crate's own.
 
 **Registration + dual API**: `register()` installs the codec
 (decoder + encoder factories, the Matroska `A_VORBIS` tag, and the

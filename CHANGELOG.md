@@ -16,6 +16,39 @@ All notable changes to `oxideav-vorbis` are recorded here.
   `q = 0.5` on loud white noise; adopted across the low half of the
   knob on every noisy battery.
 
+### Changed
+
+- `synthesis::forward_couple_scalar` now takes the **larger-magnitude
+  channel as the magnitude** (`|M| = max(|L|, |R|)`, ties to `L`); the
+  four §4.3.5 cases are the same algebraic inverses, only the
+  pre-image chosen for mixed-sign pairs changes. `M = 0` therefore
+  implies `L = R = 0`, and `|A| ≤ 2·|M|` always. Motivation (measured
+  black-box): the inverse rule's `M > 0` split is taken the opposite
+  way at exactly `M = 0` by a widely deployed decoder, flipping the
+  sign of the reconstructed channel on every zero-magnitude /
+  non-zero-angle bin; the old pre-image (`M = L` whenever `L ≤ 0 <
+  R`) landed near-hard-panned pairs on `M ≈ 0, A ≈ R`, which
+  quantisation collapsed onto that corner (measured up to 0.78
+  full-scale sample disagreement between decoders on a coupled
+  battery stream).
+- whole-stream encoder: coupled pairs get a **joint magnitude/angle
+  re-plan** wherever the quantised magnitude is zero under a
+  non-zero quantised angle — every magnitude class is tried, the
+  angle re-planned with its zero-magnitude bins zeroed, and the
+  smallest weighted Lagrangian kept — so every coupled stream decodes
+  bit-identically under both branch conventions.
+- whole-stream encoder: the §4.2.4 mode list is capped at **two
+  modes** (one coupling-step set per block size on a switching
+  stream; the whole-stream set vs. uncoupled on a single-blocksize
+  stream) — a widely deployed black-box decoder's packet parser
+  diagnoses any other mode count as an unknown-encoder stream. The
+  per-frame election still drives the choice: a block size couples a
+  pair when the bits-like cost summed over its frames favours it.
+- `forward_then_inverse_couple_scalar_is_identity_on_floats` asserts
+  the round-trip to `f32` precision (the difference `A` rounds by an
+  ulp on the wide-magnitude probe; it is bit-exact whenever `A` is
+  formed without rounding).
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.11...v0.0.12) - 2026-08-30
 
 ### Other

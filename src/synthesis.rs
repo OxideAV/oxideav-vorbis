@@ -74,22 +74,41 @@
 //!
 //! is a per-sample identity for every real `(L, R)` pair. The four
 //! forward cases come straight out of the §4.3.5 step-3 rule by
-//! algebraic inversion:
+//! algebraic inversion, with the **magnitude vector carrying the
+//! larger-magnitude channel value** (`|M| = max(|L|, |R|)`, so
+//! `|A| ≤ 2·|M|` always — the natural square-polar reading of the
+//! rule):
 //!
 //! | §4.3.5 case (sign of `M`, `A`) | `new_M` | `new_A` | Forward recovery |
 //! | --- | --- | --- | --- |
-//! | `M > 0`, `A > 0` | `M`     | `M - A` | `M = L`, `A = L - R`; fires when `L > 0 AND L > R` |
-//! | `M > 0`, `A ≤ 0` | `M + A` | `M`     | `M = R`, `A = L - R`; fires when `R > 0 AND L ≤ R` |
-//! | `M ≤ 0`, `A > 0` | `M`     | `M + A` | `M = L`, `A = R - L`; fires when `L ≤ 0 AND R > L` |
-//! | `M ≤ 0`, `A ≤ 0` | `M - A` | `M`     | `M = R`, `A = R - L`; fires when `R ≤ 0 AND R ≤ L` |
+//! | `M > 0`, `A > 0` | `M`     | `M - A` | `M = L`, `A = L - R`; fires when `L > 0 AND |L| ≥ |R|` |
+//! | `M > 0`, `A ≤ 0` | `M + A` | `M`     | `M = R`, `A = L - R`; fires when `R > 0 AND |R| > |L|` |
+//! | `M ≤ 0`, `A > 0` | `M`     | `M + A` | `M = L`, `A = R - L`; fires when `L ≤ 0 AND |L| ≥ |R|` |
+//! | `M ≤ 0`, `A ≤ 0` | `M - A` | `M`     | `M = R`, `A = R - L`; fires when `R < 0 AND |R| > |L|` |
 //!
 //! Each `(L, R)` lands in exactly one of the four cases — the
 //! conditions are mutually exclusive and exhaustive, and the boundary
 //! values (zero, ties) are absorbed by the existing `> 0` / `≤ 0`
-//! splits the inverse uses on `M` and `A`. The
+//! splits the inverse uses on `M` and `A` (an `L = R` tie has `A = 0`,
+//! which both `A` branches of the inverse decode identically). The
 //! `forward_then_inverse_couple_is_identity_*` tests pin the
 //! round-trip property exhaustively on a grid of `(L, R)` values
 //! covering every quadrant and every boundary tie.
+//!
+//! The larger-magnitude choice matters beyond fidelity: the inverse
+//! rule's `M > 0` / `M ≤ 0` split makes `M = 0` with `A ≠ 0` an
+//! **interoperability hazard** — a widely deployed black-box decoder
+//! was measured to take the `M > 0` branch at `M = 0` (the exact
+//! opposite of the specification's pseudo-code and of the crate's own
+//! decoder and a second black-box decoder, which agree), flipping the
+//! sign of the reconstructed channel on every such bin. A pre-image
+//! with `M = L` when `|R| > |L|` (an earlier reading of the rule)
+//! lands a near-hard-panned pair on `M ≈ 0, A ≈ R`, which residue
+//! quantisation collapses onto exactly that hazard; under the
+//! larger-magnitude map `M = 0` implies `L = R = 0`, so a quantised
+//! `M = 0` only ever meets a tiny `A` (`|A| ≤ 2·|M|` before
+//! quantisation), and the encoder's residue planner clears the rare
+//! leftovers by re-planning (see `oggfile`).
 //!
 //! # Spectrum factoring — the encoder counterpart of §4.3.6
 //!
@@ -560,33 +579,38 @@ pub fn inverse_couple_all(
 /// couple_scalar(m, a) == (l, r)
 /// ```
 ///
-/// holds exactly (modulo `f32` rounding; for representable inputs the
-/// `+` / `-` operations are exact, so the identity is bit-exact for
-/// every legal pair).
+/// holds (bit-exactly whenever the difference `A` is formed without
+/// `f32` rounding — operands within a factor of two of each other or
+/// on a shared grid — and to `f32` precision otherwise).
 ///
 /// The four §4.3.5 step-3 cases (sign of `M`, sign of `A`) partition
 /// the `(L, R)` plane via the conditions tabulated in the module
-/// header; each case carries a closed-form recovery of `(M, A)`:
+/// header; the magnitude carries the larger-magnitude channel value
+/// (`|M| = max(|L|, |R|)`, ties to `L`), and each case carries a
+/// closed-form recovery of `(M, A)`:
 ///
 /// ```text
-/// L > 0  AND L > R  : M = L, A = L - R   (mirrors `M > 0, A > 0`)
-/// R > 0  AND L ≤ R  : M = R, A = L - R   (mirrors `M > 0, A ≤ 0`)
-/// L ≤ 0  AND R > L  : M = L, A = R - L   (mirrors `M ≤ 0, A > 0`)
-/// R ≤ 0  AND R ≤ L  : M = R, A = R - L   (mirrors `M ≤ 0, A ≤ 0`)
+/// |L| ≥ |R| AND L > 0 : M = L, A = L - R   (mirrors `M > 0, A > 0`)
+/// |R| > |L| AND R > 0 : M = R, A = L - R   (mirrors `M > 0, A ≤ 0`)
+/// |L| ≥ |R| AND L ≤ 0 : M = L, A = R - L   (mirrors `M ≤ 0, A > 0`)
+/// |R| > |L| AND R < 0 : M = R, A = R - L   (mirrors `M ≤ 0, A ≤ 0`)
 /// ```
+///
+/// `M = 0` therefore only occurs for `L = R = 0` (see the module
+/// header for why the `M = 0, A ≠ 0` corner must be avoided).
 #[must_use]
 pub fn forward_couple_scalar(l: f32, r: f32) -> (f32, f32) {
-    if l > 0.0 {
-        if l > r {
+    if l.abs() >= r.abs() {
+        if l > 0.0 {
             // §4.3.5 case (M > 0, A > 0). M = L, A = L - R.
             (l, l - r)
         } else {
-            // §4.3.5 case (M > 0, A ≤ 0). M = R, A = L - R.
-            (r, l - r)
+            // §4.3.5 case (M ≤ 0, A > 0). M = L, A = R - L.
+            (l, r - l)
         }
-    } else if r > l {
-        // §4.3.5 case (M ≤ 0, A > 0). M = L, A = R - L.
-        (l, r - l)
+    } else if r > 0.0 {
+        // §4.3.5 case (M > 0, A ≤ 0). M = R, A = L - R.
+        (r, l - r)
     } else {
         // §4.3.5 case (M ≤ 0, A ≤ 0). M = R, A = R - L.
         (r, r - l)
@@ -1676,6 +1700,32 @@ mod tests {
     }
 
     #[test]
+    fn forward_couple_scalar_magnitude_is_the_larger_channel() {
+        // |M| = max(|L|, |R|) on every sign combination, so M = 0 only
+        // for L = R = 0 and |A| never exceeds 2·|M| — the interop
+        // property the module header explains.
+        for li in -7..=7 {
+            for ri in -7..=7 {
+                let (l, r) = (li as f32 * 0.5, ri as f32 * 0.5);
+                let (m, a) = forward_couple_scalar(l, r);
+                assert_eq!(m.abs(), l.abs().max(r.abs()), "(L,R)=({l},{r}) -> M={m}");
+                assert!(a.abs() <= 2.0 * m.abs() + 1e-6, "(L,R)=({l},{r}) -> A={a}");
+                if m == 0.0 {
+                    assert_eq!((l, r), (0.0, 0.0));
+                }
+            }
+        }
+        // Mixed-sign pairs: the larger-magnitude channel is the
+        // magnitude, whichever side it sits on.
+        assert_eq!(forward_couple_scalar(-1.0, 4.0), (4.0, -5.0));
+        assert_eq!(forward_couple_scalar(1.0, -4.0), (-4.0, -5.0));
+        assert_eq!(forward_couple_scalar(-4.0, 1.0), (-4.0, 5.0));
+        assert_eq!(forward_couple_scalar(4.0, -1.0), (4.0, 5.0));
+        assert_eq!(forward_couple_scalar(0.0, 3.0), (3.0, -3.0));
+        assert_eq!(forward_couple_scalar(0.0, -3.0), (-3.0, -3.0));
+    }
+
+    #[test]
     fn forward_then_inverse_couple_scalar_is_identity_on_grid() {
         // Exhaustive (L, R) round-trip over an integer grid covering
         // every quadrant and every L/R sign comparison.
@@ -1710,13 +1760,18 @@ mod tests {
             (12345.678, -98765.43),
             (-0.001, 0.001),
         ];
+        // The round-trip is exact whenever the difference `A` is
+        // formed without rounding (Sterbenz: operands within a factor
+        // of two of each other, or an exact grid); the wide-magnitude
+        // probe rounds `A` by an ulp, so the identity holds to f32
+        // precision rather than bit-exactly there.
         for &(l, r) in probes {
             let (m, a) = forward_couple_scalar(l, r);
             let (rl, rr) = couple_scalar(m, a);
-            assert_eq!(
-                (rl, rr),
-                (l, r),
-                "round-trip failed at (L,R)=({l},{r}); intermediate (M,A)=({m},{a})"
+            let tol = 1e-6 * l.abs().max(r.abs());
+            assert!(
+                (rl - l).abs() <= tol && (rr - r).abs() <= tol,
+                "round-trip failed at (L,R)=({l},{r}); intermediate (M,A)=({m},{a}) -> ({rl},{rr})"
             );
         }
     }

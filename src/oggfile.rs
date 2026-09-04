@@ -68,7 +68,10 @@ use crate::psy::{
     PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 use crate::quality::{EncoderTuning, QualityError};
-use crate::residue_encode::{plan_vector_classifications_rd_bin_weighted, ResidueEncodeError};
+use crate::residue_encode::{
+    plan_partition_cascade_scored_weighted, plan_vector_classifications_rd_bin_weighted,
+    ResidueEncodeError,
+};
 use crate::setup::{
     parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader,
     MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
@@ -1093,6 +1096,22 @@ impl ResidueLadder {
 /// A stream declares one mode per distinct `(entry, steps)` pair the
 /// per-packet coupling election uses, so a packet selects its
 /// coupling by selecting its mode.
+/// One frame's shared-floor coupling candidate for one adjacent
+/// channel pair: the bits-like costs of coding the pair coupled and
+/// uncoupled, and the coupled representation (shared floor posts,
+/// magnitude / angle residue targets, per-bin audibility weights)
+/// adopted when the frame's mode couples the pair.
+#[derive(Debug, Clone, Default)]
+struct PairCandidate {
+    coupled_cost: f64,
+    uncoupled_cost: f64,
+    floor1_y: Vec<u32>,
+    t_mag: Vec<f32>,
+    t_ang: Vec<f32>,
+    bw_mag: Vec<f64>,
+    bw_ang: Vec<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModeSpec {
     entry: usize,
@@ -1923,12 +1942,11 @@ fn encode_pcm_to_packets_geometry(
     } else {
         Vec::new()
     };
-    let mut frame_steps: Vec<Vec<MappingCouplingStep>> = Vec::with_capacity(frames);
+    let mut pair_cands: Vec<Vec<PairCandidate>> = Vec::with_capacity(frames);
     for f in 0..frames {
         let e = entry_of(f);
         let half = sizes[f] / 2;
         let end = frame_res_end(f);
-        let ps = frame_ps(f);
         let mut y_row = Vec::with_capacity(ch);
         let mut t_row = Vec::with_capacity(ch);
         let mut w_row = Vec::with_capacity(ch);
@@ -1962,7 +1980,7 @@ fn encode_pcm_to_packets_geometry(
             w_row.push(w);
             bw_row.push(bw);
         }
-        let mut steps = Vec::new();
+        let mut cand_row = Vec::with_capacity(pairs.len());
         for &(mag, ang) in &pairs {
             let shared_env: Vec<f32> = envelopes[f][mag]
                 .iter()
@@ -2004,32 +2022,110 @@ fn encode_pcm_to_packets_geometry(
                 let w = bw_mag[k].max(bw_ang[k]);
                 coupled += bits(w, m) + bits(w * f64::from(scale), a);
             }
-            if coupled <= uncoupled {
-                steps.push(MappingCouplingStep {
-                    magnitude_channel: mag as u8,
-                    angle_channel: ang as u8,
-                });
-                let means = |bw: &[f64]| -> Vec<f64> {
-                    bw.chunks(ps)
-                        .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
-                        .collect()
-                };
-                w_row[mag] = means(&bw_mag);
-                w_row[ang] = means(&bw_ang);
-                bw_row[mag] = bw_mag;
-                bw_row[ang] = bw_ang;
-                t_row[mag] = t_mag;
-                t_row[ang] = t_ang;
-                y_row[mag] = y_s.clone();
-                y_row[ang] = y_s;
-            }
+            cand_row.push(PairCandidate {
+                coupled_cost: coupled,
+                uncoupled_cost: uncoupled,
+                floor1_y: y_s,
+                t_mag,
+                t_ang,
+                bw_mag,
+                bw_ang,
+            });
         }
-        frame_steps.push(steps);
+        pair_cands.push(cand_row);
         floor_ys.push(y_row);
         targets.push(t_row);
         weights.push(w_row);
         bin_weights.push(bw_row);
     }
+    // ---- the coupling variants a stream may declare ----
+    // The §4.2.4 mode list is capped at **two modes per stream**: a
+    // widely deployed black-box decoder's packet parser treats any
+    // other mode count as an unknown-encoder stream (it diagnoses the
+    // header and gives up on per-packet timing), and the reference
+    // streams all carry exactly one mode per block size. So a
+    // switching stream gets one coupling-step set per block size —
+    // each candidate pair is kept for that size when the bits-like
+    // cost summed over the size's frames favours coupling — and a
+    // single-blocksize stream gets the per-frame election between
+    // that whole-stream set and the uncoupled mapping (two modes).
+    let mode_budget = 2usize;
+    let mut entry_variants: Vec<Vec<Vec<MappingCouplingStep>>> = Vec::with_capacity(n_entries);
+    for e in 0..n_entries {
+        let mut majority = Vec::new();
+        for (i, &(mag, ang)) in pairs.iter().enumerate() {
+            let (mut c, mut u) = (0.0f64, 0.0f64);
+            for (f, row) in pair_cands.iter().enumerate() {
+                if entry_of(f) == e {
+                    c += row[i].coupled_cost;
+                    u += row[i].uncoupled_cost;
+                }
+            }
+            // Couple when the summed cost favours it; an entry with no
+            // audible content on the pair (both sums zero) stays
+            // uncoupled.
+            if u > 0.0 && c <= u {
+                majority.push(MappingCouplingStep {
+                    magnitude_channel: mag as u8,
+                    angle_channel: ang as u8,
+                });
+            }
+        }
+        let mut variants = vec![majority];
+        if mode_budget / n_entries >= 2 && !variants[0].is_empty() {
+            variants.push(Vec::new());
+        }
+        entry_variants.push(variants);
+    }
+    let mut frame_steps: Vec<Vec<MappingCouplingStep>> = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let variants = &entry_variants[entry_of(f)];
+        let cost_of = |steps: &Vec<MappingCouplingStep>| -> f64 {
+            pairs
+                .iter()
+                .enumerate()
+                .map(|(i, &(mag, _))| {
+                    let cand = &pair_cands[f][i];
+                    if steps.iter().any(|s| s.magnitude_channel as usize == mag) {
+                        cand.coupled_cost
+                    } else {
+                        cand.uncoupled_cost
+                    }
+                })
+                .sum()
+        };
+        let mut best = 0usize;
+        for (v, steps) in variants.iter().enumerate() {
+            if cost_of(steps) < cost_of(&variants[best]) {
+                best = v;
+            }
+        }
+        let steps = variants[best].clone();
+        let ps = frame_ps(f);
+        for step in &steps {
+            let (mag, ang) = (step.magnitude_channel as usize, step.angle_channel as usize);
+            let i = pairs
+                .iter()
+                .position(|&(m, _)| m == mag)
+                .expect("a declared step names a candidate pair");
+            let cand = std::mem::take(&mut pair_cands[f][i]);
+            let means = |bw: &[f64]| -> Vec<f64> {
+                bw.chunks(ps)
+                    .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
+                    .collect()
+            };
+            weights[f][mag] = means(&cand.bw_mag);
+            weights[f][ang] = means(&cand.bw_ang);
+            bin_weights[f][mag] = cand.bw_mag;
+            bin_weights[f][ang] = cand.bw_ang;
+            targets[f][mag] = cand.t_mag;
+            targets[f][ang] = cand.t_ang;
+            floor_ys[f][mag] = cand.floor1_y.clone();
+            floor_ys[f][ang] = cand.floor1_y;
+        }
+        frame_steps.push(steps);
+    }
+    drop(pair_cands);
 
     // ---- §4.3.5 channel coupling (gated per adjacent pair) ----
     // Candidate steps couple the disjoint adjacent pairs (0,1), (2,3),
@@ -2757,6 +2853,7 @@ fn encode_pcm_to_packets_geometry(
         // converges like entropy-constrained quantiser design; the
         // loop stops early at a plan fixed point.
         let (mut frame_plans, mut weighted_error) = plan_all(None)?;
+        let mut last_bias: Option<Vec<f64>> = None;
         for _ in 0..CLASSWORD_PRICE_PASSES {
             let mut hist = vec![0u64; classifications as usize];
             let mut total = 0u64;
@@ -2784,11 +2881,160 @@ fn encode_pcm_to_packets_geometry(
                 })
                 .collect();
             let (replanned, replanned_error) = plan_all(Some(&bias))?;
+            last_bias = Some(bias);
             if replanned == frame_plans {
                 break;
             }
             frame_plans = replanned;
             weighted_error = replanned_error;
+        }
+
+        // ---- the coupled-pair `M = 0, A ≠ 0` repair ----
+        // The §4.3.5 inverse rule is discontinuous at `M = 0`: the
+        // `M > 0` / `M ≤ 0` split decides which channel receives the
+        // angle, so a magnitude quantised to exactly zero under a
+        // non-zero angle reconstructs the pair on the wrong side
+        // whichever branch fires — and a widely deployed black-box
+        // decoder was measured to take the `M > 0` branch there (the
+        // crate's decoder and a second black-box decoder follow the
+        // specification's pseudo-code), so the two decoders disagree
+        // on every such bin as well. The forward map keeps `|A| ≤
+        // 2|M|` before quantisation (see `synthesis`), so the corner
+        // only survives where the rate-distortion chooser coded the
+        // angle partition finer than its magnitude partition (the
+        // angle carries 4× the energy of a small side component). The
+        // pair's partition is then re-planned **jointly**: every
+        // magnitude class is tried in turn, the angle re-planned under
+        // it with the angle targets zeroed wherever the magnitude
+        // still decodes to zero (a leftover non-zero angle on a zero
+        // magnitude drops the angle partition to the silence class),
+        // and the combination with the smallest weighted Lagrangian
+        // — magnitude and angle distortion against the *original*
+        // targets plus λ × (value + marginal classword bits) — is
+        // kept. Every remaining bin of the stream then decodes
+        // identically under both branch conventions.
+        let decode_partition = |entries: &[Option<Vec<u32>>; 8],
+                                row: &[Option<&VorbisCodebook>; 8],
+                                ps: usize|
+         -> Result<Vec<f32>, OggFileError> {
+            let mut out = vec![0.0f32; ps];
+            for (slot, book) in entries.iter().zip(row) {
+                if let (Some(list), Some(book)) = (slot, book) {
+                    let dims = book.dimensions as usize;
+                    for (i, &entry) in list.iter().enumerate() {
+                        let v = crate::vq::unpack_vector(book, entry)
+                            .map_err(|e| OggFileError::Header(e.to_string()))?;
+                        for (j, &x) in v.iter().enumerate() {
+                            if let Some(o) = out.get_mut(i * dims + j) {
+                                *o += x;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        };
+        let weighted_err = |target: &[f32], q: &[f32], bw: &[f64]| -> f64 {
+            target
+                .iter()
+                .zip(q)
+                .zip(bw)
+                .map(|((&t, &v), &w)| w * f64::from((t - v) * (t - v)))
+                .sum()
+        };
+        let bias_of = |class: u32| last_bias.as_ref().map_or(0.0, |b| b[class as usize]);
+        for f in 0..frames {
+            let ps = frame_ps(f);
+            let end = frame_res_end(f);
+            for step in &frame_steps[f] {
+                let (mag, ang) = (step.magnitude_channel as usize, step.angle_channel as usize);
+                for p in 0..end / ps {
+                    let lo = p * ps;
+                    let m_class = frame_plans[f][mag].classifications[p];
+                    let m_q = decode_partition(
+                        &frame_plans[f][mag].partition_entries[p],
+                        &value_rows[m_class as usize],
+                        ps,
+                    )?;
+                    let a_class = frame_plans[f][ang].classifications[p];
+                    let a_q = decode_partition(
+                        &frame_plans[f][ang].partition_entries[p],
+                        &value_rows[a_class as usize],
+                        ps,
+                    )?;
+                    let hazard = |m: &[f32], a: &[f32]| {
+                        m.iter().zip(a).any(|(&mv, &av)| mv == 0.0 && av != 0.0)
+                    };
+                    if !hazard(&m_q, &a_q) {
+                        continue;
+                    }
+                    let (t_m, t_a) = (&targets[f][mag][lo..lo + ps], &targets[f][ang][lo..lo + ps]);
+                    let (bw_m, bw_a) = (
+                        &bin_weights[f][mag][lo..lo + ps],
+                        &bin_weights[f][ang][lo..lo + ps],
+                    );
+                    let old_err = weighted_err(t_m, &m_q, bw_m) + weighted_err(t_a, &a_q, bw_a);
+                    // (cost, m_class, m_entries, a_class, a_entries, err)
+                    type Repair = (
+                        f64,
+                        u32,
+                        [Option<Vec<u32>>; 8],
+                        u32,
+                        [Option<Vec<u32>>; 8],
+                        f64,
+                    );
+                    let mut best: Option<Repair> = None;
+                    for (cm, row) in value_rows.iter().enumerate() {
+                        let scored =
+                            plan_partition_cascade_scored_weighted(t_m, row, 1, ps as u32, bw_m)?;
+                        let m_dec = decode_partition(&scored.entries, row, ps)?;
+                        let masked: Vec<f32> = t_a
+                            .iter()
+                            .zip(&m_dec)
+                            .map(|(&t, &m)| if m == 0.0 { 0.0 } else { t })
+                            .collect();
+                        let choice = plan_vector_classifications_rd_bin_weighted(
+                            &masked,
+                            &value_rows,
+                            1,
+                            ps as u32,
+                            tuning.lambda,
+                            bw_a,
+                            last_bias.as_deref(),
+                        )?
+                        .swap_remove(0);
+                        let a_dec = decode_partition(
+                            &choice.entries,
+                            &value_rows[choice.classification as usize],
+                            ps,
+                        )?;
+                        let (ca, ea, a_bits, a_err) = if hazard(&m_dec, &a_dec) {
+                            (
+                                0u32,
+                                Default::default(),
+                                0u64,
+                                weighted_err(t_a, &vec![0.0; ps], bw_a),
+                            )
+                        } else {
+                            let e = weighted_err(t_a, &a_dec, bw_a);
+                            (choice.classification, choice.entries, choice.bit_cost, e)
+                        };
+                        let err = scored.error_sq + a_err;
+                        let bits =
+                            (scored.bit_cost + a_bits) as f64 + bias_of(cm as u32) + bias_of(ca);
+                        let cost = err + tuning.lambda * bits;
+                        if best.as_ref().map_or(true, |b| cost < b.0) {
+                            best = Some((cost, cm as u32, scored.entries, ca, ea, err));
+                        }
+                    }
+                    let (_, cm, em, ca, ea, new_err) = best.expect("the class ladder is non-empty");
+                    weighted_error += new_err - old_err;
+                    frame_plans[f][mag].classifications[p] = cm;
+                    frame_plans[f][mag].partition_entries[p] = em;
+                    frame_plans[f][ang].classifications[p] = ca;
+                    frame_plans[f][ang].partition_entries[p] = ea;
+                }
+            }
         }
 
         // Exact emission tallies for the final plans (the writer's
