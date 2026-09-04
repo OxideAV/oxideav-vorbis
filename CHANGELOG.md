@@ -4,6 +4,15 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.12...v0.0.13) - 2026-09-04
+
+### Other
+
+- level-relative noise margin, 2.5-decade low-rate lambda, 5 kHz band floor
+- genuine low-bitrate mode below the quality knee
+- larger-magnitude coupling map, M=0 joint re-plan, two-mode budget
+- refinement rungs on the coarse residue cascade
+
 ### Added
 
 - residue class ladder: three **refinement rungs** — `coarse +`
