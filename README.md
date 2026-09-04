@@ -40,7 +40,11 @@ class ladder** whose tiers are *measured candidates* — silence /
 joint 4-D noise book / a 4-D **mid band book** / two ternary
 **8-D deep tiers** / a **half-span coarse tier** / a **wide
 cascade tier** for anti-phase angle partitions / coarse / coarse +
-fine — kept only when a greedy post-training adoption loop measures
+fine / three **refinement rungs** (coarse + a second-stage lattice
+at the coarse step ÷ 2, ÷ 4, ÷ 8 — operating points at ~6 dB spacing
+between the 17 dB coarse-only class and the 43 dB coarse + fine
+cascade, so the low knob holds an intermediate point instead of
+time-sharing the two) — kept only when a greedy post-training adoption loop measures
 the whole Lagrangian (weighted distortion + λ × setup-table +
 classword + value bits) strictly smaller, with every value book's
 codeword lengths retrained sparse from the final plans' exact
@@ -1002,13 +1006,16 @@ stream).
   reference** (white-noise battery: 22.1 dB vs 28.8 dB at ~296 kbps;
   the correlated-with-delay stereo battery: 22.0 vs 37.3 dB at
   ~466 kbps at `q = 0.3`, closing to −2 dB at `q = 0.5` and parity
-  above). The structural cause is measured: the class ladder offers
-  a ~17 dB coarse point and a ~43 dB coarse + fine point with a
-  26 dB gap between them, so the low knob mixes the two instead of
-  holding an intermediate operating point. The r453 half-span tier
-  narrows this (+2.4 dB); quarter- and eighth-span tiers were
-  measured and rejected (never adopted); the remaining fix is a
-  finer cascade rung or per-band coarse dimensionality.
+  above). The r456 refinement rungs close the ladder's 26 dB gap
+  between the coarse-only and coarse + fine points (adopted at the
+  low knob: −10…−12 % audio bytes at equal SNR on white noise at
+  `q = 0.2`, +3.4 dB at `q = 0.5` on loud white noise); what remains
+  at equal rate is the masking model's allocation — the threshold
+  in quiet drops the top of a −20 dBFS noise spectrum outright and
+  the weighted chooser spends the low knob's bits where the mask is
+  lowest — so waveform SNR on wideband noise trails the reference
+  below its `q = 8` operating region while the perceptual objective
+  is met.
 - **The knob's floor is high**: `q = 0` spends ~130 kbps on a
   tones+hiss corpus where the reference reaches ~20 kbps modes; the
   ABR entry degrades to the `q = 0` stream for smaller budgets. A

@@ -146,6 +146,26 @@ const MID_BOOK_LEVELS: u32 = 5;
 /// mid tier at the full mid-band span.
 const BAND8_BOOK_DIMS: u16 = 8;
 
+/// The **refinement rungs** of the coarse cascade: `(step divisor,
+/// levels)` pairs, each a second-stage lattice book over the coarse
+/// stage's leftover at `coarse_step / divisor` with `levels` per
+/// dimension, offered as a `coarse + rung` two-stage class. The base
+/// ladder's two-stage class refines the coarse leftover with the fine
+/// book at `coarse_step / 16` — a 24 dB step above the coarse-only
+/// class with nothing in between, so the rate-distortion chooser at
+/// the low knob could only *mix* the two (time-sharing on a convex
+/// distortion-rate curve lands above the curve: measured on white
+/// noise a third of the partitions at ~17 dB and the rest at ~43 dB,
+/// 22 dB whole-stream where the curve's own point at that rate sits
+/// near 29 dB). The rungs at `/4` (+12 dB over coarse) and `/8`
+/// (+18 dB) put operating points on the curve at ~6 dB spacing. Each
+/// spans its predecessor's leftover (`±coarse_step / 2`, plus
+/// grid-snap slack) with 2× headroom (`levels · step = 2 ·
+/// coarse_step`), so no rung clips; 8² = 64 and 16² = 256 entries,
+/// sparse-pruned to the cells used. Candidates only: the Lagrangian
+/// adoption loop keeps a rung only where it measures smaller.
+const REFINEMENT_RUNGS: [(u32, u32); 3] = [(2, 4), (4, 8), (8, 16)];
+
 /// Classword-aware planning refinements: after the value-bit-only
 /// first pass, how many plan ↔ re-price alternations the integrated
 /// encoder runs with the per-class marginal classword bias (see the
@@ -961,6 +981,18 @@ fn resample_envelope(src: &[f32], dst_len: usize) -> Vec<f32> {
 /// codeword costs. Candidates that cannot pay for themselves are
 /// measured out again by the adoption loop before packets are
 /// written.
+/// The cascade shape of an appended band-class candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandShape {
+    /// A single-pass class carrying the candidate book alone.
+    Single,
+    /// The candidate book as pass 0, the base fine book as pass 1.
+    PlusFine,
+    /// The base coarse book as pass 0, the candidate book as pass 1
+    /// (a refinement rung, [`REFINEMENT_RUNGS`]).
+    AfterCoarse,
+}
+
 struct ResidueLadder {
     /// Value books, in codebook-table order starting at index 2.
     value_books: Vec<VorbisCodebook>,
@@ -1013,6 +1045,29 @@ impl ResidueLadder {
         row[1] = Some(3);
         self.cascade.push(0b11);
         self.books.push(row);
+    }
+
+    /// Append one further class whose pass 0 is the base ladder's
+    /// **coarse** book (codebook 2) and whose pass 1 is `book`: a
+    /// refinement rung of the coarse cascade (see
+    /// [`REFINEMENT_RUNGS`]).
+    fn push_refined_class(&mut self, book: VorbisCodebook) {
+        let index = (2 + self.value_books.len()) as u8;
+        self.value_books.push(book);
+        let mut row: [Option<u8>; 8] = Default::default();
+        row[0] = Some(2);
+        row[1] = Some(index);
+        self.cascade.push(0b11);
+        self.books.push(row);
+    }
+
+    /// Append a band-class candidate in its declared shape.
+    fn push_band(&mut self, book: VorbisCodebook, shape: BandShape) {
+        match shape {
+            BandShape::Single => self.push_band_class(book),
+            BandShape::PlusFine => self.push_cascaded_band_class(book),
+            BandShape::AfterCoarse => self.push_refined_class(book),
+        }
     }
 
     /// §8.6.1 `residue_classifications` this ladder declares.
@@ -2189,7 +2244,7 @@ fn encode_pcm_to_packets_geometry(
     // on the *joint* grid-cell occupancy. Lookup type 1 is the widely
     // interoperable lookup form; a type-2 (per-entry-free) table is
     // spec-legal but rejected by common black-box decoders.
-    let (coarse, fine, half_geometry) = if joint_geometry {
+    let (coarse, fine, half_geometry, rungs) = if joint_geometry {
         let d = config.vq_dims as usize;
         // Design corpus: every coded partition's chunks (bins past
         // `residue_end` are never coded and must not shape the books).
@@ -2240,9 +2295,8 @@ fn encode_pcm_to_packets_geometry(
         // the entry ceiling, which is why the whole geometry hands
         // over to the scalar ladders past the cap (see
         // `joint_geometry` above).
-        let design_pair = |corpus: Vec<f32>,
-                           span: f32|
-         -> Result<(VorbisCodebook, VorbisCodebook), OggFileError> {
+        type DesignedPair = (VorbisCodebook, VorbisCodebook, Vec<VorbisCodebook>);
+        let design_pair = |corpus: Vec<f32>, span: f32| -> Result<DesignedPair, OggFileError> {
             let corpus = subsample_corpus(corpus, d, VQ_DESIGN_MAX_VECTORS);
             let corpus = if corpus.is_empty() {
                 vec![0.0; d]
@@ -2291,9 +2345,33 @@ fn encode_pcm_to_packets_geometry(
                 true,
             )?
             .codebook;
-            Ok((coarse, fine))
+            // The refinement rungs: second-stage lattices over the same
+            // coarse leftover at the rung steps ([`REFINEMENT_RUNGS`]).
+            let mut rungs = Vec::with_capacity(REFINEMENT_RUNGS.len());
+            if config.residue_bands {
+                for &(divisor, levels) in &REFINEMENT_RUNGS {
+                    let step = crate::book_design::pack_nearest(coarse_step / divisor as f32);
+                    let ladder = crate::book_design::uniform_value_ladder(
+                        -(levels as f32 / 2.0) * step,
+                        step,
+                        levels,
+                        8,
+                    )?;
+                    rungs.push(
+                        crate::book_design::design_lattice_vq_codebook(
+                            &leftovers,
+                            config.vq_dims,
+                            &ladder,
+                            VQ_DESIGN_MAX_CODEWORD_LEN,
+                            true,
+                        )?
+                        .codebook,
+                    );
+                }
+            }
+            Ok((coarse, fine, rungs))
         };
-        let (coarse, fine) = design_pair(raw, max_abs)?;
+        let (coarse, fine, rungs) = design_pair(raw, max_abs)?;
         // The half-span tier's geometry (designed below, once the band
         // designer exists): the coarse step and level count.
         let half_geometry = config.residue_bands.then(|| {
@@ -2302,7 +2380,7 @@ fn encode_pcm_to_packets_geometry(
                 lv,
             )
         });
-        (coarse, fine, half_geometry)
+        (coarse, fine, half_geometry, rungs)
     } else {
         // The coarse span is fixed (it must reach the loudest residue
         // target); the fine step follows the quality knob — the top
@@ -2318,6 +2396,7 @@ fn encode_pcm_to_packets_geometry(
                 crate::book_design::pack_nearest(max_abs / tuning.fine_step_divisor),
             ),
             None,
+            Vec::new(),
         )
     };
     // ---- the joint band books (noise + optional mid tier) ----
@@ -2424,15 +2503,19 @@ fn encode_pcm_to_packets_geometry(
     // with it than without it — see the adoption loop below.
     // `(book, cascaded)`: a single-pass band class, or (cascaded) the
     // book as pass 0 with the base fine book as pass 1.
-    let mut band_candidates: Vec<(VorbisCodebook, bool)> = Vec::new();
+    let mut band_candidates: Vec<(VorbisCodebook, BandShape)> = Vec::new();
     if let Some(book) = mid {
-        band_candidates.push((book, false));
+        band_candidates.push((book, BandShape::Single));
     }
     if let Some(book) = noise8 {
-        band_candidates.push((book, false));
+        band_candidates.push((book, BandShape::Single));
     }
     if let Some(book) = mid8 {
-        band_candidates.push((book, false));
+        band_candidates.push((book, BandShape::Single));
+    }
+    // The coarse cascade's refinement rungs (see [`REFINEMENT_RUNGS`]).
+    for book in rungs {
+        band_candidates.push((book, BandShape::AfterCoarse));
     }
     // The half-span tier: the coarse geometry (same dimensionality and
     // level count) over half the span, so a partition whose peak fits
@@ -2454,7 +2537,7 @@ fn encode_pcm_to_packets_geometry(
                 levels,
                 crate::book_design::pack_nearest(coarse_step / 2.0),
             )?,
-            false,
+            BandShape::Single,
         ));
         // The wide cascade tier, offered on coupled streams: the
         // coarse geometry over **twice** the span as pass 0, the base
@@ -2475,7 +2558,7 @@ fn encode_pcm_to_packets_geometry(
                     levels,
                     crate::book_design::pack_nearest(coarse_step * 2.0),
                 )?,
-                true,
+                BandShape::PlusFine,
             ));
         }
     }
@@ -2485,15 +2568,11 @@ fn encode_pcm_to_packets_geometry(
     let build = |coarse: &VorbisCodebook,
                  fine: &VorbisCodebook,
                  noise: &VorbisCodebook,
-                 bands: &[(VorbisCodebook, bool)]|
+                 bands: &[(VorbisCodebook, BandShape)]|
      -> VorbisSetupHeader {
         let mut ladder = ResidueLadder::base(coarse.clone(), fine.clone(), noise.clone());
-        for (book, cascaded) in bands {
-            if *cascaded {
-                ladder.push_cascaded_band_class(book.clone());
-            } else {
-                ladder.push_band_class(book.clone());
-            }
+        for (book, shape) in bands {
+            ladder.push_band(book.clone(), *shape);
         }
         build_setup(
             floor_headers.clone(),
@@ -2594,7 +2673,7 @@ fn encode_pcm_to_packets_geometry(
     // books (`trained[3..]`), so every evaluation prices the exact
     // codeword lengths the closed-loop trainer settled on.
     let evaluate = |band_idx: &[usize]| -> Result<Evaluated, OggFileError> {
-        let bands: Vec<(VorbisCodebook, bool)> = band_idx
+        let bands: Vec<(VorbisCodebook, BandShape)> = band_idx
             .iter()
             .map(|&i| (trained[3 + i].clone(), band_candidates[i].1))
             .collect();

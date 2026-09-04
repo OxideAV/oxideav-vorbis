@@ -4,6 +4,18 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- residue class ladder: three **refinement rungs** — `coarse +`
+  a second-stage lattice at the coarse step ÷ 2 / ÷ 4 / ÷ 8 (4 / 8 /
+  16 levels per dimension, designed from the coarse leftover,
+  sparse-pruned to the cells used) — as adoption candidates, putting
+  operating points at ~6 dB spacing between the 17 dB coarse-only
+  class and the 43 dB coarse + fine cascade. Measured: −10…−12 %
+  audio bytes at equal SNR on white noise at `q = 0.2`, +3.4 dB at
+  `q = 0.5` on loud white noise; adopted across the low half of the
+  knob on every noisy battery.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.11...v0.0.12) - 2026-08-30
 
 ### Other
