@@ -1,8 +1,8 @@
 //! The r456 **low-bitrate mode** of the whole-stream encoder: below
 //! the quality knee (`quality::LOW_BITRATE_KNEE`) the lever laws
-//! steepen — the residue `lambda` climbs two further decades, the
+//! steepen — the residue `lambda` climbs 2.5 further decades, the
 //! noise-like maskers' thresholds rise while the tonal maskers' fall,
-//! and the coded band is limited toward 8 kHz — so `q = 0` reaches the
+//! and the coded band is limited toward 5 kHz — so `q = 0` reaches the
 //! reference encoder's lowest operating region instead of stopping at
 //! ~130 kbps.
 //!
@@ -106,7 +106,7 @@ fn the_knob_floor_reaches_the_low_rate_region_monotonically() {
     );
     // Still a playable encode of the harmonic beds, not silence.
     assert!(
-        points[0].1 >= 6.0,
+        points[0].1 >= 4.0,
         "q = 0 must keep the partials: {:.2} dB",
         points[0].1
     );

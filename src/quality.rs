@@ -22,7 +22,8 @@
 //!   ([`LOW_BITRATE_KNEE`]) the levers steepen into a genuine
 //!   low-rate mode: `lambda` climbs a further
 //!   [`LOW_BITRATE_LAMBDA_DECADES`] decades to `q = 0`, the noise-like
-//!   maskers' thresholds rise by [`LOW_BITRATE_NOISE_MARGIN_DB`] while
+//!   maskers' thresholds rise by [`LOW_BITRATE_NOISE_MARGIN_DB`] (hiss
+//!   under a bed only — see [`crate::psy::PsyConfig::noise_margin_db`]) while
 //!   the tonal maskers' fall by [`LOW_BITRATE_TONAL_MARGIN_DB`] (bits
 //!   move from hiss to partials), and the coded band is limited
 //!   ([`EncoderTuning::coded_bandwidth_hz`]) toward
@@ -50,14 +51,15 @@
 pub const LOW_BITRATE_KNEE: f32 = 0.2;
 
 /// How many further decades `lambda` climbs from the knee to `q = 0`
-/// (`lambda(0) = lambda(knee) · 10^decades`): at 2 decades the
-/// exchange rate at `q = 0` is ~1.2 audibility units per bit, where a
+/// (`lambda(0) = lambda(knee) · 10^decades`): at 2.5 decades the
+/// exchange rate at `q = 0` is ~4 audibility units per bit, where a
 /// near-threshold partition's silence error no longer buys its
 /// codewords (measured on the tones + hiss battery: `q = 0` lands at
-/// ~24 kbps stereo — the reference encoder's lowest operating
-/// region — where 2.5 decades dropped the tonal partitions too and
-/// left 13 kbps at single-digit SNR).
-pub const LOW_BITRATE_LAMBDA_DECADES: f64 = 2.0;
+/// ~15 kbps stereo, under the reference encoder's lowest operating
+/// region, and the ABR entry resolves 30 / 59 kbps for 32 / 64 kbps
+/// budgets; 2 decades left the same budgets at 26 / 57 kbps with
+/// 1–2 dB less on the partials).
+pub const LOW_BITRATE_LAMBDA_DECADES: f64 = 2.5;
 
 /// The extra threshold raise applied to **noise-like maskers only**
 /// at `q = 0` ([`crate::psy::PsyConfig::noise_margin_db`], linear from
@@ -88,8 +90,12 @@ pub const LOW_BITRATE_TONAL_MARGIN_DB: f32 = 12.0;
 /// is capped there and the floor is designed / fitted over the coded
 /// band only, so the bits saved above the cutoff go to the audible
 /// band instead of the model's rate-distortion trade spending a
-/// classword per silent partition up there.
-pub const LOW_BITRATE_MIN_BANDWIDTH_HZ: f32 = 8_000.0;
+/// classword per silent partition up there. 5 kHz is where a
+/// −12 dBFS stereo white-noise battery — whose every partition the
+/// model rightly keeps, since the noise *is* the content — floors at
+/// ~73 kbps (8 kHz floored it at 131 kbps, out of reach of any
+/// low-rate budget).
+pub const LOW_BITRATE_MIN_BANDWIDTH_HZ: f32 = 5_000.0;
 
 /// The full-band limit the knee (and everything above it) codes to.
 const FULL_BANDWIDTH_HZ: f32 = 20_000.0;

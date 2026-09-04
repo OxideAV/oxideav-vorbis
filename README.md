@@ -31,10 +31,12 @@ with a joint magnitude/angle re-plan clearing the quantisation
 leftovers; the angle vector carries an interaural-phase
 point-stereo discount above 1.5 kHz at the low knob) — behind one
 quality scalar (with a genuine **low-bitrate mode** below `q = 0.2`:
-the residue `lambda` climbs two further decades, the noise-like
-maskers' thresholds rise by up to 24 dB while the tonal maskers'
-fall by up to 12 dB, and the coded band is limited toward 8 kHz —
-`q = 0` reaches ~15 kbps on a stereo tones + hiss corpus) or an
+the residue `lambda` climbs 2.5 further decades, the noise-like
+maskers' thresholds rise by up to 24 dB — hiss under a bed only, the
+margin ramps in from 20 to 40 dB below the frame's loudest band —
+while the tonal maskers' fall by up to 12 dB, and the coded band is
+limited toward 5 kHz —
+`q = 0` reaches ~14 kbps on a stereo tones + hiss corpus) or an
 **ABR bit target** (`StreamEncoderConfig::target_bitrate`, bisecting
 the knob over eight full encodes), on a **band-level masking
 model** (masker level = analysis-band energy spread over the masked
@@ -1042,10 +1044,14 @@ stream).
   below its `q = 8` operating region while the perceptual objective
   is met.
 - **The low-bitrate mode trails the reference on tonal material at
-  equal rate**: `q = 0` now reaches 15 kbps on the tones + hiss
-  corpus and the ABR entry meets 32 / 48 / 64 kbps budgets, but the
-  reference's lowest mode codes the same corpus at 40 kbps / 21.5 dB
-  — its tonal partials keep ~7 dB more waveform SNR at 20–30 kbps.
+  equal rate**: `q = 0` now reaches 14 kbps on the tones + hiss
+  corpus and the ABR entry meets 32 / 64 kbps budgets (30 / 59 kbps
+  at 13.7 / 13.9 dB), but the reference's lowest mode codes the same
+  corpus at 40 kbps / 21.5 dB — its tonal partials keep ~7 dB more
+  waveform SNR at 20–60 kbps. Loud broadband noise (a −12 dBFS
+  white-noise battery) floors at 73 kbps stereo: the model rightly
+  keeps every partition of content that *is* noise, so the only
+  low-rate lever there is the 5 kHz band limit.
   The measured cause is the noise-to-mask objective itself: a coarse
   class trained under the low-rate `lambda` sparsifies to ~15 dB on
   the partials and the model calls that transparent (the `14.5 + z`

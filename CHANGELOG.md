@@ -17,18 +17,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
   knob on every noisy battery.
 
 - a genuine **low-bitrate mode** below the quality knee
-  (`quality::LOW_BITRATE_KNEE = 0.2`): the residue `lambda` climbs two
+  (`quality::LOW_BITRATE_KNEE = 0.2`): the residue `lambda` climbs 2.5
   further decades to `q = 0` (`EncoderTuning::lambda_for_quality` /
   `quality_for_lambda`), the noise-like maskers' thresholds rise by up
   to 24 dB while the tonal maskers' fall by up to 12 dB (new
   `PsyConfig::noise_margin_db` / `tonal_margin_db` — bits move from
   hiss to partials), and the coded band is limited log-linearly toward
-  8 kHz (`EncoderTuning::coded_bandwidth_hz`, §8.6.1 `residue_end`
+  5 kHz (`EncoderTuning::coded_bandwidth_hz`, §8.6.1 `residue_end`
   rounded up to a partition, the floor designed and fitted over the
   coded band). The knee and everything above it are unchanged.
-  Measured on a stereo tones + hiss corpus: `q = 0` 240 → 15 kbps, the
-  ABR entry meets 32 / 48 / 64 kbps budgets from below (the reference
-  encoder's lowest mode sits at 40 kbps / 21.5 dB); on the staged
+  Measured on a stereo tones + hiss corpus: `q = 0` 240 → 14 kbps, the
+  ABR entry meets 32 / 64 kbps budgets from below at 30 / 59 kbps
+  (13.7 / 13.9 dB own-decode SNR; the reference encoder's lowest mode
+  sits at 40 kbps / 21.5 dB); a −12 dBFS stereo white-noise battery
+  floors at 73 kbps (the 5 kHz band at ~3 bits/bin); the noise margin
+  is **level-relative** — nothing within 20 dB of the frame's loudest
+  band, the full margin from 40 dB down — so a frame whose content is
+  itself noise-like (applause, a −12 dBFS white-noise battery) keeps
+  the nominal offset instead of being silenced outright; on the staged
   fixtures `q = 0.1` lands 10–26 kbps within 3 dB of the reference at
   equal rate (mono +3.9 dB). Lever choice is measured: a uniform
   threshold raise dropped the partials before the hiss; sub-coarse
@@ -39,7 +45,8 @@ All notable changes to `oxideav-vorbis` are recorded here.
 - ABR bit targeting bisects the **quality** (log-linear in `lambda`)
   over eight halvings instead of `lambda` linearly over six: with the
   low-rate law spanning six decades, linear bisection resolved only
-  the top decade (a 32 kbps budget landed 23 kbps).
+  the top decade (a 32 kbps budget landed 23 kbps); eight halvings
+  resolve the steep low end of the knob.
 - `synthesis::forward_couple_scalar` now takes the **larger-magnitude
   channel as the magnitude** (`|M| = max(|L|, |R|)`, ties to `L`); the
   four §4.3.5 cases are the same algebraic inverses, only the

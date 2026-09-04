@@ -86,16 +86,19 @@ pub struct PsyConfig {
     /// is the model's nominal operating point.
     pub threshold_offset_db: f32,
     /// Extra decibels the **noise-like maskers'** thresholds are raised
-    /// by, scaled by each band's noisiness `1 − tonality` — the
-    /// low-rate lever that spends the noise-masking-noise offset's
-    /// conservatism ([`NOISE_OFFSET_DB`]) without touching the tonal
-    /// maskers' protection: raising every threshold uniformly
-    /// ([`Self::threshold_offset_db`]) lets the reconstruction noise
-    /// around a strong tone climb to within a couple of dB of the tone
-    /// (the tonal offset is only `14.5 + z` dB), which is where a
-    /// low-rate encode audibly falls apart first, while hiss under a
-    /// tone bed is the material a low rate can afford to drop. `0.0`
-    /// applies the nominal offsets.
+    /// by, scaled by each band's noisiness `1 − tonality` and by how
+    /// far the band sits below the frame's loudest band (nothing
+    /// within 20 dB of it, the full margin from 40 dB down — see
+    /// [`NOISE_MARGIN_ONSET_DB`]) — the low-rate lever that spends the
+    /// noise-masking-noise offset's conservatism ([`NOISE_OFFSET_DB`])
+    /// on *hiss under a bed* without touching the tonal maskers'
+    /// protection or the frame's own noise-like content: raising every
+    /// threshold uniformly ([`Self::threshold_offset_db`]) lets the
+    /// reconstruction noise around a strong tone climb to within a
+    /// couple of dB of the tone (the tonal offset is only `14.5 + z`
+    /// dB), which is where a low-rate encode audibly falls apart
+    /// first, while hiss tens of dB under a tone bed is the material a
+    /// low rate can afford to drop. `0.0` applies the nominal offsets.
     pub noise_margin_db: f32,
     /// Extra decibels the **tonal maskers'** thresholds are lowered
     /// by, scaled by each band's tonality — the complement of
@@ -312,6 +315,27 @@ fn tonal_offset_db(z: f32) -> f32 {
 /// the synthetic battery.
 const NOISE_OFFSET_DB: f32 = 18.0;
 
+/// How far (dB) below the frame's loudest band a noise-like band must
+/// sit before [`PsyConfig::noise_margin_db`] starts to apply, and the
+/// span over which it ramps to its full value: the margin targets
+/// *hiss under a bed* (noise-like texture tens of dB under the
+/// content that carries the frame), never the content itself — a
+/// frame whose loudest bands are noise-like (applause, rain, a
+/// cymbal wash) keeps the nominal noise-masking-noise offset, since a
+/// margin there would raise the threshold over the signal and the
+/// low-rate mode would silence the frame outright (measured: a
+/// −12 dBFS white-noise battery encoded to a residue-free 6 kbps).
+const NOISE_MARGIN_ONSET_DB: f32 = 20.0;
+const NOISE_MARGIN_SPAN_DB: f32 = 20.0;
+
+/// The fraction of [`PsyConfig::noise_margin_db`] a band `below_peak`
+/// dB under the frame's loudest band receives: `0` within
+/// [`NOISE_MARGIN_ONSET_DB`] of the peak, `1` from
+/// `NOISE_MARGIN_ONSET_DB + NOISE_MARGIN_SPAN_DB` down, linear between.
+fn noise_margin_depth(below_peak: f32) -> f32 {
+    ((below_peak - NOISE_MARGIN_ONSET_DB) / NOISE_MARGIN_SPAN_DB).clamp(0.0, 1.0)
+}
+
 /// A tiny energy floor keeps the geometric mean defined for zero
 /// bins; it is far below any audible level at every calibration.
 const ENERGY_FLOOR: f64 = 1.0e-30;
@@ -409,15 +433,26 @@ fn threshold_from_bands(
     let bands = layout.count();
     // Band levels in dB (amplitude-calibrated: full-scale line =
     // full_scale_db), reduced to one masker each: (centre bark, dB).
+    let levels: Vec<Option<f32>> = (0..bands)
+        .map(|b| {
+            (energy[b] > ENERGY_FLOOR * layout.width(b) as f64)
+                .then(|| config.full_scale_db + 10.0 * energy[b].log10() as f32)
+        })
+        .collect();
+    // The frame's loudest band: the noise-masker margin only applies
+    // to bands sitting well below it (see `noise_margin_depth`).
+    let peak_db = levels
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut maskers: Vec<(f32, f32)> = Vec::with_capacity(bands);
     for b in 0..bands {
-        if energy[b] <= ENERGY_FLOOR * layout.width(b) as f64 {
-            continue;
-        }
-        let level_db = config.full_scale_db + 10.0 * energy[b].log10() as f32;
+        let Some(level_db) = levels[b] else { continue };
         let alpha = band_tonality[b];
+        let noise_margin = config.noise_margin_db * noise_margin_depth(peak_db - level_db);
         let offset = alpha * (tonal_offset_db(layout.band_center[b]) + config.tonal_margin_db)
-            + (1.0 - alpha) * (NOISE_OFFSET_DB - config.noise_margin_db);
+            + (1.0 - alpha) * (NOISE_OFFSET_DB - noise_margin);
         maskers.push((layout.band_center[b], level_db - offset));
     }
 
@@ -1399,7 +1434,7 @@ mod tests {
         // it (noise-like bands), each dominating its own region.
         let mut s = vec![0.0f32; n];
         s[bin_at(1_000.0, n)] = 0.5;
-        s[bin_at(8_000.0, n)..bin_at(12_000.0, n)].fill(0.02);
+        s[bin_at(8_000.0, n)..bin_at(12_000.0, n)].fill(0.001);
         let m0 = compute_masking(&s, &cfg()).unwrap();
         let (kt, kn) = (bin_at(1_000.0, n), bin_at(10_000.0, n));
         assert!(
@@ -1436,6 +1471,34 @@ mod tests {
             "tonal region fell {fall_t} dB"
         );
         assert!(fall_n.abs() < 2.5, "noise region moved {fall_n} dB");
+    }
+
+    #[test]
+    fn noise_margin_spares_the_frames_own_noise_content() {
+        // A noise pedestal that IS the frame's content (no louder
+        // band anywhere): the margin must not raise its threshold —
+        // a low-rate encode would otherwise silence it outright.
+        let n = 256;
+        let mut s = vec![0.0f32; n];
+        s[bin_at(2_000.0, n)..bin_at(6_000.0, n)].fill(0.01);
+        let m0 = compute_masking(&s, &cfg()).unwrap();
+        let mut c = cfg();
+        c.noise_margin_db = 24.0;
+        let m1 = compute_masking(&s, &c).unwrap();
+        let k = bin_at(4_000.0, n);
+        let rise = 20.0 * (m1.threshold[k] / m0.threshold[k]).log10();
+        assert!(rise.abs() < 0.5, "own-content noise band moved {rise} dB");
+        // The same pedestal 40+ dB under a tone bed gets the full
+        // margin (band levels: the tone band sums to ~120 dB, the
+        // pedestal band to ~70 dB).
+        s[bin_at(500.0, n)] = 16.0;
+        let m0 = compute_masking(&s, &cfg()).unwrap();
+        let m1 = compute_masking(&s, &c).unwrap();
+        let rise = 20.0 * (m1.threshold[k] / m0.threshold[k]).log10();
+        assert!(rise > 20.0, "bedded noise band rose only {rise} dB");
+        assert_eq!(noise_margin_depth(10.0), 0.0);
+        assert_eq!(noise_margin_depth(30.0), 0.5);
+        assert_eq!(noise_margin_depth(60.0), 1.0);
     }
 
     // ---------- floor envelope glue ----------
