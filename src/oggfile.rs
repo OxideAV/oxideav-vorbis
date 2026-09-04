@@ -1333,16 +1333,22 @@ fn encode_pcm_to_packets_abr(
     }
     let seconds = pcm[0].len() as f64 / f64::from(config.sample_rate);
     let target_bits = (f64::from(bits_per_second) * seconds) as u64;
-    // The from_quality lambda law, invertible: λ = 10^(−1.4 − 2.6 q).
-    let q_of = |lambda: f64| ((-1.4 - lambda.log10()) / 2.6).clamp(0.0, 1.0) as f32;
-    let lambda_of = |q: f64| 10f64.powf(-1.4 - 2.6 * q);
+    // The solver bisects a monotone non-increasing rate curve over a
+    // scalar whose low end is the expensive side: the knob is walked
+    // as `u = 1 − q` (so `u = 0` is `q = 1`, the fidelity end), which
+    // is log-linear in the residue `lambda` — bisecting `lambda`
+    // itself resolved only its top decade once the low-bitrate mode
+    // stretched the law over six (measured: a 32 kbps budget landed
+    // 23 kbps while a step of the knob under the probe would have
+    // fit).
+    let q_of = |u: f64| (1.0 - u).clamp(0.0, 1.0) as f32;
     // Every probe is kept so the returned stream is exactly the one
     // the solver measured — no re-encode, no drift.
     let mut probes: Vec<(u64, EncodedVorbisStream)> = Vec::new();
-    let mut encode_at = |lambda: f64| -> Result<u64, OggFileError> {
+    let mut encode_at = |u: f64| -> Result<u64, OggFileError> {
         let mut probe = config.clone();
         probe.target_bitrate = None;
-        probe.quality = q_of(lambda);
+        probe.quality = q_of(u);
         let stream = encode_pcm_to_packets(pcm, &probe)?;
         let bits = 8 * stream
             .audio
@@ -1352,20 +1358,18 @@ fn encode_pcm_to_packets_abr(
         probes.push((bits, stream));
         Ok(bits)
     };
-    // λ(q=1) is the expensive end, λ(q=0) the cheap end; six halvings
-    // resolve the knob to ~1.5 % of its range.
-    let solution = crate::quality::solve_lambda_for_bits(
-        target_bits,
-        lambda_of(1.0),
-        lambda_of(0.0),
-        6,
-        &mut encode_at,
-    )
-    .map_err(|e| match e {
-        crate::quality::LambdaSolveError::Rate(inner) => inner,
-        // The bracket and iteration count are fixed above.
-        other => OggFileError::Header(other.to_string()),
-    })?;
+    // `u = 0` (q = 1) is the expensive end, `u = 1` (q = 0) the cheap
+    // end; eight halvings resolve the knob to ~0.4 % of its range
+    // (the low-rate mode's rate curve is steep just above `q = 0`:
+    // measured on a tones + hiss corpus, 15 kbps at `q = 0` and
+    // 200 kbps at `q = 0.1`, so six halvings left a 48 kbps budget
+    // 40 % underspent).
+    let solution = crate::quality::solve_lambda_for_bits(target_bits, 0.0, 1.0, 8, &mut encode_at)
+        .map_err(|e| match e {
+            crate::quality::LambdaSolveError::Rate(inner) => inner,
+            // The bracket and iteration count are fixed above.
+            other => OggFileError::Header(other.to_string()),
+        })?;
     let position = probes
         .iter()
         .position(|(bits, _)| *bits == solution.bits)
@@ -1795,6 +1799,8 @@ fn encode_pcm_to_packets_geometry(
     let psy_config_for = |c: usize| PsyConfig {
         threshold_offset_db: tuning.threshold_offset_db
             + extra_margins.get(c).copied().unwrap_or(0.0),
+        noise_margin_db: tuning.noise_margin_db,
+        tonal_margin_db: tuning.tonal_margin_db,
         ..PsyConfig::new(config.sample_rate)
     };
     let uniform_sizes = sizes.windows(2).all(|w| w[0] == w[1]);
@@ -1851,7 +1857,27 @@ fn encode_pcm_to_packets_geometry(
     // chooser itself: partitions the masking model prices at or
     // under the threshold in quiet go to the silence class for a
     // couple of grouped-classword bits.
-    let residue_ends: Vec<usize> = (0..n_entries).map(entry_half).collect();
+    // The low-rate mode limits the coded band
+    // ([`EncoderTuning::coded_bandwidth_hz`]): `residue_end` is the
+    // bandwidth's bin rounded up to a whole partition, and the floor
+    // is designed and fitted over the coded band only (the envelope
+    // above it is pinned to the ladder floor, so no post is spent
+    // there).
+    let residue_ends: Vec<usize> = (0..n_entries)
+        .map(|e| {
+            let half = entry_half(e);
+            match tuning.coded_bandwidth_hz {
+                Some(bw) if bw < config.sample_rate as f32 / 2.0 => {
+                    let ps = partition_size_for(half as u32) as usize;
+                    let bins =
+                        (bw / (config.sample_rate as f32 / 2.0) * half as f32).ceil() as usize;
+                    bins.div_ceil(ps).max(1) * ps
+                }
+                _ => half,
+            }
+            .min(half)
+        })
+        .collect();
     let frame_ps = |f: usize| partition_size_for((sizes[f] / 2) as u32) as usize;
     let frame_res_end = |f: usize| residue_ends[entry_of(f)];
 
@@ -1865,7 +1891,10 @@ fn encode_pcm_to_packets_geometry(
         env_seen[e] = true;
         let mut e_row = Vec::with_capacity(ch);
         for (x, masking) in per_ch.iter().zip(m_row) {
-            let envelope = plan_psy_floor_envelope(x, masking, tuning.floor_smooth_radius)?;
+            let mut envelope = plan_psy_floor_envelope(x, masking, tuning.floor_smooth_radius)?;
+            for v in envelope.iter_mut().skip(residue_ends[e]) {
+                *v = crate::floor1::INVERSE_DB_TABLE[0];
+            }
             for (acc, &v) in env_max[e].iter_mut().zip(&envelope) {
                 *acc = acc.max(v);
             }

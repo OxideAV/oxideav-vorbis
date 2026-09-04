@@ -30,8 +30,13 @@ magnitude vector carries the larger-magnitude channel value so the
 with a joint magnitude/angle re-plan clearing the quantisation
 leftovers; the angle vector carries an interaural-phase
 point-stereo discount above 1.5 kHz at the low knob) — behind one
-quality scalar or an **ABR bit target**
-(`StreamEncoderConfig::target_bitrate`), on a **band-level masking
+quality scalar (with a genuine **low-bitrate mode** below `q = 0.2`:
+the residue `lambda` climbs two further decades, the noise-like
+maskers' thresholds rise by up to 24 dB while the tonal maskers'
+fall by up to 12 dB, and the coded band is limited toward 8 kHz —
+`q = 0` reaches ~15 kbps on a stereo tones + hiss corpus) or an
+**ABR bit target** (`StreamEncoderConfig::target_bitrate`, bisecting
+the knob over eight full encodes), on a **band-level masking
 model** (masker level = analysis-band energy spread over the masked
 band's bins; ATH capped and band-shared; tonality = max of spectral
 flatness and cross-frame **phase predictability**) whose per-bin
@@ -1036,11 +1041,20 @@ stream).
   lowest — so waveform SNR on wideband noise trails the reference
   below its `q = 8` operating region while the perceptual objective
   is met.
-- **The knob's floor is high**: `q = 0` spends ~130 kbps on a
-  tones+hiss corpus where the reference reaches ~20 kbps modes; the
-  ABR entry degrades to the `q = 0` stream for smaller budgets. A
-  genuine low-bitrate mode needs a deeper masking margin than the
-  −12 dB the `q = 0` tuning applies plus coarser base ladders.
+- **The low-bitrate mode trails the reference on tonal material at
+  equal rate**: `q = 0` now reaches 15 kbps on the tones + hiss
+  corpus and the ABR entry meets 32 / 48 / 64 kbps budgets, but the
+  reference's lowest mode codes the same corpus at 40 kbps / 21.5 dB
+  — its tonal partials keep ~7 dB more waveform SNR at 20–30 kbps.
+  The measured cause is the noise-to-mask objective itself: a coarse
+  class trained under the low-rate `lambda` sparsifies to ~15 dB on
+  the partials and the model calls that transparent (the `14.5 + z`
+  dB tonal offset, deepened by 12 dB in this mode); the staged
+  fixtures land within 3 dB of the reference at 10–26 kbps. The
+  knob's rate is steep just above `q = 0` (15 → 200 kbps over
+  `q ∈ [0, 0.1]` on that corpus, where the hiss switches on), which
+  the ABR solve handles by bisecting the knob — a budget inside that
+  cliff is met from below by its lower edge.
 - **The angle-vector point-stereo discount is SNR-invisible**: the
   interaural-phase discount above 1.5 kHz trades waveform SNR (what
   the harness measures) for bits, so its benefit is asserted from

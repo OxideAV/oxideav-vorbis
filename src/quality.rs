@@ -16,10 +16,19 @@
 //!   `q ∈ [0, 1]` to a coherent lever set: `lambda` falls
 //!   log-linearly with `q` (each step of `q` buys a constant-ratio
 //!   drop in the bits→audibility exchange rate), the masking margin
-//!   rises linearly (−12 dB at `q = 0`, capped at +6 dB), and the
-//!   floor post budget grows with the fidelity the residue will
-//!   carry. Monotone by construction: a higher `q` never spends fewer
-//!   bits or raises the modelled audible noise.
+//!   rises linearly (−7.2 dB at the low-bitrate knee `q = 0.2`,
+//!   capped at +6 dB), and the floor post budget grows with the
+//!   fidelity the residue will carry. Below the **low-bitrate knee**
+//!   ([`LOW_BITRATE_KNEE`]) the levers steepen into a genuine
+//!   low-rate mode: `lambda` climbs a further
+//!   [`LOW_BITRATE_LAMBDA_DECADES`] decades to `q = 0`, the noise-like
+//!   maskers' thresholds rise by [`LOW_BITRATE_NOISE_MARGIN_DB`] while
+//!   the tonal maskers' fall by [`LOW_BITRATE_TONAL_MARGIN_DB`] (bits
+//!   move from hiss to partials), and the coded band is limited
+//!   ([`EncoderTuning::coded_bandwidth_hz`]) toward
+//!   [`LOW_BITRATE_MIN_BANDWIDTH_HZ`]. Monotone by construction: a
+//!   higher `q` never spends fewer bits or raises the modelled
+//!   audible noise.
 //! * [`solve_lambda_for_bits`] inverts the rate side: given a bit
 //!   budget and any caller-supplied `rate(lambda)` measurement (the
 //!   rate of a residue plan, a whole packet, or a whole stream), it
@@ -28,14 +37,73 @@
 //!   entry: quality targeting picks `lambda` from `q`; bit targeting
 //!   picks `lambda` from the budget.
 
+/// The quality setting below which the knob is a **low-bitrate
+/// mode**: above it the lever laws are the r453 calibration (each
+/// point of the knob on its own step of the rate/fidelity frontier);
+/// below it they steepen so `q = 0` reaches the reference encoder's
+/// lowest operating region instead of stopping at ~130 kbps on a
+/// tones + hiss corpus (measured: at the old `q = 0` the weighted
+/// chooser still coded every partition the model called audible —
+/// `lambda = 10⁻¹·⁴` prices a partition's worth of noise-to-mask
+/// error at hundreds of bits, so the hiss under a tone bed at −45 dBFS
+/// cost 3–4 bits per bin).
+pub const LOW_BITRATE_KNEE: f32 = 0.2;
+
+/// How many further decades `lambda` climbs from the knee to `q = 0`
+/// (`lambda(0) = lambda(knee) · 10^decades`): at 2 decades the
+/// exchange rate at `q = 0` is ~1.2 audibility units per bit, where a
+/// near-threshold partition's silence error no longer buys its
+/// codewords (measured on the tones + hiss battery: `q = 0` lands at
+/// ~24 kbps stereo — the reference encoder's lowest operating
+/// region — where 2.5 decades dropped the tonal partitions too and
+/// left 13 kbps at single-digit SNR).
+pub const LOW_BITRATE_LAMBDA_DECADES: f64 = 2.0;
+
+/// The extra threshold raise applied to **noise-like maskers only**
+/// at `q = 0` ([`crate::psy::PsyConfig::noise_margin_db`], linear from
+/// `0` at the knee): the low-rate mode drops noise-masked texture
+/// (hiss under a tone bed) before it loosens the protection around
+/// tonal peaks. The uniform margin (`threshold_offset_db`) stays at
+/// its knee value through the low-rate mode: measured, deepening it
+/// uniformly (−12 dB more at `q = 0`) let the reconstruction noise
+/// around strong partials climb to within a couple of dB of the
+/// partial — the tonal offset is only `14.5 + z` dB — and the tones
+/// were dropped before the hiss was. 24 dB is where the hiss under a
+/// tone bed (its peak-held floor sits ~5 dB over its own level)
+/// drops out of the rate-distortion trade at the low-rate `lambda`;
+/// 12 dB still spent 40 kbps on it.
+pub const LOW_BITRATE_NOISE_MARGIN_DB: f32 = 24.0;
+
+/// The extra threshold **lowering** applied to tonal maskers at
+/// `q = 0` ([`crate::psy::PsyConfig::tonal_margin_db`], linear from
+/// `0` at the knee): the complement of the noise margin — the bits
+/// the low-rate mode can afford go to the partials. Measured on the
+/// tones + hiss battery at `q = 0.1`: 17.6 → 24.2 dB at 150 kbps for
+/// 12 dB (6 dB gave 23.3 dB); on the staged fixtures +3 dB at equal
+/// rate.
+pub const LOW_BITRATE_TONAL_MARGIN_DB: f32 = 12.0;
+
+/// The coded bandwidth the low-rate mode limits to at `q = 0`
+/// (log-linear from the full band at the knee): §8.6.1 `residue_end`
+/// is capped there and the floor is designed / fitted over the coded
+/// band only, so the bits saved above the cutoff go to the audible
+/// band instead of the model's rate-distortion trade spending a
+/// classword per silent partition up there.
+pub const LOW_BITRATE_MIN_BANDWIDTH_HZ: f32 = 8_000.0;
+
+/// The full-band limit the knee (and everything above it) codes to.
+const FULL_BANDWIDTH_HZ: f32 = 20_000.0;
+
 /// The coherent lever set one quality setting expands to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderTuning {
     /// The rate-distortion Lagrange multiplier for the residue
     /// choosers. In the perceptually weighted chooser the distortion
     /// term is on the noise-to-mask scale, so `lambda` prices bits in
-    /// audibility units: `10⁻¹·⁴` at `q = 0` down to `10⁻⁴` at
-    /// `q = 1`, log-linear in between. (The law was recalibrated for
+    /// audibility units: `10⁻¹·⁹²` at the low-bitrate knee `q = 0.2`
+    /// down to `10⁻⁴` at `q = 1`, log-linear in between, and a
+    /// further [`LOW_BITRATE_LAMBDA_DECADES`] decades up at `q = 0`
+    /// ([`EncoderTuning::lambda_for_quality`]). (The law was recalibrated for
     /// the four-class residue ladder: under the old `10⁰ → 10⁻⁴` law
     /// the intermediate classes made the whole low half of the knob
     /// collapse onto near-identical cheap plans and the `q ≈ 0.75`
@@ -43,9 +111,9 @@ pub struct EncoderTuning {
     /// measured rate point on its own step of the frontier.)
     pub lambda: f64,
     /// The masking-margin lever for
-    /// [`crate::psy::PsyConfig::threshold_offset_db`]: −12 dB (coarse,
-    /// aggressive masking) at `q = 0`, rising linearly and **capped at
-    /// +6 dB** (reached at `q = 0.75`). The cap is measured, not
+    /// [`crate::psy::PsyConfig::threshold_offset_db`]: −7.2 dB at and
+    /// below the low-bitrate knee `q = 0.2`, rising linearly and
+    /// **capped at +6 dB** (reached at `q = 0.75`). The cap is measured, not
     /// aesthetic: the psy floor envelope rides
     /// `max(peak-held |X|, threshold)`, so pushing the threshold ever
     /// lower drags the floor onto `|X|` in every quiet bin — the
@@ -97,6 +165,23 @@ pub struct EncoderTuning {
     /// wobbles non-monotonically around the fixed ceiling while bytes
     /// triple. Monotone non-decreasing in `q`.
     pub fine_step_divisor: f32,
+    /// The **coded bandwidth** (Hz): `None` codes the whole spectrum
+    /// (the knee and above); the low-rate mode limits §8.6.1
+    /// `residue_end` (and the floor design/fit band) to this
+    /// frequency, falling log-linearly from 20 kHz at the knee to
+    /// [`LOW_BITRATE_MIN_BANDWIDTH_HZ`] at `q = 0`. Monotone
+    /// non-decreasing in `q`.
+    pub coded_bandwidth_hz: Option<f32>,
+    /// The **noise-masker margin** for
+    /// [`crate::psy::PsyConfig::noise_margin_db`]: `0` at the knee and
+    /// above, rising linearly to [`LOW_BITRATE_NOISE_MARGIN_DB`] at
+    /// `q = 0`. Monotone non-increasing in `q`.
+    pub noise_margin_db: f32,
+    /// The **tonal-masker margin** for
+    /// [`crate::psy::PsyConfig::tonal_margin_db`]: `0` at the knee and
+    /// above, rising linearly to [`LOW_BITRATE_TONAL_MARGIN_DB`] at
+    /// `q = 0`. Monotone non-increasing in `q`.
+    pub tonal_margin_db: f32,
 }
 
 /// Errors from the quality → tuning map.
@@ -152,20 +237,53 @@ impl EncoderTuning {
             return Err(QualityError::QualityOutOfRange(q));
         }
         let qf = f64::from(q);
+        // Depth into the low-bitrate mode: 0 at and above the knee,
+        // 1 at q = 0.
+        let low = ((LOW_BITRATE_KNEE - q) / LOW_BITRATE_KNEE).clamp(0.0, 1.0);
         Ok(EncoderTuning {
-            // 10^-1.4 at q=0 → 10^-4 at q=1.
-            lambda: 10f64.powf(-1.4 - 2.6 * qf),
-            threshold_offset_db: (-12.0 + 24.0 * q).min(6.0),
-            // 0 through the +6 dB cap knee (q = 0.75), then linear to
-            // +6 dB of per-channel headroom at q = 1.
+            lambda: Self::lambda_for_quality(q),
+            threshold_offset_db: (-12.0 + 24.0 * q.max(LOW_BITRATE_KNEE)).min(6.0),
             adaptive_margin_headroom_db: ((q - 0.75) * 24.0).clamp(0.0, 6.0),
             floor_post_budget: 8 + (24.0 * qf).round() as usize,
             floor_smooth_radius: 2,
-            // 192 up to q = 0.7, then log-linear to 4 × 192 = 768 at
-            // q = 1 — the top of the knob lowers the ladder noise
-            // floor instead of buying more saturated-SNR density.
             fine_step_divisor: 192.0 * 4f32.powf(((q - 0.7) / 0.3).max(0.0)),
+            coded_bandwidth_hz: (low > 0.0).then(|| {
+                FULL_BANDWIDTH_HZ * (LOW_BITRATE_MIN_BANDWIDTH_HZ / FULL_BANDWIDTH_HZ).powf(low)
+            }),
+            noise_margin_db: LOW_BITRATE_NOISE_MARGIN_DB * low,
+            tonal_margin_db: LOW_BITRATE_TONAL_MARGIN_DB * low,
         })
+    }
+
+    /// The residue `lambda` law: `10^(−1.4 − 2.6·q)` from the knee up
+    /// (the r453 calibration), climbing a further
+    /// [`LOW_BITRATE_LAMBDA_DECADES`] decades linearly in `q` below
+    /// it. Strictly decreasing in `q`; [`Self::quality_for_lambda`]
+    /// is its inverse.
+    #[must_use]
+    pub fn lambda_for_quality(q: f32) -> f64 {
+        let q = f64::from(q.clamp(0.0, 1.0));
+        let knee = f64::from(LOW_BITRATE_KNEE);
+        let base = 10f64.powf(-1.4 - 2.6 * q.max(knee));
+        if q < knee {
+            base * 10f64.powf(LOW_BITRATE_LAMBDA_DECADES * (knee - q) / knee)
+        } else {
+            base
+        }
+    }
+
+    /// The inverse of [`Self::lambda_for_quality`], clamped to
+    /// `[0, 1]`.
+    #[must_use]
+    pub fn quality_for_lambda(lambda: f64) -> f32 {
+        let knee = f64::from(LOW_BITRATE_KNEE);
+        let at_knee = 10f64.powf(-1.4 - 2.6 * knee);
+        let q = if lambda <= at_knee {
+            (-1.4 - lambda.log10()) / 2.6
+        } else {
+            knee - knee * (lambda / at_knee).log10() / LOW_BITRATE_LAMBDA_DECADES
+        };
+        q.clamp(0.0, 1.0) as f32
     }
 }
 
@@ -342,11 +460,32 @@ mod tests {
     #[test]
     fn tuning_endpoints_are_pinned() {
         let lo = EncoderTuning::from_quality(0.0).unwrap();
+        let knee = EncoderTuning::from_quality(LOW_BITRATE_KNEE).unwrap();
         let hi = EncoderTuning::from_quality(1.0).unwrap();
-        assert!((lo.lambda - 10f64.powf(-1.4)).abs() < 1e-12);
+        // The knee carries the r453 calibration; q = 0 sits
+        // LOW_BITRATE_LAMBDA_DECADES above it.
+        let expect_knee = 10f64.powf(-1.4 - 2.6 * f64::from(LOW_BITRATE_KNEE));
+        assert!((knee.lambda / expect_knee - 1.0).abs() < 1e-9);
+        assert!(
+            (lo.lambda / knee.lambda / 10f64.powf(LOW_BITRATE_LAMBDA_DECADES) - 1.0).abs() < 1e-9
+        );
         assert!((hi.lambda - 1e-4).abs() < 1e-12);
-        assert_eq!(lo.threshold_offset_db, -12.0);
+        assert!((knee.threshold_offset_db - (-7.2)).abs() < 1e-5);
+        assert!((lo.threshold_offset_db - (-7.2)).abs() < 1e-5);
+        assert_eq!(knee.noise_margin_db, 0.0);
+        assert_eq!(knee.tonal_margin_db, 0.0);
+        assert_eq!(lo.noise_margin_db, LOW_BITRATE_NOISE_MARGIN_DB);
+        assert_eq!(lo.tonal_margin_db, LOW_BITRATE_TONAL_MARGIN_DB);
         assert_eq!(hi.threshold_offset_db, 6.0);
+        assert_eq!(knee.coded_bandwidth_hz, None);
+        assert_eq!(hi.coded_bandwidth_hz, None);
+        assert!((lo.coded_bandwidth_hz.unwrap() - LOW_BITRATE_MIN_BANDWIDTH_HZ).abs() < 1.0);
+        let mid_low = EncoderTuning::from_quality(0.1).unwrap();
+        let bw = mid_low.coded_bandwidth_hz.unwrap();
+        assert!(
+            bw > LOW_BITRATE_MIN_BANDWIDTH_HZ && bw < 20_000.0,
+            "bw {bw}"
+        );
         assert_eq!(lo.floor_post_budget, 8);
         assert_eq!(hi.floor_post_budget, 32);
         assert_eq!(lo.adaptive_margin_headroom_db, 0.0);
@@ -373,7 +512,7 @@ mod tests {
         let mut prev: Option<EncoderTuning> = None;
         for i in 0..=20 {
             let t = EncoderTuning::from_quality(i as f32 / 20.0).unwrap();
-            if let Some(p) = prev {
+            if let Some(p) = &prev {
                 assert!(t.lambda < p.lambda, "lambda strictly falls with q");
                 assert!(
                     t.threshold_offset_db >= p.threshold_offset_db,
@@ -392,8 +531,39 @@ mod tests {
                     "adaptive margin headroom never falls"
                 );
             }
+            if let Some(p) = prev.as_ref() {
+                assert!(
+                    t.coded_bandwidth_hz.unwrap_or(f32::INFINITY)
+                        >= p.coded_bandwidth_hz.unwrap_or(f32::INFINITY),
+                    "coded bandwidth never falls"
+                );
+                assert!(
+                    t.noise_margin_db <= p.noise_margin_db,
+                    "noise-masker margin never rises with q"
+                );
+                assert!(
+                    t.tonal_margin_db <= p.tonal_margin_db,
+                    "tonal-masker margin never rises with q"
+                );
+            }
             prev = Some(t);
         }
+    }
+
+    #[test]
+    fn lambda_law_inverts_across_the_knee() {
+        for i in 0..=40 {
+            let q = i as f32 / 40.0;
+            let lambda = EncoderTuning::lambda_for_quality(q);
+            let back = EncoderTuning::quality_for_lambda(lambda);
+            assert!(
+                (back - q).abs() < 1e-4,
+                "q {q} -> lambda {lambda} -> {back}"
+            );
+            assert_eq!(EncoderTuning::from_quality(q).unwrap().lambda, lambda);
+        }
+        assert_eq!(EncoderTuning::quality_for_lambda(1e9), 0.0);
+        assert_eq!(EncoderTuning::quality_for_lambda(1e-9), 1.0);
     }
 
     // ---------- lambda-for-bits bisection ----------

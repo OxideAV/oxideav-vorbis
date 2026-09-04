@@ -85,6 +85,26 @@ pub struct PsyConfig {
     /// values raise it (more aggressive masking → fewer bits). `0.0`
     /// is the model's nominal operating point.
     pub threshold_offset_db: f32,
+    /// Extra decibels the **noise-like maskers'** thresholds are raised
+    /// by, scaled by each band's noisiness `1 − tonality` — the
+    /// low-rate lever that spends the noise-masking-noise offset's
+    /// conservatism ([`NOISE_OFFSET_DB`]) without touching the tonal
+    /// maskers' protection: raising every threshold uniformly
+    /// ([`Self::threshold_offset_db`]) lets the reconstruction noise
+    /// around a strong tone climb to within a couple of dB of the tone
+    /// (the tonal offset is only `14.5 + z` dB), which is where a
+    /// low-rate encode audibly falls apart first, while hiss under a
+    /// tone bed is the material a low rate can afford to drop. `0.0`
+    /// applies the nominal offsets.
+    pub noise_margin_db: f32,
+    /// Extra decibels the **tonal maskers'** thresholds are lowered
+    /// by, scaled by each band's tonality — the complement of
+    /// [`Self::noise_margin_db`]: at a low rate the bits a stream can
+    /// afford go to the partials the ear locks onto, whose
+    /// reconstruction noise the textbook `14.5 + z` dB tonal offset
+    /// leaves closer to audibility than the noise-masking-noise offset
+    /// leaves hiss. `0.0` applies the nominal offsets.
+    pub tonal_margin_db: f32,
 }
 
 impl PsyConfig {
@@ -96,6 +116,8 @@ impl PsyConfig {
             sample_rate,
             full_scale_db: 96.0,
             threshold_offset_db: 0.0,
+            noise_margin_db: 0.0,
+            tonal_margin_db: 0.0,
         }
     }
 }
@@ -394,8 +416,8 @@ fn threshold_from_bands(
         }
         let level_db = config.full_scale_db + 10.0 * energy[b].log10() as f32;
         let alpha = band_tonality[b];
-        let offset =
-            alpha * tonal_offset_db(layout.band_center[b]) + (1.0 - alpha) * NOISE_OFFSET_DB;
+        let offset = alpha * (tonal_offset_db(layout.band_center[b]) + config.tonal_margin_db)
+            + (1.0 - alpha) * (NOISE_OFFSET_DB - config.noise_margin_db);
         maskers.push((layout.band_center[b], level_db - offset));
     }
 
@@ -1368,6 +1390,52 @@ mod tests {
                 "bin {k}: ratio {ratio} vs {expect}"
             );
         }
+    }
+
+    #[test]
+    fn noise_and_tonal_margins_move_only_their_maskers() {
+        let n = 256;
+        // A pure tone (tonal band) and a flat noise pedestal far above
+        // it (noise-like bands), each dominating its own region.
+        let mut s = vec![0.0f32; n];
+        s[bin_at(1_000.0, n)] = 0.5;
+        s[bin_at(8_000.0, n)..bin_at(12_000.0, n)].fill(0.02);
+        let m0 = compute_masking(&s, &cfg()).unwrap();
+        let (kt, kn) = (bin_at(1_000.0, n), bin_at(10_000.0, n));
+        assert!(
+            m0.band_tonality[m0.bin_band[kt]] > 0.8,
+            "tone band is tonal"
+        );
+        assert!(
+            m0.band_tonality[m0.bin_band[kn]] < 0.2,
+            "pedestal band is noise-like"
+        );
+
+        // The noise margin raises the noise-masked threshold by (1 - alpha)
+        // times the margin and leaves the tonal region essentially alone.
+        let mut c = cfg();
+        c.noise_margin_db = 12.0;
+        let mn = compute_masking(&s, &c).unwrap();
+        let rise_n = 20.0 * (mn.threshold[kn] / m0.threshold[kn]).log10();
+        let rise_t = 20.0 * (mn.threshold[kt] / m0.threshold[kt]).log10();
+        assert!(
+            rise_n > 9.0 && rise_n <= 12.0 + 1e-3,
+            "noise region rose {rise_n} dB"
+        );
+        assert!(rise_t.abs() < 2.5, "tonal region moved {rise_t} dB");
+
+        // The tonal margin lowers the tone-masked threshold by alpha
+        // times the margin and leaves the noise region essentially alone.
+        let mut c = cfg();
+        c.tonal_margin_db = 12.0;
+        let mt = compute_masking(&s, &c).unwrap();
+        let fall_t = 20.0 * (m0.threshold[kt] / mt.threshold[kt]).log10();
+        let fall_n = 20.0 * (m0.threshold[kn] / mt.threshold[kn]).log10();
+        assert!(
+            fall_t > 9.0 && fall_t <= 12.0 + 1e-3,
+            "tonal region fell {fall_t} dB"
+        );
+        assert!(fall_n.abs() < 2.5, "noise region moved {fall_n} dB");
     }
 
     // ---------- floor envelope glue ----------
