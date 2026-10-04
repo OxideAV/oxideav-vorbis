@@ -784,7 +784,14 @@ pub fn decode_packet(
 pub fn register(ctx: &mut RuntimeContext) {
     ctx.codecs.register(
         oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("vorbis"))
-            .capabilities(oxideav_core::CodecCapabilities::audio("vorbis_sw"))
+            .capabilities(
+                // The encoder analyses float PCM (interleaved or planar);
+                // pipelines convert integer sources in front of it.
+                oxideav_core::CodecCapabilities::audio("vorbis_sw").with_sample_formats(vec![
+                    oxideav_core::SampleFormat::F32,
+                    oxideav_core::SampleFormat::F32P,
+                ]),
+            )
             .decoder(decoder::make_decoder)
             .encoder(encoder::make_encoder)
             .tags([oxideav_core::CodecTag::matroska("A_VORBIS")])
