@@ -16,8 +16,8 @@
 //! Fully synthetic — no fixtures required.
 
 use oxideav_vorbis::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, parse_setup_header, MappingCouplingStep,
-    StreamEncoderConfig,
+    MappingCouplingStep, StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets,
+    parse_setup_header,
 };
 
 const RATE: u32 = 44_100;

@@ -27,12 +27,12 @@
 //! standalone CI.
 
 use oxideav_core::bits::BitReaderLsb;
-use oxideav_vorbis::codebook::{parse_codebook, VorbisCodebook, VqLookup};
+use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup, parse_codebook};
 use oxideav_vorbis::residue::ResidueDecoder;
 use oxideav_vorbis::setup::ResidueHeader;
 use oxideav_vorbis::{
-    design_entropy_codebook, plan_vector_residue, tally_residue_plans, write_codebook,
-    write_residue_body, BookTallies, ResidueVectorPlan,
+    BookTallies, ResidueVectorPlan, design_entropy_codebook, plan_vector_residue,
+    tally_residue_plans, write_codebook, write_residue_body,
 };
 
 /// Blocksize the residue vectors live under (`n/2 = 64` scalars).

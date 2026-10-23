@@ -64,7 +64,7 @@
 //!   `expected.wav` dumps within ±1 s16 at `imdct_scale = 1.0`.
 
 use crate::audio::{
-    decode_audio_packet_windowed, AudioDecoderState, AudioPacketError, WindowedPacketOutcome,
+    AudioDecoderState, AudioPacketError, WindowedPacketOutcome, decode_audio_packet_windowed,
 };
 use crate::overlap::{OverlapAdd, OverlapError};
 use crate::setup::VorbisSetupHeader;
@@ -453,11 +453,7 @@ impl StreamingDecoder {
                 tail
             })
             .collect();
-        if any_tail {
-            Some(tails)
-        } else {
-            None
-        }
+        if any_tail { Some(tails) } else { None }
     }
 }
 

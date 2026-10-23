@@ -66,7 +66,7 @@
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::huffman::{BuildError, DecodeError, HuffmanTree};
 use crate::setup::ResidueHeader;
-use crate::vq::{unpack_vector, UnpackError};
+use crate::vq::{UnpackError, unpack_vector};
 use oxideav_core::bits::BitReaderLsb;
 
 /// Errors that can arise while preparing or running a residue decode.
@@ -160,15 +160,10 @@ impl core::fmt::Display for ResidueError {
                 f,
                 "vorbis residue: residue_books[{class}][{stage}] = {book} >= codebook count {codebook_count} (§8.6.1)"
             ),
-            ResidueError::ZeroClasswordsPerCodeword => write!(
-                f,
-                "vorbis residue: classbook dimensions = 0 (§8.6.2)"
-            ),
-            ResidueError::ValueBookHasNoLookup {
-                class,
-                stage,
-                book,
-            } => write!(
+            ResidueError::ZeroClasswordsPerCodeword => {
+                write!(f, "vorbis residue: classbook dimensions = 0 (§8.6.2)")
+            }
+            ResidueError::ValueBookHasNoLookup { class, stage, book } => write!(
                 f,
                 "vorbis residue: residue_books[{class}][{stage}] = {book} has lookup_type 0 (§8.6.1)"
             ),
@@ -534,7 +529,7 @@ impl ResidueDecoder {
         let dims = book.codebook.dimensions as usize;
         if self.residue_type == 0 {
             // §8.6.3 format 0 specifics.
-            if dims == 0 || n % dims != 0 {
+            if dims == 0 || !n.is_multiple_of(dims) {
                 return Err(PartitionStop::Err(
                     ResidueError::Format0PartitionNotDivisible {
                         partition_size: self.partition_size,
@@ -1008,9 +1003,9 @@ mod tests {
         r1[0] = Some(1); // class 1
         let mut r2 = [None; 8];
         r2[0] = Some(1); // class 2
-                         // 3 classifications, classbook idx 0.
-                         // partition_size 1, begin 0, end 2 → 2 partitions; classwords 2,
-                         // so a single classbook codeword covers both partitions.
+        // 3 classifications, classbook idx 0.
+        // partition_size 1, begin 0, end 2 → 2 partitions; classwords 2,
+        // so a single classbook codeword covers both partitions.
         let header = residue_header(1, 0, 2, 1, 3, 0, vec![r0, r1, r2]);
         let dec = ResidueDecoder::new(&header, &codebooks).unwrap();
 
@@ -1047,7 +1042,7 @@ mod tests {
         let mut row = [None; 8];
         row[0] = Some(1); // stage 0 → book 1
         row[1] = Some(2); // stage 1 → book 2
-                          // 1 partition of size 1, begin 0 end 1.
+        // 1 partition of size 1, begin 0 end 1.
         let header = residue_header(1, 0, 1, 1, 1, 0, vec![row]);
         let dec = ResidueDecoder::new(&header, &codebooks).unwrap();
 

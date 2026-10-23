@@ -14,13 +14,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use oxideav_vorbis::AudioDecoderState;
 use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup};
 use oxideav_vorbis::setup::{
     Floor1Header, FloorHeader, FloorKind, MappingHeader, MappingSubmap, ModeHeader, ResidueHeader,
     VorbisSetupHeader,
 };
 use oxideav_vorbis::streaming::StreamingDecoder;
-use oxideav_vorbis::AudioDecoderState;
 use std::sync::OnceLock;
 
 const N0: usize = 256;

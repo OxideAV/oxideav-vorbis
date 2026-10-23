@@ -30,12 +30,12 @@
 //! standalone CI.
 
 use oxideav_core::bits::BitReaderLsb;
-use oxideav_vorbis::codebook::{parse_codebook, VorbisCodebook, VqLookup};
+use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup, parse_codebook};
 use oxideav_vorbis::floor0::{Floor0Curve, Floor0Decoder};
 use oxideav_vorbis::floor0_envelope::plan_floor0_packet;
 use oxideav_vorbis::setup::Floor0Header;
 use oxideav_vorbis::{
-    tally_floor0_packet, write_codebook, write_floor0_packet, BookTallies, Floor0Packet,
+    BookTallies, Floor0Packet, tally_floor0_packet, write_codebook, write_floor0_packet,
 };
 
 /// Spectral bins the envelopes are defined over (also the render `n/2`).

@@ -34,8 +34,8 @@ use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup};
 use oxideav_vorbis::floor1::{Floor1Decoder, FloorCurve, INVERSE_DB_TABLE};
 use oxideav_vorbis::setup::{Floor1Class, Floor1Header};
 use oxideav_vorbis::{
-    apply_window_and_mdct_vec, invert_inverse_db, plan_floor1_envelope, plan_floor1_y,
-    write_floor1_packet, Floor1Packet,
+    Floor1Packet, apply_window_and_mdct_vec, invert_inverse_db, plan_floor1_envelope,
+    plan_floor1_y, write_floor1_packet,
 };
 
 use oxideav_core::bits::BitReaderLsb;

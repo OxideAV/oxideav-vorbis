@@ -48,9 +48,10 @@ use oxideav_vorbis::setup::{
     ResidueHeader, VorbisSetupHeader,
 };
 use oxideav_vorbis::{
-    apply_window_and_mdct_vec, decode_audio_packet_windowed, imdct_naive_vec, plan_floor1_envelope,
-    plan_floor1_y, plan_partition_cascade, write_audio_packet, AudioChannelFloor,
-    AudioDecoderState, AudioPacketHeader, Floor1Packet, ResidueVectorPlan, WindowedPacketOutcome,
+    AudioChannelFloor, AudioDecoderState, AudioPacketHeader, Floor1Packet, ResidueVectorPlan,
+    WindowedPacketOutcome, apply_window_and_mdct_vec, decode_audio_packet_windowed,
+    imdct_naive_vec, plan_floor1_envelope, plan_floor1_y, plan_partition_cascade,
+    write_audio_packet,
 };
 
 use oxideav_core::bits::BitReaderLsb;

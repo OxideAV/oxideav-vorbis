@@ -603,7 +603,7 @@ pub fn plan_floor1_partition_cvals(
                     cb.codeword_lengths
                         .iter()
                         .enumerate()
-                        .filter(|(_, &l)| l != crate::codebook::UNUSED_ENTRY)
+                        .filter(|&(_, &l)| l != crate::codebook::UNUSED_ENTRY)
                         .map(|(e, _)| e as u32)
                         .collect::<Vec<u32>>()
                 }
@@ -1367,7 +1367,7 @@ mod tests {
     /// packet (no hand-supplied floor1_y, no hand-supplied cvals).
     #[test]
     fn cval_plan_end_to_end_packet_roundtrip() {
-        use crate::encoder::{write_floor1_packet, Floor1Packet};
+        use crate::encoder::{Floor1Packet, write_floor1_packet};
         use crate::floor1::Floor1Decoder;
         use oxideav_core::bits::BitReaderLsb;
 

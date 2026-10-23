@@ -816,9 +816,9 @@ mod tests {
         let mut w = BitWriterLsb::new();
         w.write_u32(0, 1); // packet_type
         w.write_u32(0, 7); // mode_number = 0
-                           // No further bits; finish() pads — but the bit reader knows
-                           // about all 8 bits of the byte. There are exactly 0 bits left
-                           // after the 8 consumed → previous_window_flag EOFs.
+        // No further bits; finish() pads — but the bit reader knows
+        // about all 8 bits of the byte. There are exactly 0 bits left
+        // after the 8 consumed → previous_window_flag EOFs.
         let bytes = w.finish();
         // Sanity-check the writer produced exactly 1 byte.
         assert_eq!(bytes.len(), 1);

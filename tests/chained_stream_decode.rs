@@ -51,8 +51,8 @@
 //! is data availability, not a disabled test (no `#[ignore]`).
 
 use oxideav_vorbis::{
-    parse_identification_header, parse_setup_header, AudioDecoderState, StreamingDecoder,
-    StreamingFrame,
+    AudioDecoderState, StreamingDecoder, StreamingFrame, parse_identification_header,
+    parse_setup_header,
 };
 
 /// The pinned §4.3.7 IMDCT normalization scalar (see
@@ -153,10 +153,10 @@ fn ogg_logical_streams(data: &[u8]) -> Vec<LogicalStream> {
     }
     // Flush any trailing continuation per serial.
     for (serial, acc) in pending {
-        if let Some(s) = streams.iter_mut().rev().find(|s| s.serial == serial) {
-            if !acc.is_empty() {
-                s.packets.push(acc);
-            }
+        if let Some(s) = streams.iter_mut().rev().find(|s| s.serial == serial)
+            && !acc.is_empty()
+        {
+            s.packets.push(acc);
         }
     }
     streams
@@ -173,7 +173,9 @@ fn wav_s16(data: &[u8]) -> Vec<i16> {
         if id == b"data" {
             let end = (start + sz).min(data.len());
             return data[start..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
         }

@@ -251,7 +251,7 @@ pub fn lpc_to_lsp(a: &[f64], order: usize) -> Result<Vec<f64>, Floor0LspError> {
     //   (1 − z⁻¹)(1 + z⁻¹) (degree order−1, carrying (order−1)/2 roots).
     //
     // Either way the two reduced polynomials carry exactly `order` roots.
-    let (pr, qr) = if order % 2 == 0 {
+    let (pr, qr) = if order.is_multiple_of(2) {
         (deflate_symmetric(&pp, true), deflate_symmetric(&qq, false))
     } else {
         let q1 = deflate_symmetric(&qq, false); // Q / (1 - z^-1)

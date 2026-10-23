@@ -35,8 +35,8 @@
 use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup};
 use oxideav_vorbis::setup::ResidueHeader;
 use oxideav_vorbis::{
-    plan_partition_cascade, plan_vector_partition_entries, plan_vector_residue, write_residue_body,
-    ResidueDecoder, ResidueVectorPlan,
+    ResidueDecoder, ResidueVectorPlan, plan_partition_cascade, plan_vector_partition_entries,
+    plan_vector_residue, write_residue_body,
 };
 
 use oxideav_core::bits::BitReaderLsb;

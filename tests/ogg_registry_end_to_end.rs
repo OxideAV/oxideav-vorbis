@@ -49,7 +49,9 @@ fn wav_s16(data: &[u8]) -> Vec<i16> {
         if id == b"data" {
             let end = (start + sz).min(data.len());
             return data[start..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
         }
@@ -113,7 +115,9 @@ fn decode_via_registry(name: &str, ogg: Vec<u8>) -> Vec<Vec<f32>> {
                     for (row, plane) in per_ch.iter_mut().zip(&a.data) {
                         row.extend(
                             plane
-                                .chunks_exact(4)
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
                                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
                         );
                     }
@@ -352,7 +356,9 @@ fn seek_then_reset_resumes_bit_identically() {
                         for plane in &a.data {
                             pcm.extend(
                                 plane
-                                    .chunks_exact(4)
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
                             );
                         }

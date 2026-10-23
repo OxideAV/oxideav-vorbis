@@ -35,8 +35,8 @@
 //! tests need no corpus and always run.
 
 use oxideav_vorbis::{
-    parse_identification_header, parse_setup_header, AudioDecoderState, StreamingDecoder,
-    StreamingError, StreamingFrame, VorbisSetupHeader,
+    AudioDecoderState, StreamingDecoder, StreamingError, StreamingFrame, VorbisSetupHeader,
+    parse_identification_header, parse_setup_header,
 };
 
 fn fixtures_root() -> String {

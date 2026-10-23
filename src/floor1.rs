@@ -48,7 +48,7 @@
 //! the §4.3 audio-packet driver (a later round) and tests can reuse
 //! them.
 
-use crate::codebook::{ilog, VorbisCodebook};
+use crate::codebook::{VorbisCodebook, ilog};
 use crate::huffman::{BuildError, HuffmanTree};
 use crate::setup::{Floor1Class, Floor1Header};
 use oxideav_core::bits::BitReaderLsb;
@@ -561,11 +561,7 @@ pub fn render_point(x0: i32, y0: i32, x1: i32, y1: i32, x: i32) -> i32 {
     let ady = dy.abs();
     let err = ady * (x - x0);
     let off = err / adx;
-    if dy < 0 {
-        y0 - off
-    } else {
-        y0 + off
-    }
+    if dy < 0 { y0 - off } else { y0 + off }
 }
 
 /// §9.2.7 render_line: draw the integer line segment `(x0, y0)`–`(x1,
@@ -1266,7 +1262,7 @@ mod tests {
         w.write_bit(true); // nonzero
         w.write_u32(40, 7); // endpoint 0
         w.write_u32(20, 7); // endpoint 1
-                            // master codeword for entry 2 = '10' (MSb first).
+        // master codeword for entry 2 = '10' (MSb first).
         w.write_bit(true);
         w.write_bit(false);
         // subbook A: entry 1 → bit '1' (Y[2] wrapped = 1).

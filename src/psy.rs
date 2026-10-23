@@ -656,13 +656,13 @@ pub fn compute_masking_with_predictability(
     unpredictability: Option<&[f32]>,
     config: &PsyConfig,
 ) -> Result<MaskingAnalysis, PsyError> {
-    if let Some(c) = unpredictability {
-        if c.len() != spectrum.len() {
-            return Err(PsyError::LengthMismatch {
-                floor: spectrum.len(),
-                threshold: c.len(),
-            });
-        }
+    if let Some(c) = unpredictability
+        && c.len() != spectrum.len()
+    {
+        return Err(PsyError::LengthMismatch {
+            floor: spectrum.len(),
+            threshold: c.len(),
+        });
     }
     if spectrum.is_empty() {
         return Err(PsyError::EmptySpectrum);
@@ -863,7 +863,7 @@ pub fn residue_partition_weights(
         return Err(PsyError::ZeroPartitionSize);
     }
     let ps = partition_size as usize;
-    if begin >= end || end > floor.len() || (end - begin) % ps != 0 {
+    if begin >= end || end > floor.len() || !(end - begin).is_multiple_of(ps) {
         return Err(PsyError::BadResidueWindow {
             begin,
             end,
@@ -1115,13 +1115,13 @@ impl TemporalMasking {
         psy: &PsyConfig,
     ) -> Result<Option<MaskingAnalysis>, PsyError> {
         let fresh = compute_masking_with_predictability(spectrum, unpredictability, psy)?;
-        if let Some(pending) = &self.pending {
-            if pending.threshold.len() != fresh.threshold.len() {
-                return Err(PsyError::LengthMismatch {
-                    floor: fresh.threshold.len(),
-                    threshold: pending.threshold.len(),
-                });
-            }
+        if let Some(pending) = &self.pending
+            && pending.threshold.len() != fresh.threshold.len()
+        {
+            return Err(PsyError::LengthMismatch {
+                floor: fresh.threshold.len(),
+                threshold: pending.threshold.len(),
+            });
         }
         let emitted = match self.pending.take() {
             None => {

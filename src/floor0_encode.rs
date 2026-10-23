@@ -79,7 +79,7 @@
 //! [`crate::encoder::write_audio_packet`] path.
 
 use crate::codebook::{VorbisCodebook, VqLookup};
-use crate::vq::{quantize_vector, QuantizeError};
+use crate::vq::{QuantizeError, quantize_vector};
 
 /// Errors that can arise while planning a floor-0 packet's VQ entry run
 /// (Vorbis I §6.2.2, encode direction).

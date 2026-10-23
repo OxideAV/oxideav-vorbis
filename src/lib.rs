@@ -260,90 +260,90 @@ pub use audio::AudioDecoderState;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use audio::{
-    apply_imdct_and_window, decode_audio_packet_pre_imdct, decode_audio_packet_windowed,
-    decode_one_packet, decode_one_packet_windowed, AudioPacketError, AudioPacketOutcome,
-    WindowedPacketOutcome,
+    AudioPacketError, AudioPacketOutcome, WindowedPacketOutcome, apply_imdct_and_window,
+    decode_audio_packet_pre_imdct, decode_audio_packet_windowed, decode_one_packet,
+    decode_one_packet_windowed,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use blocksize::plan_block_sequence_perceptual;
 pub use blocksize::{
-    choose_blocksize, detect_transient, plan_block_sequence, BlockSequencePlan, BlocksizeError,
-    TransientAnalysis,
+    BlockSequencePlan, BlocksizeError, TransientAnalysis, choose_blocksize, detect_transient,
+    plan_block_sequence,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use book_design::{
-    design_codeword_lengths, design_codeword_lengths_dense, design_entropy_codebook,
-    design_value_ladder, redesign_codebook, stream_cost_bits, tally_floor0_packet,
-    tally_floor1_packet, tally_residue_plans, train_residue_books_rd,
-    train_residue_books_rd_ladder, BookDesignError, BookTallies, ResidueLadderTrainingOutcome,
-    ResidueRdTrainingOutcome, ValueLadderDesign, MAX_CODEWORD_LEN,
+    BookDesignError, BookTallies, MAX_CODEWORD_LEN, ResidueLadderTrainingOutcome,
+    ResidueRdTrainingOutcome, ValueLadderDesign, design_codeword_lengths,
+    design_codeword_lengths_dense, design_entropy_codebook, design_value_ladder, redesign_codebook,
+    stream_cost_bits, tally_floor0_packet, tally_floor1_packet, tally_residue_plans,
+    train_residue_books_rd, train_residue_books_rd_ladder,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use channel_order::{speaker_at, speaker_layout, Speaker};
+pub use channel_order::{Speaker, speaker_at, speaker_layout};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use codebook::{
-    float32_pack, float32_unpack, ilog, lookup1_values, parse_codebook,
-    ParseError as CodebookParseError, VorbisCodebook, VqLookup, UNUSED_ENTRY,
+    ParseError as CodebookParseError, UNUSED_ENTRY, VorbisCodebook, VqLookup, float32_pack,
+    float32_unpack, ilog, lookup1_values, parse_codebook,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use comment::{
-    parse_comment_header, split_key_value, ParseError as CommentParseError, VorbisCommentHeader,
+    ParseError as CommentParseError, VorbisCommentHeader, parse_comment_header, split_key_value,
 };
-pub use decoder::{make_decoder, VorbisDecoder, OUTPUT_SAMPLE_FORMAT};
+pub use decoder::{OUTPUT_SAMPLE_FORMAT, VorbisDecoder, make_decoder};
 // `make_encoder` and `VorbisStreamEncoder` are the stable encoder entry
 // points; every other `encoder` re-export is internal write plumbing.
-pub use encoder::{make_encoder, VorbisStreamEncoder};
+pub use encoder::{VorbisStreamEncoder, make_encoder};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use encoder::{
-    pack_residue_classification_groups, pack_residue_classifications, plan_residue_bundles,
-    residue_body_shape, residue_partition_codeword_count, write_audio_packet,
-    write_audio_packet_header, write_codebook, write_comment_header, write_floor0_header,
-    write_floor0_packet, write_floor1_header, write_floor1_packet, write_identification_header,
-    write_mapping_header, write_mode_header, write_residue_body, write_residue_header,
-    write_residue_partition, AudioChannelFloor, Floor0Packet, Floor1Packet, PackResidueClassError,
+    AudioChannelFloor, Floor0Packet, Floor1Packet, PackResidueClassError,
     PackResidueClassGroupsError, PlanResidueBundlesError, ResidueBodyShape, ResidueBundlePlan,
     ResidueVectorPlan, SubmapResidueBundle, WriteAudioPacketError, WriteAudioPacketHeaderError,
     WriteCodebookError, WriteError, WriteFloor0Error, WriteFloor0PacketError, WriteFloor1Error,
     WriteFloor1PacketError, WriteMappingError, WriteModeError, WriteResidueBodyError,
-    WriteResidueError, WriteResiduePartitionError,
+    WriteResidueError, WriteResiduePartitionError, pack_residue_classification_groups,
+    pack_residue_classifications, plan_residue_bundles, residue_body_shape,
+    residue_partition_codeword_count, write_audio_packet, write_audio_packet_header,
+    write_codebook, write_comment_header, write_floor0_header, write_floor0_packet,
+    write_floor1_header, write_floor1_packet, write_identification_header, write_mapping_header,
+    write_mode_header, write_residue_body, write_residue_header, write_residue_partition,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use floor0::{bark as floor0_bark, Floor0Curve, Floor0Decoder, Floor0Error};
+pub use floor0::{Floor0Curve, Floor0Decoder, Floor0Error, bark as floor0_bark};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use floor0_encode::{floor0_vector_count, plan_floor0_coefficients, Floor0EncodeError};
+pub use floor0_encode::{Floor0EncodeError, floor0_vector_count, plan_floor0_coefficients};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use floor0_layout::{
-    score_floor0_orders, select_floor0_order, select_floor0_order_rd, suggest_floor0_params,
-    Floor0LayoutError, Floor0OrderFit,
+    Floor0LayoutError, Floor0OrderFit, score_floor0_orders, select_floor0_order,
+    select_floor0_order_rd, suggest_floor0_params,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use floor1::{
-    high_neighbor, low_neighbor, render_line, render_point, Floor1Decoder, Floor1Error, FloorCurve,
+    Floor1Decoder, Floor1Error, FloorCurve, high_neighbor, low_neighbor, render_line, render_point,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use floor1_encode::{
-    full_x_list as floor1_full_x_list, plan_floor1_packet, plan_floor1_partition_cvals,
-    plan_floor1_y, Floor1CvalError, Floor1EncodeError, Floor1PacketPlanError,
+    Floor1CvalError, Floor1EncodeError, Floor1PacketPlanError, full_x_list as floor1_full_x_list,
+    plan_floor1_packet, plan_floor1_partition_cvals, plan_floor1_y,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use floor1_envelope::{invert_inverse_db, plan_floor1_envelope, Floor1EnvelopeError};
+pub use floor1_envelope::{Floor1EnvelopeError, invert_inverse_db, plan_floor1_envelope};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use floor1_layout::{
-    design_floor1_header, floor1_x_list_distortion, min_rangebits, plan_floor1_partition_layout,
-    plan_floor1_x_list, select_floor1_post_budget, Floor1LayoutError, Floor1PartitionLayout,
+    Floor1LayoutError, Floor1PartitionLayout, design_floor1_header, floor1_x_list_distortion,
+    min_rangebits, plan_floor1_partition_layout, plan_floor1_x_list, select_floor1_post_budget,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -356,21 +356,21 @@ pub use huffman::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use identification::{
-    parse_identification_header, ParseError as IdentificationParseError, VorbisIdentificationHeader,
+    ParseError as IdentificationParseError, VorbisIdentificationHeader, parse_identification_header,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use imdct::{imdct, imdct_naive, imdct_naive_vec, imdct_vec, ImdctError};
+pub use imdct::{ImdctError, imdct, imdct_naive, imdct_naive_vec, imdct_vec};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use mdct::{
-    apply_window_and_mdct, apply_window_and_mdct_vec, mdct, mdct_naive, mdct_naive_vec, mdct_vec,
-    ApplyWindowAndMdctError, MdctError,
+    ApplyWindowAndMdctError, MdctError, apply_window_and_mdct, apply_window_and_mdct_vec, mdct,
+    mdct_naive, mdct_naive_vec, mdct_vec,
 };
 pub use oggfile::{
+    DecodedOggStream, EncodedVorbisStream, MuxError, OggFileError, StreamEncoderConfig,
     decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets, lace_vorbis_headers,
-    mux_vorbis_stream, ogg_packets, DecodedOggStream, EncodedVorbisStream, MuxError, OggFileError,
-    StreamEncoderConfig,
+    mux_vorbis_stream, ogg_packets,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -378,26 +378,26 @@ pub use overlap::{OverlapAdd, OverlapError};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use packet::{
-    dot_product, dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader,
-    PacketError, PacketHeaderStage, VectorKind,
+    AudioPacketHeader, PacketError, PacketHeaderStage, VectorKind, dot_product, dot_product_all,
+    nonzero_propagate, read_packet_header,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use packet_kind::{
-    classify_packet, parse_header_packet, ClassifyError, HeaderDispatchError, HeaderPacket,
-    PacketKind,
+    ClassifyError, HeaderDispatchError, HeaderPacket, PacketKind, classify_packet,
+    parse_header_packet,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use psy::{
-    ath_db, complex_spectrum, compute_masking, compute_masking_with_predictability,
+    Complex, MaskingAnalysis, PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig, ath_db,
+    complex_spectrum, compute_masking, compute_masking_with_predictability,
     plan_psy_floor_envelope, residue_bin_weights, residue_partition_weights, unpredictability,
-    Complex, MaskingAnalysis, PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use quality::{
-    solve_lambda_for_bits, EncoderTuning, LambdaSolution, LambdaSolveError, QualityError,
+    EncoderTuning, LambdaSolution, LambdaSolveError, QualityError, solve_lambda_for_bits,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -406,13 +406,13 @@ pub use residue::{ResidueDecoder, ResidueError};
 pub use residue_encode::plan_partition_cascade_scored_weighted;
 #[doc(hidden)]
 pub use residue_encode::{
-    plan_partition_cascade, plan_partition_cascade_scored, plan_vector_classifications,
-    plan_vector_classifications_rd, plan_vector_classifications_rd_bin_weighted,
-    plan_vector_classifications_rd_weighted, plan_vector_classifications_rd_weighted_biased,
-    plan_vector_partition_entries, plan_vector_residue, plan_vector_residue_rd,
-    plan_vector_residue_rd_weighted, plan_vector_residue_rd_weighted_biased,
-    replay_partition_cascade, select_residue_config, PartitionClassChoice, ResidueConfigCandidate,
-    ResidueEncodeError, ScoredPartitionCascade, ScoredVectorResidue, SelectedResidueConfig,
+    PartitionClassChoice, ResidueConfigCandidate, ResidueEncodeError, ScoredPartitionCascade,
+    ScoredVectorResidue, SelectedResidueConfig, plan_partition_cascade,
+    plan_partition_cascade_scored, plan_vector_classifications, plan_vector_classifications_rd,
+    plan_vector_classifications_rd_bin_weighted, plan_vector_classifications_rd_weighted,
+    plan_vector_classifications_rd_weighted_biased, plan_vector_partition_entries,
+    plan_vector_residue, plan_vector_residue_rd, plan_vector_residue_rd_weighted,
+    plan_vector_residue_rd_weighted_biased, replay_partition_cascade, select_residue_config,
 };
 // `VorbisSetupHeader` is named in the public `decode_packet` signature;
 // the rest of the `setup` re-exports are internal parsed-header types.
@@ -420,9 +420,9 @@ pub use setup::VorbisSetupHeader;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use setup::{
-    parse_setup_header, parse_setup_header_body, Floor0Header, Floor1Class, Floor1Header,
-    FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap, ModeHeader,
-    ParseError as SetupParseError, ResidueHeader, SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
+    Floor0Header, Floor1Class, Floor1Header, FloorHeader, FloorKind, MappingCouplingStep,
+    MappingHeader, MappingSubmap, ModeHeader, ParseError as SetupParseError, ResidueHeader,
+    SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE, parse_setup_header, parse_setup_header_body,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -430,16 +430,16 @@ pub use streaming::{StreamingDecoder, StreamingError, StreamingFrame};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use synthesis::{
+    CouplingEnergy, CouplingError, FactorSpectrumError, WindowError, WindowPremultiplyError,
     couple_scalar, coupling_energy, factor_spectrum, factor_spectrum_all, forward_couple,
     forward_couple_all, forward_couple_scalar, inverse_couple, inverse_couple_all,
-    prune_coupling_steps, should_couple, slope, vorbis_window, window_premultiply, CouplingEnergy,
-    CouplingError, FactorSpectrumError, WindowError, WindowPremultiplyError,
+    prune_coupling_steps, should_couple, slope, vorbis_window, window_premultiply,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use vq::{
-    quantize_vector, quantize_vector_weighted, unpack_vector, QuantizeError as VqQuantizeError,
-    QuantizedEntry, UnpackError as VqUnpackError,
+    QuantizeError as VqQuantizeError, QuantizedEntry, UnpackError as VqUnpackError,
+    quantize_vector, quantize_vector_weighted, unpack_vector,
 };
 
 /// Crate-local error type for the in-progress clean-room rebuild.

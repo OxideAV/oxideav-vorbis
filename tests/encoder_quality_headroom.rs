@@ -14,8 +14,8 @@
 //! `q = 1`, not just spend more bytes.
 
 use oxideav_vorbis::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, parse_identification_header,
-    parse_setup_header, StreamEncoderConfig, VqLookup,
+    StreamEncoderConfig, VqLookup, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets,
+    parse_identification_header, parse_setup_header,
 };
 
 const RATE: u32 = 44_100;

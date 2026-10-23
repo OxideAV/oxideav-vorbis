@@ -39,8 +39,8 @@
 
 use oxideav_core::bits::BitReaderLsb;
 use oxideav_vorbis::{
-    floor0_bark, ilog, plan_floor0_coefficients, write_floor0_packet, Floor0Curve, Floor0Decoder,
-    Floor0Header, Floor0Packet, VorbisCodebook, VqLookup,
+    Floor0Curve, Floor0Decoder, Floor0Header, Floor0Packet, VorbisCodebook, VqLookup, floor0_bark,
+    ilog, plan_floor0_coefficients, write_floor0_packet,
 };
 
 /// Build a tessellation (lookup-2) VQ value codebook with explicit

@@ -79,7 +79,7 @@
 //! [`crate::encoder::write_audio_packet`] path.
 
 use crate::codebook::{VorbisCodebook, VqLookup};
-use crate::vq::{quantize_vector, QuantizeError};
+use crate::vq::{QuantizeError, quantize_vector};
 
 /// Errors that can arise while planning a residue partition's cascade
 /// (Vorbis I §8.6.2 / §8.6.3 / §8.6.4).
@@ -321,7 +321,7 @@ fn partition_reads(
     let n = partition_size as usize;
     let dims = dimensions as usize;
     if residue_type == 0 {
-        if n % dims != 0 {
+        if !n.is_multiple_of(dims) {
             return Err(ResidueEncodeError::Format0NotDivisible {
                 pass,
                 partition_size,
@@ -363,11 +363,7 @@ fn gather_index(
         // §8.6.4: append contiguously, k*dims + j.
         read * dims + j
     };
-    if idx < n {
-        Some(idx)
-    } else {
-        None
-    }
+    if idx < n { Some(idx) } else { None }
 }
 
 /// Plan one residue partition's cascade (Vorbis I §8.6.2 step 19 in the
@@ -896,7 +892,7 @@ pub fn plan_vector_classifications(
         return Err(ResidueEncodeError::NoClassifications);
     }
     let ps = partition_size as usize;
-    if scalars.len() % ps != 0 {
+    if !scalars.len().is_multiple_of(ps) {
         return Err(ResidueEncodeError::ResidualLengthMismatch {
             // The expected length is the nearest multiple at or below the
             // supplied length; report the supplied length's remainder via
@@ -1216,7 +1212,7 @@ fn plan_vector_classifications_rd_core(
         return Err(ResidueEncodeError::NonFiniteLambda(lambda));
     }
     let ps = partition_size as usize;
-    if scalars.len() % ps != 0 {
+    if !scalars.len().is_multiple_of(ps) {
         return Err(ResidueEncodeError::ResidualLengthMismatch {
             expected: (scalars.len() / ps) * ps,
             actual: scalars.len(),
@@ -2204,7 +2200,7 @@ mod tests {
             },
         };
         let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]); // delta 1
-                                                                  // class 0: coarse alone → nearest to [3,3] is [2,2] or [4,4], err 2.
+        // class 0: coarse alone → nearest to [3,3] is [2,2] or [4,4], err 2.
         let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
         row0[0] = Some(&coarse);
         // class 1: coarse then fine → coarse [2,2] (or [4,4]) leaves ±1, fine

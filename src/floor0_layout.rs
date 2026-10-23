@@ -44,7 +44,7 @@
 
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::floor0::Floor0Decoder;
-use crate::floor0_envelope::{fit_floor0_amplitude, plan_floor0_lsp, Floor0ShapeParams};
+use crate::floor0_envelope::{Floor0ShapeParams, fit_floor0_amplitude, plan_floor0_lsp};
 use crate::setup::Floor0Header;
 
 /// Errors that can arise while selecting a floor-0 order (Vorbis I §6.2.1,

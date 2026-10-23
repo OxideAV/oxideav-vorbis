@@ -32,9 +32,9 @@ use oxideav_core::{
 };
 
 use crate::audio::AudioDecoderState;
-use crate::identification::{parse_identification_header, VorbisIdentificationHeader};
-use crate::packet_kind::{classify_packet, PacketKind};
-use crate::setup::{parse_setup_header, VorbisSetupHeader};
+use crate::identification::{VorbisIdentificationHeader, parse_identification_header};
+use crate::packet_kind::{PacketKind, classify_packet};
+use crate::setup::{VorbisSetupHeader, parse_setup_header};
 use crate::streaming::{StreamingDecoder, StreamingFrame};
 
 /// Which header packet the decoder expects next.

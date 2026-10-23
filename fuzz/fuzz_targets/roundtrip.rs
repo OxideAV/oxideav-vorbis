@@ -12,7 +12,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_vorbis::oggfile::{decode_ogg_to_pcm, encode_pcm_to_ogg, StreamEncoderConfig};
+use oxideav_vorbis::oggfile::{StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
@@ -28,11 +28,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let mut pcm: Vec<Vec<f32>> = vec![Vec::with_capacity(per_channel); channels];
-    let mut it = payload.chunks_exact(2);
+    let mut it = payload.as_chunks::<2>().0.iter();
     for _ in 0..per_channel {
         for row in pcm.iter_mut() {
             let b = it.next().expect("length checked above");
-            let v = i16::from_le_bytes([b[0], b[1]]);
+            let v = i16::from_le_bytes(*b);
             row.push(f32::from(v) / 32768.0);
         }
     }

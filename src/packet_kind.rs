@@ -57,9 +57,9 @@
 //! treats that as the dedicated [`ClassifyError::EmptyPacket`] case so
 //! the caller can distinguish it from a malformed first byte.
 
-use crate::comment::{parse_comment_header, VorbisCommentHeader};
-use crate::identification::{parse_identification_header, VorbisIdentificationHeader};
-use crate::setup::{parse_setup_header, VorbisSetupHeader, SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE};
+use crate::comment::{VorbisCommentHeader, parse_comment_header};
+use crate::identification::{VorbisIdentificationHeader, parse_identification_header};
+use crate::setup::{SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE, VorbisSetupHeader, parse_setup_header};
 
 /// The four kinds of packet defined for a Vorbis I bitstream.
 ///
@@ -508,7 +508,7 @@ mod tests {
         for packet_type in [0x01u8, 0x03, 0x05] {
             for len in 1..7usize {
                 let p: Vec<u8> = core::iter::once(packet_type)
-                    .chain(std::iter::repeat(0u8).take(len - 1))
+                    .chain(std::iter::repeat_n(0u8, len - 1))
                     .collect();
                 assert_eq!(
                     classify_packet(&p),

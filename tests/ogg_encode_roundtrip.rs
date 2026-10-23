@@ -23,7 +23,7 @@
 
 use oxideav_ogg::page::Page;
 use oxideav_vorbis::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, OggFileError, StreamEncoderConfig,
+    OggFileError, StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets,
 };
 
 const RATE: u32 = 44_100;

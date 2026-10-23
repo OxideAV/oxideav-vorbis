@@ -46,8 +46,8 @@ use oxideav_vorbis::setup::{
     VorbisSetupHeader,
 };
 use oxideav_vorbis::{
-    decode_audio_packet_pre_imdct, write_floor0_packet, AudioDecoderState, AudioPacketOutcome,
-    Floor0Curve, Floor0Decoder, Floor0Header, Floor0Packet, VorbisCodebook, VqLookup,
+    AudioDecoderState, AudioPacketOutcome, Floor0Curve, Floor0Decoder, Floor0Header, Floor0Packet,
+    VorbisCodebook, VqLookup, decode_audio_packet_pre_imdct, write_floor0_packet,
 };
 
 /// A dim-1 tessellation value book for the floor-0 LSP coefficients:
@@ -240,8 +240,8 @@ fn floor0_audio_packet_decodes_through_full_driver() {
     // prelude) and decode them standalone.
     let mut prelude_reader = BitReaderLsb::new(&packet);
     let _ = prelude_reader.read_u32(1).unwrap(); // discard packet_type bit
-                                                 // Re-pack the remaining bits into a byte buffer the standalone decoder
-                                                 // can read from a fresh BitReaderLsb.
+    // Re-pack the remaining bits into a byte buffer the standalone decoder
+    // can read from a fresh BitReaderLsb.
     let body_bits = floor0_body_bit_len(&header, entries.len());
     let mut bw = BitWriterLsb::new();
     for _ in 0..body_bits {

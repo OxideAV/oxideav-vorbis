@@ -183,10 +183,9 @@ impl fmt::Display for ParseError {
                 f,
                 "vorbis comment header: comment #{idx} invalid UTF-8 at byte {off} (§5.2.2)"
             ),
-            ParseError::BadFramingFlag => write!(
-                f,
-                "vorbis comment header: framing_bit=0 (§5.2.1 step 8)"
-            ),
+            ParseError::BadFramingFlag => {
+                write!(f, "vorbis comment header: framing_bit=0 (§5.2.1 step 8)")
+            }
         }
     }
 }

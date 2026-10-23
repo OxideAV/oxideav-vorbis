@@ -28,13 +28,13 @@
 //! standalone CI.
 
 use oxideav_core::bits::BitReaderLsb;
-use oxideav_vorbis::codebook::{parse_codebook, VorbisCodebook};
+use oxideav_vorbis::codebook::{VorbisCodebook, parse_codebook};
 use oxideav_vorbis::floor1::Floor1Decoder;
 use oxideav_vorbis::floor1_encode::plan_floor1_packet;
 use oxideav_vorbis::setup::{Floor1Class, Floor1Header};
 use oxideav_vorbis::{
-    design_entropy_codebook, tally_floor1_packet, write_codebook, write_floor1_packet, BookTallies,
-    Floor1Packet,
+    BookTallies, Floor1Packet, design_entropy_codebook, tally_floor1_packet, write_codebook,
+    write_floor1_packet,
 };
 
 /// Floor length (spectral bins) the envelopes are defined over.

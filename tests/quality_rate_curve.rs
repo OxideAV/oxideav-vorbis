@@ -29,11 +29,11 @@ use oxideav_vorbis::setup::{
     ResidueHeader, VorbisSetupHeader,
 };
 use oxideav_vorbis::{
-    compute_masking, decode_audio_packet_pre_imdct, design_floor1_header, plan_floor1_envelope,
-    plan_floor1_y, plan_psy_floor_envelope, plan_vector_residue_rd_weighted,
-    residue_partition_weights, solve_lambda_for_bits, write_audio_packet, AudioChannelFloor,
-    AudioDecoderState, AudioPacketHeader, AudioPacketOutcome, EncoderTuning, Floor1Packet,
-    PsyConfig, ResidueEncodeError, ResidueVectorPlan,
+    AudioChannelFloor, AudioDecoderState, AudioPacketHeader, AudioPacketOutcome, EncoderTuning,
+    Floor1Packet, PsyConfig, ResidueEncodeError, ResidueVectorPlan, compute_masking,
+    decode_audio_packet_pre_imdct, design_floor1_header, plan_floor1_envelope, plan_floor1_y,
+    plan_psy_floor_envelope, plan_vector_residue_rd_weighted, residue_partition_weights,
+    solve_lambda_for_bits, write_audio_packet,
 };
 
 const N: usize = 512;

@@ -52,7 +52,7 @@
 
 use core::fmt;
 
-use crate::codebook::{VorbisCodebook, VqLookup, UNUSED_ENTRY};
+use crate::codebook::{UNUSED_ENTRY, VorbisCodebook, VqLookup};
 
 /// The §3.2.1 maximum codeword length: the codebook header stores
 /// `length − 1` in 5 bits, so lengths span `1..=32`.
@@ -353,10 +353,9 @@ impl fmt::Display for BookDesignError {
                 f,
                 "vorbis book design: {rows} weight rows for {residuals} corpus residuals"
             ),
-            BookDesignError::ZeroIterations => write!(
-                f,
-                "vorbis book design: max_iterations must be at least 1"
-            ),
+            BookDesignError::ZeroIterations => {
+                write!(f, "vorbis book design: max_iterations must be at least 1")
+            }
             BookDesignError::EmptyTraining => {
                 write!(f, "vorbis book design: empty training sample set")
             }
@@ -814,10 +813,10 @@ pub fn tally_floor1_packet(
         let mut cval = packet.partition_cvals[partition];
 
         // Step 12: master selector codeword.
-        if cbits > 0 {
-            if let Some(book) = class.masterbook {
-                emissions.push((book as usize, cval));
-            }
+        if cbits > 0
+            && let Some(book) = class.masterbook
+        {
+            emissions.push((book as usize, cval));
         }
 
         // Steps 13..19: per-dimension Y codewords.
@@ -1770,11 +1769,7 @@ pub(crate) fn pack_nearest(x: f32) -> f32 {
     let full = mant | (1 << 23); // 24-bit significand
     let rounded = (full + 4) >> 3; // 21 bits, round-half-up
     let value = rounded as f32 * (2.0f32).powi(exp - 127 - 20);
-    if x.is_sign_negative() {
-        -value
-    } else {
-        value
-    }
+    if x.is_sign_negative() { -value } else { value }
 }
 
 /// Design a §3.2.1 VQ value ladder from training scalars: the
@@ -2012,7 +2007,7 @@ pub fn design_vq_codebook(
         return Err(BookDesignError::NonFiniteTraining { index });
     }
     let d = dims as usize;
-    if training.len() % d != 0 {
+    if !training.len().is_multiple_of(d) {
         return Err(BookDesignError::TrainingNotVectorAligned {
             len: training.len(),
             dims: d,
@@ -2101,11 +2096,11 @@ pub fn design_vq_codebook(
                 worst.sort_by(|a, b| b.0.partial_cmp(&a.0).expect("finite").then(a.1.cmp(&b.1)));
                 let mut take = worst.iter();
                 for c in 0..k {
-                    if counts[c] == 0 {
-                        if let Some(&(_, i)) = take.next() {
-                            for (j, &s) in vec_at(i).iter().enumerate() {
-                                centers[c * d + j] = f64::from(s);
-                            }
+                    if counts[c] == 0
+                        && let Some(&(_, i)) = take.next()
+                    {
+                        for (j, &s) in vec_at(i).iter().enumerate() {
+                            centers[c * d + j] = f64::from(s);
                         }
                     }
                 }
@@ -2364,7 +2359,7 @@ pub fn design_lattice_vq_codebook(
         return Err(BookDesignError::NonFiniteTraining { index });
     }
     let d = dims as usize;
-    if training.len() % d != 0 {
+    if !training.len().is_multiple_of(d) {
         return Err(BookDesignError::TrainingNotVectorAligned {
             len: training.len(),
             dims: d,
@@ -3108,10 +3103,12 @@ mod tests {
             "dominant symbol gets 1 bit"
         );
         // Dense: every original entry stays encodable.
-        assert!(retrained[0]
-            .codeword_lengths
-            .iter()
-            .all(|&l| l != UNUSED_ENTRY));
+        assert!(
+            retrained[0]
+                .codeword_lengths
+                .iter()
+                .all(|&l| l != UNUSED_ENTRY)
+        );
         // Table-shape mismatch is rejected.
         assert_eq!(
             tallies.retrain(&books[..1], 32, true),
@@ -3987,10 +3984,12 @@ mod tests {
             let design = design_value_ladder(&samples, levels, 8).expect("designs");
             assert!(float32_pack(design.minimum_value).is_some());
             assert!(float32_pack(design.delta_value).is_some());
-            assert!(design
-                .multiplicands
-                .iter()
-                .all(|&m| m < (1u32 << design.value_bits)));
+            assert!(
+                design
+                    .multiplicands
+                    .iter()
+                    .all(|&m| m < (1u32 << design.value_bits))
+            );
             assert!(design.mse.is_finite());
         }
     }
@@ -4164,7 +4163,7 @@ mod tests {
             .codeword_lengths
             .iter()
             .enumerate()
-            .filter(|(_, &l)| l != UNUSED_ENTRY)
+            .filter(|&(_, &l)| l != UNUSED_ENTRY)
             .map(|(i, _)| i)
             .collect();
         assert_eq!(vq.codebook.codeword_lengths[used[0]], 1, "errata 20150226");

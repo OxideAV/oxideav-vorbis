@@ -31,8 +31,8 @@ use oxideav_vorbis::setup::{
 };
 use oxideav_vorbis::streaming::{StreamingDecoder, StreamingFrame};
 use oxideav_vorbis::{
-    plan_partition_cascade, write_audio_packet, AudioChannelFloor, AudioDecoderState,
-    AudioPacketHeader, Floor1Packet, ResidueVectorPlan,
+    AudioChannelFloor, AudioDecoderState, AudioPacketHeader, Floor1Packet, ResidueVectorPlan,
+    plan_partition_cascade, write_audio_packet,
 };
 
 use oxideav_core::bits::BitReaderLsb;

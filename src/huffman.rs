@@ -112,7 +112,7 @@ use core::fmt;
 
 use oxideav_core::bits::{BitReaderLsb, BitWriterLsb};
 
-use crate::codebook::{VorbisCodebook, UNUSED_ENTRY};
+use crate::codebook::{UNUSED_ENTRY, VorbisCodebook};
 
 /// One node of a canonical Vorbis Huffman tree.
 ///
@@ -319,7 +319,7 @@ impl HuffmanTree {
             let (entry, &len) = lengths
                 .iter()
                 .enumerate()
-                .find(|(_, &l)| l != UNUSED_ENTRY)
+                .find(|&(_, &l)| l != UNUSED_ENTRY)
                 .expect("used_count == 1 implies a used entry");
             if len != 1 {
                 return Err(BuildError::SingleEntryWrongLength { length: len });
@@ -408,10 +408,10 @@ impl HuffmanTree {
         // Underspecified check: any internal node with a dangling child
         // (`u32::MAX`) means the length list leaves capacity unused.
         for n in &nodes {
-            if let HuffmanNode::Internal { left, right } = *n {
-                if left == u32::MAX || right == u32::MAX {
-                    return Err(BuildError::UnderspecifiedTree);
-                }
+            if let HuffmanNode::Internal { left, right } = *n
+                && (left == u32::MAX || right == u32::MAX)
+            {
+                return Err(BuildError::UnderspecifiedTree);
             }
         }
 

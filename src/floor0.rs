@@ -56,7 +56,7 @@
 //! decode." [`Floor0Decoder::decode`] therefore folds every
 //! end-of-packet into [`Floor0Curve::Unused`].
 
-use crate::codebook::{ilog, VorbisCodebook, VqLookup};
+use crate::codebook::{VorbisCodebook, VqLookup, ilog};
 use crate::huffman::{BuildError, HuffmanTree};
 use crate::setup::Floor0Header;
 use crate::vq::unpack_vector;

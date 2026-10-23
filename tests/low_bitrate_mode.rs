@@ -17,7 +17,7 @@
 
 use oxideav_vorbis::quality::{EncoderTuning, LOW_BITRATE_KNEE};
 use oxideav_vorbis::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, parse_setup_header, StreamEncoderConfig,
+    StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, parse_setup_header,
 };
 
 const RATE: u32 = 44_100;

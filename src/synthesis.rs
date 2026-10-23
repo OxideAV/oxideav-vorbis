@@ -421,11 +421,7 @@ pub fn window_premultiply(
 #[must_use]
 pub fn couple_scalar(m: f32, a: f32) -> (f32, f32) {
     if m > 0.0 {
-        if a > 0.0 {
-            (m, m - a)
-        } else {
-            (m + a, m)
-        }
+        if a > 0.0 { (m, m - a) } else { (m + a, m) }
     } else if a > 0.0 {
         (m, m + a)
     } else {
@@ -1288,7 +1284,7 @@ mod tests {
         let w = vorbis_window(n, bs0, true, false, true).unwrap();
         let left_window_start = n / 4 - bs0 / 4; // 48
         let left_window_end = n / 4 + bs0 / 4; // 80
-                                               // Lead-in 0..48 is exactly zero.
+        // Lead-in 0..48 is exactly zero.
         for (i, &v) in w.iter().enumerate().take(left_window_start) {
             assert_eq!(v, 0.0, "lead-in bin {i} not zero");
         }
@@ -1312,7 +1308,7 @@ mod tests {
         let w = vorbis_window(n, bs0, true, true, false).unwrap();
         let right_window_start = n * 3 / 4 - bs0 / 4; // 176
         let right_window_end = n * 3 / 4 + bs0 / 4; // 208
-                                                    // Falling edge 176..208 is strictly decreasing from ~1 to ~0.
+        // Falling edge 176..208 is strictly decreasing from ~1 to ~0.
         for i in right_window_start..right_window_end - 1 {
             assert!(w[i] + 1e-6 >= w[i + 1], "falling edge not monotone at {i}");
         }
@@ -1338,10 +1334,10 @@ mod tests {
         // ignore the flags; shape is fixed).
         let short = vorbis_window(bs0, bs0, false, true, true).unwrap();
         let rstart = bs1 * 3 / 4 - bs0 / 4; // 176
-                                            // The long falling edge spans rstart..rstart+bs0 (32 samples
-                                            // each side -> bs0/2*2 = bs0); the short rising edge spans
-                                            // 0..bs0/2. They overlap sample-for-sample after the 3/4-vs-1/4
-                                            // alignment.
+        // The long falling edge spans rstart..rstart+bs0 (32 samples
+        // each side -> bs0/2*2 = bs0); the short rising edge spans
+        // 0..bs0/2. They overlap sample-for-sample after the 3/4-vs-1/4
+        // alignment.
         for j in 0..bs0 / 2 {
             let l = long[rstart + j];
             let s = short[j];

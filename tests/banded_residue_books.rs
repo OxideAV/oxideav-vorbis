@@ -25,8 +25,8 @@
 //! improvements) at no measured fidelity cost.
 
 use oxideav_vorbis::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets, parse_identification_header,
-    parse_setup_header, StreamEncoderConfig,
+    StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets,
+    parse_identification_header, parse_setup_header,
 };
 
 fn fixtures_root() -> String {
@@ -64,7 +64,7 @@ fn wav_pcm(path: &str) -> (u32, Vec<Vec<f32>>) {
             let end = (start + sz).min(data.len());
             let ch = channels as usize;
             rows = vec![Vec::new(); ch];
-            for (i, s) in data[start..end].chunks_exact(2).enumerate() {
+            for (i, s) in data[start..end].as_chunks::<2>().0.iter().enumerate() {
                 rows[i % ch].push(f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0);
             }
         }

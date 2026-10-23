@@ -29,14 +29,14 @@ use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup};
 use oxideav_vorbis::encoder::write_setup_header;
 use oxideav_vorbis::floor1::Floor1Decoder;
 use oxideav_vorbis::setup::{
-    parse_setup_header, Floor1Class, Floor1Header, FloorHeader, FloorKind, MappingHeader,
-    MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
+    Floor1Class, Floor1Header, FloorHeader, FloorKind, MappingHeader, MappingSubmap, ModeHeader,
+    ResidueHeader, VorbisSetupHeader, parse_setup_header,
 };
 use oxideav_vorbis::{
-    apply_window_and_mdct_vec, decode_audio_packet_windowed, plan_floor1_envelope, plan_floor1_y,
-    plan_vector_residue, tally_floor1_packet, tally_residue_plans, write_audio_packet,
     AudioChannelFloor, AudioDecoderState, AudioPacketHeader, BookTallies, Floor1Packet,
-    ResidueVectorPlan, WindowedPacketOutcome,
+    ResidueVectorPlan, WindowedPacketOutcome, apply_window_and_mdct_vec,
+    decode_audio_packet_windowed, plan_floor1_envelope, plan_floor1_y, plan_vector_residue,
+    tally_floor1_packet, tally_residue_plans, write_audio_packet,
 };
 
 const N: usize = 256;

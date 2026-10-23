@@ -273,7 +273,7 @@ pub fn plan_floor1_x_list(
             // right endpoint, never a candidate).
             let lo = x0 + 1;
             let hi = x1.min(n); // exclusive upper; bins `lo..hi` (bin `n`
-                                // is the right endpoint, never a candidate)
+            // is the right endpoint, never a candidate)
             for (offset, &ladder_y) in ladder[lo..hi].iter().enumerate() {
                 let x = lo + offset;
                 let approx = ladder_interp(x0, y0, x1, y1, x);

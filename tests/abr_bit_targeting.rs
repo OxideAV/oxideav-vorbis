@@ -8,8 +8,8 @@
 //! `bitrate_nominal`. Fully synthetic corpus.
 
 use oxideav_vorbis::{
-    decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets, parse_identification_header,
-    StreamEncoderConfig,
+    StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets,
+    parse_identification_header,
 };
 
 const RATE: u32 = 44_100;

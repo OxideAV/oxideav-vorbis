@@ -49,7 +49,9 @@ fn f32_plane(samples: &[f32]) -> Vec<u8> {
 
 fn plane_f32(plane: &[u8]) -> Vec<f32> {
     plane
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
@@ -124,14 +126,16 @@ fn registry_resolves_the_payload_magic_from_a_first_packet() {
 
     // Non-matching prefixes stay unresolved: an audio packet (type
     // LSB clear), a comment header (0x03), and a truncated magic.
-    assert!(ctx
-        .codecs
-        .resolve_payload_magic_ref(&[0x00, 0x55])
-        .is_none());
-    assert!(ctx
-        .codecs
-        .resolve_payload_magic_ref(b"\x03vorbis")
-        .is_none());
+    assert!(
+        ctx.codecs
+            .resolve_payload_magic_ref(&[0x00, 0x55])
+            .is_none()
+    );
+    assert!(
+        ctx.codecs
+            .resolve_payload_magic_ref(b"\x03vorbis")
+            .is_none()
+    );
     assert!(ctx.codecs.resolve_payload_magic_ref(b"\x01vorbi").is_none());
 }
 

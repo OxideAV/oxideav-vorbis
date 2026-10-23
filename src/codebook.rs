@@ -236,11 +236,7 @@ impl std::error::Error for ParseError {}
 /// as `0`; `u32` cannot be negative).
 #[must_use]
 pub fn ilog(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        32 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 32 - x.leading_zeros() }
 }
 
 /// `float32_unpack(x)` per Vorbis I §9.2.2: decode a Vorbis-packed
@@ -1068,7 +1064,7 @@ mod tests {
         w.write_u32(VorbisCodebook::SYNC_PATTERN, 24);
         w.write_u32(1, 16); // dimensions
         w.write_u32(0, 24); // entries = 0
-                            // Pad so the parser has bits to attempt the next read.
+        // Pad so the parser has bits to attempt the next read.
         w.write_u32(0, 32);
         let bytes = w.finish();
         let mut r = BitReaderLsb::new(&bytes);
@@ -1111,7 +1107,7 @@ mod tests {
         w.write_bit(false); // ordered = 0
         w.write_bit(false); // sparse = 0
         w.write_u32(0, 5); // first entry length-1 = 0 (length 1)
-                           // ...and now truncate: only one of two entries is present.
+        // ...and now truncate: only one of two entries is present.
         let bytes = w.finish();
         let mut r = BitReaderLsb::new(&bytes);
         assert_eq!(
@@ -1143,7 +1139,7 @@ mod tests {
         w.write_u32(0, 32); // delta_value
         w.write_u32(15, 4); // value_bits - 1 -> 16
         w.write_bit(false); // sequence_p
-                            // No multiplicands present: 4_294_836_225 declared, zero on the wire.
+        // No multiplicands present: 4_294_836_225 declared, zero on the wire.
         let bytes = w.finish();
         let mut r = BitReaderLsb::new(&bytes);
         assert_eq!(

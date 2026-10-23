@@ -147,10 +147,10 @@ fn ogg_logical_streams(data: &[u8]) -> Vec<LogicalStream> {
         pos = body;
     }
     for (serial, acc) in pending {
-        if let Some(s) = streams.iter_mut().rev().find(|s| s.serial == serial) {
-            if !acc.is_empty() {
-                s.packets.push(acc);
-            }
+        if let Some(s) = streams.iter_mut().rev().find(|s| s.serial == serial)
+            && !acc.is_empty()
+        {
+            s.packets.push(acc);
         }
     }
     streams

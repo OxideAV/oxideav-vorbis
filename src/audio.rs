@@ -101,14 +101,14 @@
 
 use crate::floor0::{Floor0Curve, Floor0Decoder, Floor0Error};
 use crate::floor1::{Floor1Decoder, Floor1Error, FloorCurve};
-use crate::imdct::{imdct, ImdctError};
+use crate::imdct::{ImdctError, imdct};
 use crate::packet::{
-    dot_product_all, nonzero_propagate, read_packet_header, AudioPacketHeader, PacketError,
+    AudioPacketHeader, PacketError, dot_product_all, nonzero_propagate, read_packet_header,
 };
 use crate::residue::{ResidueDecoder, ResidueError};
 use crate::setup::{FloorHeader, FloorKind, MappingHeader, VorbisSetupHeader};
 use crate::synthesis::{
-    inverse_couple_all, window_premultiply, CouplingError, WindowError, WindowPremultiplyError,
+    CouplingError, WindowError, WindowPremultiplyError, inverse_couple_all, window_premultiply,
 };
 use oxideav_core::bits::BitReaderLsb;
 
@@ -1266,12 +1266,12 @@ mod tests {
     fn write_used_packet() -> Vec<u8> {
         let mut w = BitWriterLsb::new();
         w.write_u32(0, 1); // packet_type = audio
-                           // mode_count = 1 → 0 mode bits.
+        // mode_count = 1 → 0 mode bits.
         w.write_u32(1, 1); // floor1 [nonzero] flag set
         w.write_u32(0, 3); // endpoint amplitude 0 (3 bits)
         w.write_u32(0, 3); // endpoint amplitude 1 (3 bits)
-                           // floor1 has 0 partitions → no further floor bits.
-                           // residue: begin == end == 0 → zero partitions decoded.
+        // floor1 has 0 partitions → no further floor bits.
+        // residue: begin == end == 0 → zero partitions decoded.
         w.finish()
     }
 
@@ -1365,8 +1365,8 @@ mod tests {
                 assert_eq!(n, 64);
                 assert_eq!(spectra.len(), 1);
                 assert_eq!(spectra[0].len(), 32); // n/2
-                                                  // Floor returned a curve (Unused short-circuits earlier);
-                                                  // residue is all zero. Spectrum = floor * 0 = 0 for every bin.
+                // Floor returned a curve (Unused short-circuits earlier);
+                // residue is all zero. Spectrum = floor * 0 = 0 for every bin.
                 for &s in &spectra[0] {
                     assert_eq!(s, 0.0);
                 }
@@ -1755,8 +1755,8 @@ mod tests {
         let result2 = overlap.push_frame(frame2).unwrap();
         let pcm = result2.expect("second frame should emit PCM");
         assert_eq!(pcm.len(), 64 / 4 + 64 / 4); // 32 samples
-                                                // Trivial setup → spectrum is 0 → IMDCT is 0 → windowed is 0 →
-                                                // overlap-add of zero + zero is zero.
+        // Trivial setup → spectrum is 0 → IMDCT is 0 → windowed is 0 →
+        // overlap-add of zero + zero is zero.
         for &s in &pcm {
             assert_eq!(s, 0.0);
         }

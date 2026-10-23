@@ -179,13 +179,13 @@ use core::fmt;
 
 use oxideav_core::bits::BitWriterLsb;
 
-use crate::codebook::{float32_pack, ilog, lookup1_values, VorbisCodebook, VqLookup, UNUSED_ENTRY};
+use crate::codebook::{UNUSED_ENTRY, VorbisCodebook, VqLookup, float32_pack, ilog, lookup1_values};
 use crate::comment::VorbisCommentHeader;
 use crate::identification::VorbisIdentificationHeader;
 use crate::packet::AudioPacketHeader;
 use crate::setup::{
     Floor0Header, Floor1Header, FloorKind, MappingHeader, ModeHeader, ResidueHeader,
-    VorbisSetupHeader, SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE,
+    SETUP_PACKET_MAGIC, SETUP_PACKET_TYPE, VorbisSetupHeader,
 };
 
 /// Errors that may arise while writing a Vorbis I header packet.
@@ -407,14 +407,20 @@ impl fmt::Display for WriteCodebookError {
                 f,
                 "vorbis codebook (write): lookup-type-1 multiplicand count {actual} != lookup1_values()={expected} (§9.2.3)"
             ),
-            WriteCodebookError::TessellationMultiplicandCountMismatch { expected, actual } => write!(
-                f,
-                "vorbis codebook (write): lookup-type-2 multiplicand count {actual} != entries*dimensions={expected} (§3.2.1)"
-            ),
+            WriteCodebookError::TessellationMultiplicandCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "vorbis codebook (write): lookup-type-2 multiplicand count {actual} != entries*dimensions={expected} (§3.2.1)"
+                )
+            }
             WriteCodebookError::UnrepresentableLookupFloat { is_minimum, value } => write!(
                 f,
                 "vorbis codebook (write): {field}={value} not expressible in the §9.2.2 packed-float container",
-                field = if *is_minimum { "minimum_value" } else { "delta_value" }
+                field = if *is_minimum {
+                    "minimum_value"
+                } else {
+                    "delta_value"
+                }
             ),
             WriteCodebookError::OrderedHasUnusedEntries => write!(
                 f,
@@ -1464,10 +1470,9 @@ impl fmt::Display for WriteFloor1PacketError {
                 f,
                 "vorbis floor1 packet (write): classes[{class}].subclass_books[{subclass}]={book} >= codebooks.len()={codebook_count} (§7.2.2)"
             ),
-            WriteFloor1PacketError::Huffman(e) => write!(
-                f,
-                "vorbis floor1 packet (write): Huffman build error: {e}"
-            ),
+            WriteFloor1PacketError::Huffman(e) => {
+                write!(f, "vorbis floor1 packet (write): Huffman build error: {e}")
+            }
             WriteFloor1PacketError::UnencodableY {
                 partition,
                 dimension,
@@ -3818,19 +3823,19 @@ pub(crate) fn write_floor1_packet_into_writer(
 
         // Master selector: encodable only if a master tree exists and
         // `cval` is a leaf.
-        if cbits > 0 {
-            if let Some(tree) = &class.masterbook_tree {
-                let mut dummy = BitWriterLsb::new();
-                tree.encode_entry(cval, &mut dummy).map_err(|_| {
-                    WriteFloor1PacketError::UnencodableCval {
-                        partition: partition_idx,
-                        cval,
-                        book: header.classes[header.partition_class_list[partition_idx] as usize]
-                            .masterbook
-                            .unwrap_or(0),
-                    }
-                })?;
-            }
+        if cbits > 0
+            && let Some(tree) = &class.masterbook_tree
+        {
+            let mut dummy = BitWriterLsb::new();
+            tree.encode_entry(cval, &mut dummy).map_err(|_| {
+                WriteFloor1PacketError::UnencodableCval {
+                    partition: partition_idx,
+                    cval,
+                    book: header.classes[header.partition_class_list[partition_idx] as usize]
+                        .masterbook
+                        .unwrap_or(0),
+                }
+            })?;
         }
 
         for dim_idx in 0..class.dimensions {
@@ -3885,13 +3890,13 @@ pub(crate) fn write_floor1_packet_into_writer(
         let mut cval = packet.partition_cvals[partition_idx];
 
         // step 12: master selector (only when cbits > 0).
-        if cbits > 0 {
-            if let Some(tree) = &class.masterbook_tree {
-                // `encode_entry` is infallible here because the
-                // pre-check verified `cval` is a leaf.
-                tree.encode_entry(cval, writer)
-                    .expect("encode_entry must succeed after pre-check; cval already validated");
-            }
+        if cbits > 0
+            && let Some(tree) = &class.masterbook_tree
+        {
+            // `encode_entry` is infallible here because the
+            // pre-check verified `cval` is a leaf.
+            tree.encode_entry(cval, writer)
+                .expect("encode_entry must succeed after pre-check; cval already validated");
         }
 
         // step 13: per-dimension Y emission.
@@ -4181,10 +4186,9 @@ impl fmt::Display for WriteFloor0PacketError {
                 f,
                 "vorbis floor0 packet (write): entries[{index}]={entry} not encodable (book tree has {used_count} used entries) (§6.2.2 step 7)"
             ),
-            WriteFloor0PacketError::Huffman(e) => write!(
-                f,
-                "vorbis floor0 packet (write): Huffman build error: {e}"
-            ),
+            WriteFloor0PacketError::Huffman(e) => {
+                write!(f, "vorbis floor0 packet (write): Huffman build error: {e}")
+            }
         }
     }
 }
@@ -4940,7 +4944,7 @@ pub fn residue_partition_codeword_count(
         // §8.6.3 step 1: [step] = [n] / [codebook_dimensions]; steps
         // 2..5 read exactly [step] VQ vectors covering step×dims = n
         // scalars, so dims must divide n.
-        if n % dims != 0 {
+        if !n.is_multiple_of(dims) {
             return Err(WriteResiduePartitionError::Format0NotDivisible {
                 partition_size,
                 dimensions,
@@ -6706,7 +6710,7 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
             _ => {
                 return Err(oxideav_core::Error::invalid(
                     "vorbis encoder: expected an audio frame",
-                ))
+                ));
             }
         };
         let ch = self.pcm.len();
@@ -6721,7 +6725,9 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
                 for (row, plane) in self.pcm.iter_mut().zip(&audio.data) {
                     row.extend(
                         plane
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
                     );
                 }
@@ -6730,14 +6736,14 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
                 let plane = audio.data.first().ok_or_else(|| {
                     oxideav_core::Error::invalid("vorbis encoder: interleaved frame has no plane")
                 })?;
-                for (i, b) in plane.chunks_exact(4).enumerate() {
+                for (i, b) in plane.as_chunks::<4>().0.iter().enumerate() {
                     self.pcm[i % ch].push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
                 }
             }
             other => {
                 return Err(oxideav_core::Error::unsupported(format!(
                     "vorbis encoder: sample format {other:?} (use F32 / F32P)"
-                )))
+                )));
             }
         }
         Ok(())
@@ -8407,9 +8413,9 @@ mod tests {
     fn floor1_rejects_partition_class_value_overflow() {
         let mut h = minimal_floor1();
         h.partition_class_list = vec![16]; // 4-bit field caps at 15
-                                           // Resize classes to satisfy the count check should this rule
-                                           // ever be reordered; but the value-overflow gate must fire
-                                           // first in any case.
+        // Resize classes to satisfy the count check should this rule
+        // ever be reordered; but the value-overflow gate must fire
+        // first in any case.
         let mut classes = Vec::with_capacity(17);
         for _ in 0..17 {
             classes.push(Floor1Class {
@@ -8472,8 +8478,8 @@ mod tests {
     fn floor1_rejects_subclasses_overflow() {
         let mut h = minimal_floor1();
         h.classes[0].subclasses = 4; // 2-bit field caps at 3
-                                     // Pad subclass_books to the matching length so the test
-                                     // catches the subclasses check, not the book-count check.
+        // Pad subclass_books to the matching length so the test
+        // catches the subclasses check, not the book-count check.
         h.classes[0].subclass_books = vec![Some(0); 16];
         h.classes[0].masterbook = Some(0);
         assert_eq!(
@@ -8797,8 +8803,8 @@ mod tests {
         assert_eq!(bytes[2], 0xAC); // rate high byte
         assert_eq!(bytes[3], 0x40); // bark_map_size low byte
         assert_eq!(bytes[4], 0x00); // bark_map_size high byte
-                                    // Byte 5: amplitude_bits=8 in low 6 bits; high 2 bits =
-                                    // low 2 bits of amplitude_offset=100=0b01100100, i.e. 0b00.
+        // Byte 5: amplitude_bits=8 in low 6 bits; high 2 bits =
+        // low 2 bits of amplitude_offset=100=0b01100100, i.e. 0b00.
         assert_eq!(bytes[5], 0b00_001000);
         // Byte 6: high 6 bits of amplitude_offset=0b011001 in low 6
         // bits; high 2 bits = low 2 bits of (number_of_books - 1)=0.
@@ -10971,7 +10977,7 @@ mod tests {
     // Setup header (round 27) — wrapping §4.2.4 packet writer.
     // ================================================================
 
-    use crate::setup::{parse_setup_header, MappingSubmap, ParseError as SetupParseError};
+    use crate::setup::{MappingSubmap, ParseError as SetupParseError, parse_setup_header};
 
     /// The smallest valid mono setup header that satisfies every
     /// §4.2.4 invariant: exactly one codebook, one zero
@@ -11972,7 +11978,7 @@ mod tests {
     /// with the matching `PacketError` variant.
     #[test]
     fn audio_packet_header_writer_invariants_align_with_parser() {
-        use crate::packet::{read_packet_header, PacketError};
+        use crate::packet::{PacketError, read_packet_header};
         use oxideav_core::bits::{BitReaderLsb, BitWriterLsb};
 
         let setup = ap_setup(vec![
@@ -12156,9 +12162,9 @@ mod tests {
         expected_w.write_bit(true); // nonzero
         expected_w.write_u32(40, 7); // ep0 (ilog(127) = 7 bits)
         expected_w.write_u32(20, 7); // ep1
-                                     // Class subclasses == 0: no master codeword. csub = 0,
-                                     // cval = 0 → sub_idx = 0 for both dimensions, reads
-                                     // 2-entry scalar book whose codewords are '0' and '1'.
+        // Class subclasses == 0: no master codeword. csub = 0,
+        // cval = 0 → sub_idx = 0 for both dimensions, reads
+        // 2-entry scalar book whose codewords are '0' and '1'.
         expected_w.write_bit(true); // Y[2] = 1 → entry 1 → codeword '1'
         expected_w.write_bit(false); // Y[3] = 0 → entry 0 → codeword '0'
         let expected = expected_w.finish();
@@ -15135,7 +15141,7 @@ mod tests {
     // produces a byte-identical packet AND that the bytes round-trip
     // back through the real `decode_audio_packet_pre_imdct`.
 
-    use crate::audio::{decode_audio_packet_pre_imdct, AudioDecoderState, AudioPacketOutcome};
+    use crate::audio::{AudioDecoderState, AudioPacketOutcome, decode_audio_packet_pre_imdct};
     use crate::setup::{FloorHeader, MappingCouplingStep as ApMappingCouplingStep};
 
     fn ap_floor1_all_zero_header() -> Floor1Header {
@@ -15443,7 +15449,7 @@ mod tests {
     #[test]
     fn write_audio_packet_rejects_floor_type_mismatch() {
         let setup = ap_mono_setup(); // floor 0 in setup is Type1.
-                                     // Supply a Type0 body for a channel whose header is Type1.
+        // Supply a Type0 body for a channel whose header is Type1.
         let floors = vec![AudioChannelFloor::Type0(Floor0Packet::Unused)];
         let residue_plans = vec![ap_residue_plans_for(&[true])];
         match write_audio_packet(&ap_header(64), &setup, 64, 1024, 1, &floors, &residue_plans) {

@@ -23,9 +23,9 @@
 
 use oxideav_core::bits::BitReaderLsb;
 use oxideav_vorbis::codebook::{VorbisCodebook, VqLookup};
-use oxideav_vorbis::encoder::{write_floor0_packet, Floor0Packet};
+use oxideav_vorbis::encoder::{Floor0Packet, write_floor0_packet};
 use oxideav_vorbis::floor0::{Floor0Curve, Floor0Decoder};
-use oxideav_vorbis::floor0_envelope::{plan_floor0_packet, Floor0PacketPlanError};
+use oxideav_vorbis::floor0_envelope::{Floor0PacketPlanError, plan_floor0_packet};
 use oxideav_vorbis::setup::Floor0Header;
 
 /// A fine-resolution **scalar** (dimensions = 1) value codebook spanning a

@@ -41,7 +41,7 @@ use oxideav_vorbis::floor0::{Floor0Curve, Floor0Decoder};
 use oxideav_vorbis::packet::read_packet_header;
 use oxideav_vorbis::setup::{FloorKind, VorbisSetupHeader};
 use oxideav_vorbis::vq::unpack_vector;
-use oxideav_vorbis::{parse_identification_header, parse_setup_header, VqLookup};
+use oxideav_vorbis::{VqLookup, parse_identification_header, parse_setup_header};
 
 fn fixture_dir() -> String {
     format!(

@@ -42,6 +42,7 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - ABR bit targeting bisects the **quality** (log-linear in `lambda`)
   over eight halvings instead of `lambda` linearly over six: with the
   low-rate law spanning six decades, linear bisection resolved only

@@ -70,7 +70,7 @@ use core::fmt;
 
 use oxideav_core::bits::BitReaderLsb;
 
-use crate::codebook::{self, ilog, parse_codebook, VorbisCodebook};
+use crate::codebook::{self, VorbisCodebook, ilog, parse_codebook};
 
 /// Common-header packet-type byte for the setup header (Vorbis I §4.2.1).
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -515,10 +515,9 @@ impl fmt::Display for ParseError {
                 f,
                 "vorbis setup header: wrong packet_type byte 0x{t:02x} (expected 0x05 per §4.2.1)"
             ),
-            ParseError::BadMagic => write!(
-                f,
-                "vorbis setup header: missing 'vorbis' magic per §4.2.1"
-            ),
+            ParseError::BadMagic => {
+                write!(f, "vorbis setup header: missing 'vorbis' magic per §4.2.1")
+            }
             ParseError::Codebook { index, source } => write!(
                 f,
                 "vorbis setup header: codebook[{index}] parse failed: {source}"
@@ -718,7 +717,7 @@ pub fn parse_setup_header_body(
                 return Err(ParseError::UnsupportedFloorType {
                     index,
                     floor_type: t,
-                })
+                });
             }
         };
         floors.push(FloorHeader { floor_type, kind });
@@ -1226,14 +1225,14 @@ mod tests {
             self.w.write_u32(1, 16); // floor_type = 1
             self.w.write_u32(1, 5); // partitions = 1
             self.w.write_u32(0, 4); // partition_class_list[0] = 0
-                                    // one class (maximum_class = 0):
+            // one class (maximum_class = 0):
             self.w.write_u32(0, 3); // dimensions - 1 = 0 → 1
             self.w.write_u32(0, 2); // subclasses = 0
-                                    // subclasses=0 → no masterbook; 2^0=1 subclass slot:
+            // subclasses=0 → no masterbook; 2^0=1 subclass slot:
             self.w.write_u32(1, 8); // subclass_books[0][0] = 0 (after −1 → −1 sentinel; encode raw=1 → stored value 0)
             self.w.write_u32(0, 2); // multiplier - 1 = 0 → 1
             self.w.write_u32(4, 4); // rangebits = 4
-                                    // x_list: partitions × class.dimensions = 1 × 1 = 1 read:
+            // x_list: partitions × class.dimensions = 1 × 1 = 1 read:
             self.w.write_u32(5, 4); // x_list[0] = 5
             self
         }
@@ -1267,10 +1266,10 @@ mod tests {
             self.w.write_u32(15, 24); // partition_size - 1 = 15 → 16
             self.w.write_u32(0, 6); // classifications - 1 = 0 → 1
             self.w.write_u32(0, 8); // classbook
-                                    // cascade[0]: low_bits=1, bitflag=0 → high_bits=0 → cascade=1
+            // cascade[0]: low_bits=1, bitflag=0 → high_bits=0 → cascade=1
             self.w.write_u32(1, 3); // low_bits
             self.w.write_bit(false); // bitflag = 0
-                                     // books[0][0] = 0 (only stage 0 is set in cascade)
+            // books[0][0] = 0 (only stage 0 is set in cascade)
             self.w.write_u32(0, 8);
             self
         }
@@ -1291,8 +1290,8 @@ mod tests {
             self.w.write_bit(false); // submaps_flag = 0 → submaps = 1
             self.w.write_bit(false); // square_polar_flag = 0 → coupling_steps = 0
             self.w.write_u32(0, 2); // reserved
-                                    // submaps == 1: no mux[]
-                                    // one submap: 8 bits placeholder + 8 bits floor + 8 bits residue
+            // submaps == 1: no mux[]
+            // one submap: 8 bits placeholder + 8 bits floor + 8 bits residue
             self.w.write_u32(0, 8); // time placeholder
             self.w.write_u32(0, 8); // floor index
             self.w.write_u32(0, 8); // residue index
@@ -1641,7 +1640,7 @@ mod tests {
         b.w.write_u32(0, 8); // time placeholder
         b.w.write_u32(0, 8); // floor 0
         b.w.write_u32(0, 8); // residue 0
-                             // mapping[1]
+        // mapping[1]
         b.w.write_u32(0, 16);
         b.w.write_bit(false);
         b.w.write_bit(false);
@@ -1649,7 +1648,7 @@ mod tests {
         b.w.write_u32(0, 8);
         b.w.write_u32(1, 8); // floor 1
         b.w.write_u32(1, 8); // residue 1
-                             // 2 modes: short → mapping 0, long → mapping 1
+        // 2 modes: short → mapping 0, long → mapping 1
         b = b.mode_count_minus_1(1);
         b.w.write_bit(false); // mode[0].blockflag = 0
         b.w.write_u32(0, 16);
@@ -1705,11 +1704,11 @@ mod tests {
         b.w.write_u32(7, 24); // partition_size - 1 = 7 → 8
         b.w.write_u32(0, 6); // classifications - 1 = 0 → 1
         b.w.write_u32(0, 8); // classbook
-                             // cascade[0]: low_bits=3, bitflag=1, high_bits=2 → cascade = 2*8 + 3 = 19 = 0b00010011
+        // cascade[0]: low_bits=3, bitflag=1, high_bits=2 → cascade = 2*8 + 3 = 19 = 0b00010011
         b.w.write_u32(3, 3); // low_bits = 3 (bits 0, 1 set)
         b.w.write_bit(true); // bitflag
         b.w.write_u32(2, 5); // high_bits = 2 (so bit 4 set in cascade)
-                             // books[0][...]: bits 0, 1, 4 set → 3 reads
+        // books[0][...]: bits 0, 1, 4 set → 3 reads
         b.w.write_u32(0, 8);
         b.w.write_u32(1, 8);
         b.w.write_u32(2, 8);
@@ -1748,7 +1747,7 @@ mod tests {
         b.w.write_u32(7, 24); // partition_size - 1 = 7 → 8
         b.w.write_u32(0, 6); // classifications - 1 = 0 → 1
         b.w.write_u32(0, 8); // classbook
-                             // cascade[0] = bit 0 only (low_bits=1, bitflag=0, high_bits=0)
+        // cascade[0] = bit 0 only (low_bits=1, bitflag=0, high_bits=0)
         b.w.write_u32(1, 3);
         b.w.write_bit(false);
         b.w.write_u32(0, 8); // books[0][0]
@@ -1783,15 +1782,15 @@ mod tests {
         b.w.write_bit(false); // submaps_flag → submaps = 1
         b.w.write_bit(true); // square_polar_flag
         b.w.write_u32(0, 8); // coupling_steps - 1 = 0 → 1
-                             // audio_channels = 2 → ilog(1) = 1 bit per channel index
+        // audio_channels = 2 → ilog(1) = 1 bit per channel index
         b.w.write_u32(0, 1); // magnitude = 0
         b.w.write_u32(1, 1); // angle = 1
         b.w.write_u32(0, 2); // reserved
-                             // no mux (submaps == 1)
+        // no mux (submaps == 1)
         b.w.write_u32(0, 8); // time placeholder
         b.w.write_u32(0, 8); // floor
         b.w.write_u32(0, 8); // residue
-                             // 1 mode + framing
+        // 1 mode + framing
         let b = b
             .mode_count_minus_1(0)
             .minimal_short_mode()
@@ -1833,7 +1832,7 @@ mod tests {
         b.w.write_u32(1, 4); // submaps - 1 = 1 → 2 submaps
         b.w.write_bit(false); // square_polar_flag = 0 (5.1 has no coupling per fixture trace)
         b.w.write_u32(0, 2); // reserved
-                             // mux for 6 channels
+        // mux for 6 channels
         for &v in &[0u32, 0, 0, 0, 0, 1] {
             b.w.write_u32(v, 4);
         }
@@ -1905,7 +1904,7 @@ mod tests {
         b.w.write_bit(false); // submaps_flag → 1
         b.w.write_bit(true); // square_polar_flag
         b.w.write_u32(0, 8); // coupling_steps - 1 = 0 → 1
-                             // audio_channels=2 → ilog(1)=1 bit per channel
+        // audio_channels=2 → ilog(1)=1 bit per channel
         b.w.write_u32(0, 1); // magnitude = 0
         b.w.write_u32(0, 1); // angle = 0 (== magnitude → reject)
         let bytes = b.finish();
@@ -1939,7 +1938,7 @@ mod tests {
         b.w.write_bit(false); // submaps_flag → 1
         b.w.write_bit(true); // square_polar_flag
         b.w.write_u32(0, 8); // coupling_steps - 1 = 0 → 1
-                             // audio_channels=3 → ilog(2)=2 bits per channel
+        // audio_channels=3 → ilog(2)=2 bits per channel
         b.w.write_u32(3, 2); // magnitude = 3 (out of range; channels are 0..=2)
         b.w.write_u32(0, 2); // angle = 0
         let bytes = b.finish();
@@ -1998,7 +1997,7 @@ mod tests {
         b.w.write_u32(1, 4); // submaps - 1 = 1 → 2 submaps
         b.w.write_bit(false); // no coupling
         b.w.write_u32(0, 2); // reserved
-                             // mux for 2 channels: [0, 5] — second value 5 is out of range
+        // mux for 2 channels: [0, 5] — second value 5 is out of range
         b.w.write_u32(0, 4);
         b.w.write_u32(5, 4);
         let bytes = b.finish();

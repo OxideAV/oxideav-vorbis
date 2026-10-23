@@ -104,7 +104,7 @@
 //! partition into per-entry sub-vectors and walks the cascade stages
 //! belongs in a future round.
 
-use crate::codebook::{VorbisCodebook, VqLookup, UNUSED_ENTRY};
+use crate::codebook::{UNUSED_ENTRY, VorbisCodebook, VqLookup};
 
 /// Errors that can arise while unpacking a VQ vector from a codebook
 /// entry (Vorbis I §3.2.1 / §3.3).
@@ -636,9 +636,9 @@ fn quantize_vector_impl(
         // lower-index entry is never cut).
         if full_grid && codebook.codeword_lengths.len() == codebook.entries as usize {
             let last = 0.0f32; // §3.2.1 step 5's accumulator, inert without sequence_p
-                               // Per-dimension levels sorted by squared distance to the
-                               // target component (ties to the lower level, which is the
-                               // lower §3.2.1 digit and thus the lower entry index).
+            // Per-dimension levels sorted by squared distance to the
+            // target component (ties to the lower level, which is the
+            // lower §3.2.1 digit and thus the lower entry index).
             let mut cands: Vec<Vec<(f64, u32, f32)>> = Vec::with_capacity(dims);
             for (j, &t) in target.iter().enumerate() {
                 let wj = weight(j);
@@ -1811,7 +1811,7 @@ mod tests {
                 .zip(&weights)
                 .map(|((&t, &x), &w)| (f64::from(t) - f64::from(x)).powi(2) * w)
                 .sum();
-            if best.map_or(true, |(bd, _)| d < bd) {
+            if best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, e));
             }
         }

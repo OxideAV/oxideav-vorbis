@@ -46,39 +46,39 @@
 //! `max(signal, masking threshold)` and the residue chooser charges
 //! `weights · error²  + λ · bits` per §8.6 partition).
 
+use crate::VorbisCommentHeader;
 use crate::audio::AudioDecoderState;
-use crate::blocksize::{plan_block_sequence_perceptual, BlocksizeError};
+use crate::blocksize::{BlocksizeError, plan_block_sequence_perceptual};
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::encoder::{
-    write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
     AudioChannelFloor, Floor1Packet, ResidueVectorPlan, WriteAudioPacketError, WriteError,
+    write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
 };
 use crate::floor1::Floor1Decoder;
-use crate::floor1_encode::{plan_floor1_y, Floor1EncodeError};
-use crate::floor1_envelope::{plan_floor1_envelope, Floor1EnvelopeError};
-use crate::floor1_layout::{design_floor1_header, Floor1LayoutError};
+use crate::floor1_encode::{Floor1EncodeError, plan_floor1_y};
+use crate::floor1_envelope::{Floor1EnvelopeError, plan_floor1_envelope};
+use crate::floor1_layout::{Floor1LayoutError, design_floor1_header};
 use crate::framing::{FrameSplitter, FramingError};
-use crate::identification::{parse_identification_header, VorbisIdentificationHeader};
-use crate::mdct::{mdct_vec, MdctError};
+use crate::identification::{VorbisIdentificationHeader, parse_identification_header};
+use crate::mdct::{MdctError, mdct_vec};
 use crate::packet::AudioPacketHeader;
-use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
+use crate::packet_kind::{ClassifyError, PacketKind, classify_packet};
 use crate::psy::{
+    Complex, MaskingAnalysis, PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
     complex_spectrum, compute_masking_with_predictability, plan_psy_floor_envelope,
-    residue_bin_weights, residue_partition_weights, unpredictability, Complex, MaskingAnalysis,
-    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
+    residue_bin_weights, residue_partition_weights, unpredictability,
 };
 use crate::quality::{EncoderTuning, QualityError};
 use crate::residue_encode::{
-    plan_partition_cascade_scored_weighted, plan_vector_classifications_rd_bin_weighted,
-    ResidueEncodeError,
+    ResidueEncodeError, plan_partition_cascade_scored_weighted,
+    plan_vector_classifications_rd_bin_weighted,
 };
 use crate::setup::{
-    parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader,
-    MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
+    Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap,
+    ModeHeader, ResidueHeader, VorbisSetupHeader, parse_setup_header,
 };
 use crate::streaming::{StreamingDecoder, StreamingError, StreamingFrame};
-use crate::synthesis::{forward_couple_all, WindowError};
-use crate::VorbisCommentHeader;
+use crate::synthesis::{WindowError, forward_couple_all};
 use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
 use oxideav_ogg::page::Page;
 
@@ -1733,13 +1733,13 @@ fn encode_pcm_to_packets_geometry(
     // preserve across long↔short transitions). The per-frame scale
     // keeps this per-frame-linear property on a switched stream.
     let mut spectra: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames); // [frame][channel][bin]
-                                                                      // Per-frame, per-channel phase-predictability figure for the
-                                                                      // masking model's tonality estimate (`psy::unpredictability`):
-                                                                      // the windowed block's complex spectrum against the linear
-                                                                      // extrapolation of the two preceding frames' — defined only where
-                                                                      // the last three frames share one block size (across a §4.3.1
-                                                                      // switch the model falls back to spectral flatness). Only a
-                                                                      // two-deep complex history per channel is kept.
+    // Per-frame, per-channel phase-predictability figure for the
+    // masking model's tonality estimate (`psy::unpredictability`):
+    // the windowed block's complex spectrum against the linear
+    // extrapolation of the two preceding frames' — defined only where
+    // the last three frames share one block size (across a §4.3.1
+    // switch the model falls back to spectral flatness). Only a
+    // two-deep complex history per channel is kept.
     let mut unpred: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(frames);
     {
         // Zero-pad the tail so every frame's analysis span is covered:
@@ -3052,7 +3052,7 @@ fn encode_pcm_to_packets_geometry(
                         let bits =
                             (scored.bit_cost + a_bits) as f64 + bias_of(cm as u32) + bias_of(ca);
                         let cost = err + tuning.lambda * bits;
-                        if best.as_ref().map_or(true, |b| cost < b.0) {
+                        if best.as_ref().is_none_or(|b| cost < b.0) {
                             best = Some((cost, cm as u32, scored.entries, ca, ea, err));
                         }
                     }
@@ -3100,15 +3100,15 @@ fn encode_pcm_to_packets_geometry(
             }
         }
         for book in 2..setup.codebooks.len() {
-            if let Some(freqs) = tallies.counts(book) {
-                if freqs.iter().any(|&f| f > 0) {
-                    setup.codebooks[book] = crate::book_design::redesign_codebook(
-                        &setup.codebooks[book],
-                        freqs,
-                        VQ_DESIGN_MAX_CODEWORD_LEN,
-                        false,
-                    )?;
-                }
+            if let Some(freqs) = tallies.counts(book)
+                && freqs.iter().any(|&f| f > 0)
+            {
+                setup.codebooks[book] = crate::book_design::redesign_codebook(
+                    &setup.codebooks[book],
+                    freqs,
+                    VQ_DESIGN_MAX_CODEWORD_LEN,
+                    false,
+                )?;
             }
         }
         // The exact serialised cost the band choice can move — the
