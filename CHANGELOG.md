@@ -4,6 +4,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.12...v0.0.13) - 2026-11-07
+
+### Other
+
+- a declared bit_rate drives the ABR target in make_encoder
+- pin the low-rate tonal gains; README low-bitrate table
+- covering-repair test iterates the envelope directly
+- low-bitrate structure + energy-weighted covering floor
+- daily fuzz run for the three cargo-fuzz targets
+- edition 2024, MSRV 1.95
+- declare the encoder's float input layouts (F32 / F32P)
+- level-relative noise margin, 2.5-decade low-rate lambda, 5 kHz band floor
+- genuine low-bitrate mode below the quality knee
+- larger-magnitude coupling map, M=0 joint re-plan, two-mode budget
+- refinement rungs on the coarse residue cascade
+
 ### Added
 
 - `make_encoder` maps a declared `CodecParameters::bit_rate` onto the
