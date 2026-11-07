@@ -3617,10 +3617,10 @@ mod tests {
         for w in order.windows(2) {
             let (a, b) = (w[0], w[1]);
             let (xa, xb) = (x_list[a] as usize, x_list[b] as usize);
-            for k in xa..xb.min(half) {
+            for (k, &v) in envelope.iter().enumerate().take(xb.min(half)).skip(xa) {
                 let t = (k - xa) as f64 / (xb - xa) as f64;
                 let line = (1.0 - t) * f64::from(posts[a]) + t * f64::from(posts[b]);
-                let want = f64::from(crate::floor1_envelope::invert_inverse_db(envelope[k])) - 1.0;
+                let want = f64::from(crate::floor1_envelope::invert_inverse_db(v)) - 1.0;
                 assert!(line >= want - 1e-9, "bin {k}: {line} < {want}");
             }
         }
