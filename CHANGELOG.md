@@ -6,6 +6,10 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- `make_encoder` maps a declared `CodecParameters::bit_rate` onto the
+  whole-stream ABR target (`StreamEncoderConfig::target_bitrate`)
+  unless a `"quality"` option pins the knob — a registry consumer
+  asking for 24–60 kbps now reaches the low-bitrate structure.
 - **low-bitrate structure** below the quality knee
   (`EncoderTuning::low_rate_depth > 0`, every ABR target under
   ~60 kbps): the block pair is raised to at least 4096 / 512

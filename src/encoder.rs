@@ -6811,7 +6811,10 @@ impl oxideav_core::Encoder for VorbisStreamEncoder {
 /// short size down, keeping a lone `"blocksize"` a single-blocksize
 /// request), a `"coupling"` option (`true`/`false`, default `true`
 /// — offer §4.3.5 square-polar coupling on adjacent channel pairs,
-/// gated on profitability) and a `"vq_dims"` option (`1` or `2`,
+/// gated on profitability), a declared `bit_rate` (bits per second —
+/// the whole-stream ABR target of
+/// [`crate::StreamEncoderConfig::target_bitrate`], ignored when a
+/// `"quality"` option is set) and a `"vq_dims"` option (`1` or `2`,
 /// default `1` — the residue value books' dimensionality; at `2` the
 /// two cascade books are designed from the stream's own residue
 /// corpus as 2-D §3.2.1 lookup-type-1 lattices with jointly-trained
@@ -6849,6 +6852,19 @@ pub fn make_encoder(
             )));
         }
         config.quality = q;
+    }
+    // A declared nominal bit rate drives the ABR entry
+    // (`StreamEncoderConfig::target_bitrate`) unless an explicit
+    // `"quality"` option pins the knob.
+    if params.options.get("quality").is_none()
+        && let Some(bps) = params.bit_rate
+    {
+        if bps == 0 || bps > u64::from(u32::MAX) {
+            return Err(oxideav_core::Error::invalid(format!(
+                "vorbis encoder: bit_rate {bps} outside 1..=u32::MAX"
+            )));
+        }
+        config.target_bitrate = Some(bps as u32);
     }
     if let Some(b) = params.options.get("blocksize") {
         let n: usize = b.parse().map_err(|_| {

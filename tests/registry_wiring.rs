@@ -477,3 +477,53 @@ fn malformed_extradata_is_refused_at_build_time() {
     // Empty extradata still builds the in-band decoder.
     assert!(build(Vec::new()).is_ok(), "empty extradata = in-band mode");
 }
+
+#[test]
+fn declared_bit_rate_drives_the_abr_target() {
+    // Mono tones: a 24 kbps declaration lands at or under budget and
+    // well under the default-quality stream; an explicit "quality"
+    // option overrides the declaration.
+    let n = RATE as usize / 3;
+    let l: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            0.3 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                + 0.1 * (2.0 * std::f32::consts::PI * 660.0 * t).sin()
+        })
+        .collect();
+    let audio_bits = |params: &CodecParameters| -> usize {
+        let mut enc = make_encoder(params).expect("builds");
+        let frame = Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![f32_plane(&l)],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        packets.iter().skip(3).map(|p| p.data.len() * 8).sum()
+    };
+    let mut params = CodecParameters::audio(CodecId::new("vorbis"));
+    params.sample_rate = Some(RATE);
+    params.channels = Some(1);
+    params.sample_format = Some(SampleFormat::F32P);
+    let nominal = audio_bits(&params);
+    params.bit_rate = Some(24_000);
+    let targeted = audio_bits(&params);
+    let seconds = n as f64 / f64::from(RATE);
+    eprintln!(
+        "nominal {:.1} kbps, 24 kbps target {:.1} kbps",
+        nominal as f64 / seconds / 1000.0,
+        targeted as f64 / seconds / 1000.0
+    );
+    assert!(targeted as f64 <= 24_000.0 * seconds, "meets the budget");
+    assert!(targeted < nominal, "the target binds");
+    params.options = params.options.clone().set("quality", "0.7");
+    assert_eq!(audio_bits(&params), nominal, "quality overrides bit_rate");
+    params.options = Default::default();
+    params.bit_rate = Some(0);
+    assert!(make_encoder(&params).is_err(), "zero bit rate refused");
+}
