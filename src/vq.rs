@@ -522,6 +522,144 @@ pub fn quantize_vector_weighted(
     quantize_vector_impl(codebook, target, Some(weights))
 }
 
+/// **Rate-distortion** entry selection: given the weighted-nearest
+/// entry `nearest` for `target` (from [`quantize_vector_weighted`]),
+/// pick the used entry minimising
+///
+/// ```text
+/// Σ_j w_j · (t_j − v_j)²  +  lambda · codeword_length(entry)
+/// ```
+///
+/// over a small candidate set: on a §3.2.1 lookup-type-1 lattice
+/// without `sequence_p`, every combination (all of them up to four
+/// dimensions; the single-dimension moves and the all-shrunk vector
+/// beyond) of each dimension's nearest level and that level's
+/// neighbour one step toward zero, plus the lattice point nearest the
+/// origin. Shrinking a component toward zero is the only move that can
+/// buy bits back on a codebook whose codeword lengths fall with
+/// magnitude, so this is the rate-aware dead zone a uniform nearest
+/// quantiser lacks. Any other book (and `lambda == 0`) returns
+/// `nearest` unchanged. The returned `distance_sq` is the weighted
+/// distance of the chosen entry (rate excluded).
+#[doc(hidden)]
+pub fn refine_entry_rd(
+    codebook: &VorbisCodebook,
+    target: &[f32],
+    weights: &[f64],
+    lambda: f64,
+    nearest: QuantizedEntry,
+) -> QuantizedEntry {
+    let VqLookup::Lattice {
+        minimum_value,
+        delta_value,
+        sequence_p: false,
+        multiplicands,
+        ..
+    } = &codebook.lookup
+    else {
+        return nearest;
+    };
+    if lambda <= 0.0 {
+        return nearest;
+    }
+    let dims = codebook.dimensions as usize;
+    let lv = crate::codebook::lookup1_values(codebook.entries, codebook.dimensions) as usize;
+    if lv == 0 || multiplicands.len() != lv || dims != target.len() || dims != weights.len() {
+        return nearest;
+    }
+    let level_value = |m: usize| (multiplicands[m] as f32) * *delta_value + *minimum_value;
+    // Decompose the nearest entry into its per-dimension levels.
+    let mut levels = Vec::with_capacity(dims);
+    let mut rest = nearest.entry as usize;
+    for _ in 0..dims {
+        levels.push(rest % lv);
+        rest /= lv;
+    }
+    // The level one step toward zero from `m` (itself when `m` is
+    // already the level nearest zero on its side).
+    let toward_zero = |m: usize| -> usize {
+        let v = level_value(m);
+        let mut best = m;
+        let mut best_gap = f32::INFINITY;
+        for c in 0..lv {
+            let w = level_value(c);
+            if w.abs() < v.abs() && (w == 0.0 || w.signum() == v.signum() || v == 0.0) {
+                let gap = (v - w).abs();
+                if gap < best_gap {
+                    best_gap = gap;
+                    best = c;
+                }
+            }
+        }
+        best
+    };
+    let origin = (0..lv)
+        .min_by(|&a, &b| level_value(a).abs().total_cmp(&level_value(b).abs()))
+        .unwrap_or(0);
+    let shrunk: Vec<usize> = levels.iter().map(|&m| toward_zero(m)).collect();
+    let mut cands: Vec<Vec<usize>> = Vec::new();
+    if dims <= 4 {
+        for mask in 0..(1usize << dims) {
+            cands.push(
+                (0..dims)
+                    .map(|j| {
+                        if mask >> j & 1 == 1 {
+                            shrunk[j]
+                        } else {
+                            levels[j]
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    } else {
+        cands.push(shrunk.clone());
+        for j in 0..dims {
+            let mut c = levels.clone();
+            c[j] = shrunk[j];
+            cands.push(c);
+        }
+    }
+    cands.push(vec![origin; dims]);
+    let mut best = nearest.clone();
+    let mut best_cost =
+        nearest.distance_sq + lambda * f64::from(codebook.codeword_lengths[nearest.entry as usize]);
+    for cand in cands {
+        let mut entry = 0usize;
+        let mut stride = 1usize;
+        for &m in &cand {
+            entry += m * stride;
+            stride *= lv;
+        }
+        let Some(&len) = codebook.codeword_lengths.get(entry) else {
+            continue;
+        };
+        if len == UNUSED_ENTRY || entry as u32 == best.entry {
+            continue;
+        }
+        let vector: Vec<f32> = cand.iter().map(|&m| level_value(m)).collect();
+        let distance_sq: f64 = target
+            .iter()
+            .zip(&vector)
+            .zip(weights)
+            .map(|((&t, &v), &w)| {
+                let d = f64::from(t) - f64::from(v);
+                d * d * w
+            })
+            .sum();
+        let cost = distance_sq + lambda * f64::from(len);
+        if cost < best_cost {
+            best_cost = cost;
+            best = QuantizedEntry {
+                entry: entry as u32,
+                vector,
+                distance_sq,
+            };
+        }
+    }
+    best
+}
+
 fn quantize_vector_impl(
     codebook: &VorbisCodebook,
     target: &[f32],
@@ -1818,5 +1956,73 @@ mod tests {
         let (bd, be) = best.unwrap();
         assert_eq!(fast.entry, be);
         assert!((fast.distance_sq - bd).abs() < 1e-9);
+    }
+
+    // ---------- rate-distortion entry selection ----------
+
+    /// A 2-D 5-level lattice over {-2, -1, 0, 1, 2} whose codeword
+    /// lengths grow with magnitude (the origin cheapest).
+    fn rd_book() -> VorbisCodebook {
+        let lv = 5u32;
+        let mut lengths = Vec::new();
+        for e in 0..lv * lv {
+            let (a, b) = ((e % lv) as i32 - 2, (e / lv) as i32 - 2);
+            lengths.push(2 + 2 * (a.unsigned_abs() + b.unsigned_abs()) as u8);
+        }
+        VorbisCodebook {
+            dimensions: 2,
+            entries: lv * lv,
+            codeword_lengths: lengths,
+            lookup: VqLookup::Lattice {
+                minimum_value: -2.0,
+                delta_value: 1.0,
+                value_bits: 3,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2, 3, 4],
+            },
+        }
+    }
+
+    #[test]
+    fn rd_entry_selection_is_nearest_at_zero_lambda() {
+        let book = rd_book();
+        let target = [0.6f32, -1.4];
+        let w = [1.0f64, 1.0];
+        let nearest = quantize_vector_weighted(&book, &target, &w).unwrap();
+        let refined = refine_entry_rd(&book, &target, &w, 0.0, nearest.clone());
+        assert_eq!(refined, nearest);
+    }
+
+    #[test]
+    fn rd_entry_selection_shrinks_toward_zero_under_a_rate_price() {
+        let book = rd_book();
+        let target = [0.6f32, -1.4];
+        let w = [1.0f64, 1.0];
+        let nearest = quantize_vector_weighted(&book, &target, &w).unwrap();
+        assert_eq!(nearest.vector, vec![1.0, -1.0]);
+        // A modest price shrinks the 0.6 component (0.16 → 0.36 error
+        // for 2 fewer bits); a steep one takes the origin.
+        let mid = refine_entry_rd(&book, &target, &w, 0.2, nearest.clone());
+        assert_eq!(mid.vector, vec![0.0, -1.0]);
+        assert!((mid.distance_sq - (0.36 + 0.16)).abs() < 1e-6);
+        let steep = refine_entry_rd(&book, &target, &w, 10.0, nearest.clone());
+        assert_eq!(steep.vector, vec![0.0, 0.0]);
+        // Every choice decodes to its own reported vector.
+        for q in [&mid, &steep] {
+            assert_eq!(unpack_vector(&book, q.entry).unwrap(), q.vector);
+        }
+    }
+
+    #[test]
+    fn rd_entry_selection_never_picks_an_unused_entry() {
+        let mut book = rd_book();
+        // Prune the origin: the steep price must settle elsewhere.
+        book.codeword_lengths[12] = UNUSED_ENTRY;
+        let target = [0.6f32, -1.4];
+        let w = [1.0f64, 1.0];
+        let nearest = quantize_vector_weighted(&book, &target, &w).unwrap();
+        let steep = refine_entry_rd(&book, &target, &w, 10.0, nearest);
+        assert_ne!(steep.entry, 12);
+        assert_ne!(book.codeword_lengths[steep.entry as usize], UNUSED_ENTRY);
     }
 }

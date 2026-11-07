@@ -130,16 +130,21 @@ fn the_low_rate_mode_limits_the_coded_band() {
     let setup = parse_setup_header(&packets[2], 2).expect("setup parses");
     let tuning = EncoderTuning::from_quality(0.0).unwrap();
     let bw = tuning.coded_bandwidth_hz.expect("q = 0 limits the band");
-    // Long residue (1024 bins over 22.05 kHz): the cutoff bin rounded
-    // up to a whole 32-bin partition; short residue (128 bins) to a
-    // 16-bin partition.
+    // The low-rate geometry codes on the 4096/512 pair with 16-bin
+    // partitions: long residue (2048 bins over 22.05 kHz) and short
+    // residue (256 bins), each cutoff bin rounded up to a whole
+    // partition.
     let expect = |half: usize, ps: usize| -> u32 {
         let bins = (bw / (RATE as f32 / 2.0) * half as f32).ceil() as usize;
         (bins.div_ceil(ps) * ps).min(half) as u32
     };
-    assert_eq!(setup.residues[0].residue_end, expect(128, 16));
-    assert_eq!(setup.residues[1].residue_end, expect(1024, 32));
-    assert!(setup.residues[1].residue_end < 1024, "the band is limited");
+    let id = oxideav_vorbis::parse_identification_header(&packets[0]).expect("id parses");
+    assert_eq!((id.blocksize_0, id.blocksize_1), (512, 4096));
+    assert_eq!(setup.residues[0].partition_size, 16);
+    assert_eq!(setup.residues[1].partition_size, 16);
+    assert_eq!(setup.residues[0].residue_end, expect(256, 16));
+    assert_eq!(setup.residues[1].residue_end, expect(2048, 16));
+    assert!(setup.residues[1].residue_end < 2048, "the band is limited");
     // At the knee and above the whole spectrum is coded.
     let (ogg, _, _) = encode_at(&pcm, LOW_BITRATE_KNEE);
     let packets = ogg_packets(&ogg).expect("de-frames");

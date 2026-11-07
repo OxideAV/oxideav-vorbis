@@ -956,6 +956,36 @@ pub fn residue_bin_weights(
 /// near-silent-threshold bin would otherwise dominate the whole
 /// vector's bit budget.
 const RATIO_SQ_CAP: f64 = 1.0e4;
+/// [`residue_bin_weights`] with a **compressed** rather than hard
+/// ceiling: a ratio past [`RATIO_SQ_CAP`] keeps growing as
+/// `cap · (r² / cap)^gamma` (`gamma = 0` is the hard cap, `gamma = 1`
+/// no cap at all). In the low-bitrate mode nearly every bin of tonal
+/// material sits past the 40 dB ceiling (the model asks for noise
+/// 40–50 dB under each partial, which no low rate delivers), so a hard
+/// cap flattens every weight to the same value and the chooser loses
+/// all sense of which partition is loud; the compressed tail keeps the
+/// ordering. `end` bounds the window `[0, end)`; inputs are the
+/// encoder's own validated curves.
+pub(crate) fn residue_bin_weights_soft(
+    floor: &[f32],
+    masking: &MaskingAnalysis,
+    end: usize,
+    gamma: f64,
+) -> Vec<f64> {
+    floor[..end]
+        .iter()
+        .zip(&masking.threshold[..end])
+        .map(|(&fl, &th)| {
+            let r = f64::from(fl) / f64::from(th);
+            let r2 = r * r;
+            if r2 <= RATIO_SQ_CAP {
+                r2
+            } else {
+                RATIO_SQ_CAP * (r2 / RATIO_SQ_CAP).powf(gamma)
+            }
+        })
+        .collect()
+}
 
 // ───────────────────── temporal masking ─────────────────────
 

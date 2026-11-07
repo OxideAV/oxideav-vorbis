@@ -13,10 +13,10 @@
 //!   (the 4-D 625-entry mid book plus the two ternary 8-D deep
 //!   tiers); the measured Lagrangian adoption then keeps only the
 //!   tiers that pay for their own setup table + classword-alphabet
-//!   growth, so a short stream ships the base four classes while a
-//!   longer corpus (the tiled staged fixture below) genuinely
-//!   carries the mid band class. `residue_bands = false` pins the
-//!   base four-class ladder outright.
+//!   growth (the synthetic banded corpus genuinely carries one; on
+//!   the staged fixture the adoption measures them out).
+//!   `residue_bands = false` pins the base four-class ladder
+//!   outright.
 //!
 //! Behaviour pins: every produced stream still decodes end-trim exact
 //! through the crate's own decoder, and the candidate machinery never
@@ -196,20 +196,60 @@ fn nyquist_under_the_cutoff_stays_uncapped() {
 }
 
 #[test]
-fn short_banded_corpus_measures_the_candidates_out_again() {
+fn banded_corpus_adopts_a_band_class_that_pays() {
     // The 1-second banded corpus separates (the ~0.1-scale mid bed
     // vs the loud tone partitions), so the mid + deep tiers are all
-    // *candidates* — but one second of audio cannot amortise any
-    // band book's setup table + classword-alphabet growth, and the
-    // measured Lagrangian adoption must ship the base four classes.
+    // *candidates*, and the measured Lagrangian adoption keeps a band
+    // tier that pays for its own setup table + classword-alphabet
+    // growth. (Through r456 the corpus shipped the base four classes:
+    // under the old both-posts covering lift its floors sat far above
+    // the mid bed and no band tier paid on one second; with the
+    // energy-weighted repair the bed reads at its true level and one
+    // does.)
     let pcm = banded_corpus(44_100, 1.0);
     let config = StreamEncoderConfig::new(44_100, 1);
     let stream = encode_pcm_to_packets(&pcm, &config).expect("encodes");
     let setup = setup_of(&stream, 1);
     let long = setup.residues.last().expect("long residue");
+    assert!(
+        long.classifications >= 5,
+        "the separated corpus adopts a band class"
+    );
+    assert_eq!(long.cascade.len(), long.classifications as usize);
+    // The band class carries its own book (pass 0 for a single-stage
+    // tier, a later pass for a refinement rung over the coarse book).
+    let base_books: Vec<u8> = long.books[..4]
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .collect();
+    let band_book_index = long.books[4]
+        .iter()
+        .flatten()
+        .copied()
+        .find(|b| !base_books.contains(b))
+        .expect("a band class carries its own book") as usize;
+    let band_book = &setup.codebooks[band_book_index];
+    let classbook = &setup.codebooks[long.classbook as usize];
+    assert_eq!(classbook.dimensions, 4);
     assert_eq!(
-        long.classifications, 4,
-        "a 1-second corpus cannot pay for a band class"
+        classbook.entries,
+        u32::from(long.classifications).pow(4),
+        "classifications^4 groups"
+    );
+    // The adopted band book's codeword lengths are the sparse
+    // final-emission retrain's: only cells the packets actually
+    // reference keep codewords.
+    let used = band_book
+        .codeword_lengths
+        .iter()
+        .filter(|&&l| l != 0)
+        .count();
+    assert!(
+        0 < used && (used as u32) < band_book.entries,
+        "the band book table is emission-sparse (used {used} of {})",
+        band_book.entries
     );
 
     // The produced stream still decodes end-trim exact.
@@ -225,9 +265,9 @@ fn short_banded_corpus_measures_the_candidates_out_again() {
 
     // The candidate machinery never costs: against the explicit base
     // ladder (`residue_bands = false`) the full stream serialises to
-    // (near-)identical size at no measured fidelity cost. (The two
-    // encodes are not bit-identical — the closed-loop trainer runs
-    // with the candidate classes present — so allow routing noise.)
+    // (near-)identical size or smaller. (The two encodes are not
+    // bit-identical — the closed-loop trainer runs with the candidate
+    // classes present — so allow routing noise.)
     let mut base_config = config.clone();
     base_config.residue_bands = false;
     let base = encode_pcm_to_packets(&pcm, &base_config).expect("base encodes");
@@ -278,7 +318,7 @@ fn separation_free_corpus_declines_the_mid_class() {
 }
 
 #[test]
-fn staged_corpus_carries_the_cap_and_adoption_scales_with_length() {
+fn staged_corpus_carries_the_cap_and_adoption_never_costs() {
     if !fixtures_available() {
         eprintln!("fixtures not staged; skipping");
         return;
@@ -316,13 +356,14 @@ fn staged_corpus_carries_the_cap_and_adoption_scales_with_length() {
     eprintln!("staged banded roundtrip: {} B, SNR {snr:.2} dB", ogg.len());
     assert!(snr >= 46.0, "staged SNR {snr:.2} dB below 46 dB");
 
-    // Doubled (8 s, the same material tiled): the same corpus now
-    // amortises a band book, and the adoption keeps it — its own
-    // book under the grown classword alphabet. (Through r452 the
-    // adopted tier here was the 4-D 625-entry mid tier; since the
-    // r453 half-span coarse-geometry tier competes in the same
-    // adoption, which band pays on this corpus is a measurement, so
-    // the pin is on the adoption mechanics rather than the winner.)
+    // Doubled (8 s, the same material tiled): whichever tiers the
+    // adoption keeps on the longer corpus, the candidate machinery
+    // never costs against the base ladder, and the stream stays
+    // well-formed. (Which band pays on this corpus is a measurement —
+    // through r452 the 4-D mid tier, through r456 the half-span
+    // coarse tier, and under the energy-weighted covering floor of
+    // r483 none: the floors sit on this material's partials and the
+    // base cascade serves it — so the pin is on the mechanics.)
     let tiled: Vec<Vec<f32>> = pcm
         .iter()
         .map(|row| {
@@ -334,38 +375,22 @@ fn staged_corpus_carries_the_cap_and_adoption_scales_with_length() {
     let stream = encode_pcm_to_packets(&tiled, &config).expect("tiled encodes");
     let setup = setup_of(&stream, 1);
     let long = setup.residues.last().expect("long residue");
-    assert!(
-        long.classifications >= 5,
-        "8 s of the same material amortises a band class"
-    );
     assert_eq!(long.cascade.len(), long.classifications as usize);
-    let band_class = 4usize;
-    let band_book_index = long.books[band_class][0].expect("band class pass-0 book") as usize;
-    let band_book = &setup.codebooks[band_book_index];
+    let mut base_config = config.clone();
+    base_config.residue_bands = false;
+    let base = encode_pcm_to_packets(&tiled, &base_config).expect("tiled base encodes");
+    let total = |s: &oxideav_vorbis::EncodedVorbisStream| -> usize {
+        s.setup.len() + s.audio.iter().map(|(p, _)| p.len()).sum::<usize>()
+    };
     eprintln!(
-        "tiled corpus adopts {} classes; class 4 = {}-D {}-entry book",
-        long.classifications, band_book.dimensions, band_book.entries
+        "tiled corpus adopts {} classes: {} B vs base {} B",
+        long.classifications,
+        total(&stream),
+        total(&base)
     );
-    assert!(band_book_index >= 5, "a band class carries its own book");
-    let classbook = &setup.codebooks[long.classbook as usize];
-    assert_eq!(classbook.dimensions, 4);
-    assert_eq!(
-        classbook.entries,
-        u32::from(long.classifications).pow(4),
-        "classifications^4 groups"
-    );
-    // The adopted band book's codeword lengths are the sparse
-    // final-emission retrain's: only cells the packets actually
-    // reference keep codewords.
-    let used = band_book
-        .codeword_lengths
-        .iter()
-        .filter(|&&l| l != 0)
-        .count();
     assert!(
-        0 < used && (used as u32) < band_book.entries,
-        "the band book table is emission-sparse (used {used} of {})",
-        band_book.entries
+        total(&stream) as f64 <= total(&base) as f64 * 1.02,
+        "band candidates cost bytes on the tiled corpus"
     );
     let ogg = encode_pcm_to_ogg(&tiled, &config).expect("tiled muxes");
     let decoded = decode_ogg_to_pcm(&ogg).expect("tiled decodes");

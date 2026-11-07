@@ -6860,6 +6860,8 @@ pub fn make_encoder(
             )));
         }
         config.blocksize = n;
+        // An explicit geometry is coded exactly as given.
+        config.low_rate_geometry = false;
         // A long blocksize below the default short size implies a
         // single-blocksize stream unless the caller also picks an
         // explicit short size below.
@@ -6883,6 +6885,7 @@ pub fn make_encoder(
             )));
         }
         config.short_blocksize = n;
+        config.low_rate_geometry = false;
     }
     if let Some(c) = params.options.get("coupling") {
         config.coupling = c.parse().map_err(|_| {

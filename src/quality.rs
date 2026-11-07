@@ -188,6 +188,16 @@ pub struct EncoderTuning {
     /// above, rising linearly to [`LOW_BITRATE_TONAL_MARGIN_DB`] at
     /// `q = 0`. Monotone non-increasing in `q`.
     pub tonal_margin_db: f32,
+    /// How deep into the **low-bitrate mode** the setting sits: `0` at
+    /// the knee and above, rising linearly to `1` at `q = 0`. Above
+    /// zero the whole-stream encoder switches its low-rate structure
+    /// on: the doubled block geometry
+    /// ([`crate::StreamEncoderConfig::low_rate_geometry`]), the
+    /// `floor1_multiplier = 2` post grid, 16-bin long-block residue
+    /// partitions, rate-distortion VQ entry selection and the
+    /// compressed audibility-weight ceiling. Monotone non-increasing
+    /// in `q`.
+    pub low_rate_depth: f32,
 }
 
 /// Errors from the quality → tuning map.
@@ -258,6 +268,7 @@ impl EncoderTuning {
             }),
             noise_margin_db: LOW_BITRATE_NOISE_MARGIN_DB * low,
             tonal_margin_db: LOW_BITRATE_TONAL_MARGIN_DB * low,
+            low_rate_depth: low,
         })
     }
 

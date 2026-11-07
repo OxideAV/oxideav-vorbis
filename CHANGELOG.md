@@ -6,6 +6,27 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Added
 
+- **low-bitrate structure** below the quality knee
+  (`EncoderTuning::low_rate_depth > 0`, every ABR target under
+  ~60 kbps): the block pair is raised to at least 4096 / 512
+  (`StreamEncoderConfig::low_rate_geometry`, default on; an explicit
+  `blocksize` / `short_blocksize` registry option turns it off),
+  floor posts on the `floor1_multiplier = 2` grid, 16-bin long-block
+  residue partitions, rate-distortion VQ entry selection (each read
+  takes the entry minimising weighted error + `lambda` × codeword
+  length over its nearest and toward-zero neighbours —
+  `vq::refine_entry_rd`), a compressed (square-root) tail on the
+  40 dB audibility-weight ceiling, and a coupling election priced
+  under the uncapped audibility ratios (a panned pair's quiet channel
+  no longer elects coupling at 12 dB below its uncoupled SNR).
+  Measured against r482 at equal audio rate (own-decode SNR, 6 s
+  stereo 44.1 kHz battery): tonal 24 kbps 9.5 → 22.9 dB, 32 kbps
+  16.6 → 23.9 dB; piano 32 kbps 5.7 → 16.1 dB, 45 kbps 10.6 → 20.1 dB;
+  speech 24 kbps 9.1 → 18.4 dB; music 32 kbps 11.6 → 13.4 dB, 45 kbps
+  14.6 → 19.5 dB; transient 45 kbps 4.5 → 6.7 dB (segmental 6.8 →
+  12.7 dB). Every stream decodes identically through the black-box
+  decoders (`ffmpeg` within 2.4e-7, `oggdec` within 1 s16 LSB).
+
 - residue class ladder: three **refinement rungs** — `coarse +`
   a second-stage lattice at the coarse step ÷ 2 / ÷ 4 / ÷ 8 (4 / 8 /
   16 levels per dimension, designed from the coarse leftover,
@@ -41,6 +62,17 @@ All notable changes to `oxideav-vorbis` are recorded here.
   ladder rungs (coarse step × 2 / × 4) were measured and rejected.
 
 ### Changed
+
+- floor fitting: the covering repair lifts a segment by its
+  **cheapest** move — raise the left post, the right post, or both —
+  priced by the spectral energy under the moved posts, instead of
+  lifting both posts by the worst deficit (which propagated
+  post-to-post and left floors 20–30 dB above a harmonic series'
+  loudest partials); the per-stream post x-list is designed from the
+  geometric-mean envelope over the coded band rather than the
+  per-bin maximum over every frame. At every quality: +9 dB on a
+  piano corpus at q = 0.3 (+25 % rate), tonal 317 kbps / 33.8 dB →
+  232 kbps / 37.2 dB, speech +1 dB.
 
 - edition 2024, MSRV 1.95
 - ABR bit targeting bisects the **quality** (log-linear in `lambda`)
