@@ -346,6 +346,7 @@ pub const LOW_RATE_MIN_SHORT_BLOCKSIZE: usize = 512;
 
 /// Configuration for [`encode_pcm_to_ogg`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StreamEncoderConfig {
     /// PCM sample rate in Hz (§4.2.2 `audio_sample_rate`).
     pub sample_rate: u32,
@@ -452,6 +453,69 @@ pub struct StreamEncoderConfig {
 }
 
 impl StreamEncoderConfig {
+    /// Builder-style setter for [`sample_rate`](Self::sample_rate).
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+    /// Builder-style setter for [`channels`](Self::channels).
+    pub fn with_channels(mut self, channels: u8) -> Self {
+        self.channels = channels;
+        self
+    }
+    /// Builder-style setter for [`coupling`](Self::coupling).
+    pub fn with_coupling(mut self, coupling: bool) -> Self {
+        self.coupling = coupling;
+        self
+    }
+    /// Builder-style setter for [`quality`](Self::quality).
+    pub fn with_quality(mut self, quality: f32) -> Self {
+        self.quality = quality;
+        self
+    }
+    /// Builder-style setter for [`target_bitrate`](Self::target_bitrate).
+    pub fn with_target_bitrate(mut self, target_bitrate: Option<u32>) -> Self {
+        self.target_bitrate = target_bitrate;
+        self
+    }
+    /// Builder-style setter for [`blocksize`](Self::blocksize).
+    pub fn with_blocksize(mut self, blocksize: usize) -> Self {
+        self.blocksize = blocksize;
+        self
+    }
+    /// Builder-style setter for [`short_blocksize`](Self::short_blocksize).
+    pub fn with_short_blocksize(mut self, short_blocksize: usize) -> Self {
+        self.short_blocksize = short_blocksize;
+        self
+    }
+    /// Builder-style setter for [`serial`](Self::serial).
+    pub fn with_serial(mut self, serial: u32) -> Self {
+        self.serial = serial;
+        self
+    }
+    /// Builder-style setter for [`training_iterations`](Self::training_iterations).
+    pub fn with_training_iterations(mut self, training_iterations: usize) -> Self {
+        self.training_iterations = training_iterations;
+        self
+    }
+    /// Builder-style setter for [`vq_dims`](Self::vq_dims).
+    pub fn with_vq_dims(mut self, vq_dims: u16) -> Self {
+        self.vq_dims = vq_dims;
+        self
+    }
+    /// Builder-style setter for [`low_rate_geometry`](Self::low_rate_geometry).
+    pub fn with_low_rate_geometry(mut self, low_rate_geometry: bool) -> Self {
+        self.low_rate_geometry = low_rate_geometry;
+        self
+    }
+    /// Builder-style setter for [`residue_bands`](Self::residue_bands).
+    pub fn with_residue_bands(mut self, residue_bands: bool) -> Self {
+        self.residue_bands = residue_bands;
+        self
+    }
+}
+
+impl StreamEncoderConfig {
     /// A nominal configuration: `quality = 0.7`, long blocksize
     /// `2048` with short blocksize `256` (block switching enabled),
     /// coupling offered on adjacent pairs, 4 codebook-training
@@ -489,6 +553,7 @@ impl StreamEncoderConfig {
 
 /// Errors from the whole-stream encoder / decoder entry points.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum OggFileError {
     /// `channels` was zero or disagreed with the PCM row count.
     BadChannelCount {
@@ -658,6 +723,7 @@ const AUDIO_PAGE_TARGET_BYTES: usize = 4096;
 
 /// §A.2 packet-sequencing errors from [`mux_vorbis_stream`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MuxError {
     /// A header packet arrived out of §A.2 order (or an audio packet
     /// arrived where a header was required).
@@ -1248,6 +1314,7 @@ fn build_setup(
 /// §4.2 header packets plus the §4.3 audio packets with their absolute
 /// §A.2 granule positions — everything a container muxer needs.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EncodedVorbisStream {
     /// §4.2.2 identification-header packet.
     pub identification: Vec<u8>,
@@ -3510,6 +3577,7 @@ fn encode_pcm_to_packets_geometry(
 /// A decoded Ogg/Vorbis stream: per-channel PCM rows (bitstream
 /// channel order) plus the stream parameters.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecodedOggStream {
     /// Per-channel PCM rows, §A.2 end-trimmed to the final page's
     /// granule position.

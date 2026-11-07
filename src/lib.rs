@@ -403,6 +403,7 @@ pub use quality::{
 #[doc(hidden)]
 pub use residue::{ResidueDecoder, ResidueError};
 // internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use residue_encode::plan_partition_cascade_scored_weighted;
 #[doc(hidden)]
 pub use residue_encode::{
@@ -444,6 +445,7 @@ pub use vq::{
 
 /// Crate-local error type for the in-progress clean-room rebuild.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
     /// A code path is reachable in the public surface but its
     /// implementation has not yet landed in any round.

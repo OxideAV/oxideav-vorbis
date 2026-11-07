@@ -39,6 +39,7 @@
 
 /// Errors from the block-size decision heuristic.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlocksizeError {
     /// The PCM block was empty. Energy analysis needs at least one sample.
     EmptyBlock,
@@ -101,6 +102,7 @@ impl std::error::Error for BlocksizeError {}
 /// The energy-envelope figures [`detect_transient`] computes — exposed so
 /// a caller can audit or re-threshold the decision without recomputing.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TransientAnalysis {
     /// Per-sub-frame energy `Σ x²`, in sub-frame order. Length equals the
     /// requested `subframes`.
@@ -237,6 +239,7 @@ pub fn choose_blocksize(
 /// direction): the per-packet `blockflag` sequence plus the granule walk
 /// it implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BlockSequencePlan {
     /// Per-packet `blockflag`s: `false` selects the short block
     /// (`blocksize_0`), `true` the long block (`blocksize_1`). One entry

@@ -4,6 +4,22 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `with_<field>` builder setters for every field of
+  `StreamEncoderConfig`.
+
+### Changed
+
+- `#[non_exhaustive]` on `StreamEncoderConfig`, the result records
+  `EncodedVorbisStream`, `DecodedOggStream`, `TransientAnalysis`,
+  `BlockSequencePlan`, and the error enums `Error`, `OggFileError`,
+  `MuxError`, `BlocksizeError`. `VorbisSetupHeader` (the §4.2.4 setup
+  header, built by callers for the writer) stays exhaustive.
+- `#[doc(hidden)]` on the crate-root re-export
+  `plan_partition_cascade_scored_weighted` (its module was already
+  hidden).
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.12...v0.0.13) - 2026-11-07
 
 ### Other
