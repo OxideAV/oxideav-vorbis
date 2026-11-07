@@ -4,6 +4,12 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.13...v0.0.14) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive encoder config / results / errors, builders
+
 ### Added
 
 - `with_<field>` builder setters for every field of
