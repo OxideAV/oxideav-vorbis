@@ -26,6 +26,9 @@ All notable changes to `oxideav-vorbis` are recorded here.
   14.6 → 19.5 dB; transient 45 kbps 4.5 → 6.7 dB (segmental 6.8 →
   12.7 dB). Every stream decodes identically through the black-box
   decoders (`ffmpeg` within 2.4e-7, `oggdec` within 1 s16 LSB).
+  Pinned by `tests/low_rate_tonal_quality.rs` (panned decaying notes
+  at `q = 0`: 1.5 → 14.9 dB whole-stream, −5.5 → 16.9 dB on the quiet
+  channel).
 
 - residue class ladder: three **refinement rungs** — `coarse +`
   a second-stage lattice at the coarse step ÷ 2 / ÷ 4 / ÷ 8 (4 / 8 /

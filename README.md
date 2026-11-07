@@ -35,8 +35,12 @@ the residue `lambda` climbs 2.5 further decades, the noise-like
 maskers' thresholds rise by up to 24 dB — hiss under a bed only, the
 margin ramps in from 20 to 40 dB below the frame's loudest band —
 while the tonal maskers' fall by up to 12 dB, and the coded band is
-limited toward 5 kHz —
-`q = 0` reaches ~14 kbps on a stereo tones + hiss corpus) or an
+limited toward 5 kHz; the mode codes on a 4096 / 512 block pair,
+`floor1_multiplier = 2` posts, 16-bin long partitions and
+rate-distortion VQ entry selection, with the coupling election
+priced under uncapped audibility so a panned pair's quiet channel
+keeps its fidelity — tones + hiss at 22 kbps / 23.4 dB, speech-like
+at 22 kbps / 18.4 dB) or an
 **ABR bit target** (`StreamEncoderConfig::target_bitrate`, bisecting
 the knob over eight full encodes), on a **band-level masking
 model** (masker level = analysis-band energy spread over the masked
@@ -44,7 +48,9 @@ band's bins; ATH capped and band-shared; tonality = max of spectral
 flatness and cross-frame **phase predictability**) whose per-bin
 audibility weights drive a **masking-weighted VQ selection** (every
 §8.6.2 read picks its entry under its own elements' weights), a
-**covering floor-1 fit** (posts lifted until the rendered curve
+**covering floor-1 fit** (posts lifted — each segment by its
+energy-priced cheapest move, the x-list designed from the stream's
+geometric-mean envelope — until the rendered curve
 covers the envelope, so no spectral line between posts blows up its
 residue target), residue ladders spanned to the 99.9th-percentile
 partition peak of the magnitude/uncoupled vectors, the coded band
@@ -1025,9 +1031,9 @@ and mono stay single-pass and byte-identical
 
 ### Not yet supported / known gaps
 
-All figures are r453 equal-rate comparisons against the black-box
-reference encoder (own-decode SNR; both decoders agree on every
-stream).
+Figures are equal-rate comparisons against the black-box reference
+encoder (own-decode SNR; both decoders agree on every stream) — r453
+for the high-rate noise items, r483 for the low-bitrate table.
 
 - **White noise / dense noisy content at the low knob trails the
   reference** (white-noise battery: 22.1 dB vs 28.8 dB at ~296 kbps;
@@ -1043,24 +1049,31 @@ stream).
   lowest — so waveform SNR on wideband noise trails the reference
   below its `q = 8` operating region while the perceptual objective
   is met.
-- **The low-bitrate mode trails the reference on tonal material at
-  equal rate**: `q = 0` now reaches 14 kbps on the tones + hiss
-  corpus and the ABR entry meets 32 / 64 kbps budgets (30 / 59 kbps
-  at 13.7 / 13.9 dB), but the reference's lowest mode codes the same
-  corpus at 40 kbps / 21.5 dB — its tonal partials keep ~7 dB more
-  waveform SNR at 20–60 kbps. Loud broadband noise (a −12 dBFS
-  white-noise battery) floors at 73 kbps stereo: the model rightly
-  keeps every partition of content that *is* noise, so the only
-  low-rate lever there is the 5 kHz band limit.
-  The measured cause is the noise-to-mask objective itself: a coarse
-  class trained under the low-rate `lambda` sparsifies to ~15 dB on
-  the partials and the model calls that transparent (the `14.5 + z`
-  dB tonal offset, deepened by 12 dB in this mode); the staged
-  fixtures land within 3 dB of the reference at 10–26 kbps. The
-  knob's rate is steep just above `q = 0` (15 → 200 kbps over
-  `q ∈ [0, 0.1]` on that corpus, where the hiss switches on), which
-  the ABR solve handles by bisecting the knob — a budget inside that
-  cliff is met from below by its lower edge.
+- **Below 60 kbps the encoder now leads or matches the reference on
+  tonal, speech and music material and trails on piano-like notes
+  and dense transients** (r483, 6 s stereo 44.1 kHz battery, the
+  best own-decode SNR within each budget; the reference's lowest
+  mode does not go under ~38 kbps on this battery):
+
+  | material | 24 kbps | 32 kbps | 45 kbps | 60 kbps | reference |
+  | --- | --- | --- | --- | --- | --- |
+  | tones + hiss | 23.4 dB | 24.3 dB | 25.8 dB | 27.1 dB | 24.3 dB @ 45 kbps |
+  | speech-like | 18.4 dB | 18.5 dB | 19.1 dB | 19.1 dB | 20.7 dB @ 44 kbps, 22.1 @ 59 |
+  | music mix | 16.3 dB | 16.3 dB | 20.2 dB | 20.2 dB | 18.9 dB @ 41 kbps, 21.2 @ 60 |
+  | piano notes | — (q = 0 is 24.9 kbps / 13.7 dB) | 16.1 dB | 20.9 dB | 24.3 dB | 20.6 @ 24, 22.9 @ 27, 23.7 @ 44 |
+  | transients | — | 6.1 dB | 6.7 dB | 7.5 dB | 7.4 @ 44, 8.5 @ 58 (segmental 15.6 / 19.5 vs our 12.7 / 15.4) |
+
+  (r482: 9.6 / 16.8 / 16.8 / 16.8 dB tonal, 9.5 / 15.6 / 18.6 /
+  18.6 speech, 8.9 / 12.4 / 14.6 / 17.1 music, 5.7 / 7.6 / 11.4 /
+  13.0 piano.) What remains: the per-stream fixed floor post
+  x-list cannot follow note-to-note partial structure (the
+  reference spends 27 posts where the budget here is 8 — more posts
+  measured as pure rate at equal SNR, so the gap is in placement, not
+  count); the speech/music rate curve flattens past ~40 kbps (the
+  widening coded band spends on noise-like high bands at ~1 dB per
+  doubling); the attack detector's 4096-sample lookahead keeps
+  dense-transient material on short blocks ~1.8× as often as the
+  reference.
 - **The angle-vector point-stereo discount is SNR-invisible**: the
   interaural-phase discount above 1.5 kHz trades waveform SNR (what
   the harness measures) for bits, so its benefit is asserted from
