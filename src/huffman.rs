@@ -152,6 +152,11 @@ pub struct HuffmanTree {
     /// codebook (errata 20150226). `decode_entry` short-circuits in
     /// this case to always return `entry` while sinking one bit.
     single_entry: Option<u32>,
+    /// Encode-side codeword table, built on the first
+    /// [`HuffmanTree::encode_entry`]: per entry `(bits, length)` with
+    /// the codeword's first (root-side) bit in bit 0 of `bits`, or
+    /// length `0` for an entry with no leaf.
+    codes: std::sync::OnceLock<Vec<(u32, u8)>>,
 }
 
 /// Errors raised by [`HuffmanTree::from_codebook`] /
@@ -333,6 +338,7 @@ impl HuffmanTree {
                 nodes,
                 used_count: 1,
                 single_entry: Some(entry as u32),
+                codes: std::sync::OnceLock::new(),
             });
         }
 
@@ -419,6 +425,7 @@ impl HuffmanTree {
             nodes,
             used_count,
             single_entry: None,
+            codes: std::sync::OnceLock::new(),
         })
     }
 
@@ -497,8 +504,7 @@ impl HuffmanTree {
     /// leaf of the tree — either because it points past the codebook's
     /// `entries` field or because the entry's codeword length was
     /// [`UNUSED_ENTRY`] at build time. The writer is not mutated on
-    /// failure (validation happens via a single tree walk that emits
-    /// nothing until it has determined the codeword).
+    /// failure (the codeword is looked up before anything is emitted).
     ///
     /// # Single-entry codebook fast path
     ///
@@ -523,48 +529,51 @@ impl HuffmanTree {
             return Ok(());
         }
 
-        // Walk the tree from the root, recording the bit (0 = left,
-        // 1 = right) taken at each internal node, until we hit the
-        // requested leaf. The recorded `Vec<bool>` is the canonical
-        // codeword for `entry`, MSb-first. Tree depth is bounded by
-        // §3.2.1's 32-bit hard limit on codeword length, so the
-        // recursion budget is tiny.
-        let mut codeword: Vec<bool> = Vec::with_capacity(32);
-        if !self.walk_to_leaf(0, entry, &mut codeword) {
-            return Err(EncodeError::UnknownEntry {
+        // The canonical codeword for `entry` is the root-to-leaf path
+        // (0 = left, 1 = right), emitted first bit first. The paths of
+        // every leaf are tabulated by one walk of the tree on first
+        // use; tree depth is bounded by §3.2.1's 32-bit limit on
+        // codeword length.
+        let codes = self.codes.get_or_init(|| self.codeword_table());
+        match codes.get(entry as usize) {
+            Some(&(bits, len)) if len > 0 => {
+                writer.write_u32(bits, u32::from(len));
+                Ok(())
+            }
+            _ => Err(EncodeError::UnknownEntry {
                 entry,
                 used_count: self.used_count,
-            });
+            }),
         }
-        // Emit the codeword bits MSb-first: walk_to_leaf appends bits
-        // in root-to-leaf order, which is already MSb-first.
-        for bit in &codeword {
-            writer.write_bit(*bit);
-        }
-        Ok(())
     }
 
-    /// DFS helper for [`Self::encode_entry`]: walk from `node_idx`
-    /// looking for `Leaf(entry)`, appending the chosen bit (false for
-    /// `left`, true for `right`) at each internal node and back-tracking
-    /// on miss. Returns `true` iff the leaf was found.
-    fn walk_to_leaf(&self, node_idx: u32, entry: u32, path: &mut Vec<bool>) -> bool {
-        match self.nodes[node_idx as usize] {
-            HuffmanNode::Leaf(found) => found == entry,
-            HuffmanNode::Internal { left, right } => {
-                path.push(false);
-                if self.walk_to_leaf(left, entry, path) {
-                    return true;
+    /// Every leaf's root-to-leaf path, indexed by entry (see `codes`).
+    /// An entry reachable by more than one path keeps the first in
+    /// left-before-right order.
+    fn codeword_table(&self) -> Vec<(u32, u8)> {
+        let mut codes: Vec<(u32, u8)> = Vec::new();
+        // (node, path bits, depth); the right child is pushed first so
+        // the left subtree is walked first.
+        let mut stack: Vec<(u32, u32, u8)> = vec![(0, 0, 0)];
+        while let Some((node, bits, depth)) = stack.pop() {
+            match self.nodes.get(node as usize) {
+                Some(&HuffmanNode::Leaf(entry)) => {
+                    let slot = entry as usize;
+                    if codes.len() <= slot {
+                        codes.resize(slot + 1, (0, 0));
+                    }
+                    if codes[slot].1 == 0 {
+                        codes[slot] = (bits, depth);
+                    }
                 }
-                path.pop();
-                path.push(true);
-                if self.walk_to_leaf(right, entry, path) {
-                    return true;
+                Some(&HuffmanNode::Internal { left, right }) if depth < 32 => {
+                    stack.push((right, bits | (1 << depth), depth + 1));
+                    stack.push((left, bits, depth + 1));
                 }
-                path.pop();
-                false
+                _ => {}
             }
         }
+        codes
     }
 }
 

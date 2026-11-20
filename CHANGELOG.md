@@ -8,6 +8,24 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 - `with_<field>` builder setters for every field of
   `StreamEncoderConfig`.
+- `examples/quality_battery.rs`: the encoder measurement harness — a
+  deterministic signal battery (struck notes, plucked strings,
+  castanet-like clicks, speech-like, sustained chord, mix), encode /
+  decode entry points with timing, and SNR / short-segment SNR /
+  Bark-band noise-to-mask measures computed independently of the
+  encoder's own model.
+
+### Performance
+
+- Encoder (output byte-identical): the residue planner prepares each
+  value book once per vector instead of re-deriving its geometry on
+  every VQ read, walks sparse lattice rows on demand instead of
+  sorting them, shares a partition's first cascade stage between the
+  classes that start with the same book, scores every
+  `(partition, class)` pair once for the whole band-adoption loop
+  instead of re-planning per candidate set, and the packet writer
+  builds each codebook's Huffman tree once per stream with a codeword
+  table in place of a per-symbol tree walk.
 
 ### Changed
 

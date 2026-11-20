@@ -930,6 +930,581 @@ fn quantize_vector_impl(
     best.ok_or(QuantizeError::NoUsableEntries)
 }
 
+/// A codebook prepared for **repeated** nearest-entry searches: the
+/// per-call work [`quantize_vector`] redoes on every invocation (the
+/// §3.2.1 `lookup1_values` root, the dense / sparse classification of
+/// the codeword-length table, the per-level reconstruction values) is
+/// done once here. [`PreparedBook::quantize`] and
+/// [`PreparedBook::refine_rd`] return exactly what
+/// [`quantize_vector`] / [`quantize_vector_weighted`] and
+/// [`refine_entry_rd`] return for the same arguments — the same entry,
+/// the same reconstruction vector and the same distance, bit for bit —
+/// without allocating.
+#[derive(Debug)]
+pub(crate) struct PreparedBook<'a> {
+    book: &'a VorbisCodebook,
+    grid: Option<PreparedGrid>,
+}
+
+/// The full-grid §3.2.1 lookup-type-1 geometry of a [`PreparedBook`].
+#[derive(Debug)]
+struct PreparedGrid {
+    /// `lookup1_values`: levels per dimension.
+    lv: usize,
+    /// Every entry carries a codeword.
+    dense: bool,
+    /// Reconstruction value per level (`sequence_p` clear).
+    values: Vec<f32>,
+    /// Level indices ordered by ascending value.
+    by_value: Vec<u32>,
+    /// Every level value is finite and no two are equal.
+    ordered: bool,
+    /// Per level: the level one step toward zero (see
+    /// [`refine_entry_rd`]).
+    toward_zero: Vec<u32>,
+    /// The level nearest zero.
+    origin: u32,
+}
+
+/// Reusable working storage for [`PreparedBook`] searches.
+#[derive(Debug, Default)]
+pub(crate) struct QuantScratch {
+    /// `dims × lv` distance-ordered `(distance, level, value)` rows.
+    cands: Vec<(f64, u32, f32)>,
+    suffix_min: Vec<f64>,
+    cursors: Vec<RowCursor>,
+    path: Vec<f32>,
+    best: Vec<f32>,
+    levels: Vec<u32>,
+    trial: Vec<f32>,
+}
+
+/// One dimension's on-demand candidate row state (see [`LazyRows`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct RowCursor {
+    target: f32,
+    weight: f64,
+    /// Value-ordered positions not yet emitted: `..down` below the
+    /// target, `up..` at or above it.
+    down: usize,
+    up: usize,
+    /// The candidates at positions `down - 1` and `up`, when present.
+    lower: Option<(f64, u32, f32)>,
+    upper: Option<(f64, u32, f32)>,
+    /// Candidates emitted so far (all `lv` at once on the eager path).
+    ready: usize,
+}
+
+/// Rows of at most this many levels are sorted outright.
+const EAGER_ROW_LEVELS: usize = 6;
+
+/// Per-dimension level candidates in `(distance, level)` order —
+/// exactly the fully sorted rows of [`quantize_vector`]'s
+/// branch-and-bound — produced on demand.
+///
+/// Along the value-ordered levels the weighted squared distance to the
+/// target is non-increasing up to the target and non-decreasing past
+/// it (every floating-point step of `(t − v)² · w` is monotone in
+/// `|t − v|` for a finite target and a finite non-negative weight), so
+/// merging outward from the target emits the candidates in ascending
+/// distance. Candidates of exactly equal distance are emitted as one
+/// run ordered by level, which is the sorted order's tie rule. A
+/// short row, or a non-finite target or weight (or a negative
+/// weight), is sorted whole instead.
+struct LazyRows<'s, 'g> {
+    grid: &'g PreparedGrid,
+    cands: &'s mut [(f64, u32, f32)],
+    cursors: &'s mut [RowCursor],
+}
+
+impl LazyRows<'_, '_> {
+    fn key(grid: &PreparedGrid, target: f32, weight: f64, pos: usize) -> (f64, u32, f32) {
+        let level = grid.by_value[pos];
+        let v = grid.values[level as usize];
+        let d = f64::from(target) - f64::from(v);
+        (d * d * weight, level, v)
+    }
+
+    /// Start dimension `j`'s row for target component `t` at weight `w`.
+    fn open(&mut self, j: usize, t: f32, w: f64) {
+        let grid = self.grid;
+        let lv = grid.lv;
+        let mut c = RowCursor {
+            target: t,
+            weight: w,
+            ..RowCursor::default()
+        };
+        if lv > EAGER_ROW_LEVELS && grid.ordered && t.is_finite() && w.is_finite() && w >= 0.0 {
+            let split = grid
+                .by_value
+                .partition_point(|&level| grid.values[level as usize] < t);
+            c.down = split;
+            c.up = split;
+            c.lower = (split > 0).then(|| Self::key(grid, t, w, split - 1));
+            c.upper = (split < lv).then(|| Self::key(grid, t, w, split));
+        } else {
+            let row = &mut self.cands[j * lv..(j + 1) * lv];
+            for (pos, slot) in row.iter_mut().enumerate() {
+                *slot = Self::key(grid, t, w, pos);
+            }
+            // Insertion sort under the `(distance, level)` total order.
+            for i in 1..lv {
+                let mut k = i;
+                while k > 0
+                    && row[k]
+                        .0
+                        .total_cmp(&row[k - 1].0)
+                        .then(row[k].1.cmp(&row[k - 1].1))
+                        .is_lt()
+                {
+                    row.swap(k, k - 1);
+                    k -= 1;
+                }
+            }
+            c.ready = lv;
+            c.up = lv;
+        }
+        self.cursors[j] = c;
+    }
+
+    /// Candidate `i` of dimension `j`.
+    #[inline]
+    fn get(&mut self, j: usize, i: usize) -> (f64, u32, f32) {
+        let lv = self.grid.lv;
+        if self.cursors[j].ready <= i {
+            self.extend(j, i);
+        }
+        self.cands[j * lv + i]
+    }
+
+    /// Emit dimension `j`'s candidates through index `i`.
+    fn extend(&mut self, j: usize, i: usize) {
+        let grid = self.grid;
+        let lv = grid.lv;
+        let mut c = self.cursors[j];
+        let row = &mut self.cands[j * lv..(j + 1) * lv];
+        while c.ready <= i {
+            let distance = match (c.lower, c.upper) {
+                (Some(a), Some(b)) => a.0.min(b.0),
+                (Some(a), None) => a.0,
+                (None, Some(b)) => b.0,
+                (None, None) => unreachable!("fewer than lv candidates emitted"),
+            };
+            // Emit the whole run at this distance, ordered by level.
+            let run_start = c.ready;
+            while let Some(k) = c.lower {
+                if k.0 != distance {
+                    break;
+                }
+                row[c.ready] = k;
+                c.ready += 1;
+                c.down -= 1;
+                c.lower = (c.down > 0).then(|| Self::key(grid, c.target, c.weight, c.down - 1));
+            }
+            while let Some(k) = c.upper {
+                if k.0 != distance {
+                    break;
+                }
+                row[c.ready] = k;
+                c.ready += 1;
+                c.up += 1;
+                c.upper = (c.up < lv).then(|| Self::key(grid, c.target, c.weight, c.up));
+            }
+            if c.ready - run_start > 1 {
+                row[run_start..c.ready].sort_unstable_by_key(|k| k.1);
+            }
+        }
+        self.cursors[j] = c;
+    }
+}
+
+impl PreparedGrid {
+    /// The level minimising `(t − v)² · w`, lowest level index on an
+    /// exact tie — `(level, value, distance)`, identical to a scan of
+    /// every level in index order under a strict `<`.
+    fn nearest_level(&self, t: f32, w: f64) -> (usize, f32, f64) {
+        let lv = self.lv;
+        let at = |pos: usize| {
+            let level = self.by_value[pos] as usize;
+            let v = self.values[level];
+            let d = f64::from(t) - f64::from(v);
+            (level, v, d * d * w)
+        };
+        if self.ordered {
+            // The two levels bracketing the target; the levels beyond
+            // them on either side are no nearer (the distance is
+            // monotone in `|t − v|` through every rounding step), so
+            // the bracket decides unless a second neighbour ties it.
+            let split = self
+                .by_value
+                .partition_point(|&level| self.values[level as usize] < t);
+            let lower = (split > 0).then(|| at(split - 1));
+            let upper = (split < lv).then(|| at(split));
+            let best = match (lower, upper) {
+                (Some(a), Some(b)) => {
+                    if a.2 < b.2 || (a.2 == b.2 && a.0 < b.0) {
+                        Some(a)
+                    } else if b.2 < a.2 || (a.2 == b.2 && b.0 < a.0) {
+                        Some(b)
+                    } else {
+                        None
+                    }
+                }
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(best) = best {
+                let clear_below = split < 2 || at(split - 2).2 > best.2;
+                let clear_above = split + 1 >= lv || at(split + 1).2 > best.2;
+                if clear_below && clear_above && best.2 < f64::INFINITY {
+                    return best;
+                }
+            }
+        }
+        let mut best_m = 0usize;
+        let mut best_v = 0.0f32;
+        let mut best_d = f64::INFINITY;
+        for (m, &v) in self.values.iter().enumerate() {
+            let d = f64::from(t) - f64::from(v);
+            let d = d * d * w;
+            // Strict `<` keeps the lowest level on an exact tie.
+            if d < best_d {
+                best_m = m;
+                best_v = v;
+                best_d = d;
+            }
+        }
+        (best_m, best_v, best_d)
+    }
+}
+
+impl<'a> PreparedBook<'a> {
+    /// Prepare `book`. Any codebook is accepted: shapes without the
+    /// factorised paths (tessellations, `sequence_p` lattices, entropy
+    /// books) simply defer to the general routines.
+    pub fn new(book: &'a VorbisCodebook) -> Self {
+        let grid = match &book.lookup {
+            VqLookup::Lattice {
+                minimum_value,
+                delta_value,
+                sequence_p: false,
+                multiplicands,
+                ..
+            } if book.dimensions > 0 => {
+                let lv = crate::codebook::lookup1_values(book.entries, book.dimensions) as usize;
+                let full_grid = lv > 0
+                    && multiplicands.len() == lv
+                    && (lv as u64).checked_pow(u32::from(book.dimensions))
+                        == Some(u64::from(book.entries));
+                if full_grid && book.codeword_lengths.len() == book.entries as usize {
+                    let values: Vec<f32> = multiplicands
+                        .iter()
+                        .map(|&mult| (mult as f32) * *delta_value + *minimum_value + 0.0f32)
+                        .collect();
+                    let mut by_value: Vec<u32> = (0..lv as u32).collect();
+                    by_value.sort_by(|&a, &b| {
+                        values[a as usize]
+                            .total_cmp(&values[b as usize])
+                            .then(a.cmp(&b))
+                    });
+                    let toward_zero = (0..lv)
+                        .map(|m| {
+                            let v = values[m];
+                            let mut best = m;
+                            let mut best_gap = f32::INFINITY;
+                            for (c, &w) in values.iter().enumerate() {
+                                if w.abs() < v.abs()
+                                    && (w == 0.0 || w.signum() == v.signum() || v == 0.0)
+                                {
+                                    let gap = (v - w).abs();
+                                    if gap < best_gap {
+                                        best_gap = gap;
+                                        best = c;
+                                    }
+                                }
+                            }
+                            best as u32
+                        })
+                        .collect();
+                    let origin = (0..lv)
+                        .min_by(|&a, &b| values[a].abs().total_cmp(&values[b].abs()))
+                        .unwrap_or(0) as u32;
+                    let ordered = values.iter().all(|v| v.is_finite())
+                        && by_value
+                            .windows(2)
+                            .all(|w| values[w[0] as usize] < values[w[1] as usize]);
+                    Some(PreparedGrid {
+                        lv,
+                        ordered,
+                        dense: book.codeword_lengths.iter().all(|&l| l != UNUSED_ENTRY),
+                        values,
+                        by_value,
+                        toward_zero,
+                        origin,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        Self { book, grid }
+    }
+
+    /// The codebook this was prepared from.
+    pub fn book(&self) -> &'a VorbisCodebook {
+        self.book
+    }
+
+    /// [`quantize_vector`] (`weights == None`) /
+    /// [`quantize_vector_weighted`]: the chosen entry and its distance,
+    /// with the entry's reconstruction written to `out`
+    /// (`out.len() == target.len() == dimensions`).
+    ///
+    /// # Errors
+    ///
+    /// As [`quantize_vector`].
+    pub fn quantize(
+        &self,
+        target: &[f32],
+        weights: Option<&[f64]>,
+        out: &mut [f32],
+        scratch: &mut QuantScratch,
+    ) -> Result<(u32, f64), QuantizeError> {
+        let dims = self.book.dimensions as usize;
+        let Some(grid) = &self.grid else {
+            let q = quantize_vector_impl(self.book, target, weights)?;
+            out.copy_from_slice(&q.vector);
+            return Ok((q.entry, q.distance_sq));
+        };
+        if target.len() != dims {
+            return Err(QuantizeError::TargetDimensionMismatch {
+                got: target.len(),
+                expected: dims,
+            });
+        }
+        let lv = grid.lv;
+        if grid.dense {
+            // Per-dimension nearest level, lowest level on a tie.
+            let mut entry: u32 = 0;
+            let mut stride: u32 = 1;
+            let mut distance_sq = 0.0f64;
+            for (j, (&t, slot)) in target.iter().zip(out.iter_mut()).enumerate() {
+                let wj = weights.map_or(1.0, |w| w[j]);
+                let (best_m, best_v, best_d) = grid.nearest_level(t, wj);
+                entry += (best_m as u32) * stride;
+                stride = stride.saturating_mul(lv as u32);
+                *slot = best_v;
+                distance_sq += best_d;
+            }
+            return Ok((entry, distance_sq));
+        }
+        // Sparse grid: the branch-and-bound of `quantize_vector`. Each
+        // dimension's levels are needed in `(distance, level)` order,
+        // but the search rarely looks past the first few, so the rows
+        // are produced on demand (`LazyRows`).
+        if scratch.cands.len() < dims * lv {
+            scratch.cands.resize(dims * lv, (0.0, 0, 0.0));
+        }
+        if scratch.cursors.len() < dims {
+            scratch.cursors.resize(dims, RowCursor::default());
+        }
+        let mut rows = LazyRows {
+            grid,
+            cands: &mut scratch.cands[..dims * lv],
+            cursors: &mut scratch.cursors[..dims],
+        };
+        for (j, &t) in target.iter().enumerate() {
+            rows.open(j, t, weights.map_or(1.0, |w| w[j]));
+        }
+        scratch.suffix_min.clear();
+        scratch.suffix_min.resize(dims + 1, 0.0);
+        for j in (0..dims).rev() {
+            let first = rows.get(j, 0).0;
+            scratch.suffix_min[j] = scratch.suffix_min[j + 1] + first;
+        }
+        scratch.path.clear();
+        scratch.best.clear();
+        scratch.best.resize(dims, 0.0);
+        struct Search<'s, 'g> {
+            rows: LazyRows<'s, 'g>,
+            suffix_min: &'s [f64],
+            lengths: &'s [u8],
+            lv: usize,
+            dims: usize,
+            best_distance: f64,
+            best_entry: Option<u32>,
+            best: &'s mut [f32],
+        }
+        fn descend(
+            s: &mut Search<'_, '_>,
+            j: usize,
+            dist: f64,
+            entry: u64,
+            stride: u64,
+            path: &mut Vec<f32>,
+        ) {
+            if j == s.dims {
+                if s.lengths[entry as usize] == UNUSED_ENTRY {
+                    return;
+                }
+                let replace = match s.best_entry {
+                    None => true,
+                    Some(b) => {
+                        dist < s.best_distance || (dist == s.best_distance && (entry as u32) < b)
+                    }
+                };
+                if replace {
+                    s.best_distance = dist;
+                    s.best_entry = Some(entry as u32);
+                    s.best.copy_from_slice(path);
+                }
+                return;
+            }
+            for i in 0..s.lv {
+                let (dj, level, value) = s.rows.get(j, i);
+                let nd = dist + dj;
+                // Levels are distance-ordered: once this level's bound
+                // strictly exceeds the best, every later level's does
+                // too. Strict, so an equal-distance lower-index entry
+                // can still be found.
+                if s.best_entry.is_some() && nd + s.suffix_min[j + 1] > s.best_distance {
+                    break;
+                }
+                path.push(value);
+                descend(
+                    s,
+                    j + 1,
+                    nd,
+                    entry + u64::from(level) * stride,
+                    stride * s.lv as u64,
+                    path,
+                );
+                path.pop();
+            }
+        }
+        let mut search = Search {
+            rows,
+            suffix_min: &scratch.suffix_min,
+            lengths: &self.book.codeword_lengths,
+            lv,
+            dims,
+            best_distance: 0.0,
+            best_entry: None,
+            best: &mut scratch.best,
+        };
+        descend(&mut search, 0, 0.0, 0, 1, &mut scratch.path);
+        let (entry, distance) = (search.best_entry, search.best_distance);
+        match entry {
+            Some(entry) => {
+                out.copy_from_slice(&scratch.best);
+                Ok((entry, distance))
+            }
+            None => Err(QuantizeError::NoUsableEntries),
+        }
+    }
+
+    /// [`refine_entry_rd`] over the nearest entry `(entry, distance)`
+    /// whose reconstruction is in `out`: the rate-distortion choice,
+    /// `out` updated to its reconstruction.
+    pub fn refine_rd(
+        &self,
+        target: &[f32],
+        weights: &[f64],
+        lambda: f64,
+        nearest: (u32, f64),
+        out: &mut [f32],
+        scratch: &mut QuantScratch,
+    ) -> (u32, f64) {
+        let dims = self.book.dimensions as usize;
+        let Some(grid) = &self.grid else {
+            let refined = refine_entry_rd(
+                self.book,
+                target,
+                weights,
+                lambda,
+                QuantizedEntry {
+                    entry: nearest.0,
+                    vector: out.to_vec(),
+                    distance_sq: nearest.1,
+                },
+            );
+            out.copy_from_slice(&refined.vector);
+            return (refined.entry, refined.distance_sq);
+        };
+        if lambda <= 0.0 || dims != target.len() || dims != weights.len() {
+            return nearest;
+        }
+        let lv = grid.lv;
+        let lengths = &self.book.codeword_lengths;
+        scratch.levels.clear();
+        let mut rest = nearest.0 as usize;
+        for _ in 0..dims {
+            scratch.levels.push((rest % lv) as u32);
+            rest /= lv;
+        }
+        scratch.trial.clear();
+        scratch.trial.resize(dims, 0.0);
+        let (mut best_entry, mut best_distance) = nearest;
+        let mut best_cost = nearest.1 + lambda * f64::from(lengths[nearest.0 as usize]);
+        let levels = &scratch.levels;
+        let trial = &mut scratch.trial;
+        // Candidate `pick(j)` = the level of dimension `j`.
+        let mut consider = |pick: &dyn Fn(usize) -> u32| {
+            let mut entry = 0usize;
+            let mut stride = 1usize;
+            for (j, slot) in trial.iter_mut().enumerate() {
+                let m = pick(j) as usize;
+                entry += m * stride;
+                stride *= lv;
+                *slot = grid.values[m];
+            }
+            let Some(&len) = lengths.get(entry) else {
+                return;
+            };
+            if len == UNUSED_ENTRY || entry as u32 == best_entry {
+                return;
+            }
+            let distance_sq: f64 = target
+                .iter()
+                .zip(trial.iter())
+                .zip(weights)
+                .map(|((&t, &v), &w)| {
+                    let d = f64::from(t) - f64::from(v);
+                    d * d * w
+                })
+                .sum();
+            let cost = distance_sq + lambda * f64::from(len);
+            if cost < best_cost {
+                best_cost = cost;
+                best_entry = entry as u32;
+                best_distance = distance_sq;
+                out.copy_from_slice(trial);
+            }
+        };
+        let shrunk = |j: usize| grid.toward_zero[levels[j] as usize];
+        if dims <= 4 {
+            for mask in 0..(1usize << dims) {
+                consider(&|j| {
+                    if mask >> j & 1 == 1 {
+                        shrunk(j)
+                    } else {
+                        levels[j]
+                    }
+                });
+            }
+        } else {
+            consider(&shrunk);
+            for only in 0..dims {
+                consider(&|j| if j == only { shrunk(j) } else { levels[j] });
+            }
+        }
+        consider(&|_| grid.origin);
+        (best_entry, best_distance)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2024,5 +2599,167 @@ mod tests {
         let steep = refine_entry_rd(&book, &target, &w, 10.0, nearest);
         assert_ne!(steep.entry, 12);
         assert_ne!(book.codeword_lengths[steep.entry as usize], UNUSED_ENTRY);
+    }
+
+    /// A deterministic generator for the prepared-book equivalence
+    /// sweeps.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as u32
+        }
+
+        fn unit(&mut self) -> f32 {
+            self.next() as f32 / (1u32 << 31) as f32
+        }
+    }
+
+    /// [`PreparedBook`] must return exactly what the per-call routines
+    /// return: the entry, the reconstruction and the distance of the
+    /// nearest search, and the rate-distortion refinement on top —
+    /// over dense, sparse, short-row, long-row, unordered and
+    /// duplicate-level grids, with ties, zero weights and out-of-span
+    /// targets.
+    #[test]
+    fn prepared_book_matches_the_per_call_quantisers() {
+        let mut rng = Lcg(0x1234_5678_9ABC_DEF1);
+        // (dims, multiplicands, keep one entry in `sparsity`; 0 = dense)
+        let shapes: Vec<(u16, Vec<u32>, u32)> = vec![
+            (1, (0..31).collect(), 0),
+            (2, (0..31).collect(), 0),
+            (2, (0..31).collect(), 3),
+            (2, (0..31).collect(), 40),
+            (4, (0..3).collect(), 0),
+            (4, (0..5).collect(), 2),
+            (8, (0..3).collect(), 9),
+            (2, (0..9).collect(), 2),
+            // Levels out of value order, and a repeated level.
+            (2, vec![4, 0, 7, 2, 9, 1, 8, 3, 6], 2),
+            (2, vec![0, 1, 1, 2, 3, 3, 4, 5, 6], 2),
+            (3, vec![2, 0, 1], 2),
+        ];
+        let mut scratch = QuantScratch::default();
+        for (dims, multiplicands, sparsity) in shapes {
+            let lv = multiplicands.len() as u32;
+            let entries = lv.pow(u32::from(dims));
+            let span = *multiplicands.iter().max().unwrap() as f32;
+            let delta = 0.125f32;
+            let minimum = -(span / 2.0) * delta;
+            let lengths: Vec<u8> = (0..entries)
+                .map(|_| {
+                    if sparsity == 0 || rng.next().is_multiple_of(sparsity) {
+                        1 + (rng.next() % 12) as u8
+                    } else {
+                        crate::codebook::UNUSED_ENTRY
+                    }
+                })
+                .collect();
+            let mut lengths = lengths;
+            lengths[(entries / 2) as usize] = 3; // never fully unused
+            let book = VorbisCodebook {
+                dimensions: dims,
+                entries,
+                codeword_lengths: lengths,
+                lookup: VqLookup::Lattice {
+                    minimum_value: minimum,
+                    delta_value: delta,
+                    value_bits: 8,
+                    sequence_p: false,
+                    multiplicands: multiplicands.clone(),
+                },
+            };
+            let prepared = PreparedBook::new(&book);
+            let d = dims as usize;
+            for case in 0..600 {
+                let target: Vec<f32> = (0..d)
+                    .map(|_| match rng.next() % 6 {
+                        // On a level, on a midpoint, far out of span,
+                        // or anywhere in span.
+                        0 => minimum + (rng.next() % lv) as f32 * delta,
+                        1 => minimum + ((rng.next() % lv) as f32 + 0.5) * delta,
+                        2 => (rng.unit() - 0.5) * 40.0,
+                        _ => (rng.unit() - 0.5) * (span + 2.0) * delta,
+                    })
+                    .collect();
+                let weights: Vec<f64> = (0..d)
+                    .map(|_| match rng.next() % 8 {
+                        0 => 0.0,
+                        1 => 1e-30,
+                        2 => 1e12,
+                        _ => f64::from(rng.unit()) * 50.0,
+                    })
+                    .collect();
+                let mut out = vec![0.0f32; d];
+                // Unweighted.
+                let want = quantize_vector(&book, &target).unwrap();
+                let got = prepared
+                    .quantize(&target, None, &mut out, &mut scratch)
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    (want.entry, want.distance_sq),
+                    "case {case} {target:?}"
+                );
+                assert_eq!(out, want.vector);
+                // Weighted, then the rate-distortion refinement.
+                let want = quantize_vector_weighted(&book, &target, &weights).unwrap();
+                let got = prepared
+                    .quantize(&target, Some(&weights), &mut out, &mut scratch)
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    (want.entry, want.distance_sq),
+                    "case {case} {target:?} {weights:?}"
+                );
+                assert_eq!(out, want.vector);
+                for lambda in [0.0, 0.01, 3.0] {
+                    let refined = refine_entry_rd(&book, &target, &weights, lambda, want.clone());
+                    let mut refined_out = out.clone();
+                    let got = prepared.refine_rd(
+                        &target,
+                        &weights,
+                        lambda,
+                        (want.entry, want.distance_sq),
+                        &mut refined_out,
+                        &mut scratch,
+                    );
+                    assert_eq!(got, (refined.entry, refined.distance_sq), "case {case}");
+                    assert_eq!(refined_out, refined.vector);
+                }
+            }
+        }
+    }
+
+    /// Shapes without a factorised path defer to the general routines.
+    #[test]
+    fn prepared_book_defers_on_tessellations() {
+        let book = VorbisCodebook {
+            dimensions: 2,
+            entries: 4,
+            codeword_lengths: vec![2; 4],
+            lookup: VqLookup::Tessellation {
+                minimum_value: -1.0,
+                delta_value: 0.5,
+                value_bits: 4,
+                sequence_p: false,
+                multiplicands: vec![0, 1, 2, 3, 4, 0, 1, 4],
+            },
+        };
+        let prepared = PreparedBook::new(&book);
+        let mut scratch = QuantScratch::default();
+        let mut out = [0.0f32; 2];
+        for target in [[0.0f32, 0.0], [0.9, -0.9], [-3.0, 3.0]] {
+            let want = quantize_vector(&book, &target).unwrap();
+            let got = prepared
+                .quantize(&target, None, &mut out, &mut scratch)
+                .unwrap();
+            assert_eq!(got, (want.entry, want.distance_sq));
+            assert_eq!(out.to_vec(), want.vector);
+        }
     }
 }

@@ -3403,6 +3403,39 @@ pub fn write_setup_header(
     Ok(writer.finish())
 }
 
+/// The canonical §3.2.1 Huffman trees of one setup header's
+/// codebooks, each built on first use and shared by every packet body
+/// written against the same codebook list (index-aligned with it).
+#[derive(Debug)]
+pub(crate) struct TreeCache {
+    trees:
+        Vec<std::cell::OnceCell<Result<crate::huffman::HuffmanTree, crate::huffman::BuildError>>>,
+}
+
+impl TreeCache {
+    /// A cache for a list of `codebook_count` codebooks.
+    pub(crate) fn new(codebook_count: usize) -> Self {
+        let mut trees = Vec::new();
+        trees.resize_with(codebook_count, std::cell::OnceCell::new);
+        Self { trees }
+    }
+
+    /// The tree of codebook `index`, which must be `book`.
+    fn get(
+        &self,
+        index: usize,
+        book: &VorbisCodebook,
+    ) -> Result<&crate::huffman::HuffmanTree, crate::huffman::BuildError> {
+        match self.trees.get(index) {
+            Some(cell) => cell
+                .get_or_init(|| crate::huffman::HuffmanTree::from_codebook(book))
+                .as_ref()
+                .map_err(Clone::clone),
+            None => Err(crate::huffman::BuildError::EmptyTree),
+        }
+    }
+}
+
 /// Serialises a [`AudioPacketHeader`] to the §4.3.1 audio-packet prelude
 /// bit pattern — the partial audio-packet WRITE primitive that emits the
 /// prelude bits a §4.3 audio packet starts with.
@@ -3665,6 +3698,18 @@ pub(crate) fn write_floor1_packet_into_writer(
     codebooks: &[VorbisCodebook],
     writer: &mut BitWriterLsb,
 ) -> Result<(), WriteFloor1PacketError> {
+    let trees = TreeCache::new(codebooks.len());
+    write_floor1_packet_cached(packet, header, codebooks, &trees, writer)
+}
+
+/// [`write_floor1_packet_into_writer`] over a shared [`TreeCache`].
+fn write_floor1_packet_cached(
+    packet: &Floor1Packet,
+    header: &crate::setup::Floor1Header,
+    codebooks: &[VorbisCodebook],
+    trees: &TreeCache,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteFloor1PacketError> {
     // ---- §7.2.3 step 1: unused short-circuit. ----
     if !packet.nonzero {
         // Emit only the `[nonzero] = 0` bit; the decoder returns
@@ -3720,11 +3765,11 @@ pub(crate) fn write_floor1_packet_into_writer(
     // partition_class_list / class-list out-of-range cases are then
     // gated upstream; on success we have a parallel `Vec<ClassEnc>`
     // ready for the emit pass.
-    struct ClassEnc {
+    struct ClassEnc<'t> {
         dimensions: usize,
         subclasses: u8,
-        masterbook_tree: Option<crate::huffman::HuffmanTree>,
-        subclass_trees: Vec<Option<crate::huffman::HuffmanTree>>,
+        masterbook_tree: Option<&'t crate::huffman::HuffmanTree>,
+        subclass_trees: Vec<Option<&'t crate::huffman::HuffmanTree>>,
     }
 
     let mut per_partition: Vec<ClassEnc> = Vec::with_capacity(partitions);
@@ -3749,7 +3794,7 @@ pub(crate) fn write_floor1_packet_into_writer(
                             codebook_count: codebooks.len(),
                         },
                     )?;
-                    Some(crate::huffman::HuffmanTree::from_codebook(cb)?)
+                    Some(trees.get(book as usize, cb)?)
                 }
                 // (header parser already rejects subclasses > 0 with no
                 // masterbook; defensive None here means the decoder
@@ -3760,7 +3805,7 @@ pub(crate) fn write_floor1_packet_into_writer(
             None
         };
 
-        let mut subclass_trees: Vec<Option<crate::huffman::HuffmanTree>> =
+        let mut subclass_trees: Vec<Option<&crate::huffman::HuffmanTree>> =
             Vec::with_capacity(class.subclass_books.len());
         for (sub_idx, slot) in class.subclass_books.iter().enumerate() {
             match slot {
@@ -3774,7 +3819,7 @@ pub(crate) fn write_floor1_packet_into_writer(
                             codebook_count: codebooks.len(),
                         },
                     )?;
-                    subclass_trees.push(Some(crate::huffman::HuffmanTree::from_codebook(cb)?));
+                    subclass_trees.push(Some(trees.get(*book as usize, cb)?));
                 }
             }
         }
@@ -5589,6 +5634,28 @@ pub(crate) fn write_residue_body_into_writer(
     do_not_decode: &[bool],
     writer: &mut BitWriterLsb,
 ) -> Result<(), WriteResidueBodyError> {
+    let trees = TreeCache::new(codebooks.len());
+    write_residue_body_cached(
+        plans,
+        header,
+        codebooks,
+        blocksize,
+        do_not_decode,
+        &trees,
+        writer,
+    )
+}
+
+/// [`write_residue_body_into_writer`] over a shared [`TreeCache`].
+fn write_residue_body_cached(
+    plans: &[ResidueVectorPlan],
+    header: &ResidueHeader,
+    codebooks: &[VorbisCodebook],
+    blocksize: usize,
+    do_not_decode: &[bool],
+    tree_cache: &TreeCache,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteResidueBodyError> {
     // ---- fail-closed validation (no bits emitted on any error). ----
     // (1) §8.6.2 steps 1..5: derive the decode-vector count and
     // partitions_to_read (also gates residue_type / partition_size).
@@ -5607,7 +5674,7 @@ pub(crate) fn write_residue_body_into_writer(
     if classwords == 0 {
         return Err(WriteResidueBodyError::ZeroClasswordsPerCodeword);
     }
-    let classbook_tree = crate::huffman::HuffmanTree::from_codebook(classbook)?;
+    let classbook_tree = tree_cache.get(header.classbook as usize, classbook)?;
     let num_classifications = header.classifications as u32;
 
     // (3) §8.6.1: resolve and validate every configured (class, stage)
@@ -5618,8 +5685,7 @@ pub(crate) fn write_residue_body_into_writer(
     // same handful of books, and rebuilding a large designed lattice
     // book's tree per partition was a measured hot spot.
     let class_count = header.classifications as usize;
-    let mut trees: Vec<Option<crate::huffman::HuffmanTree>> = Vec::new();
-    trees.resize_with(codebooks.len(), || None);
+    let mut trees: Vec<Option<&crate::huffman::HuffmanTree>> = vec![None; codebooks.len()];
     let mut value_books: Vec<[Option<(&VorbisCodebook, usize)>; 8]> =
         Vec::with_capacity(class_count);
     for (class, stage_books) in header.books.iter().take(class_count).enumerate() {
@@ -5642,7 +5708,7 @@ pub(crate) fn write_residue_body_into_writer(
                 });
             }
             if trees[*book_idx as usize].is_none() {
-                trees[*book_idx as usize] = Some(crate::huffman::HuffmanTree::from_codebook(book)?);
+                trees[*book_idx as usize] = Some(tree_cache.get(*book_idx as usize, book)?);
             }
             row[stage] = Some((book, *book_idx as usize));
         }
@@ -5722,7 +5788,7 @@ pub(crate) fn write_residue_body_into_writer(
                         write_residue_partition_with_tree(
                             entries,
                             book,
-                            trees[*tree_idx].as_ref().expect("tree built with the row"),
+                            trees[*tree_idx].expect("tree built with the row"),
                             header.residue_type,
                             header.partition_size,
                             &mut scratch,
@@ -5831,7 +5897,7 @@ pub(crate) fn write_residue_body_into_writer(
                         write_residue_partition_with_tree(
                             entries,
                             book,
-                            trees[tree_idx].as_ref().expect("tree built with the row"),
+                            trees[tree_idx].expect("tree built with the row"),
                             header.residue_type,
                             header.partition_size,
                             writer,
@@ -6433,6 +6499,62 @@ pub(crate) fn write_audio_packet_into_writer(
     residue_plans: &[Vec<ResidueVectorPlan>],
     writer: &mut BitWriterLsb,
 ) -> Result<(), WriteAudioPacketError> {
+    let trees = TreeCache::new(setup.codebooks.len());
+    write_audio_packet_into_writer_cached(
+        header,
+        setup,
+        blocksize_0,
+        blocksize_1,
+        audio_channels,
+        floors,
+        residue_plans,
+        &trees,
+        writer,
+    )
+}
+
+/// [`write_audio_packet`] over a [`TreeCache`] for `setup.codebooks`
+/// that the caller keeps across the packets of a stream, so each
+/// codebook's Huffman tree is built once per stream instead of once
+/// per packet body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_audio_packet_cached(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    audio_channels: u8,
+    floors: &[AudioChannelFloor],
+    residue_plans: &[Vec<ResidueVectorPlan>],
+    trees: &TreeCache,
+) -> Result<Vec<u8>, WriteAudioPacketError> {
+    let mut writer = BitWriterLsb::with_capacity(64);
+    write_audio_packet_into_writer_cached(
+        header,
+        setup,
+        blocksize_0,
+        blocksize_1,
+        audio_channels,
+        floors,
+        residue_plans,
+        trees,
+        &mut writer,
+    )?;
+    Ok(writer.finish())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_audio_packet_into_writer_cached(
+    header: &AudioPacketHeader,
+    setup: &VorbisSetupHeader,
+    blocksize_0: usize,
+    blocksize_1: usize,
+    audio_channels: u8,
+    floors: &[AudioChannelFloor],
+    residue_plans: &[Vec<ResidueVectorPlan>],
+    trees: &TreeCache,
+    writer: &mut BitWriterLsb,
+) -> Result<(), WriteAudioPacketError> {
     // ---- fail-closed validation (no bits emitted on any error). ----
     let channels = audio_channels as usize;
     if channels == 0 {
@@ -6574,6 +6696,7 @@ pub(crate) fn write_audio_packet_into_writer(
             blocksize_1,
             &resolved_floors,
             &resolved_residues,
+            trees,
             &mut probe,
         )?;
     }
@@ -6586,6 +6709,7 @@ pub(crate) fn write_audio_packet_into_writer(
         blocksize_1,
         &resolved_floors,
         &resolved_residues,
+        trees,
         writer,
     )
 }
@@ -6606,6 +6730,7 @@ fn emit_audio_packet_bodies(
         &SubmapResidueBundle,
         &Vec<ResidueVectorPlan>,
     )],
+    trees: &TreeCache,
     writer: &mut BitWriterLsb,
 ) -> Result<(), WriteAudioPacketError> {
     write_audio_packet_header_into_writer(header, setup, blocksize_0, blocksize_1, writer)
@@ -6623,7 +6748,7 @@ fn emit_audio_packet_bodies(
                 )?;
             }
             ResolvedFloor::Type1(h, p) => {
-                write_floor1_packet_into_writer(p, h, &setup.codebooks, writer).map_err(
+                write_floor1_packet_cached(p, h, &setup.codebooks, trees, writer).map_err(
                     |source| WriteAudioPacketError::Floor1 {
                         channel: ch,
                         source,
@@ -6635,12 +6760,13 @@ fn emit_audio_packet_bodies(
 
     // §4.3.4 — residue bodies in submap order.
     for (residue_header, bundle, plans) in resolved_residues {
-        write_residue_body_into_writer(
+        write_residue_body_cached(
             plans,
             residue_header,
             &setup.codebooks,
             header.n,
             &bundle.do_not_decode,
+            trees,
             writer,
         )
         .map_err(|source| WriteAudioPacketError::Residue {

@@ -52,7 +52,7 @@ use crate::blocksize::{BlocksizeError, plan_block_sequence_perceptual};
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::encoder::{
     AudioChannelFloor, Floor1Packet, ResidueVectorPlan, WriteAudioPacketError, WriteError,
-    write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
+    write_comment_header, write_identification_header, write_setup_header,
 };
 use crate::floor1::Floor1Decoder;
 use crate::floor1_encode::{Floor1EncodeError, plan_floor1_y};
@@ -3153,6 +3153,73 @@ fn encode_pcm_to_packets_geometry(
     } else {
         plan_vector_classifications_rd_bin_weighted
     };
+    // Every candidate band set shares the trained books, so a
+    // partition's cascade under a given class — its weighted error and
+    // value-codeword bits — is the same whichever other classes the
+    // set carries. Each `(partition, class)` pair of the **full**
+    // ladder is therefore scored once here; an evaluation then only
+    // re-selects per partition under its own class subset and
+    // classword prices, and plans the entries of the selected classes
+    // (remembered per partition across evaluations, since most
+    // partitions keep their class from one candidate set to the next).
+    let full_bands: Vec<(VorbisCodebook, BandShape)> = band_candidates
+        .iter()
+        .enumerate()
+        .map(|(i, cand)| (trained[3 + i].clone(), cand.1))
+        .collect();
+    let full_setup = build(&trained[0], &trained[1], &trained[2], &full_bands);
+    let full_rows: Vec<[Option<&VorbisCodebook>; 8]> = full_setup.residues[0]
+        .books
+        .iter()
+        .map(|row| {
+            let mut resolved: [Option<&VorbisCodebook>; 8] = Default::default();
+            for (pass, slot) in row.iter().enumerate() {
+                if let Some(book) = slot {
+                    resolved[pass] = Some(&full_setup.codebooks[*book as usize]);
+                }
+            }
+            resolved
+        })
+        .collect();
+    let entry_lambda = if low_rate { tuning.lambda } else { 0.0 };
+    let mut walker = crate::residue_encode::ClassWalker::new(&full_rows);
+    let full_classes = walker.classes();
+    let class_stages: Vec<usize> = (0..full_classes)
+        .map(|k| walker.populated_stages(k))
+        .collect();
+    // class_scores[f][c][p · full_classes + k] = (weighted error, bits).
+    let mut class_scores: Vec<Vec<Vec<(f64, u64)>>> = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let (end, ps) = (frame_res_end(f), frame_ps(f));
+        let mut row = Vec::with_capacity(ch);
+        for c in 0..ch {
+            let mut scores = Vec::with_capacity(end / ps * full_classes);
+            for p in 0..end / ps {
+                let scalars = &targets[f][c][p * ps..(p + 1) * ps];
+                let bw = &bin_weights[f][c][p * ps..(p + 1) * ps];
+                walker.begin_partition(Some(bw))?;
+                for k in 0..full_classes {
+                    let (error_sq, bits, _) =
+                        walker.evaluate(k, scalars, 1, ps as u32, Some(bw), entry_lambda)?;
+                    scores.push((error_sq, bits));
+                }
+            }
+            row.push(scores);
+        }
+        class_scores.push(row);
+    }
+    let walker = std::cell::RefCell::new(walker);
+    // Per partition: the full-ladder class planned last and its entries.
+    type PlannedClass = Option<(usize, [Option<Vec<u32>>; 8])>;
+    let planned_cache: std::cell::RefCell<Vec<Vec<Vec<PlannedClass>>>> = std::cell::RefCell::new(
+        (0..frames)
+            .map(|f| {
+                (0..ch)
+                    .map(|_| vec![None; frame_res_end(f) / frame_ps(f)])
+                    .collect()
+            })
+            .collect(),
+    );
     type Evaluated = (f64, VorbisSetupHeader, Vec<Vec<ResidueVectorPlan>>);
     // A candidate set is a list of indices into the *trained* band
     // books (`trained[3..]`), so every evaluation prices the exact
@@ -3185,48 +3252,51 @@ fn encode_pcm_to_packets_geometry(
                 resolved
             })
             .collect();
-        // Plans one full pass and also accumulates the plans' **weighted
-        // distortion** `Σ w[p]·error²[p]` — the same noise-to-mask
-        // objective every chooser above optimises — so the adoption
-        // loop below can compare candidate band sets on the whole
-        // Lagrangian, not on bits alone (a band class that buys real
-        // fidelity must never be dropped for a byte win).
-        type Planned = (Vec<Vec<ResidueVectorPlan>>, f64);
-        let plan_all = |bias: Option<&[f64]>| -> Result<Planned, OggFileError> {
-            let mut frame_plans: Vec<Vec<ResidueVectorPlan>> = Vec::with_capacity(frames);
+        // The set's classes as full-ladder class indices, in ladder
+        // order (the four base classes, then the kept bands).
+        let global: Vec<usize> = (0..4).chain(band_idx.iter().map(|&i| 4 + i)).collect();
+        // One selection pass: per partition the class minimising
+        // `error + λ·(value bits + classword price)` — ties to fewer
+        // populated stages, then the lower class — with the plans'
+        // **weighted distortion** `Σ w·error²` accumulated alongside
+        // (the same noise-to-mask objective every chooser above
+        // optimises, so the adoption loop below compares candidate
+        // band sets on the whole Lagrangian, not on bits alone: a band
+        // class that buys real fidelity must never be dropped for a
+        // byte win).
+        type Selected = (Vec<Vec<Vec<u32>>>, f64);
+        let select = |bias: Option<&[f64]>| -> Selected {
+            let mut classes: Vec<Vec<Vec<u32>>> = Vec::with_capacity(frames);
             let mut weighted_error = 0.0f64;
-            for f in 0..frames {
-                let end = frame_res_end(f);
-                let mut plans = Vec::with_capacity(ch);
-                for c in 0..ch {
-                    // The per-bin masking-weighted chooser: every VQ
-                    // read is selected under its own elements'
-                    // audibility weights and the Lagrangian charges the
-                    // weighted error directly.
-                    let choices = plan_classes(
-                        &targets[f][c][..end],
-                        &value_rows,
-                        1,
-                        frame_ps(f) as u32,
-                        tuning.lambda,
-                        &bin_weights[f][c],
-                        bias,
-                    )?;
-                    let mut classifications = Vec::with_capacity(choices.len());
-                    let mut partition_entries = Vec::with_capacity(choices.len());
-                    for choice in choices {
-                        weighted_error += choice.error_sq;
-                        classifications.push(choice.classification);
-                        partition_entries.push(choice.entries);
+            for score_row in &class_scores {
+                let mut row = Vec::with_capacity(ch);
+                for scores in score_row {
+                    let mut picked = Vec::with_capacity(scores.len() / full_classes);
+                    for part in scores.chunks_exact(full_classes) {
+                        let mut best = 0usize;
+                        let mut best_cost = f64::INFINITY;
+                        let mut best_stages = usize::MAX;
+                        for (local, &k) in global.iter().enumerate() {
+                            let (error_sq, bits) = part[k];
+                            let cost = error_sq
+                                + tuning.lambda * (bits as f64 + bias.map_or(0.0, |b| b[local]));
+                            if local == 0
+                                || cost < best_cost
+                                || (cost == best_cost && class_stages[k] < best_stages)
+                            {
+                                best = local;
+                                best_cost = cost;
+                                best_stages = class_stages[k];
+                            }
+                        }
+                        weighted_error += part[global[best]].0;
+                        picked.push(best as u32);
                     }
-                    plans.push(ResidueVectorPlan {
-                        classifications,
-                        partition_entries,
-                    });
+                    row.push(picked);
                 }
-                frame_plans.push(plans);
+                classes.push(row);
             }
-            Ok((frame_plans, weighted_error))
+            (classes, weighted_error)
         };
         // Classword-aware planning: pass 1 prices value bits alone;
         // each refinement pass then prices every class's **marginal
@@ -3234,25 +3304,21 @@ fn encode_pcm_to_packets_geometry(
         // (`-log2 p(c)` — the per-partition share of an
         // entropy-optimal classword under an independence model,
         // which the dense occupancy retrain below approaches) and
-        // re-plans under the biased chooser. Without this, a class
+        // re-selects under the biased chooser. Without this, a class
         // adopted for a marginal value-bit win can inflate the
         // classword entropy by more than it saves — the mispricing
         // that made a naive richer class ladder spend *more* audio
-        // bytes at identical fidelity. Alternating plan ↔ re-price
+        // bytes at identical fidelity. Alternating select ↔ re-price
         // converges like entropy-constrained quantiser design; the
-        // loop stops early at a plan fixed point.
-        let (mut frame_plans, mut weighted_error) = plan_all(None)?;
+        // loop stops early at a fixed point.
+        let (mut selected, mut weighted_error) = select(None);
         let mut last_bias: Option<Vec<f64>> = None;
         for _ in 0..CLASSWORD_PRICE_PASSES {
             let mut hist = vec![0u64; classifications as usize];
             let mut total = 0u64;
-            for plans in &frame_plans {
-                for plan in plans {
-                    for &c in &plan.classifications {
-                        hist[c as usize] += 1;
-                        total += 1;
-                    }
-                }
+            for &c in selected.iter().flatten().flatten() {
+                hist[c as usize] += 1;
+                total += 1;
             }
             if total == 0 {
                 break;
@@ -3269,13 +3335,46 @@ fn encode_pcm_to_packets_geometry(
                     (-p.log2()).clamp(0.0, f64::from(CLASSWORD_PRICE_CAP_BITS))
                 })
                 .collect();
-            let (replanned, replanned_error) = plan_all(Some(&bias))?;
+            let (reselected, reselected_error) = select(Some(&bias));
             last_bias = Some(bias);
-            if replanned == frame_plans {
+            if reselected == selected {
                 break;
             }
-            frame_plans = replanned;
-            weighted_error = replanned_error;
+            selected = reselected;
+            weighted_error = reselected_error;
+        }
+        // The selected classes' entries: every VQ read chosen under
+        // its own elements' audibility weights (the per-bin
+        // masking-weighted cascade).
+        let mut frame_plans: Vec<Vec<ResidueVectorPlan>> = Vec::with_capacity(frames);
+        {
+            let mut walker = walker.borrow_mut();
+            let mut cache = planned_cache.borrow_mut();
+            for (f, selected_row) in selected.iter().enumerate() {
+                let ps = frame_ps(f);
+                let mut plans = Vec::with_capacity(ch);
+                for (c, picked) in selected_row.iter().enumerate() {
+                    let mut partition_entries = Vec::with_capacity(picked.len());
+                    for (p, &local) in picked.iter().enumerate() {
+                        let k = global[local as usize];
+                        let slot = &mut cache[f][c][p];
+                        if slot.as_ref().is_none_or(|(have, _)| *have != k) {
+                            let scalars = &targets[f][c][p * ps..(p + 1) * ps];
+                            let bw = &bin_weights[f][c][p * ps..(p + 1) * ps];
+                            walker.begin_partition(Some(bw))?;
+                            walker.evaluate(k, scalars, 1, ps as u32, Some(bw), entry_lambda)?;
+                            *slot = Some((k, walker.take_entries(k)));
+                        }
+                        partition_entries
+                            .push(slot.as_ref().expect("planned just above").1.clone());
+                    }
+                    plans.push(ResidueVectorPlan {
+                        classifications: picked.clone(),
+                        partition_entries,
+                    });
+                }
+                frame_plans.push(plans);
+            }
         }
 
         // ---- the coupled-pair `M = 0, A ≠ 0` repair ----
@@ -3534,6 +3633,7 @@ fn encode_pcm_to_packets_geometry(
 
     // ---- §4.3 audio packets + §A.2 encapsulation ----
     let mut audio_packets: Vec<(Vec<u8>, u64)> = Vec::with_capacity(frames);
+    let packet_trees = crate::encoder::TreeCache::new(setup.codebooks.len());
     for (f, plans) in frame_plans.into_iter().enumerate() {
         let e = entry_of(f);
         let mut floors = Vec::with_capacity(ch);
@@ -3545,7 +3645,7 @@ fn encode_pcm_to_packets_geometry(
             }));
         }
         let submap_plans = [plans];
-        let packet = write_audio_packet(
+        let packet = crate::encoder::write_audio_packet_cached(
             &headers[f],
             &setup,
             n0,
@@ -3553,6 +3653,7 @@ fn encode_pcm_to_packets_geometry(
             config.channels,
             &floors,
             &submap_plans,
+            &packet_trees,
         )?;
         // §4.3.8: packet f finishes (n_{f-1} + n_f) / 4 samples — the
         // schedule's granule walk; the final packet's granule is the

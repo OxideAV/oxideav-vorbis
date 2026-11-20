@@ -1290,6 +1290,292 @@ fn plan_vector_classifications_rd_impl(
     )
 }
 
+/// Working storage of the vector-level chooser's cascade walk.
+#[derive(Default)]
+struct CascadeScratch {
+    /// The running residual of the class under evaluation.
+    work: Vec<f32>,
+    target: Vec<f32>,
+    read_weights: Vec<f64>,
+    recon: Vec<f32>,
+    quant: crate::vq::QuantScratch,
+}
+
+/// One partition's memoised first cascade stage.
+#[derive(Default)]
+struct FirstStage {
+    book: usize,
+    pass: usize,
+    entries: Vec<u32>,
+    bits: u64,
+    /// The running residual after the stage.
+    work: Vec<f32>,
+}
+
+/// One cascade stage of [`plan_partition_cascade_impl`] over the
+/// running residual `scratch.work`: quantise every read through
+/// `book`, subtract the reconstructions, append the entries to
+/// `entries` and return the stage's value-codeword bits.
+#[allow(clippy::too_many_arguments)]
+fn plan_stage(
+    book: &crate::vq::PreparedBook<'_>,
+    pass: usize,
+    residue_type: u16,
+    partition_size: u32,
+    weights: Option<&[f64]>,
+    rd_lambda: f64,
+    scratch: &mut CascadeScratch,
+    entries: &mut Vec<u32>,
+) -> Result<u64, ResidueEncodeError> {
+    let codebook = book.book();
+    let n = partition_size as usize;
+    let dims = codebook.dimensions as usize;
+    if dims == 0 {
+        return Err(ResidueEncodeError::ZeroDimensions { pass });
+    }
+    if matches!(codebook.lookup, VqLookup::None) {
+        return Err(ResidueEncodeError::ScalarValueBook { pass });
+    }
+    let reads = partition_reads(residue_type, partition_size, codebook.dimensions, pass)?;
+    let step = if residue_type == 0 { n / dims } else { 0 };
+    scratch.target.clear();
+    scratch.target.resize(dims, 0.0);
+    scratch.read_weights.clear();
+    scratch.read_weights.resize(dims, 0.0);
+    scratch.recon.clear();
+    scratch.recon.resize(dims, 0.0);
+    let mut bits = 0u64;
+    for read in 0..reads {
+        for j in 0..dims {
+            let idx = gather_index(residue_type, read, j, step, dims, n);
+            scratch.target[j] = idx.map_or(0.0, |i| scratch.work[i]);
+            if let Some(w) = weights {
+                scratch.read_weights[j] = idx.map_or(0.0, |i| w[i]);
+            }
+        }
+        let quantised = match weights {
+            Some(_) => book
+                .quantize(
+                    &scratch.target,
+                    Some(&scratch.read_weights),
+                    &mut scratch.recon,
+                    &mut scratch.quant,
+                )
+                .map(|nearest| {
+                    book.refine_rd(
+                        &scratch.target,
+                        &scratch.read_weights,
+                        rd_lambda,
+                        nearest,
+                        &mut scratch.recon,
+                        &mut scratch.quant,
+                    )
+                }),
+            None => book.quantize(
+                &scratch.target,
+                None,
+                &mut scratch.recon,
+                &mut scratch.quant,
+            ),
+        };
+        let (entry, _) =
+            quantised.map_err(|source| ResidueEncodeError::Quantize { pass, read, source })?;
+        for (j, &recon) in scratch.recon.iter().enumerate() {
+            if let Some(idx) = gather_index(residue_type, read, j, step, dims, n) {
+                scratch.work[idx] -= recon;
+            }
+        }
+        bits += u64::from(
+            codebook
+                .codeword_lengths
+                .get(entry as usize)
+                .copied()
+                .unwrap_or(0),
+        );
+        entries.push(entry);
+    }
+    Ok(bits)
+}
+
+/// The per-partition class evaluator under the vector-level choosers:
+/// every distinct value book of a class table prepared once
+/// ([`crate::vq::PreparedBook`]), and classes sharing their first
+/// populated cascade stage sharing that stage's quantisation per
+/// partition (the first stage depends only on the book, the
+/// partition's scalars and its weights).
+pub(crate) struct ClassWalker<'b> {
+    prepared: Vec<crate::vq::PreparedBook<'b>>,
+    /// Per class, per pass: index into `prepared`.
+    rows: Vec<[Option<usize>; 8]>,
+    scratch: CascadeScratch,
+    /// First-stage memo slots of the current partition.
+    memo: Vec<FirstStage>,
+    memo_used: usize,
+    /// The entry lists of the class evaluated last, per pass (empty
+    /// for an unpopulated pass).
+    entries: [Vec<u32>; 8],
+}
+
+impl<'b> ClassWalker<'b> {
+    /// Prepare the class table `value_books` (one row of per-pass
+    /// value books per classification).
+    pub(crate) fn new(value_books: &[[Option<&'b VorbisCodebook>; 8]]) -> Self {
+        let mut prepared: Vec<crate::vq::PreparedBook<'b>> = Vec::new();
+        let mut rows: Vec<[Option<usize>; 8]> = Vec::with_capacity(value_books.len());
+        for stage_books in value_books {
+            let mut row = [None; 8];
+            for (pass, slot) in stage_books.iter().enumerate() {
+                if let Some(book) = *slot {
+                    let id = match prepared.iter().position(|pb| std::ptr::eq(pb.book(), book)) {
+                        Some(id) => id,
+                        None => {
+                            prepared.push(crate::vq::PreparedBook::new(book));
+                            prepared.len() - 1
+                        }
+                    };
+                    row[pass] = Some(id);
+                }
+            }
+            rows.push(row);
+        }
+        Self {
+            prepared,
+            rows,
+            scratch: CascadeScratch::default(),
+            memo: Vec::new(),
+            memo_used: 0,
+            entries: Default::default(),
+        }
+    }
+
+    /// The number of classifications in the table.
+    pub(crate) fn classes(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The number of populated cascade stages of `class`.
+    pub(crate) fn populated_stages(&self, class: usize) -> usize {
+        self.rows[class].iter().flatten().count()
+    }
+
+    /// Start a new partition (drops the first-stage memo) and validate
+    /// its per-bin weights.
+    pub(crate) fn begin_partition(
+        &mut self,
+        part_weights: Option<&[f64]>,
+    ) -> Result<(), ResidueEncodeError> {
+        self.memo_used = 0;
+        if let Some(pw) = part_weights
+            && let Some(k) = pw.iter().position(|v| !v.is_finite() || *v < 0.0)
+        {
+            return Err(ResidueEncodeError::BadWeight {
+                partition: k,
+                value: pw[k],
+            });
+        }
+        Ok(())
+    }
+
+    /// Plan `class`'s cascade over the current partition: the
+    /// (weighted) squared error it leaves, its value-codeword bits and
+    /// its populated stage count, with the chosen entries left in
+    /// `self.entries`. Exactly [`plan_partition_cascade_impl`].
+    pub(crate) fn evaluate(
+        &mut self,
+        class: usize,
+        partition_scalars: &[f32],
+        residue_type: u16,
+        partition_size: u32,
+        part_weights: Option<&[f64]>,
+        rd_lambda: f64,
+    ) -> Result<(f64, u64, usize), ResidueEncodeError> {
+        let scratch = &mut self.scratch;
+        scratch.work.clear();
+        scratch.work.extend_from_slice(partition_scalars);
+        let mut populated_stages = 0usize;
+        let mut bit_cost = 0u64;
+        let mut first = true;
+        for (pass, slot) in self.rows[class].iter().enumerate() {
+            self.entries[pass].clear();
+            let Some(id) = *slot else { continue };
+            populated_stages += 1;
+            if first {
+                first = false;
+                let hit = self.memo[..self.memo_used]
+                    .iter()
+                    .position(|m| m.book == id && m.pass == pass);
+                let slot_index = match hit {
+                    Some(i) => i,
+                    None => {
+                        if self.memo.len() == self.memo_used {
+                            self.memo.push(FirstStage::default());
+                        }
+                        let m = &mut self.memo[self.memo_used];
+                        m.book = id;
+                        m.pass = pass;
+                        m.entries.clear();
+                        m.bits = plan_stage(
+                            &self.prepared[id],
+                            pass,
+                            residue_type,
+                            partition_size,
+                            part_weights,
+                            rd_lambda,
+                            scratch,
+                            &mut m.entries,
+                        )?;
+                        m.work.clear();
+                        m.work.extend_from_slice(&scratch.work);
+                        self.memo_used += 1;
+                        self.memo_used - 1
+                    }
+                };
+                let m = &self.memo[slot_index];
+                scratch.work.copy_from_slice(&m.work);
+                bit_cost += m.bits;
+                self.entries[pass].extend_from_slice(&m.entries);
+            } else {
+                bit_cost += plan_stage(
+                    &self.prepared[id],
+                    pass,
+                    residue_type,
+                    partition_size,
+                    part_weights,
+                    rd_lambda,
+                    scratch,
+                    &mut self.entries[pass],
+                )?;
+            }
+        }
+        let mut error_sq = 0.0f64;
+        for (k, &w) in scratch.work.iter().enumerate() {
+            error_sq += f64::from(w) * f64::from(w) * part_weights.map_or(1.0, |ws| ws[k]);
+        }
+        Ok((error_sq, bit_cost, populated_stages))
+    }
+
+    /// The entry lists [`Self::evaluate`] left for `class`, in the
+    /// `[Option<Vec<u32>>; 8]` row shape of a
+    /// [`crate::encoder::ResidueVectorPlan`].
+    pub(crate) fn take_entries(&self, class: usize) -> [Option<Vec<u32>>; 8] {
+        let mut out: [Option<Vec<u32>>; 8] = Default::default();
+        for ((dst, src), slot) in out.iter_mut().zip(&self.entries).zip(&self.rows[class]) {
+            if slot.is_some() {
+                *dst = Some(src.clone());
+            }
+        }
+        out
+    }
+}
+
+impl core::fmt::Debug for ClassWalker<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClassWalker")
+            .field("classes", &self.rows.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_vector_classifications_rd_core(
     scalars: &[f32],
@@ -1352,31 +1638,33 @@ fn plan_vector_classifications_rd_core(
         }
     }
 
+    let rd_lambda = if entry_rd { lambda } else { 0.0 };
+    let mut walker = ClassWalker::new(value_books);
+    // The running best, as per-pass entry lists.
+    let mut best_entries: [Vec<u32>; 8] = Default::default();
+
     let mut choices = Vec::with_capacity(num_partitions);
     for p in 0..num_partitions {
         let partition_scalars = &scalars[p * ps..(p + 1) * ps];
         let weight = weights.map_or(1.0, |w| w[p]);
+        let part_weights = bin_weights.map(|bw| &bw[p * ps..(p + 1) * ps]);
+        walker.begin_partition(part_weights)?;
 
-        let mut best: Option<PartitionClassChoice> = None;
+        // `usize::MAX` marks "no class yet".
+        let mut best_class = usize::MAX;
         let mut best_cost = f64::INFINITY;
         let mut best_stages = usize::MAX;
-        for (class, stage_books) in value_books.iter().enumerate() {
-            let scored = match bin_weights {
-                Some(bw) => plan_partition_cascade_scored_weighted_rd(
-                    partition_scalars,
-                    stage_books,
-                    residue_type,
-                    partition_size,
-                    &bw[p * ps..(p + 1) * ps],
-                    if entry_rd { lambda } else { 0.0 },
-                )?,
-                None => plan_partition_cascade_scored(
-                    partition_scalars,
-                    stage_books,
-                    residue_type,
-                    partition_size,
-                )?,
-            };
+        let mut best_error = 0.0f64;
+        let mut best_bits = 0u64;
+        for class in 0..value_books.len() {
+            let (error_sq, bit_cost, populated_stages) = walker.evaluate(
+                class,
+                partition_scalars,
+                residue_type,
+                partition_size,
+                part_weights,
+                rd_lambda,
+            )?;
 
             // Lagrangian rate-distortion cost. `bit_cost` is exact bits;
             // `error_sq` is squared sample distortion (scaled by the
@@ -1386,31 +1674,44 @@ fn plan_vector_classifications_rd_core(
             // classification (0.0 when unbiased). The accumulation is
             // in f64 to keep the comparison stable across a wide
             // dynamic range.
-            let cost = weight * scored.error_sq
-                + lambda * (scored.bit_cost as f64 + class_bit_bias.map_or(0.0, |b| b[class]));
+            let cost = weight * error_sq
+                + lambda * (bit_cost as f64 + class_bit_bias.map_or(0.0, |b| b[class]));
 
             // Lexicographic preference: (cost ↑, populated stages ↑,
             // classification index ↑). `<` keeps the first-seen
             // (lower-index) candidate on an exact cost-and-stage tie.
-            let replace = match &best {
-                None => true,
-                Some(_) => {
-                    cost < best_cost || (cost == best_cost && scored.populated_stages < best_stages)
-                }
-            };
+            let replace = best_class == usize::MAX
+                || cost < best_cost
+                || (cost == best_cost && populated_stages < best_stages);
             if replace {
+                best_class = class;
                 best_cost = cost;
-                best_stages = scored.populated_stages;
-                best = Some(PartitionClassChoice {
-                    classification: class as u32,
-                    entries: scored.entries,
-                    error_sq: scored.error_sq,
-                    bit_cost: scored.bit_cost,
-                });
+                best_stages = populated_stages;
+                best_error = error_sq;
+                best_bits = bit_cost;
+                for (dst, src) in best_entries.iter_mut().zip(&walker.entries) {
+                    dst.clear();
+                    dst.extend_from_slice(src);
+                }
             }
         }
 
-        choices.push(best.expect("value_books non-empty ⇒ a classification was chosen"));
+        let mut entries: [Option<Vec<u32>>; 8] = Default::default();
+        for ((dst, src), slot) in entries
+            .iter_mut()
+            .zip(&best_entries)
+            .zip(&walker.rows[best_class])
+        {
+            if slot.is_some() {
+                *dst = Some(src.clone());
+            }
+        }
+        choices.push(PartitionClassChoice {
+            classification: best_class as u32,
+            entries,
+            error_sq: best_error,
+            bit_cost: best_bits,
+        });
     }
 
     Ok(choices)
@@ -3153,5 +3454,131 @@ mod tests {
             select_residue_config(&[3.0, 3.0], &ok_cands, -1.0),
             Err(ResidueEncodeError::NonFiniteLambda(-1.0))
         );
+    }
+
+    /// The vector-level chooser (prepared books, shared first stages)
+    /// must pick exactly what an independent per-class evaluation
+    /// through the per-partition cascade planner picks.
+    #[test]
+    fn vector_chooser_matches_independent_per_class_cascades() {
+        let lattice = |dims: u16, lv: u32, delta: f32, sparse: bool| -> VorbisCodebook {
+            let entries = lv.pow(u32::from(dims));
+            VorbisCodebook {
+                dimensions: dims,
+                entries,
+                codeword_lengths: (0..entries)
+                    .map(|e| {
+                        if sparse && e % 5 == 1 {
+                            crate::codebook::UNUSED_ENTRY
+                        } else {
+                            1 + (e % 11) as u8
+                        }
+                    })
+                    .collect(),
+                lookup: VqLookup::Lattice {
+                    minimum_value: -((lv - 1) as f32 / 2.0) * delta,
+                    delta_value: delta,
+                    value_bits: 8,
+                    sequence_p: false,
+                    multiplicands: (0..lv).collect(),
+                },
+            }
+        };
+        let coarse = lattice(2, 15, 0.25, true);
+        let fine = lattice(2, 15, 0.03, false);
+        let rung = lattice(2, 4, 0.125, false);
+        let noise = lattice(4, 3, 0.1, true);
+        let deep = lattice(8, 3, 0.1, true);
+        let row = |a: Option<&'static VorbisCodebook>, b: Option<&'static VorbisCodebook>| {
+            let mut r: [Option<&VorbisCodebook>; 8] = Default::default();
+            r[0] = a;
+            r[1] = b;
+            r
+        };
+        let leak = |b: VorbisCodebook| -> &'static VorbisCodebook { Box::leak(Box::new(b)) };
+        let (coarse, fine, rung, noise, deep) = (
+            leak(coarse),
+            leak(fine),
+            leak(rung),
+            leak(noise),
+            leak(deep),
+        );
+        let rows = vec![
+            row(None, None),
+            row(Some(noise), None),
+            row(Some(coarse), None),
+            row(Some(coarse), Some(fine)),
+            row(Some(deep), None),
+            row(Some(coarse), Some(rung)),
+            row(None, Some(coarse)),
+        ];
+        let ps = 16usize;
+        let mut lcg: u64 = 77;
+        let mut unit = move || {
+            lcg = lcg
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (lcg >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let scalars: Vec<f32> = (0..ps * 40)
+            .map(|i| (unit() - 0.5) * if (i / ps).is_multiple_of(3) { 0.2 } else { 3.0 })
+            .collect();
+        let bin_weights: Vec<f64> = (0..scalars.len())
+            .map(|i| {
+                if i % 13 == 0 {
+                    0.0
+                } else {
+                    f64::from(unit()) * 30.0
+                }
+            })
+            .collect();
+        let bias: Vec<f64> = (0..rows.len()).map(|c| 0.5 * c as f64).collect();
+        for (lambda, entry_rd) in [(0.0, false), (0.02, false), (0.02, true), (1.5, true)] {
+            let plan = if entry_rd {
+                plan_vector_classifications_rd_bin_weighted_entry_rd
+            } else {
+                plan_vector_classifications_rd_bin_weighted
+            };
+            let got = plan(
+                &scalars,
+                &rows,
+                1,
+                ps as u32,
+                lambda,
+                &bin_weights,
+                Some(&bias),
+            )
+            .unwrap();
+            for (p, choice) in got.iter().enumerate() {
+                let (lo, hi) = (p * ps, (p + 1) * ps);
+                let mut best: Option<(f64, usize, usize, ScoredPartitionCascade)> = None;
+                for (class, stage_books) in rows.iter().enumerate() {
+                    let scored = plan_partition_cascade_scored_weighted_rd(
+                        &scalars[lo..hi],
+                        stage_books,
+                        1,
+                        ps as u32,
+                        &bin_weights[lo..hi],
+                        if entry_rd { lambda } else { 0.0 },
+                    )
+                    .unwrap();
+                    let cost = scored.error_sq + lambda * (scored.bit_cost as f64 + bias[class]);
+                    let better = match &best {
+                        None => true,
+                        Some((c, stages, _, _)) => {
+                            cost < *c || (cost == *c && scored.populated_stages < *stages)
+                        }
+                    };
+                    if better {
+                        best = Some((cost, scored.populated_stages, class, scored));
+                    }
+                }
+                let (_, _, class, scored) = best.unwrap();
+                assert_eq!(choice.classification as usize, class, "partition {p}");
+                assert_eq!(choice.entries, scored.entries, "partition {p}");
+                assert_eq!(choice.error_sq, scored.error_sq, "partition {p}");
+                assert_eq!(choice.bit_cost, scored.bit_cost, "partition {p}");
+            }
+        }
     }
 }
