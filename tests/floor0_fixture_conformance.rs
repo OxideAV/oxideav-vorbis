@@ -277,9 +277,9 @@ fn headers_match_the_documented_layout() {
     assert_eq!(res.cascade, vec![1, 1], "only cascade bit 0 set");
     assert_eq!(res.books[0][0], Some(2));
     assert_eq!(res.books[1][0], Some(3));
-    for class in 0..2 {
-        for pass in 1..8 {
-            assert_eq!(res.books[class][pass], None, "no book past pass 0");
+    for class_books in &res.books[..2] {
+        for book in &class_books[1..8] {
+            assert_eq!(*book, None, "no book past pass 0");
         }
     }
 

@@ -3704,8 +3704,7 @@ pub(crate) fn write_floor1_packet_into_writer(
 
     // Endpoint ranges (§7.2.3 step 2/3): each Y must fit in `amp_bits`,
     // i.e. be strictly less than `range`.
-    for idx in 0..2 {
-        let v = packet.floor1_y[idx];
+    for (idx, &v) in packet.floor1_y.iter().enumerate().take(2) {
         if v >= range {
             return Err(WriteFloor1PacketError::EndpointOverflow {
                 index: idx,

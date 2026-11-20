@@ -3479,11 +3479,11 @@ fn encode_pcm_to_packets_geometry(
         // band book must buy its own table.
         let setup_packet = write_setup_header(&setup, config.channels)?;
         let mut bits = 8 * setup_packet.len() as u64;
-        for book in 1..setup.codebooks.len() {
+        for (book, codebook) in setup.codebooks.iter().enumerate().skip(1) {
             if let Some(freqs) = tallies.counts(book) {
                 bits += freqs
                     .iter()
-                    .zip(&setup.codebooks[book].codeword_lengths)
+                    .zip(&codebook.codeword_lengths)
                     .map(|(&f, &l)| f * u64::from(l))
                     .sum::<u64>();
             }

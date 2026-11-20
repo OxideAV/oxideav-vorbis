@@ -791,14 +791,14 @@ pub fn plan_psy_floor_envelope(
     let n = spectrum.len();
     let lo = crate::floor1::INVERSE_DB_TABLE[0];
     let mut envelope = Vec::with_capacity(n);
-    for k in 0..n {
+    for (k, &threshold) in masking.threshold.iter().enumerate() {
         let from = k.saturating_sub(smooth_radius);
         let to = (k + smooth_radius).min(n - 1);
         let mut peak = 0.0f32;
         for &x in &spectrum[from..=to] {
             peak = peak.max(x.abs());
         }
-        let v = peak.max(masking.threshold[k]).clamp(lo, 1.0);
+        let v = peak.max(threshold).clamp(lo, 1.0);
         envelope.push(v);
     }
     Ok(envelope)
