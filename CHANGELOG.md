@@ -4,6 +4,17 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-vorbis/compare/v0.0.13...v0.0.14) - 2026-11-20
+
+### Other
+
+- decoder speed: Huffman prefix table for the first eight bits of each codeword
+- fill a budget left underspent by the knob's structural steps, starve under the knob's cheapest end
+- encoder quality: squared-error residue weights with masked-noise relief, three-stage deep cascade, rate-distortion entry selection at every quality
+- encoder speed: prepared value books, shared first stages, class scores computed once, Huffman trees built once per stream
+- clippy 1.100: iterate instead of indexing in four loops
+- API hygiene: non_exhaustive encoder config / results / errors, builders
+
 ### Added
 
 - `with_<field>` builder setters for every field of
