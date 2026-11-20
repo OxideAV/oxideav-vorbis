@@ -1047,8 +1047,9 @@ entry points with timing, and three measures computed by the harness
 alone — whole-stream SNR, a 256-sample segmental SNR, and a Bark-band
 noise-to-mask ratio (NMR, lower is better) that shares no code with
 the encoder's own masking model. Every figure below is taken on a
-black-box decoder's output of the stream (`oggdec`; `ffmpeg` decodes
-the same streams), at the black-box reference encoder's own operating
+black-box decoder's output of the stream (a second black-box decoder
+reads the same streams to the same SNR), at the black-box reference
+encoder's own operating
 points, with this encoder's rate–quality curve interpolated to the
 reference's exact audio-packet bitrate. "before" is the encoder as
 of the previous release.
@@ -1113,6 +1114,17 @@ What moved it, in measured order:
 - **Rate-distortion VQ entry selection at every quality** (it was a
   low-bitrate-mode lever): 2–3 % fewer audio bytes at equal SNR at
   120–210 kbps.
+- **ABR budget fill**: the knob's structural steps leave jumps in the
+  rate curve (the block pair changes at the low-bitrate knee), and a
+  budget inside a jump was underspent — 128 kbps on the struck notes
+  delivered 102.5 kbps; it now delivers 127.9 kbps (the solved
+  probe's `lambda` alone is bisected further), and a budget under
+  the knob's cheapest end is approached from the other side
+  (sustained chord at 28 kbps: the `q = 0` stream before — 30.9 kbps,
+  10.4 dB — and 27.1 kbps / 16.9 dB now, against the reference's
+  12.0 dB at 28.1 kbps).
+  Measured targets → delivered: 32 → 31.1, 64 → 62.7, 96 → 95.9,
+  128 → 127.9, 160 → 159.8 kbps (struck notes), 128 → 126.2 (mix).
 
 Speed (6 s stereo 44.1 kHz battery clips, user CPU seconds on one
 core of an Apple-silicon laptop, medians of three, other jobs running
@@ -1134,7 +1146,7 @@ first cascade stage share its quantisation, every
 `(partition, class)` pair is scored once for the whole band-adoption
 loop, and the packet writer builds each Huffman tree once per stream
 and looks codewords up in a table. An ABR encode is the knob solve's
-nine full encodes.
+nine full encodes plus up to six for the fill.
 
 ### Not yet supported / known gaps
 
@@ -1161,9 +1173,8 @@ encoder, from the r491 battery above.
   `q` sets an error level, so `q = 0.5` lands 160 kbps on the struck
   notes, 208 kbps on the mix and 322 kbps on mono white noise. Use
   `target_bitrate` for a rate.
-- **An ABR encode costs nine full encodes**, and a budget inside one
-  of the knob's structural rate jumps is underspent (128 kbps on the
-  struck notes delivers 102.5 kbps).
+- **An ABR encode costs up to fifteen full encodes** (0.12–0.4×
+  realtime on the battery).
 - The r453 dense correlated-with-delay stereo battery (22.0 vs
   37.3 dB at `q = 0.3` then) was not re-measured this round.
 - **The angle-vector point-stereo discount is SNR-invisible**: the

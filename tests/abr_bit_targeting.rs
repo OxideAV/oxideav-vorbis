@@ -3,8 +3,9 @@
 //! quality solve of `quality::solve_lambda_for_bits` run over real
 //! encodes. Pins: a reachable budget is met from below (and the
 //! spend approaches it), the delivered rate is monotone in the
-//! budget, an unreachable budget degrades to the cheapest (`q = 0`)
-//! stream, and the identification header carries the target as
+//! budget, an unreachable budget degrades to the cheapest stream the
+//! encoder can make (at or under the `q = 0` knob end), and the
+//! identification header carries the target as
 //! `bitrate_nominal`. Fully synthetic corpus.
 
 use oxideav_vorbis::{
@@ -83,7 +84,7 @@ fn abr_meets_reachable_budgets_monotonically() {
 }
 
 #[test]
-fn unreachable_budget_returns_the_cheapest_knob_end() {
+fn unreachable_budget_degrades_to_the_cheapest_stream() {
     let pcm = corpus();
     let seconds = pcm[0].len() as f64 / f64::from(RATE);
     let mut config = StreamEncoderConfig::new(RATE, 1);
@@ -91,15 +92,17 @@ fn unreachable_budget_returns_the_cheapest_knob_end() {
     let ogg = encode_pcm_to_ogg(&pcm, &config).expect("encodes");
     let got = audio_kbps(&ogg, seconds);
 
-    // The q = 0 encode is the floor the ABR entry must degrade to.
+    // The q = 0 encode bounds what the ABR entry may degrade to.
     let mut floor_cfg = StreamEncoderConfig::new(RATE, 1);
     floor_cfg.quality = 0.0;
     let floor = encode_pcm_to_ogg(&pcm, &floor_cfg).expect("floor encodes");
     let floor_kbps = audio_kbps(&floor, seconds);
     eprintln!("unreachable 1 kbps -> {got:.1} kbps (q=0 floor {floor_kbps:.1})");
+    // An out-of-reach budget starves the `q = 0` structure: the
+    // result is never dearer than the knob's cheapest end.
     assert!(
-        (got - floor_kbps).abs() <= 0.02 * floor_kbps.max(1.0),
-        "unreachable budget must land on the q=0 stream: {got:.1} vs {floor_kbps:.1} kbps"
+        got <= floor_kbps * 1.02,
+        "unreachable budget must land at or under the q=0 stream: {got:.1} vs {floor_kbps:.1} kbps"
     );
     let decoded = decode_ogg_to_pcm(&ogg).expect("decodes");
     assert_eq!(decoded.pcm[0].len(), pcm[0].len());

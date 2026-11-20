@@ -28,6 +28,12 @@ All notable changes to `oxideav-vorbis` are recorded here.
   −2.6…−7.3 dB to −0.6…+5.0 dB, on castanet-like clicks from
   −7.5…−1.1 dB to +1.0…+6.0 dB (README table). Streams at a given
   `quality` differ in size and fidelity from the previous release's.
+- `StreamEncoderConfig::target_bitrate`: a budget the knob's
+  structural steps would leave more than 3 % underspent is filled by
+  bisecting the residue `lambda` alone (128 kbps on struck notes:
+  102.5 → 127.9 kbps delivered), and a budget under the `q = 0`
+  stream's rate is now approached from below instead of returning
+  the `q = 0` stream.
 
 ### Performance
 

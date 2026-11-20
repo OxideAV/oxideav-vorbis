@@ -447,8 +447,13 @@ pub struct StreamEncoderConfig {
     /// Lagrangian `lambda` is bisected over its `q ∈ [0, 1]` law (each
     /// probe is a full encode, every other lever following the same
     /// `q`), and the returned stream is the highest-fidelity probe
-    /// measured within budget. When even `q = 0` overshoots, the
-    /// `q = 0` stream is returned (the cheapest the encoder offers).
+    /// measured within budget. Where the knob's structural steps
+    /// leave that probe more than 3 % under the budget, its `lambda`
+    /// alone is bisected further to fill it; when even `q = 0`
+    /// overshoots, the `q = 0` structure is starved the same way (up
+    /// to two decades of `lambda`) and the stream nearest the budget
+    /// from below is returned — or the cheapest one measured when the
+    /// budget is out of reach altogether.
     /// The identification header's `bitrate_nominal` carries the
     /// target. Whole-stream targeting is deliberate: the encoder is a
     /// whole-stream design, so the "reservoir" is the file itself —
@@ -1550,7 +1555,7 @@ fn encode_pcm_to_packets_abr(
     let q_of = |u: f64| (1.0 - u).clamp(0.0, 1.0) as f32;
     // Every probe is kept so the returned stream is exactly the one
     // the solver measured — no re-encode, no drift.
-    let mut probes: Vec<(u64, EncodedVorbisStream)> = Vec::new();
+    let mut probes: Vec<(u64, f32, EncodedVorbisStream)> = Vec::new();
     let mut encode_at = |u: f64| -> Result<u64, OggFileError> {
         let mut probe = config.clone();
         probe.target_bitrate = None;
@@ -1561,7 +1566,7 @@ fn encode_pcm_to_packets_abr(
             .iter()
             .map(|(p, _)| p.len() as u64)
             .sum::<u64>();
-        probes.push((bits, stream));
+        probes.push((bits, probe.quality, stream));
         Ok(bits)
     };
     // `u = 0` (q = 1) is the expensive end, `u = 1` (q = 0) the cheap
@@ -1578,9 +1583,81 @@ fn encode_pcm_to_packets_abr(
         })?;
     let position = probes
         .iter()
-        .position(|(bits, _)| *bits == solution.bits)
+        .position(|(bits, _, _)| *bits == solution.bits)
         .expect("the solution's rate was measured on one of the probes");
-    let mut stream = probes.swap_remove(position).1;
+    let (solved_bits, solved_quality, mut stream) = probes.swap_remove(position);
+    drop(probes);
+    // ---- the budget fill ----
+    // The knob's structural levers (block geometry, coded band, post
+    // budget) step with the quality, so the rate curve over `q` has
+    // jumps — widest at the low-bitrate knee, where the block pair
+    // changes — and a budget inside a jump leaves the solved probe
+    // well under it (measured: a 128 kbps budget on struck notes
+    // landed 102 kbps). The fill keeps the solved probe's structure
+    // and bisects the residue `lambda` alone downward from the probe's
+    // own (at most two decades, six probes), returning the stream that
+    // uses the most of the budget. The top quarter of the knob, whose
+    // levers are measured multi-pass selections, is left as solved.
+    //
+    // A budget under the knob's cheapest end (`q = 0` overshoots) is
+    // approached the same way from the other side: the `q = 0`
+    // structure with `lambda` bisected **upward** (at most two
+    // decades), keeping the stream that uses the most of the budget —
+    // or, when even the dearest `lambda` probed overshoots, the
+    // cheapest stream measured.
+    let fill = if !solution.within_budget {
+        Some(1.0f64)
+    } else if (solved_bits as f64) < 0.97 * target_bits as f64 && solved_quality <= 0.75 {
+        Some(-1.0f64)
+    } else {
+        None
+    };
+    if let Some(direction) = fill {
+        let mut probe = config.clone();
+        probe.target_bitrate = None;
+        probe.quality = solved_quality;
+        let base = EncoderTuning::from_quality(solved_quality)?;
+        // (bits, within budget) of the stream currently held.
+        let mut held = (solved_bits, solution.within_budget);
+        // `near` is the `lambda` exponent offset on the solved probe's
+        // side of the budget, `far` the two-decade bound.
+        let (mut near, mut far) = (0.0f64, 2.0f64);
+        for _ in 0..6 {
+            let mid = 0.5 * (near + far);
+            let tuning = EncoderTuning {
+                lambda: base.lambda * 10f64.powf(direction * mid),
+                ..base.clone()
+            };
+            let candidate =
+                encode_pcm_to_packets_geometry(pcm, &probe, &tuning, probe.vq_dims > 1, &[])?;
+            let bits = 8 * candidate
+                .audio
+                .iter()
+                .map(|(p, _)| p.len() as u64)
+                .sum::<u64>();
+            let within = bits <= target_bits;
+            // Within budget beats over budget; within budget the
+            // larger spend wins, over budget the smaller.
+            let better = match (within, held.1) {
+                (true, true) => bits > held.0,
+                (true, false) => true,
+                (false, true) => false,
+                (false, false) => bits < held.0,
+            };
+            if better {
+                held = (bits, within);
+                stream = candidate;
+            }
+            // Filling upward (direction < 0) moves away from the solved
+            // probe while the budget holds; starving (direction > 0)
+            // moves away while it is still exceeded.
+            if within == (direction < 0.0) {
+                near = mid;
+            } else {
+                far = mid;
+            }
+        }
+    }
     // Stamp the target as the nominal bitrate (§4.2.2: purely
     // informational fields).
     let id = write_identification_header(&VorbisIdentificationHeader {
