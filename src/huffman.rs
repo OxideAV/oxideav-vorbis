@@ -157,6 +157,24 @@ pub struct HuffmanTree {
     /// the codeword's first (root-side) bit in bit 0 of `bits`, or
     /// length `0` for an entry with no leaf.
     codes: std::sync::OnceLock<Vec<(u32, u8)>>,
+    /// Decode-side prefix table, built on the first
+    /// [`HuffmanTree::decode_entry`]: one slot per value of the next
+    /// [`DECODE_PREFIX_BITS`] stream bits.
+    prefixes: std::sync::OnceLock<Vec<PrefixSlot>>,
+}
+
+/// How many stream bits the decode prefix table resolves at once.
+const DECODE_PREFIX_BITS: u32 = 8;
+
+/// Where the tree walk stands after the next [`DECODE_PREFIX_BITS`]
+/// stream bits (or fewer, when a leaf is reached first).
+#[derive(Debug, Clone, Copy)]
+struct PrefixSlot {
+    /// The leaf's entry (`leaf`), or the node the walk continues from.
+    value: u32,
+    /// Stream bits the prefix accounts for.
+    bits: u8,
+    leaf: bool,
 }
 
 /// Errors raised by [`HuffmanTree::from_codebook`] /
@@ -339,6 +357,7 @@ impl HuffmanTree {
                 used_count: 1,
                 single_entry: Some(entry as u32),
                 codes: std::sync::OnceLock::new(),
+                prefixes: std::sync::OnceLock::new(),
             });
         }
 
@@ -426,6 +445,7 @@ impl HuffmanTree {
             used_count,
             single_entry: None,
             codes: std::sync::OnceLock::new(),
+            prefixes: std::sync::OnceLock::new(),
         })
     }
 
@@ -472,7 +492,24 @@ impl HuffmanTree {
             return Ok(entry);
         }
 
+        // The first bits of the walk come from the prefix table when
+        // the packet still holds a full prefix; the last bits of a
+        // packet (and anything past the prefix) are walked bit by bit,
+        // which also keeps the end-of-packet behaviour exactly the
+        // bit-by-bit walk's.
         let mut cur: u32 = 0;
+        if let Ok(prefix) = reader.peek_u32(DECODE_PREFIX_BITS) {
+            let slot = self.prefixes.get_or_init(|| self.prefix_table())[prefix as usize];
+            if slot.leaf || slot.bits > 0 {
+                reader
+                    .skip(u32::from(slot.bits))
+                    .map_err(|_| DecodeError::UnexpectedEndOfPacket)?;
+                if slot.leaf {
+                    return Ok(slot.value);
+                }
+                cur = slot.value;
+            }
+        }
         loop {
             match self.nodes[cur as usize] {
                 HuffmanNode::Leaf(entry) => return Ok(entry),
@@ -545,6 +582,53 @@ impl HuffmanTree {
                 used_count: self.used_count,
             }),
         }
+    }
+
+    /// The decode prefix table (see `prefixes`): for each value of the
+    /// next [`DECODE_PREFIX_BITS`] stream bits (first bit in bit 0),
+    /// the leaf the walk reaches within them or the node it stands on
+    /// after them. A prefix that would step outside the arena gets an
+    /// empty slot (no bits, no leaf), which decodes bit by bit.
+    fn prefix_table(&self) -> Vec<PrefixSlot> {
+        (0..1u32 << DECODE_PREFIX_BITS)
+            .map(|prefix| {
+                let mut cur = 0u32;
+                let mut depth = 0u32;
+                loop {
+                    match self.nodes.get(cur as usize) {
+                        Some(&HuffmanNode::Leaf(entry)) => {
+                            break PrefixSlot {
+                                value: entry,
+                                bits: depth as u8,
+                                leaf: true,
+                            };
+                        }
+                        Some(&HuffmanNode::Internal { left, right }) => {
+                            if depth == DECODE_PREFIX_BITS {
+                                break PrefixSlot {
+                                    value: cur,
+                                    bits: depth as u8,
+                                    leaf: false,
+                                };
+                            }
+                            cur = if prefix >> depth & 1 == 1 {
+                                right
+                            } else {
+                                left
+                            };
+                            depth += 1;
+                        }
+                        None => {
+                            break PrefixSlot {
+                                value: 0,
+                                bits: 0,
+                                leaf: false,
+                            };
+                        }
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Every leaf's root-to-leaf path, indexed by entry (see `codes`).
@@ -1200,6 +1284,73 @@ mod r338_regression {
         let mut r = BitReaderLsb::new(&bytes);
         for e in 0u32..7 {
             assert_eq!(tree.decode_entry(&mut r).unwrap(), e, "entry {e}");
+        }
+    }
+
+    /// The bit-by-bit tree walk the prefix table short-cuts.
+    fn walk_decode(tree: &HuffmanTree, reader: &mut BitReaderLsb<'_>) -> Result<u32, DecodeError> {
+        let mut cur = 0u32;
+        loop {
+            match tree.nodes[cur as usize] {
+                HuffmanNode::Leaf(entry) => return Ok(entry),
+                HuffmanNode::Internal { left, right } => {
+                    let bit = reader
+                        .read_bit()
+                        .map_err(|_| DecodeError::UnexpectedEndOfPacket)?;
+                    cur = if bit { right } else { left };
+                }
+            }
+        }
+    }
+
+    /// `decode_entry` (prefix table, then the walk) returns exactly the
+    /// bit-by-bit walk's entries, leaves the reader at the same bit,
+    /// and fails at the same symbol on every truncation of the packet
+    /// — over shallow, deep, sparse and skewed trees.
+    #[test]
+    fn prefix_table_decode_matches_the_bit_walk() {
+        // Skewed: lengths 1, 2, …, 19, 19 (codewords far past the prefix).
+        let mut skewed: Vec<u8> = (1..=19).collect();
+        skewed.push(19);
+        // Balanced 9-bit book, and a sparse mix of short and long codes.
+        let balanced = vec![9u8; 512];
+        let mut sparse = vec![UNUSED_ENTRY; 40];
+        for (slot, len) in [(3usize, 1u8), (7, 2), (11, 3), (20, 5), (21, 5), (30, 4)] {
+            sparse[slot] = len;
+        }
+        for lengths in [skewed, balanced, sparse, vec![1, 1], vec![2, 2, 2, 2]] {
+            let tree = HuffmanTree::from_lengths(&lengths).expect("builds");
+            let used: Vec<u32> = (0..lengths.len() as u32)
+                .filter(|&e| lengths[e as usize] != UNUSED_ENTRY)
+                .collect();
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut writer = BitWriterLsb::new();
+            let mut symbols = Vec::new();
+            for _ in 0..400 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let entry = used[(state % used.len() as u64) as usize];
+                tree.encode_entry(entry, &mut writer).expect("used entry");
+                symbols.push(entry);
+            }
+            let packet = writer.finish();
+            for keep in [packet.len(), packet.len() - 1, packet.len() / 2, 3, 1, 0] {
+                let data = &packet[..keep.min(packet.len())];
+                let mut fast = BitReaderLsb::new(data);
+                let mut slow = BitReaderLsb::new(data);
+                for (index, &symbol) in symbols.iter().enumerate() {
+                    let got = tree.decode_entry(&mut fast);
+                    let want = walk_decode(&tree, &mut slow);
+                    assert_eq!(got, want, "symbol {index}, {keep} bytes kept");
+                    assert_eq!(fast.bit_position(), slow.bit_position());
+                    match got {
+                        Ok(entry) if keep == packet.len() => assert_eq!(entry, symbol),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
         }
     }
 }

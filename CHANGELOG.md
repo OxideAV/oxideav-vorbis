@@ -48,6 +48,9 @@ All notable changes to `oxideav-vorbis` are recorded here.
   table in place of a per-symbol tree walk. 6 s stereo, user CPU:
   28.9 s → 3.35 s at `q = 0.5` on struck notes (with the changes
   above), 17.1 s → 1.50 s at `q = 0.1`.
+- Decoder (PCM bit-identical): the first eight bits of every Huffman
+  codeword resolve through a per-tree prefix table; a 2-minute stereo
+  stream decodes in 0.306 s against 0.339 s (392× realtime).
 
 ### Changed
 

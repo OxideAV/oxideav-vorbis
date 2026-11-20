@@ -1135,7 +1135,7 @@ on the machine):
 | encode struck notes `q = 0.1` | 17.1 s | 1.50 s | 4.0× |
 | encode struck notes `q = 0.5` | 28.9 s | 3.35 s | 1.8× |
 | encode mix `q = 0.5` | 23.9 s | 4.44 s | 1.35× |
-| decode (2 min stereo, 127 kbps) | — | 0.44 s | 273× |
+| decode (2 min stereo, 127 kbps) | 0.339 s | 0.306 s | 392× |
 
 The encoder speed work is output-preserving in itself (the stage
 before the quality changes produced byte-identical streams at
@@ -1146,7 +1146,9 @@ first cascade stage share its quantisation, every
 `(partition, class)` pair is scored once for the whole band-adoption
 loop, and the packet writer builds each Huffman tree once per stream
 and looks codewords up in a table. An ABR encode is the knob solve's
-nine full encodes plus up to six for the fill.
+nine full encodes plus up to six for the fill. The decoder resolves
+the first eight bits of every Huffman codeword through a per-tree
+prefix table (PCM bit-identical).
 
 ### Not yet supported / known gaps
 
