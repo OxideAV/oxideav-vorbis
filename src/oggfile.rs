@@ -66,13 +66,10 @@ use crate::packet_kind::{ClassifyError, PacketKind, classify_packet};
 use crate::psy::{
     Complex, MaskingAnalysis, PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
     complex_spectrum, compute_masking_with_predictability, plan_psy_floor_envelope,
-    residue_bin_weights, residue_partition_weights, unpredictability,
+    residue_bin_weights, unpredictability,
 };
 use crate::quality::{EncoderTuning, QualityError};
-use crate::residue_encode::{
-    ResidueEncodeError, plan_partition_cascade_scored_weighted,
-    plan_vector_classifications_rd_bin_weighted,
-};
+use crate::residue_encode::{ResidueEncodeError, plan_partition_cascade_scored_weighted};
 use crate::setup::{
     Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap,
     ModeHeader, ResidueHeader, VorbisSetupHeader, parse_setup_header,
@@ -115,15 +112,88 @@ fn partition_size_for(half_n: u32, low_rate: bool) -> u32 {
     }
 }
 
-/// The audibility-weight ceiling's compression exponent in the
-/// low-bitrate mode (see `psy::residue_bin_weights_soft`): past the
-/// 40 dB ceiling a ratio still counts with its square root. Chosen by
-/// measurement over {0, 0.5, 1}: `1` (no ceiling) and `0` (the hard
-/// cap) land on the same rate–SNR curve on tonal material, `0.5` sits
-/// 1–2 dB above both at 20–40 kbps.
-const LOW_RATE_WEIGHT_GAMMA: f64 = 0.5;
+/// The price of one unit of **time-domain squared error** (full scale
+/// = 1.0) in the residue Lagrangian `Σ w·error² + λ·bits`: the scale
+/// that places the [`EncoderTuning`] `lambda` law's operating range on
+/// the rates the quality knob is documented for.
+const SQUARED_ERROR_PRICE: f64 = 1.0e7 / 512.0;
 
-/// Per-partition means of a per-bin weight row.
+/// Per-bin planning weights of one residue vector: the squared error
+/// its residue-domain quantisation error leaves **in the decoded
+/// signal**. A residue error `e` at bin `k` surfaces as the spectral
+/// error `e · floor[k]` (the decoder multiplies the residue by the
+/// floor, §4.3.6), and under the encoder's `4/n` forward scale a
+/// spectral error vector of squared norm `Σ` costs `(n/4) · Σ` of
+/// squared error in the overlap-added output, so
+///
+/// ```text
+/// w[k] = SQUARED_ERROR_PRICE · (n/4) · floor[k]²
+/// ```
+///
+/// makes the residue Lagrangian a plain rate–distortion trade on the
+/// decoded waveform, commensurable across block sizes. The masking
+/// model acts through the floor (it shapes the quantiser steps and so
+/// the noise), not through these weights: measured against
+/// `(floor / threshold)²` audibility weights at equal rate, the
+/// squared-error weights gained 4–10 dB of whole-stream SNR on struck
+/// and plucked notes, clicks, a sustained chord and a mix **and**
+/// 2–5 dB on an independent Bark-band noise-to-mask measure (the
+/// audibility weights saturate on tonal material — the model asks for
+/// noise 40 dB under every partial — and the chooser then codes a
+/// few partitions far too finely and drops the rest).
+fn squared_error_weights(
+    floor: &[f32],
+    n: usize,
+    masking: &MaskingAnalysis,
+    relief: &NoiseRelief,
+) -> Vec<f64> {
+    let scale = SQUARED_ERROR_PRICE * n as f64 / 4.0;
+    // The squared spectral error the Lagrangian settles at where it
+    // prices plain squared error (see [`NoiseRelief`]).
+    let settled = relief.lambda / (2.0 * std::f64::consts::LN_2 * scale);
+    floor
+        .iter()
+        .enumerate()
+        .map(|(k, &fl)| {
+            let w = scale * f64::from(fl) * f64::from(fl);
+            let threshold = f64::from(masking.threshold[k]);
+            let ratio = settled / (threshold * threshold);
+            if relief.strength > 0.0 && ratio < 1.0 {
+                let noise_like = 1.0 - f64::from(masking.band_tonality[masking.bin_band[k]]);
+                w * ratio.powf(relief.strength * noise_like)
+            } else {
+                w
+            }
+        })
+        .collect()
+}
+
+/// The **masked-noise relief** on the squared-error weights: a
+/// rate-distortion optimum under plain squared error settles every
+/// coded bin at one error level, `lambda / (2·ln 2)` in weighted
+/// units (the high-resolution slope of `D(R)`: 6.02 dB per bit).
+/// Where the masking threshold of a **noise-like** band sits above
+/// that level there is nothing to gain from coding under the
+/// threshold — noise masks noise — so the weight there is scaled by
+/// `(settled error / threshold²)^(strength · (1 − tonality))`, which
+/// moves the optimum's error level up to the threshold in a fully
+/// noise-like band and leaves a tonal band on plain squared error
+/// (the masking model's tonal offsets ask for noise 30–40 dB under
+/// every partial; pricing those as free was what starved the weaker
+/// partials). Without the relief the squared-error objective holds
+/// loud broadband noise to the same absolute error level as
+/// everything else — measured: 149 kbps for a band-limited 2.7 dB on
+/// mono white noise at `q = 0.1` and 376 kbps at the low-rate knee,
+/// against 82 kbps and 259 kbps relieved.
+struct NoiseRelief {
+    /// The residue Lagrangian's bits → weighted-error exchange rate.
+    lambda: f64,
+    /// The exponent's scale in `[0, 1]`; `0` is plain squared error
+    /// (waveform fidelity).
+    strength: f64,
+}
+
+/// Per-partition means of per-bin weights.
 fn partition_means(bw: &[f64], ps: usize) -> Vec<f64> {
     bw.chunks(ps)
         .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
@@ -1110,6 +1180,9 @@ enum BandShape {
     /// The base coarse book as pass 0, the candidate book as pass 1
     /// (a refinement rung, [`REFINEMENT_RUNGS`]).
     AfterCoarse,
+    /// The base coarse and fine books as passes 0 and 1, the candidate
+    /// book as pass 2 (the deep cascade).
+    AfterFine,
 }
 
 struct ResidueLadder {
@@ -1180,12 +1253,27 @@ impl ResidueLadder {
         self.books.push(row);
     }
 
+    /// Append one further class whose passes 0 and 1 are the base
+    /// ladder's **coarse** and **fine** books (codebooks 2 and 3) and
+    /// whose pass 2 is `book`: the three-stage deep cascade.
+    fn push_deep_class(&mut self, book: VorbisCodebook) {
+        let index = (2 + self.value_books.len()) as u8;
+        self.value_books.push(book);
+        let mut row: [Option<u8>; 8] = Default::default();
+        row[0] = Some(2);
+        row[1] = Some(3);
+        row[2] = Some(index);
+        self.cascade.push(0b111);
+        self.books.push(row);
+    }
+
     /// Append a band-class candidate in its declared shape.
     fn push_band(&mut self, book: VorbisCodebook, shape: BandShape) {
         match shape {
             BandShape::Single => self.push_band_class(book),
             BandShape::PlusFine => self.push_cascaded_band_class(book),
             BandShape::AfterCoarse => self.push_refined_class(book),
+            BandShape::AfterFine => self.push_deep_class(book),
         }
     }
 
@@ -2266,6 +2354,19 @@ fn encode_pcm_to_packets_geometry(
     } else {
         Vec::new()
     };
+    // The masked-noise relief: half strength through the middle of the
+    // knob (the error level in a noise-like band settles at the
+    // geometric mean of the squared-error level and the masking
+    // threshold, so fidelity still rises with the knob there), rising
+    // to full strength at the bottom of the low-bitrate mode and
+    // fading to none over the top quarter of the knob.
+    let relief = NoiseRelief {
+        lambda: tuning.lambda,
+        strength: f64::from(
+            (0.5 + 0.5 * tuning.low_rate_depth)
+                * (1.0 - tuning.adaptive_margin_headroom_db / 6.0).clamp(0.0, 1.0),
+        ),
+    };
     let mut pair_cands: Vec<Vec<PairCandidate>> = Vec::with_capacity(frames);
     for f in 0..frames {
         let e = entry_of(f);
@@ -2290,34 +2391,16 @@ fn encode_pcm_to_packets_geometry(
                 .zip(&rendered)
                 .map(|(&xv, &fv)| xv / fv)
                 .collect();
-            // NMR weights cover the §8.6.1 coded band only: bins past
-            // `residue_end` are never coded (the decoder zeroes them),
-            // so the planner sees exactly one weight per coded
-            // partition.
-            let (w, bw) = if low_rate {
-                let bw = crate::psy::residue_bin_weights_soft(
-                    &rendered,
-                    &maskings[f][c],
-                    end,
-                    LOW_RATE_WEIGHT_GAMMA,
-                );
-                (partition_means(&bw, frame_ps(f)), bw)
-            } else {
-                (
-                    residue_partition_weights(
-                        &rendered,
-                        &maskings[f][c],
-                        0,
-                        end,
-                        partition_size_for(half as u32, low_rate),
-                    )?,
-                    residue_bin_weights(&rendered, &maskings[f][c], 0, end)?,
-                )
-            };
+            // The planning weights cover the §8.6.1 coded band only:
+            // bins past `residue_end` are never coded (the decoder
+            // zeroes them), so the planner sees exactly one weight per
+            // coded bin and their means per coded partition.
+            let bw = squared_error_weights(&rendered[..end], sizes[f], &maskings[f][c], &relief);
+            let w = partition_means(&bw, frame_ps(f));
             ew_row.push(if low_rate {
                 crate::psy::residue_bin_weights_soft(&rendered, &maskings[f][c], end, 1.0)
             } else {
-                bw.clone()
+                residue_bin_weights(&rendered, &maskings[f][c], 0, end)?
             });
             y_row.push(floor1_y);
             t_row.push(target);
@@ -2341,27 +2424,6 @@ fn encode_pcm_to_packets_geometry(
                     .collect()
             };
             let (t_mag, t_ang) = (target_s(mag), target_s(ang));
-            let (bw_mag, bw_ang) = if low_rate {
-                (
-                    crate::psy::residue_bin_weights_soft(
-                        &rendered_s,
-                        &maskings[f][mag],
-                        end,
-                        LOW_RATE_WEIGHT_GAMMA,
-                    ),
-                    crate::psy::residue_bin_weights_soft(
-                        &rendered_s,
-                        &maskings[f][ang],
-                        end,
-                        LOW_RATE_WEIGHT_GAMMA,
-                    ),
-                )
-            } else {
-                (
-                    residue_bin_weights(&rendered_s, &maskings[f][mag], 0, end)?,
-                    residue_bin_weights(&rendered_s, &maskings[f][ang], 0, end)?,
-                )
-            };
             // Bits-like measure: `log2(1 + w·t²)` per bin — the rate a
             // bin needs to bring its weighted error under the mask
             // grows with the log of its audible energy, and a sum of
@@ -2387,7 +2449,10 @@ fn encode_pcm_to_packets_geometry(
                     crate::psy::residue_bin_weights_soft(&rendered_s, &maskings[f][ang], end, 1.0),
                 )
             } else {
-                (bw_mag.clone(), bw_ang.clone())
+                (
+                    residue_bin_weights(&rendered_s, &maskings[f][mag], 0, end)?,
+                    residue_bin_weights(&rendered_s, &maskings[f][ang], 0, end)?,
+                )
             };
             let mut uncoupled = 0.0f64;
             let mut coupled = 0.0f64;
@@ -2402,6 +2467,20 @@ fn encode_pcm_to_packets_geometry(
                 let w = ew_mag[k].max(ew_ang[k]);
                 coupled += bits(w, m) + bits(w * f64::from(scale), a);
             }
+            // Both coupled vectors are planned against the shared
+            // floor's squared-error weights, each bin under the more
+            // demanding channel's relief.
+            let mut bw_mag =
+                squared_error_weights(&rendered_s[..end], sizes[f], &maskings[f][mag], &relief);
+            for (w, other) in bw_mag.iter_mut().zip(squared_error_weights(
+                &rendered_s[..end],
+                sizes[f],
+                &maskings[f][ang],
+                &relief,
+            )) {
+                *w = w.max(other);
+            }
+            let bw_ang = bw_mag.clone();
             cand_row.push(PairCandidate {
                 coupled_cost: coupled,
                 uncoupled_cost: uncoupled,
@@ -2720,7 +2799,7 @@ fn encode_pcm_to_packets_geometry(
     // on the *joint* grid-cell occupancy. Lookup type 1 is the widely
     // interoperable lookup form; a type-2 (per-entry-free) table is
     // spec-legal but rejected by common black-box decoders.
-    let (coarse, fine, half_geometry, rungs) = if joint_geometry {
+    let (coarse, fine, half_geometry, rungs, deep) = if joint_geometry {
         let d = config.vq_dims as usize;
         // Design corpus: every coded partition's chunks (bins past
         // `residue_end` are never coded and must not shape the books).
@@ -2771,7 +2850,12 @@ fn encode_pcm_to_packets_geometry(
         // the entry ceiling, which is why the whole geometry hands
         // over to the scalar ladders past the cap (see
         // `joint_geometry` above).
-        type DesignedPair = (VorbisCodebook, VorbisCodebook, Vec<VorbisCodebook>);
+        type DesignedPair = (
+            VorbisCodebook,
+            VorbisCodebook,
+            Vec<VorbisCodebook>,
+            Option<VorbisCodebook>,
+        );
         let design_pair = |corpus: Vec<f32>, span: f32| -> Result<DesignedPair, OggFileError> {
             let corpus = subsample_corpus(corpus, d, VQ_DESIGN_MAX_VECTORS);
             let corpus = if corpus.is_empty() {
@@ -2821,6 +2905,35 @@ fn encode_pcm_to_packets_geometry(
                 true,
             )?
             .codebook;
+            // The deep cascade's third stage: the fine geometry over
+            // two fine steps, designed from the fine stage's leftover.
+            let mut deep = None;
+            if config.residue_bands {
+                let mut leftovers2: Vec<f32> = Vec::with_capacity(leftovers.len());
+                for chunk in leftovers.chunks_exact(d) {
+                    let q = crate::vq::quantize_vector(&fine, chunk).expect(
+                        "a freshly designed fine book has >= 1 used entry and matching dims",
+                    );
+                    leftovers2.extend(chunk.iter().zip(&q.vector).map(|(&t, &v)| t - v));
+                }
+                let step = crate::book_design::pack_nearest(2.0 * fine_step / lv as f32);
+                let ladder = crate::book_design::uniform_value_ladder(
+                    -(lv as f32 / 2.0) * step,
+                    step,
+                    lv,
+                    8,
+                )?;
+                deep = Some(
+                    crate::book_design::design_lattice_vq_codebook(
+                        &leftovers2,
+                        config.vq_dims,
+                        &ladder,
+                        VQ_DESIGN_MAX_CODEWORD_LEN,
+                        true,
+                    )?
+                    .codebook,
+                );
+            }
             // The refinement rungs: second-stage lattices over the same
             // coarse leftover at the rung steps ([`REFINEMENT_RUNGS`]).
             let mut rungs = Vec::with_capacity(REFINEMENT_RUNGS.len());
@@ -2845,9 +2958,9 @@ fn encode_pcm_to_packets_geometry(
                     );
                 }
             }
-            Ok((coarse, fine, rungs))
+            Ok((coarse, fine, rungs, deep))
         };
-        let (coarse, fine, rungs) = design_pair(raw, max_abs)?;
+        let (coarse, fine, rungs, deep) = design_pair(raw, max_abs)?;
         // The half-span tier's geometry (designed below, once the band
         // designer exists): the coarse step and level count.
         let half_geometry = config.residue_bands.then(|| {
@@ -2856,7 +2969,7 @@ fn encode_pcm_to_packets_geometry(
                 lv,
             )
         });
-        (coarse, fine, half_geometry, rungs)
+        (coarse, fine, half_geometry, rungs, deep)
     } else {
         // The coarse span is fixed (it must reach the loudest residue
         // target); the fine step follows the quality knob — the top
@@ -2873,6 +2986,7 @@ fn encode_pcm_to_packets_geometry(
             ),
             None,
             Vec::new(),
+            None,
         )
     };
     // ---- the joint band books (noise + optional mid tier) ----
@@ -2992,6 +3106,9 @@ fn encode_pcm_to_packets_geometry(
     // The coarse cascade's refinement rungs (see [`REFINEMENT_RUNGS`]).
     for book in rungs {
         band_candidates.push((book, BandShape::AfterCoarse));
+    }
+    if let Some(book) = deep {
+        band_candidates.push((book, BandShape::AfterFine));
     }
     // The half-span tier: the coarse geometry (same dimensionality and
     // level count) over half the span, so a partition whose peak fits
@@ -3145,14 +3262,11 @@ fn encode_pcm_to_packets_geometry(
     // setup header packet plus the classword and residue-value
     // codewords (floor emissions are identical across sets).
     let trained: Vec<VorbisCodebook> = setup.codebooks[2..].to_vec();
-    // The low-bitrate mode plans with rate-distortion VQ entry
-    // selection (measured: 3–10 % fewer audio bytes at equal SNR on
-    // speech, music and tonal material at 10–35 kbps).
-    let plan_classes = if low_rate {
-        crate::residue_encode::plan_vector_classifications_rd_bin_weighted_entry_rd
-    } else {
-        plan_vector_classifications_rd_bin_weighted
-    };
+    // Every VQ read is selected rate-distortion (weighted error plus
+    // `lambda` × codeword length over the nearest entry's shrunk
+    // neighbours): measured 3–10 % fewer audio bytes at equal SNR at
+    // 10–35 kbps and 2–3 % at 120–210 kbps.
+    let plan_classes = crate::residue_encode::plan_vector_classifications_rd_bin_weighted_entry_rd;
     // Every candidate band set shares the trained books, so a
     // partition's cascade under a given class — its weighted error and
     // value-codeword bits — is the same whichever other classes the
@@ -3181,7 +3295,7 @@ fn encode_pcm_to_packets_geometry(
             resolved
         })
         .collect();
-    let entry_lambda = if low_rate { tuning.lambda } else { 0.0 };
+    let entry_lambda = tuning.lambda;
     let mut walker = crate::residue_encode::ClassWalker::new(&full_rows);
     let full_classes = walker.classes();
     let class_stages: Vec<usize> = (0..full_classes)

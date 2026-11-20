@@ -15,6 +15,20 @@ All notable changes to `oxideav-vorbis` are recorded here.
   Bark-band noise-to-mask measures computed independently of the
   encoder's own model.
 
+### Changed
+
+- Encoder: the residue rate-distortion planning prices the squared
+  error left in the decoded signal (`floor² · n/4` per bin, with a
+  masked-noise relief on noise-like bands) instead of
+  `(floor/threshold)²` audibility weights; a three-stage deep cascade
+  class joins the candidate ladder; every VQ read is selected
+  rate-distortion at every quality. At the black-box reference
+  encoder's operating points the equal-rate SNR on struck notes moved
+  from −7.0…−1.8 dB to +1.8…+7.2 dB, on plucked strings from
+  −2.6…−7.3 dB to −0.6…+5.0 dB, on castanet-like clicks from
+  −7.5…−1.1 dB to +1.0…+6.0 dB (README table). Streams at a given
+  `quality` differ in size and fidelity from the previous release's.
+
 ### Performance
 
 - Encoder (output byte-identical): the residue planner prepares each
@@ -25,7 +39,9 @@ All notable changes to `oxideav-vorbis` are recorded here.
   `(partition, class)` pair once for the whole band-adoption loop
   instead of re-planning per candidate set, and the packet writer
   builds each codebook's Huffman tree once per stream with a codeword
-  table in place of a per-symbol tree walk.
+  table in place of a per-symbol tree walk. 6 s stereo, user CPU:
+  28.9 s → 3.35 s at `q = 0.5` on struck notes (with the changes
+  above), 17.1 s → 1.50 s at `q = 0.1`.
 
 ### Changed
 

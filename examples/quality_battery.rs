@@ -5,9 +5,11 @@
 //!
 //! ```text
 //! quality_battery gen  <dir>                    write the battery as 16-bit WAVs
-//! quality_battery enc  <in.wav> <out.ogg> q=<0..1> | kbps=<n>
+//! quality_battery enc  <in.wav> <out.ogg> q=<0..1> | kbps=<n>  [long=<n>] [short=<n>]
+//!                      [lowgeo=0|1] [coupling=0|1]
 //! quality_battery dec  <in.ogg> <out.wav>       this crate's decoder
 //! quality_battery rate <in.ogg>                 audio-packet kbps
+//! quality_battery info <in.ogg>                 block sizes and the residue class table
 //! quality_battery cmp  <ref.wav> <decoded.wav>  SNR / segSNR / NMR
 //! ```
 //!
@@ -31,7 +33,10 @@
 use std::f64::consts::PI;
 use std::time::Instant;
 
-use oxideav_vorbis::{StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets};
+use oxideav_vorbis::{
+    StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, ogg_packets,
+    parse_identification_header, parse_setup_header,
+};
 
 const RATE: u32 = 44_100;
 const SECONDS: f64 = 6.0;
@@ -507,7 +512,7 @@ fn audio_kbps(ogg: &[u8], seconds: f64) -> f64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: quality_battery gen|enc|dec|rate|cmp ... (see the file header)";
+    let usage = "usage: quality_battery gen|enc|dec|rate|info|cmp ... (see the file header)";
     match args.get(1).map(String::as_str) {
         Some("gen") => {
             let dir = args.get(2).expect(usage);
@@ -525,14 +530,20 @@ fn main() {
         Some("enc") => {
             let (pcm, rate) = read_wav(args.get(2).expect(usage));
             let mut config = StreamEncoderConfig::new(rate, pcm.len() as u8);
-            let knob = args.get(4).expect(usage);
-            if let Some(q) = knob.strip_prefix("q=") {
-                config.quality = q.parse().expect("q");
-            } else if let Some(k) = knob.strip_prefix("kbps=") {
-                let kbps: f64 = k.parse().expect("kbps");
-                config.target_bitrate = Some((kbps * 1000.0) as u32);
-            } else {
-                panic!("{usage}");
+            for knob in &args[4..] {
+                let (key, value) = knob.split_once('=').expect(usage);
+                match key {
+                    "q" => config.quality = value.parse().expect("q"),
+                    "kbps" => {
+                        let kbps: f64 = value.parse().expect("kbps");
+                        config.target_bitrate = Some((kbps * 1000.0) as u32);
+                    }
+                    "long" => config.blocksize = value.parse().expect("long"),
+                    "short" => config.short_blocksize = value.parse().expect("short"),
+                    "lowgeo" => config.low_rate_geometry = value != "0",
+                    "coupling" => config.coupling = value != "0",
+                    _ => panic!("{usage}"),
+                }
             }
             let seconds = pcm[0].len() as f64 / f64::from(rate);
             let t = Instant::now();
@@ -562,6 +573,42 @@ fn main() {
                 .map(|s| s.parse().expect("seconds"))
                 .unwrap_or(SECONDS);
             println!("{:.2}", audio_kbps(&ogg, seconds));
+        }
+        Some("info") => {
+            let ogg = std::fs::read(args.get(2).expect(usage)).expect("read ogg");
+            let packets = ogg_packets(&ogg).expect("de-frames");
+            let id = parse_identification_header(&packets[0]).expect("identification header");
+            let setup = parse_setup_header(&packets[2], id.audio_channels).expect("setup header");
+            println!(
+                "blocksizes {}/{} channels {} setup {} B, {} codebooks",
+                id.blocksize_0,
+                id.blocksize_1,
+                id.audio_channels,
+                packets[2].len(),
+                setup.codebooks.len()
+            );
+            for (i, residue) in setup.residues.iter().enumerate() {
+                println!(
+                    "residue {i}: type {} end {} partition {}",
+                    residue.residue_type, residue.residue_end, residue.partition_size
+                );
+                for (class, row) in residue.books.iter().enumerate() {
+                    let stages: Vec<String> = row
+                        .iter()
+                        .flatten()
+                        .map(|&b| {
+                            let book = &setup.codebooks[b as usize];
+                            format!(
+                                "book {b} ({}-D, {} used of {})",
+                                book.dimensions,
+                                book.used_entries(),
+                                book.entries
+                            )
+                        })
+                        .collect();
+                    println!("  class {class}: {}", stages.join(" + "));
+                }
+            }
         }
         Some("cmp") => {
             let (reference, rate) = read_wav(args.get(2).expect(usage));

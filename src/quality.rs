@@ -15,7 +15,7 @@
 //! * [`EncoderTuning::from_quality`] maps a quality setting
 //!   `q ∈ [0, 1]` to a coherent lever set: `lambda` falls
 //!   log-linearly with `q` (each step of `q` buys a constant-ratio
-//!   drop in the bits→audibility exchange rate), the masking margin
+//!   drop in the bits→distortion exchange rate), the masking margin
 //!   rises linearly (−7.2 dB at the low-bitrate knee `q = 0.2`,
 //!   capped at +6 dB), and the floor post budget grows with the
 //!   fidelity the residue will carry. Below the **low-bitrate knee**
@@ -104,9 +104,11 @@ const FULL_BANDWIDTH_HZ: f32 = 20_000.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderTuning {
     /// The rate-distortion Lagrange multiplier for the residue
-    /// choosers. In the perceptually weighted chooser the distortion
-    /// term is on the noise-to-mask scale, so `lambda` prices bits in
-    /// audibility units: `10⁻¹·⁹²` at the low-bitrate knee `q = 0.2`
+    /// choosers. The whole-stream encoder's distortion term is the
+    /// squared error left in the decoded signal (priced per unit, with
+    /// a masked-noise relief on noise-like bands — see the weights in
+    /// the `oggfile` geometry core), so `lambda` sets the error level
+    /// the plans settle at: `10⁻¹·⁹²` at the low-bitrate knee `q = 0.2`
     /// down to `10⁻⁴` at `q = 1`, log-linear in between, and a
     /// further [`LOW_BITRATE_LAMBDA_DECADES`] decades up at `q = 0`
     /// ([`EncoderTuning::lambda_for_quality`]). (The law was recalibrated for
@@ -194,9 +196,8 @@ pub struct EncoderTuning {
     /// on: the doubled block geometry
     /// ([`crate::StreamEncoderConfig::low_rate_geometry`]), the
     /// `floor1_multiplier = 2` post grid, 16-bin long-block residue
-    /// partitions, rate-distortion VQ entry selection and the
-    /// compressed audibility-weight ceiling. Monotone non-increasing
-    /// in `q`.
+    /// partitions, and a masked-noise relief rising from half to full
+    /// strength. Monotone non-increasing in `q`.
     pub low_rate_depth: f32,
 }
 

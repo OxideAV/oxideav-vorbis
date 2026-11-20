@@ -20,9 +20,12 @@
 //!
 //! Behaviour pins: every produced stream still decodes end-trim exact
 //! through the crate's own decoder, and the candidate machinery never
-//! costs — a stream with the bands lever on serialises no larger
-//! than the base-ladder stream (the adoption only keeps measured
-//! improvements) at no measured fidelity cost.
+//! costs — a stream with the bands lever on either serialises no
+//! larger than the base-ladder stream at no measured fidelity cost,
+//! or (a class that reaches *below* the base cascade's error floor,
+//! the three-stage deep cascade) spends its extra bytes at a fair
+//! price in measured fidelity: the adoption only keeps improvements
+//! of the whole rate–distortion Lagrangian.
 
 use oxideav_vorbis::{
     StreamEncoderConfig, decode_ogg_to_pcm, encode_pcm_to_ogg, encode_pcm_to_packets,
@@ -156,6 +159,52 @@ fn setup_of(
     parse_setup_header(&stream.setup, channels).expect("produced setup parses")
 }
 
+/// The candidate machinery never costs: against the explicit base
+/// ladder (`residue_bands = false`) the banded stream is no larger
+/// (2 % routing noise — the two encodes are not bit-identical, the
+/// closed-loop trainer runs with the candidate classes present) at no
+/// fidelity cost beyond 0.5 dB, or the bytes it adds buy fidelity at
+/// no worse than 3 dB per extra bit per sample (half the 6.02 dB per
+/// bit a quantiser refinement earns in the high-resolution limit).
+fn assert_bands_never_cost(pcm: &[Vec<f32>], config: &StreamEncoderConfig, what: &str) {
+    let measure = |config: &StreamEncoderConfig| -> (usize, f64, u8) {
+        let stream = encode_pcm_to_packets(pcm, config).expect("encodes");
+        let classes = setup_of(&stream, 1)
+            .residues
+            .last()
+            .expect("long residue")
+            .classifications;
+        let total = stream.setup.len() + stream.audio.iter().map(|(p, _)| p.len()).sum::<usize>();
+        let ogg = encode_pcm_to_ogg(pcm, config).expect("muxes");
+        let decoded = decode_ogg_to_pcm(&ogg).expect("decodes");
+        (total, snr_db(&pcm[0], &decoded.pcm[0]), classes)
+    };
+    let (banded_total, banded_snr, _) = measure(config);
+    let mut base_config = config.clone();
+    base_config.residue_bands = false;
+    let (base_total, base_snr, base_classes) = measure(&base_config);
+    assert_eq!(
+        base_classes, 4,
+        "residue_bands = false keeps the base ladder"
+    );
+    eprintln!(
+        "{what}: banded {banded_total} B / {banded_snr:.2} dB vs base {base_total} B / {base_snr:.2} dB"
+    );
+    if banded_total as f64 <= base_total as f64 * 1.02 {
+        assert!(
+            banded_snr >= base_snr - 0.5,
+            "{what}: band candidates cost fidelity: {banded_snr:.2} vs base {base_snr:.2} dB"
+        );
+    } else {
+        let extra_bits_per_sample = 8.0 * (banded_total - base_total) as f64 / pcm[0].len() as f64;
+        assert!(
+            banded_snr - base_snr >= 3.0 * extra_bits_per_sample,
+            "{what}: band candidates cost bytes without the fidelity to show for them: \
+             {banded_total} B / {banded_snr:.2} dB vs base {base_total} B / {base_snr:.2} dB"
+        );
+    }
+}
+
 #[test]
 fn coded_band_spans_the_whole_spectrum() {
     let pcm = banded_corpus(44_100, 1.0);
@@ -263,33 +312,7 @@ fn banded_corpus_adopts_a_band_class_that_pays() {
     );
     assert!(snr >= 30.0, "banded roundtrip SNR {snr:.2} dB below 30 dB");
 
-    // The candidate machinery never costs: against the explicit base
-    // ladder (`residue_bands = false`) the full stream serialises to
-    // (near-)identical size or smaller. (The two encodes are not
-    // bit-identical — the closed-loop trainer runs with the candidate
-    // classes present — so allow routing noise.)
-    let mut base_config = config.clone();
-    base_config.residue_bands = false;
-    let base = encode_pcm_to_packets(&pcm, &base_config).expect("base encodes");
-    let base_setup = setup_of(&base, 1);
-    assert_eq!(
-        base_setup
-            .residues
-            .last()
-            .expect("long residue")
-            .classifications,
-        4,
-        "residue_bands = false keeps the base ladder"
-    );
-    let banded_total: usize =
-        stream.setup.len() + stream.audio.iter().map(|(p, _)| p.len()).sum::<usize>();
-    let base_total: usize =
-        base.setup.len() + base.audio.iter().map(|(p, _)| p.len()).sum::<usize>();
-    eprintln!("banded total {banded_total} B vs base {base_total} B");
-    assert!(
-        banded_total as f64 <= base_total as f64 * 1.02,
-        "band candidates cost bytes: {banded_total} vs base {base_total}"
-    );
+    assert_bands_never_cost(&pcm, &config, "banded synthetic");
 }
 
 #[test]
@@ -310,10 +333,13 @@ fn separation_free_corpus_declines_the_mid_class() {
     let config = StreamEncoderConfig::new(rate, 1);
     let stream = encode_pcm_to_packets(&pcm, &config).expect("encodes");
     let setup = setup_of(&stream, 1);
-    assert_eq!(
-        setup.residues.last().expect("long residue").classifications,
-        4,
-        "no amplitude separation ⇒ base ladder"
+    // (The cascade classes — refinement rungs, the deep third stage
+    // — are candidates on any corpus; the amplitude-separation gate
+    // governs the mid tier.)
+    let long = setup.residues.last().expect("long residue");
+    assert!(
+        find_mid_tier(&setup, long).is_none(),
+        "no amplitude separation ⇒ no mid band class"
     );
 }
 
@@ -376,22 +402,7 @@ fn staged_corpus_carries_the_cap_and_adoption_never_costs() {
     let setup = setup_of(&stream, 1);
     let long = setup.residues.last().expect("long residue");
     assert_eq!(long.cascade.len(), long.classifications as usize);
-    let mut base_config = config.clone();
-    base_config.residue_bands = false;
-    let base = encode_pcm_to_packets(&tiled, &base_config).expect("tiled base encodes");
-    let total = |s: &oxideav_vorbis::EncodedVorbisStream| -> usize {
-        s.setup.len() + s.audio.iter().map(|(p, _)| p.len()).sum::<usize>()
-    };
-    eprintln!(
-        "tiled corpus adopts {} classes: {} B vs base {} B",
-        long.classifications,
-        total(&stream),
-        total(&base)
-    );
-    assert!(
-        total(&stream) as f64 <= total(&base) as f64 * 1.02,
-        "band candidates cost bytes on the tiled corpus"
-    );
+    assert_bands_never_cost(&tiled, &config, "tiled corpus");
     let ogg = encode_pcm_to_ogg(&tiled, &config).expect("tiled muxes");
     let decoded = decode_ogg_to_pcm(&ogg).expect("tiled decodes");
     assert_eq!(decoded.pcm[0].len(), tiled[0].len(), "end-trim exact");

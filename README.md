@@ -45,9 +45,13 @@ at 22 kbps / 18.4 dB) or an
 the knob over eight full encodes), on a **band-level masking
 model** (masker level = analysis-band energy spread over the masked
 band's bins; ATH capped and band-shared; tonality = max of spectral
-flatness and cross-frame **phase predictability**) whose per-bin
-audibility weights drive a **masking-weighted VQ selection** (every
-§8.6.2 read picks its entry under its own elements' weights), a
+flatness and cross-frame **phase predictability**) that shapes the
+floor — and through it the quantiser steps — while the residue
+rate-distortion planning prices the **squared error left in the
+decoded signal** per bin (`floor² · n/4`, commensurable across block
+sizes, with a masked-noise relief on noise-like bands; every §8.6.2
+read picks its entry under its own elements' weights and its
+codeword length), a
 **covering floor-1 fit** (posts lifted — each segment by its
 energy-priced cheapest move, the x-list designed from the stream's
 geometric-mean envelope — until the rendered curve
@@ -64,7 +68,11 @@ fine / three **refinement rungs** (coarse + a second-stage lattice
 at the coarse step ÷ 2, ÷ 4, ÷ 8 — operating points at ~6 dB spacing
 between the 17 dB coarse-only class and the 43 dB coarse + fine
 cascade, so the low knob holds an intermediate point instead of
-time-sharing the two) — kept only when a greedy post-training adoption loop measures
+time-sharing the two) / a **three-stage deep cascade** (coarse +
+fine + a third lattice spanning two fine steps, the class that lifts
+the two-stage cascade's error floor: measured when it was introduced,
+struck notes at `q = 0.25` went 36.4 dB / 125 kbps → 45.6 dB /
+145 kbps and their SNR became monotone in `q`) — kept only when a greedy post-training adoption loop measures
 the whole Lagrangian (weighted distortion + λ × setup-table +
 classword + value bits) strictly smaller, with every value book's
 codeword lengths retrained sparse from the final plans' exact
@@ -72,11 +80,11 @@ emission tallies. Black-box verified: every swept encoder output
 (the staged fixture re-encodes and a synthetic battery at
 `q ∈ {0.3, 0.5, 0.7}`) decodes identically through the black-box
 reference decoder and the crate's own; measured at equal rate
-against the black-box reference encoder the r453 encoder leads on
-the mono fixtures (+9…+12 dB), tones, wideband noise at the upper
-knob, transients (+2…+6 dB, with better pre-echo figures), and
-trails on dense-correlated stereo and white noise at the low knob
-(see the gaps list). `register()` installs the
+against the black-box reference encoder on the r491 battery (struck
+and plucked notes, clicks, speech-like, a sustained chord, a mix) the
+encoder leads by +2…+12 dB of SNR on five materials and sits at
+parity on plucked strings, and trails on wideband noise at 60–250 kbps
+(see the measurement table and the gaps list). `register()` installs the
 codec — decoder and encoder factories, the Matroska `A_VORBIS`
 tag, and the §4.2.1 `"\x01vorbis"` payload magic for
 container-agnostic resolution — into
@@ -661,8 +669,8 @@ alone) at least halves the final Lagrangian.
 **Quality targeting** (`quality` module) ties the levers to one
 scalar: `EncoderTuning::from_quality(q ∈ [0, 1])` expands to the
 residue `lambda` (log-linear `10⁻¹·⁴ → 10⁻⁴`, recalibrated for the
-four-class ladder — pricing bits in noise-to-mask units under the
-weighted chooser), the psy margin (−12 dB rising to a measured
+four-class ladder — pricing bits against the weighted chooser's
+distortion), the psy margin (−12 dB rising to a measured
 **+6 dB cap**: past it, the threshold-riding floor envelope drags
 onto `|X|` across the quiet bins and the full-scale residue targets
 quantise poorly — SNR stops rising while bytes climb), the floor
@@ -835,7 +843,7 @@ framing splitter (per-frame §4.3.1 windows, hybrid edges included),
 the bare §4.3.7 forward MDCT at the derived `4/n`
 unity-reconstruction scale, per-channel psychoacoustics, per-size
 floor-1 design/fit, the gated §4.3.5 forward channel coupling, and
-NMR-weighted RD residue planning over an **amplitude-banded §8.6.1
+squared-error-weighted RD residue planning over an **amplitude-banded §8.6.1
 class ladder** per partition: silence, a joint **4-dimensional
 ternary noise book** (one codeword per four bins — near-threshold
 texture at a fraction of the scalar cost; designed per stream from
@@ -1029,51 +1037,135 @@ inter-channel gap 12.1 → 3.0 dB at 14.4 → 23.1 kB audio; `q ≤ 0.75`
 and mono stay single-pass and byte-identical
 (`tests/quiet_channel_margin.rs` pins both bands).
 
+### Encoder measurements (r491)
+
+`examples/quality_battery.rs` is the measurement harness: a
+deterministic stereo 44.1 kHz battery (struck inharmonic notes,
+plucked strings, castanet-like clicks, a speech-like pulse train with
+fricatives, a sustained chord, and a mix of three), encode / decode
+entry points with timing, and three measures computed by the harness
+alone — whole-stream SNR, a 256-sample segmental SNR, and a Bark-band
+noise-to-mask ratio (NMR, lower is better) that shares no code with
+the encoder's own masking model. Every figure below is taken on a
+black-box decoder's output of the stream (`oggdec`; `ffmpeg` decodes
+the same streams), at the black-box reference encoder's own operating
+points, with this encoder's rate–quality curve interpolated to the
+reference's exact audio-packet bitrate. "before" is the encoder as
+of the previous release.
+
+| material | reference point | reference SNR / NMR | SNR vs reference, before → after | NMR vs reference, before → after |
+| --- | --- | --- | --- | --- |
+| struck notes | 29 kbps | 19.8 / −6.4 dB | −7.0 → +1.8 dB | +1.0 → −0.4 dB |
+| struck notes | 57 kbps | 22.4 / −8.5 dB | −1.8 → +6.8 dB | −3.5 → −5.6 dB |
+| struck notes | 83 kbps | 27.5 / −13.0 dB | −2.4 → +7.2 dB | −3.5 → −6.6 dB |
+| struck notes | 112 kbps | 31.7 / −16.8 dB | −1.9 → +5.6 dB | −4.0 → −4.0 dB |
+| struck notes | 165 kbps | 36.9 / −21.6 dB | −3.6 → +7.1 dB | −1.7 → −4.8 dB |
+| plucked strings | 33 kbps | 9.5 / −5.2 dB | (out of reach) → −0.6 dB | → +0.1 dB |
+| plucked strings | 55 kbps | 11.7 / −6.5 dB | −2.6 → 0.0 dB | −2.4 → −3.4 dB |
+| plucked strings | 83 kbps | 14.5 / −10.4 dB | −3.2 → +0.7 dB | −3.3 → −4.7 dB |
+| plucked strings | 126 kbps | 18.0 / −13.8 dB | −3.7 → +5.0 dB | −5.1 → −5.4 dB |
+| plucked strings | 190 kbps | 27.3 / −18.5 dB | −7.3 → +4.9 dB | −5.7 → −7.8 dB |
+| clicks | 13 kbps | 8.6 / −1.2 dB | (out of reach) → +6.0 dB | → +0.8 dB |
+| clicks | 17 kbps | 13.0 / −4.2 dB | −5.6 → +4.0 dB | +6.4 → +2.3 dB |
+| clicks | 22 kbps | 14.6 / −5.5 dB | −3.8 → +4.7 dB | +4.1 → +1.5 dB |
+| clicks | 30 kbps | 15.8 / −7.3 dB | −1.1 → +5.9 dB | +2.5 → +0.8 dB |
+| clicks | 63 kbps | 31.4 / −21.0 dB | −7.5 → +1.0 dB | +2.1 → −2.1 dB |
+| speech-like | 58 kbps | 14.8 / −2.8 dB | −0.4 → +1.4 dB | −2.3 → −3.0 dB |
+| speech-like | 89 kbps | 16.4 / −6.9 dB | −1.3 → +2.7 dB | −1.7 → −3.7 dB |
+| speech-like | 108 kbps | 17.3 / −8.0 dB | −1.5 → +7.9 dB | −2.9 → −5.1 dB |
+| speech-like | 146 kbps | 19.5 / −9.4 dB | −2.7 → +12.6 dB | −6.0 → −8.4 dB |
+| sustained chord | 49 kbps | 16.1 / −4.5 dB | +1.9 → +4.8 dB | −4.6 → −5.3 dB |
+| sustained chord | 67 kbps | 21.9 / −9.3 dB | +0.2 → +2.1 dB | −2.4 → −2.9 dB |
+| sustained chord | 97 kbps | 24.5 / −11.3 dB | +1.8 → +10.7 dB | −4.9 → −7.3 dB |
+| sustained chord | 154 kbps | 29.0 / −15.2 dB | +13.2 → +19.9 dB | −12.9 → −14.1 dB |
+| mix | 43 kbps | 15.7 / −0.7 dB | −6.4 → +1.9 dB | +1.1 → −1.5 dB |
+| mix | 66 kbps | 17.3 / −2.9 dB | −0.1 → +3.3 dB | −1.1 → −2.5 dB |
+| mix | 97 kbps | 22.9 / −7.6 dB | −2.8 → +2.6 dB | 0.0 → −2.0 dB |
+| mix | 127 kbps | 25.7 / −10.2 dB | −3.3 → +5.8 dB | −0.1 → −4.5 dB |
+| mix | 207 kbps | 31.7 / −16.8 dB | −1.1 → +7.9 dB | −2.6 → −6.6 dB |
+
+What moved it, in measured order:
+
+- **The residue Lagrangian prices squared error in the decoded
+  signal** (`floor² · n/4` per bin) instead of `(floor/threshold)²`
+  audibility. On tonal material the audibility weights saturate —
+  the model asks for noise 40 dB under every partial — and the
+  chooser coded a few partitions at −32 dB or finer and dropped the
+  rest (struck notes at the knob's low end: 4 600 partitions on the
+  coarse cascades, 3 100 silent, 12.7 dB). Alone: +4…+10 dB SNR at
+  equal rate on all six materials and −2…−5 dB on the harness NMR.
+  The `n/4` factor is the transform's own scale (a spectral error of
+  squared norm `Σ` is `(n/4)·Σ` in the overlap-added output), so a
+  short block's error is no longer priced 8× a long block's.
+- **Masked-noise relief**: where a noise-like band's masking
+  threshold sits above the error level the Lagrangian settles at,
+  the weight is relaxed toward the threshold (half strength through
+  the middle of the knob, full at its low end, none at the top), so
+  loud broadband noise is not held to the absolute error level of
+  everything else. Mono white noise, before → after: `q = 0.1`
+  85.0 → 84.5 kbps at 2.7 dB (band-limited either way), `q = 0.2`
+  258.7 kbps at 27.1 → 27.5 dB, `q = 0.5` 337 kbps / 31.7 dB →
+  322 kbps / 38.0 dB.
+- **The three-stage deep cascade** class (see the ladder above): the
+  two-stage cascade's finest step is −56 dB under the *floor*, which
+  rides the partials' envelope with at most a few dozen posts, so a
+  partial 30 dB under the floor line topped out near 26 dB.
+- **Rate-distortion VQ entry selection at every quality** (it was a
+  low-bitrate-mode lever): 2–3 % fewer audio bytes at equal SNR at
+  120–210 kbps.
+
+Speed (6 s stereo 44.1 kHz battery clips, user CPU seconds on one
+core of an Apple-silicon laptop, medians of three, other jobs running
+on the machine):
+
+| stream | before | after | × realtime after |
+| --- | --- | --- | --- |
+| encode struck notes `q = 0.1` | 17.1 s | 1.50 s | 4.0× |
+| encode struck notes `q = 0.5` | 28.9 s | 3.35 s | 1.8× |
+| encode mix `q = 0.5` | 23.9 s | 4.44 s | 1.35× |
+| decode (2 min stereo, 127 kbps) | — | 0.44 s | 273× |
+
+The encoder speed work is output-preserving in itself (the stage
+before the quality changes produced byte-identical streams at
+4.75 s for the second row): each value book is prepared once per
+residue vector instead of once per VQ read, sparse lattice rows are
+walked outward from the target instead of sorted, classes sharing a
+first cascade stage share its quantisation, every
+`(partition, class)` pair is scored once for the whole band-adoption
+loop, and the packet writer builds each Huffman tree once per stream
+and looks codewords up in a table. An ABR encode is the knob solve's
+nine full encodes.
+
 ### Not yet supported / known gaps
 
 Figures are equal-rate comparisons against the black-box reference
-encoder (own-decode SNR; both decoders agree on every stream) — r453
-for the high-rate noise items, r483 for the low-bitrate table.
+encoder, from the r491 battery above.
 
-- **White noise / dense noisy content at the low knob trails the
-  reference** (white-noise battery: 22.1 dB vs 28.8 dB at ~296 kbps;
-  the correlated-with-delay stereo battery: 22.0 vs 37.3 dB at
-  ~466 kbps at `q = 0.3`, closing to −2 dB at `q = 0.5` and parity
-  above). The r456 refinement rungs close the ladder's 26 dB gap
-  between the coarse-only and coarse + fine points (adopted at the
-  low knob: −10…−12 % audio bytes at equal SNR on white noise at
-  `q = 0.2`, +3.4 dB at `q = 0.5` on loud white noise); what remains
-  at equal rate is the masking model's allocation — the threshold
-  in quiet drops the top of a −20 dBFS noise spectrum outright and
-  the weighted chooser spends the low knob's bits where the mask is
-  lowest — so waveform SNR on wideband noise trails the reference
-  below its `q = 8` operating region while the perceptual objective
-  is met.
-- **Below 60 kbps the encoder now leads or matches the reference on
-  tonal, speech and music material and trails on piano-like notes
-  and dense transients** (r483, 6 s stereo 44.1 kHz battery, the
-  best own-decode SNR within each budget; the reference's lowest
-  mode does not go under ~38 kbps on this battery):
-
-  | material | 24 kbps | 32 kbps | 45 kbps | 60 kbps | reference |
-  | --- | --- | --- | --- | --- | --- |
-  | tones + hiss | 23.4 dB | 24.3 dB | 25.8 dB | 27.1 dB | 24.3 dB @ 45 kbps |
-  | speech-like | 18.4 dB | 18.5 dB | 19.1 dB | 19.1 dB | 20.7 dB @ 44 kbps, 22.1 @ 59 |
-  | music mix | 16.3 dB | 16.3 dB | 20.2 dB | 20.2 dB | 18.9 dB @ 41 kbps, 21.2 @ 60 |
-  | piano notes | — (q = 0 is 24.9 kbps / 13.7 dB) | 16.1 dB | 20.9 dB | 24.3 dB | 20.6 @ 24, 22.9 @ 27, 23.7 @ 44 |
-  | transients | — | 6.1 dB | 6.7 dB | 7.5 dB | 7.4 @ 44, 8.5 @ 58 (segmental 15.6 / 19.5 vs our 12.7 / 15.4) |
-
-  (r482: 9.6 / 16.8 / 16.8 / 16.8 dB tonal, 9.5 / 15.6 / 18.6 /
-  18.6 speech, 8.9 / 12.4 / 14.6 / 17.1 music, 5.7 / 7.6 / 11.4 /
-  13.0 piano.) What remains: the per-stream fixed floor post
-  x-list cannot follow note-to-note partial structure (the
-  reference spends 27 posts where the budget here is 8 — more posts
-  measured as pure rate at equal SNR, so the gap is in placement, not
-  count); the speech/music rate curve flattens past ~40 kbps (the
-  widening coded band spends on noise-like high bands at ~1 dB per
-  doubling); the attack detector's 4096-sample lookahead keeps
-  dense-transient material on short blocks ~1.8× as often as the
-  reference.
+- **Wideband noise between ~60 and ~250 kbps trails the reference
+  in waveform SNR** (mono white noise: the reference codes 88 kbps
+  at 7.4 dB and 147 kbps at 16.4 dB; this encoder's low-bitrate mode
+  band-limits such a stream — 84.5 kbps at 2.7 dB at `q = 0.1` — and
+  its next operating point is 259 kbps at 27.5 dB, with nothing in
+  between: the coded-band limit is a hard `residue_end`, so inside
+  the band the noise is coded far more finely than the dropped band
+  can repay). Above the knee it leads (322 kbps / 38.0 dB at
+  `q = 0.5`). A soft high-frequency de-emphasis in place of the hard
+  band limit is the open item.
+- **Plucked strings sit at parity with the reference below
+  ~100 kbps** (−0.6…+0.7 dB SNR, with +5…+8 dB segmental SNR and
+  −3…−5 dB NMR) rather than ahead of it like the other materials, and
+  the clicks' NMR at 13–30 kbps is 1–2 dB behind the reference's
+  (their SNR is 4–6 dB ahead): the attack frames of both go to
+  512-sample short blocks in the low-bitrate mode.
+- **The quality knob is not rate-calibrated across materials**:
+  `q` sets an error level, so `q = 0.5` lands 160 kbps on the struck
+  notes, 208 kbps on the mix and 322 kbps on mono white noise. Use
+  `target_bitrate` for a rate.
+- **An ABR encode costs nine full encodes**, and a budget inside one
+  of the knob's structural rate jumps is underspent (128 kbps on the
+  struck notes delivers 102.5 kbps).
+- The r453 dense correlated-with-delay stereo battery (22.0 vs
+  37.3 dB at `q = 0.3` then) was not re-measured this round.
 - **The angle-vector point-stereo discount is SNR-invisible**: the
   interaural-phase discount above 1.5 kHz trades waveform SNR (what
   the harness measures) for bits, so its benefit is asserted from

@@ -132,13 +132,10 @@ fn produced_setup_carries_the_class_ladder_and_scaled_partitions() {
     let classes = setup.residues[0].classifications as usize;
     for residue in &setup.residues {
         // The base class ladder — silence / noise / coarse / both —
-        // plus, when the corpus' amplitude bands separate (this tonal
-        // corpus does), the 4-D mid band class appended after it.
+        // plus whichever candidate classes the measured adoption
+        // kept, appended after it.
         assert_eq!(residue.classifications as usize, classes);
-        assert!(
-            classes == 4 || classes == 5,
-            "base ladder or base + mid band, got {classes}"
-        );
+        assert!(classes >= 4, "at least the base ladder, got {classes}");
         assert_eq!(residue.cascade.len(), classes);
         assert_eq!(residue.cascade[0], 0, "class 0 is silence");
         assert_eq!(residue.cascade[1], 0b01, "class 1 reads pass 0 only");
@@ -163,16 +160,35 @@ fn produced_setup_carries_the_class_ladder_and_scaled_partitions() {
             ),
             "coarse book carries a lattice lookup"
         );
-        if classes == 5 {
-            // The mid band class: single pass, a 4-D five-level book.
-            assert_eq!(residue.cascade[4], 0b01, "mid class reads pass 0 only");
-            let mid_book = residue.books[4][0].expect("mid class carries a book") as usize;
-            assert_eq!(setup.codebooks[mid_book].dimensions, 4);
-            assert_eq!(setup.codebooks[mid_book].entries, 625);
-            assert!(
-                matches!(setup.codebooks[mid_book].lookup, VqLookup::Lattice { .. }),
-                "mid band book carries a lattice lookup"
-            );
+        let fine_book = residue.books[3][1].expect("class 3 carries a fine book") as usize;
+        // Every appended class has one of the declared shapes: a
+        // single-pass band book, a two-stage cascade sharing the base
+        // coarse book (a refinement rung) or the base fine book (the
+        // wide cascade), or the three-stage deep cascade under the
+        // base pair.
+        for class in 4..classes {
+            let row = &residue.books[class];
+            let stage = |pass: usize| row[pass].expect("a populated stage carries a book") as usize;
+            match residue.cascade[class] {
+                0b01 => {
+                    assert!(
+                        matches!(setup.codebooks[stage(0)].lookup, VqLookup::Lattice { .. }),
+                        "a band book carries a lattice lookup"
+                    );
+                }
+                0b11 => {
+                    assert!(
+                        stage(0) == coarse_book || stage(1) == fine_book,
+                        "a two-stage class shares a base book: {row:?}"
+                    );
+                }
+                0b111 => {
+                    assert_eq!(stage(0), coarse_book, "deep cascade pass 0");
+                    assert_eq!(stage(1), fine_book, "deep cascade pass 1");
+                    assert_eq!(setup.codebooks[stage(2)].dimensions, 2);
+                }
+                other => panic!("class {class} has an undeclared cascade {other:#b}"),
+            }
         }
     }
 
